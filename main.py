@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google.oauth2 import id_token
@@ -35,15 +36,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def verify_google_token(token: str = Query(...)):
-    logging.info(f"Received token: {token}")
+from fastapi import Header
+
+def verify_google_token(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    token = authorization.split("Bearer ")[1]
+    
     try:
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Decoded user info: {idinfo}")
-        return idinfo  # Contains user info
+        return idinfo
     except Exception as e:
         logging.error(f"Token verification failed: {str(e)}")
         raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
