@@ -30,7 +30,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://acesagentinterface-672026052958.australia-southeast2.run.app"],
+    allow_origins=[
+        "https://acesagentinterface-672026052958.australia-southeast2.run.app",
+        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
