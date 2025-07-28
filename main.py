@@ -33,6 +33,8 @@ app.add_middleware(
     allow_origins=[
         "https://acesagentinterface-672026052958.australia-southeast2.run.app",
         "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
+        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/canva-pitch-deck",
+        "https://acesagentinterface-672026052958.australia-southeast2.run.app/canva-pitch-deck",
     ],
     allow_credentials=True,
     allow_methods=["*"],
