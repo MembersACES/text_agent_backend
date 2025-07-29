@@ -103,8 +103,8 @@ def get_electricity_ci_info(
     request: ElectricityInvoiceRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    if not request.business_name or not request.nmi:
-        raise HTTPException(status_code=400, detail="business_name and nmi are required")
+    if not request.business_name and not request.nmi:
+        raise HTTPException(status_code=400, detail="Either business_name or nmi is required")
     
     logging.info(f"Received C&I electricity info request: business_name={request.business_name}, nmi={request.nmi}")
     data = get_electricity_ci_latest_invoice_information(
@@ -120,7 +120,7 @@ def get_electricity_sme_info(
     request: ElectricityInvoiceRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    if not request.business_name or not request.nmi:
+    if not request.business_name and not request.nmi:
         raise HTTPException(status_code=400, detail="business_name and nmi are required")
     
     logging.info(f"Received SME electricity info request: business_name={request.business_name}, nmi={request.nmi}")
@@ -137,7 +137,7 @@ def get_gas_ci_info(
     request: GasInvoiceRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    if not request.business_name or not request.mrin:
+    if not request.business_name and not request.mrin:
         raise HTTPException(status_code=400, detail="business_name and mrin are required")
 
     logging.info(f"Received C&I gas info request: business_name={request.business_name}, mrin={request.mrin}")
@@ -154,7 +154,7 @@ def get_gas_sme_info(
     request: GasInvoiceRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    if not request.business_name or not request.mrin:
+    if not request.business_name and not request.mrin:
         raise HTTPException(status_code=400, detail="business_name and mrin are required")
 
     logging.info(f"Received SME gas info request: business_name={request.business_name}, mrin={request.mrin}")
@@ -171,7 +171,7 @@ def get_waste_info(
     request: WasteInvoiceRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    if not request.business_name or not request.account_number:
+    if not request.business_name and not request.account_number:
         raise HTTPException(status_code=400, detail="business_name and account_number are required")
 
     logging.info(f"Received waste info request: business_name={request.business_name}, account_number={request.account_number}")
