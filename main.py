@@ -24,6 +24,15 @@ from tools.get_oil_invoice_information import get_oil_invoice_information
 from tools.supplier_data_request import supplier_data_request
 from tools.drive_filing import drive_filing
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement
+from tools.document_generation import (
+    loa_generation,
+    service_fee_agreement_generation,
+    expression_of_interest_generation,
+    ghg_offer_generation,
+    get_available_eoi_types
+)
+
+from tools.loa_generation import loa_generation_new
 
 load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -43,6 +52,8 @@ app.add_middleware(
         "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/document-lodgement",
         "http://localhost:3000",
         "http://localhost:3000/signed-agreement-lodgement",
+        "http://localhost:3000/document-generation",
+        "http://localhost:3000/new-client-loa",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -62,12 +73,47 @@ def verify_google_token(authorization: str = Header(...)):
         logging.info(f"Decoded user info: {idinfo}")
         return idinfo
     except Exception as e:
-        logging.error(f"Token verification failed: {str(e)}")
-        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+        error_msg = str(e)
+        logging.error(f"Token verification failed: {error_msg}")
+        
+        if "Token expired" in error_msg:
+            raise HTTPException(
+                status_code=401,
+                detail="Reauthentication required"
+            )
+        
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
+
+class DocumentGenerationRequest(BaseModel):
+    business_name: str
+    abn: str
+    trading_as: str
+    postal_address: str
+    site_address: str
+    telephone: str
+    email: str
+    contact_name: str
+    position: str
+    client_folder_url: str
+
+class NewLOAGeneration(BaseModel):
+    business_name: str
+    abn: str
+    trading_as: str
+    postal_address: str
+    site_address: str
+    telephone: str
+    email: str
+    contact_name: str
+    position: str
+
+class EOIGenerationRequest(DocumentGenerationRequest):
+    expression_type: str
 
 @app.post("/api/get-business-info")
 def get_business_info(
@@ -373,3 +419,182 @@ def get_contract_types(user_info: dict = Depends(verify_google_token)):
         "eois": eois,
         "user_email": user_info.get("email")
     }
+
+@app.post("/api/generate-loa")
+def generate_loa_endpoint(
+    request: DocumentGenerationRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Letter of Authority document"""
+    logging.info(f"Received LOA generation request for: {request.business_name}")
+    
+    try:
+        result = loa_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"LOA generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating LOA for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating LOA: {str(e)}")
+
+@app.post("/api/generate-service-agreement")
+def generate_service_agreement_endpoint(
+    request: DocumentGenerationRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Service Fee Agreement document"""
+    logging.info(f"Received Service Agreement generation request for: {request.business_name}")
+    
+    try:
+        result = service_fee_agreement_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"Service Agreement generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating Service Agreement for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating Service Agreement: {str(e)}")
+
+@app.post("/api/generate-eoi")
+def generate_eoi_endpoint(
+    request: EOIGenerationRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Expression of Interest document"""
+    logging.info(f"Received EOI generation request for: {request.business_name}, type: {request.expression_type}")
+    
+    try:
+        result = expression_of_interest_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            expression_type=request.expression_type,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"EOI generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating EOI for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating EOI: {str(e)}")
+
+@app.post("/api/generate-ghg-offer")
+def generate_ghg_offer_endpoint(
+    request: DocumentGenerationRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate GHG Offer document"""
+    logging.info(f"Received GHG Offer generation request for: {request.business_name}")
+    
+    try:
+        result = ghg_offer_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"GHG Offer generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating GHG Offer for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating GHG Offer: {str(e)}")
+
+@app.get("/api/eoi-types")
+def get_eoi_types_endpoint(user_info: dict = Depends(verify_google_token)):
+    """Get available Expression of Interest types"""
+    return {
+        "eoi_types": get_available_eoi_types(),
+        "user_email": user_info.get("email")
+    }
+
+@app.post("/api/generate-loa-new")
+def generate_loa_new_endpoint(
+    request: NewLOAGeneration,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Letter of Authority document for new clients (without client folder URL)"""
+    logging.info(f"Received new LOA generation request for: {request.business_name}")
+    
+    try:
+        
+        result_message = loa_generation_new(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+        )
+        
+        # Parse the message to extract document link
+        document_link = None
+        if "You can access it here:" in result_message:
+            link_start = result_message.find("You can access it here:") + len("You can access it here:")
+            link_end = result_message.rfind(".")  # Find the LAST period in the message
+            if link_end != -1:
+                document_link = result_message[link_start:link_end].strip()
+        
+        # Create the structured response
+        result = {
+            "status": "success",
+            "message": f'The Letter of Authority for "{request.business_name}" has been successfully generated.',
+            "document_link": document_link,
+            "user_email": user_info.get("email")
+        }
+        
+        logging.info(f"New LOA generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating new LOA for {request.business_name}: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error generating LOA: {str(e)}",
+            "document_link": None,
+            "user_email": user_info.get("email")
+        }
