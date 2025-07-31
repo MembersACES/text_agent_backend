@@ -1,12 +1,16 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 from dotenv import load_dotenv
 import os
 import logging
+import tempfile
+import os
+import httpx
 from typing import Optional
 
 # Adjust this import if your function is in a different location
@@ -19,6 +23,7 @@ from tools.get_waste_latest_invoice_information import get_waste_latest_invoice_
 from tools.get_oil_invoice_information import get_oil_invoice_information
 from tools.supplier_data_request import supplier_data_request
 from tools.drive_filing import drive_filing
+from tools.send_supplier_signed_agreement import send_supplier_signed_agreement
 
 load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -37,6 +42,7 @@ app.add_middleware(
         "https://acesagentinterface-672026052958.australia-southeast2.run.app/canva-pitch-deck",
         "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/document-lodgement",
         "http://localhost:3000",
+        "http://localhost:3000/signed-agreement-lodgement",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -96,6 +102,8 @@ class DataRequest(BaseModel):
     request_type: str
     details: Optional[str] = None
 
+class RobotDataRequest(BaseModel):
+    robot_number: str
 # --- New Endpoints for ACES ---
 
 @app.post("/api/get-electricity-ci-info")
@@ -199,6 +207,40 @@ def get_oil_info(
     logging.info(f"Returning oil info to frontend: {data}")
     return data
 
+@app.post("/api/get-robot-data")
+def get_robot_data(
+    request: RobotDataRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    logging.info(f"Received robot data request: robot_number={request.robot_number}")
+    
+    try:
+        webhook_url = "https://membersaces.app.n8n.cloud/webhook/pudu_robot_data"
+        response = httpx.post(webhook_url, json={"robot_number": request.robot_number}, timeout=10)
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Robot data service error: {response.status_code}")
+        
+        try:
+            data = response.json()
+        except Exception as e:
+            logging.error(f"Failed to parse response: {str(e)}")
+            raise HTTPException(status_code=500, detail="Invalid JSON from robot data service")
+
+        if isinstance(data, list) and data:
+            data = data[0]
+        elif not isinstance(data, dict):
+            raise HTTPException(status_code=404, detail="No robot data found")
+        
+        # Add user email to response
+        data["user_email"] = user_info.get("email")
+        logging.info(f"Returning robot data to frontend: {data}")
+        return data
+
+    except Exception as e:
+        logging.error(f"Robot data fetch failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving robot data: {str(e)}")
+
 @app.post("/api/drive-filing")
 def drive_filing_endpoint(
     business_name: str = Form(...),
@@ -252,3 +294,82 @@ def data_request(
         result = {"status": "error", "message": result, "user_email": user_info.get("email")}
     logging.info(f"Returning data request response to frontend: {result}")
     return result
+
+class SignedAgreementRequest(BaseModel):
+    business_name: str
+    contract_type: str
+    agreement_type: str = "contract"
+
+@app.post("/api/signed-agreement-lodgement")
+async def signed_agreement_lodgement(
+    business_name: str = Form(...),
+    contract_type: str = Form(...),
+    agreement_type: str = Form("contract"),
+    file: UploadFile = File(...),
+    user_info: dict = Depends(verify_google_token)
+):
+    """
+    Handle signed agreement lodgement with file upload
+    """
+    logging.info(f"Received signed agreement request: business_name={business_name}, contract_type={contract_type}, agreement_type={agreement_type}, filename={file.filename}")
+    
+    # Validate file type
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    
+    # Create a temporary file to save the uploaded content
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+        try:
+            # Read and write file content
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+            
+            # Call the existing tool function
+            result = send_supplier_signed_agreement(
+                file_path=temp_file_path,
+                business_name=business_name,
+                contract_type=contract_type,
+                agreement_type=agreement_type
+            )
+            
+            # Structure the response for the frontend
+            response = {
+                "status": "success" if "✅" in result else "error",
+                "message": result,
+                "user_email": user_info.get("email"),
+                "contract_type": contract_type,
+                "business_name": business_name,
+                "agreement_type": agreement_type
+            }
+            
+            logging.info(f"Returning signed agreement response to frontend: {response}")
+            return response
+            
+        except Exception as e:
+            logging.error(f"Error processing signed agreement: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing agreement: {str(e)}")
+        
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logging.warning(f"Could not delete temporary file: {str(e)}")
+
+# Also add an endpoint to get available contract types
+@app.get("/api/contract-types")
+def get_contract_types(user_info: dict = Depends(verify_google_token)):
+    """
+    Get available contract types for the frontend dropdown
+    """
+    from tools.send_supplier_signed_agreement import CONTRACT_EMAIL_MAPPINGS, EOI_EMAIL_MAPPINGS
+    
+    contracts = list(CONTRACT_EMAIL_MAPPINGS.keys())
+    eois = list(EOI_EMAIL_MAPPINGS.keys())
+    
+    return {
+        "contracts": contracts,
+        "eois": eois,
+        "user_email": user_info.get("email")
+    }

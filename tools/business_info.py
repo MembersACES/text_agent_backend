@@ -161,6 +161,9 @@ def get_business_information(business_name: str) -> dict:
         # Add linked utilities and their details
         linked_utilities = data.get('Linked_Details', {}).get('linked_utilities', {})
         utility_retailers = data.get('Linked_Details', {}).get('utility_retailers', {})
+
+        if "Robot Number" in linked_utilities:
+            linked_utilities["Robot"] = linked_utilities["Robot Number"]
         
         # Handle C&I Electricity
         if 'C&I Electricity' in linked_utilities:
