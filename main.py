@@ -79,12 +79,10 @@ def verify_google_token(authorization: str = Header(...)):
         if "Token expired" in error_msg:
             raise HTTPException(
                 status_code=401,
-                detail="Reauthentication required"
+                detail="REAUTHENTICATION_REQUIRED"  # Use a specific code
             )
         
         raise HTTPException(status_code=401, detail="Invalid token")
-
-
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
