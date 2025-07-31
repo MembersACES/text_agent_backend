@@ -6,3 +6,4 @@ requests
 python-multipart
 aiofiles
 requests
+httpx
