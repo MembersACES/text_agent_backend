@@ -586,8 +586,21 @@ def generate_ghg_offer_endpoint(
 def get_google_service(token: str, service_name: str, version: str):
     """Create a Google API service client with the provided token"""
     try:
-        # Create credentials from the token
-        credentials = Credentials(token=token)
+        # Create credentials with minimal required fields to avoid refresh issues
+        credentials = Credentials(
+            token=token,
+            # Set these to None to prevent refresh attempts
+            refresh_token=None,
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=None,
+            # Disable token refresh
+            always_use_jwt_access=True
+        )
+        
+        # Set token as not expired to prevent refresh attempts
+        credentials.expired = False
+        
         service = build(service_name, version, credentials=credentials)
         return service
     except Exception as e:
@@ -989,7 +1002,7 @@ def generate_presentation_pdf(drive_service, presentation_id: str) -> str:
     except Exception as e:
         logging.error(f"Error generating PDF: {str(e)}")
         return None
-        
+
 @app.post("/api/explore-google-presentations-capabilities")
 async def explore_google_capabilities(
     request: GoogleCapabilitiesRequest,
