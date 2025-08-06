@@ -6,6 +6,13 @@ from pydantic import BaseModel
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials as ServiceCredentials
+from googleapiclient.discovery import build as google_build
+import tempfile
+import requests
+import copy
+from google.auth.transport.requests import Request
+from urllib.parse import urlparse, parse_qs
 import os
 import logging
 import tempfile
@@ -17,6 +24,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import uuid
+import google.auth
 
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information
@@ -61,6 +69,8 @@ app.add_middleware(
         "http://localhost:3000/new-client-loa",
         "https://acesagentinterface-672026052958.australia-southeast2.run.app/google-presentations",
         "http://localhost:3000/google-presentations",
+         "https://acesagentinterface-672026052958.australia-southeast2.run.app/strategy-generator",
+        "http://localhost:3000/strategy-generator",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -68,6 +78,25 @@ app.add_middleware(
 )
 
 from fastapi import Header
+
+def verify_google_access_token(authorization: str = Header(...)):
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    access_token = authorization.split("Bearer ")[1]
+    
+    try:
+        # For access tokens, we create credentials directly
+        credentials = Credentials(token=access_token)
+        
+        # Test the credentials by making a simple API call
+        service = build('drive', 'v3', credentials=credentials)
+        service.files().list(pageSize=1).execute()
+        
+        return {"access_token": access_token}
+    except Exception as e:
+        logging.error(f"Access token verification failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid access token")
 
 def verify_google_token(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
@@ -155,14 +184,6 @@ class DataRequest(BaseModel):
 
 class RobotDataRequest(BaseModel):
     robot_number: str
-
-# Add these imports to the top of your main.py file
-import json
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-import uuid
-
 # Add these Pydantic models with your other BaseModel classes
 class BusinessSolution(BaseModel):
     id: str
@@ -178,21 +199,13 @@ class BusinessInfo(BaseModel):
     targetMarket: str
     objectives: str
 
-class GoogleSolutionPresentationRequest(BaseModel):
-    title: str
-    selected_solutions: list[BusinessSolution]
-    business_info: BusinessInfo
-    user_token: str
-
-class GoogleCapabilitiesRequest(BaseModel):
-    google_token: str
-
-class DeletePresentationRequest(BaseModel):
-    presentation_id: str
-    google_token: str
-
-class GoogleUserInfoRequest(BaseModel):
-    google_token: str
+class StrategyPresentationRequest(BaseModel):
+    businessInfo: dict
+    selectedStrategies: list[str]
+    coverPageTemplateId: str
+    strategyTemplates: list[dict]
+    placeholders: dict
+   
 
 @app.post("/api/get-electricity-ci-info")
 def get_electricity_ci_info(
@@ -586,26 +599,14 @@ def generate_ghg_offer_endpoint(
 def get_google_service(token: str, service_name: str, version: str):
     """Create a Google API service client with the provided token"""
     try:
-        # Create credentials with minimal required fields to avoid refresh issues
-        credentials = Credentials(
-            token=token,
-            # Set these to None to prevent refresh attempts
-            refresh_token=None,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=None,
-            # Disable token refresh
-            always_use_jwt_access=True
-        )
-        
-        # Set token as not expired to prevent refresh attempts
-        credentials.expired = False
+        # Try to use the token directly without refresh capabilities
+        credentials = Credentials(token=token)
         
         service = build(service_name, version, credentials=credentials)
         return service
     except Exception as e:
         logging.error(f"Error creating Google service: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid Google token")
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {str(e)}")
 
 # Solution-specific slide templates
 SOLUTION_SLIDE_TEMPLATES = {
@@ -795,83 +796,6 @@ def generate_personalized_content(slide_title: str, base_content: str, business_
     
     return personalized_content
 
-@app.post("/api/google/generate-solution-presentation")
-async def generate_solution_presentation(
-    request: GoogleSolutionPresentationRequest,
-    user_info: dict = Depends(verify_google_token)
-):
-    """Generate a Google Slides presentation with business information and solution slides"""
-    logging.info(f"Received solution presentation request for: {len(request.selected_solutions)} solutions")
-    
-    try:
-        # Get Google services
-        slides_service = get_google_service(request.user_token, 'slides', 'v1')
-        drive_service = get_google_service(request.user_token, 'drive', 'v3')
-        
-        # Create a new presentation
-        presentation = slides_service.presentations().create(
-            body={'title': request.title}
-        ).execute()
-        
-        presentation_id = presentation.get('presentationId')
-        logging.info(f"Created presentation with ID: {presentation_id}")
-        
-        # Get the presentation to work with
-        presentation_data = slides_service.presentations().get(
-            presentationId=presentation_id
-        ).execute()
-        
-        # Prepare the requests for updating the presentation
-        requests = []
-        
-        # Add title slide with business information
-        title_slide_requests = create_title_slide_requests(request.business_info, request.title)
-        requests.extend(title_slide_requests)
-        
-        # Add solution-specific slides
-        for solution in request.selected_solutions:
-            if solution.id in SOLUTION_SLIDE_TEMPLATES:
-                solution_requests = create_solution_slides_requests(
-                    slides_service, 
-                    presentation_id, 
-                    solution, 
-                    request.business_info
-                )
-                requests.extend(solution_requests)
-        
-        # Execute all the requests
-        if requests:
-            slides_service.presentations().batchUpdate(
-                presentationId=presentation_id,
-                body={'requests': requests}
-            ).execute()
-        
-        # Get the presentation URL
-        presentation_url = f"https://docs.google.com/presentation/d/{presentation_id}/edit"
-        
-        result = {
-            "presentation_id": presentation_id,
-            "title": request.title,
-            "url": presentation_url,
-            "solutions_included": [sol.name for sol in request.selected_solutions],
-            "slide_count": len(presentation_data.get('slides', [])),
-            "business_name": request.business_info.businessName,
-            "user_email": user_info.get("email"),
-            "status": "success",
-            "message": f"Presentation created successfully for {request.business_info.businessName}!",
-            "thumbnail_url": f"https://drive.google.com/thumbnail?id={presentation_id}&sz=w400"
-        }
-        
-        return result
-        
-    except HttpError as e:
-        logging.error(f"Google API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Google API error: {str(e)}")
-    except Exception as e:
-        logging.error(f"Error creating presentation: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 def create_title_slide_requests(business_info: BusinessInfo, title: str) -> list:
     """Create requests for the title slide"""
     requests = []
@@ -1003,118 +927,6 @@ def generate_presentation_pdf(drive_service, presentation_id: str) -> str:
         logging.error(f"Error generating PDF: {str(e)}")
         return None
 
-@app.post("/api/explore-google-presentations-capabilities")
-async def explore_google_capabilities(
-    request: GoogleCapabilitiesRequest,
-    user_info: dict = Depends(verify_google_token)
-):
-    """Test Google Presentations API capabilities"""
-    logging.info("Testing Google Presentations capabilities")
-    
-    try:
-        # Test Slides API access
-        slides_service = get_google_service(request.google_token, 'slides', 'v1')
-        
-        # Test Drive API access (for file management)
-        drive_service = get_google_service(request.google_token, 'drive', 'v3')
-        
-        # Test basic API calls
-        test_results = {
-            "slides_api_access": False,
-            "drive_api_access": False,
-            "can_create_presentations": False,
-            "can_list_files": False,
-            "available_solutions": list(SOLUTION_SLIDE_TEMPLATES.keys()),
-            "total_solution_types": len(SOLUTION_SLIDE_TEMPLATES),
-            "user_email": user_info.get("email")
-        }
-        
-        try:
-            # Test creating a simple presentation
-            test_presentation = slides_service.presentations().create(
-                body={'title': 'API Test Presentation - DELETE ME'}
-            ).execute()
-            test_results["slides_api_access"] = True
-            test_results["can_create_presentations"] = True
-            test_results["test_presentation_id"] = test_presentation.get('presentationId')
-            
-            # Clean up test presentation
-            try:
-                drive_service.files().delete(fileId=test_presentation.get('presentationId')).execute()
-            except:
-                pass  # Don't fail if cleanup doesn't work
-                
-        except Exception as e:
-            logging.warning(f"Slides API test failed: {str(e)}")
-            test_results["slides_error"] = str(e)
-        
-        try:
-            # Test Drive API
-            files_list = drive_service.files().list(pageSize=1).execute()
-            test_results["drive_api_access"] = True
-            test_results["can_list_files"] = True
-        except Exception as e:
-            logging.warning(f"Drive API test failed: {str(e)}")
-            test_results["drive_error"] = str(e)
-        
-        return {"success": True, "capabilities": test_results}
-        
-    except Exception as e:
-        logging.error(f"Error testing Google capabilities: {str(e)}")
-        return {"success": False, "error": str(e), "user_email": user_info.get("email")}
-
-@app.delete("/api/google/delete-presentation")
-async def delete_google_presentation(
-    request: DeletePresentationRequest,
-    user_info: dict = Depends(verify_google_token)
-):
-    """Delete a Google Slides presentation"""
-    logging.info(f"Deleting presentation: {request.presentation_id}")
-    
-    try:
-        drive_service = get_google_service(request.google_token, 'drive', 'v3')
-        
-        # Delete the presentation file
-        drive_service.files().delete(fileId=request.presentation_id).execute()
-        
-        return {
-            "success": True,
-            "message": "Presentation deleted successfully",
-            "presentation_id": request.presentation_id,
-            "user_email": user_info.get("email")
-        }
-        
-    except HttpError as e:
-        logging.error(f"Google API error deleting presentation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete presentation: {str(e)}")
-    except Exception as e:
-        logging.error(f"Error deleting presentation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error deleting presentation: {str(e)}")
-
-@app.post("/api/google/user-info")
-async def get_google_user_info(
-    request: GoogleUserInfoRequest,
-    user_info: dict = Depends(verify_google_token)
-):
-    """Get Google user information"""
-    try:
-        # Use OAuth2 API to get user info
-        oauth2_service = get_google_service(request.google_token, 'oauth2', 'v2')
-        user_info_response = oauth2_service.userinfo().get().execute()
-        
-        return {
-            "success": True,
-            "name": user_info_response.get("name"),
-            "email": user_info_response.get("email"),
-            "picture": user_info_response.get("picture"),
-            "verified_email": user_info_response.get("verified_email"),
-            "user_email": user_info.get("email")
-        }
-        
-    except Exception as e:
-        logging.error(f"Error getting user info: {str(e)}")
-        return {"success": False, "error": str(e), "user_email": user_info.get("email")}
-
 @app.get("/api/google/oauth-start")
 async def google_oauth_start(scope: str = Query("presentations")):
     """Start Google OAuth flow for Presentations"""
@@ -1185,4 +997,97 @@ def generate_loa_new_endpoint(
             "message": f"Error generating LOA: {str(e)}",
             "document_link": None,
             "user_email": user_info.get("email")
+        }
+
+def extract_google_drive_id(url: str) -> str:
+    """Extract Google Drive file/folder ID from URL"""
+    if not url:
+        return None
+    
+    if '/d/' in url:
+        return url.split('/d/')[1].split('/')[0]
+    elif 'id=' in url:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        return parse_qs(parsed.query).get('id', [None])[0]
+    elif '/folders/' in url:
+        return url.split('/folders/')[1].split('?')[0]
+    
+    return None
+
+@app.post("/api/generate-strategy-presentation-real")
+def generate_strategy_presentation_real_endpoint(
+    request: StrategyPresentationRequest,
+    authorization: str = Header(...),
+    user_info: dict = Depends(verify_google_access_token)
+):
+    try:
+        # Your Apps Script Web App URL
+        APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyPEwq6-loam7vlM22i0NCZ2K25bDb_VrnTqdz-WTgGosPaMiUTwrT7YtlSoL4feiqD/exec"
+        
+        # Prepare data for Apps Script
+        payload = {
+            "businessInfo": request.businessInfo,
+            "selectedStrategies": request.selectedStrategies,
+            "coverPageTemplateId": request.coverPageTemplateId,
+            "strategyTemplates": request.strategyTemplates,
+            "placeholders": request.placeholders
+        }
+        
+        # Call Apps Script
+        response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=300)  # 5 minute timeout
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result
+        else:
+            return {
+                "success": False,
+                "message": f"Apps Script error: {response.status_code}"
+            }
+            
+    except Exception as e:
+        logging.error(f"Error calling Apps Script: {str(e)}")
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }
+
+@app.post("/api/debug-google-token")
+def debug_google_token(
+    authorization: str = Header(...),
+    user_info: dict = Depends(verify_google_token)
+):
+    """Debug what tokens we have"""
+    try:
+        user_token = authorization.split("Bearer ")[1]
+        
+        # Try to inspect the token
+        logging.info(f"Token length: {len(user_token)}")
+        logging.info(f"Token starts with: {user_token[:50]}...")
+        
+        # Test if we can create a simple service
+        try:
+            credentials = Credentials(token=user_token)
+            service = build('drive', 'v3', credentials=credentials)
+            
+            # Try a simple read operation
+            files = service.files().list(pageSize=1).execute()
+            
+            return {
+                "success": True,
+                "message": "Token works for basic operations",
+                "can_read_drive": True
+            }
+            
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Token issue: {str(e)}"
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Debug failed: {str(e)}"
         }
