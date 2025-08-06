@@ -1019,7 +1019,7 @@ def extract_google_drive_id(url: str) -> str:
 def generate_strategy_presentation_real_endpoint(
     request: StrategyPresentationRequest,
     authorization: str = Header(...),
-    user_info: dict = Depends(verify_google_access_token)
+    user_info: dict = Depends(verify_google_token)
 ):
     try:
         # Your Apps Script Web App URL
