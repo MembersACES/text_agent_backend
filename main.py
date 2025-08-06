@@ -1025,13 +1025,17 @@ def generate_strategy_presentation_real_endpoint(
         # Your Apps Script Web App URL
         APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyPEwq6-loam7vlM22i0NCZ2K25bDb_VrnTqdz-WTgGosPaMiUTwrT7YtlSoL4feiqD/exec"
         
+        # Extract folder URL from business info
+        client_folder_url = request.businessInfo.get('client_folder_url', '') if hasattr(request, 'clientFolderUrl') else request.businessInfo.get('client_folder_url', '')
+        
         # Prepare data for Apps Script
         payload = {
             "businessInfo": request.businessInfo,
             "selectedStrategies": request.selectedStrategies,
             "coverPageTemplateId": request.coverPageTemplateId,
             "strategyTemplates": request.strategyTemplates,
-            "placeholders": request.placeholders
+            "placeholders": request.placeholders,
+            "clientFolderUrl": client_folder_url
         }
         
         # Call Apps Script
