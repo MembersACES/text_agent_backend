@@ -358,6 +358,136 @@ def send_supplier_signed_agreement(
             except:
                 pass
 
+def send_supplier_signed_agreement_multiple(
+    file_paths: list,
+    business_name: str,
+    contract_type: str,
+    agreement_type: str = "contract_multiple_attachments",
+    filenames: list = None
+) -> str:
+    """
+    Send multiple signed supplier agreements to a supplier via email.
+    
+    Args:
+        file_paths: List of paths to the signed agreement files to be sent
+        business_name: Name of the business (optionally with identifier: "Business Name NMI: 12345" or "Business Name MIRN: 12345")
+        contract_type: Type of contract (e.g., PowerMetric DMA)
+        agreement_type: Type of agreement - should be "contract_multiple_attachments"
+        filenames: List of original filenames (optional)
+    
+    Returns:
+        String with success/error message and details
+    """
+    logger.info(f"Processing multiple signed agreements: {contract_type} ({agreement_type}) - {len(file_paths)} files")
+    
+    # Parse business name and identifier if present
+    nmi_match = re.search(r'NMI:\s*(\d+)', business_name)
+    mirn_match = re.search(r'MIRN:\s*(\d+)', business_name)
+    
+    if nmi_match:
+        identifier = nmi_match.group(1)
+        identifier_type = "nmi"
+        actual_business_name = business_name[:nmi_match.start()].strip()
+    elif mirn_match:
+        identifier = mirn_match.group(1)
+        identifier_type = "mirn"
+        actual_business_name = business_name[:mirn_match.start()].strip()
+    else:
+        identifier = None
+        identifier_type = None
+        actual_business_name = business_name.strip()
+    
+    # Get supplier email using the existing mapping (only use CONTRACT_EMAIL_MAPPINGS for multiple attachments)
+    supplier_email, resolved_supplier_name, is_default = find_supplier_email_for_agreement(contract_type, "contract")
+    logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
+    
+    # Prepare files and payload
+    files = {}
+    try:
+        for idx, file_path in enumerate(file_paths):
+            filename = filenames[idx] if filenames and idx < len(filenames) else os.path.basename(file_path)
+            files[f"file_{idx}"] = (
+                filename,
+                open(file_path, "rb"),
+                "application/octet-stream",
+            )
+    except Exception as e:
+        logger.error(f"Error opening files: {str(e)}")
+        return f"❌ Error: Could not open files: {str(e)}"
+
+    payload = {
+        "business_name": actual_business_name,
+        "contract_type": contract_type,
+        "agreement_type": agreement_type,
+        "supplier_email": supplier_email,
+        "resolved_supplier_name": resolved_supplier_name,
+        "file_count": len(file_paths),
+    }
+    
+    # Add identifier if present
+    if identifier and identifier_type:
+        payload[identifier_type] = identifier
+
+    # Send the request
+    try:
+        response = requests.post(
+            "https://membersaces.app.n8n.cloud/webhook/email-supplier",
+            data=payload,
+            files=files,
+        )
+        
+        if response.status_code == 200:
+            # Build success message
+            success_msg = f"""✅ **{len(file_paths)} signed contracts have been successfully sent:**\n\n"""
+            # Document details
+            success_msg += f"📄 **Contract Type:** {contract_type}\n"
+            success_msg += f"🏢 **Business:** {actual_business_name}\n"
+            success_msg += f"✉️ **Sent to:** {supplier_email}\n"
+            success_msg += f"🏷️ **Supplier:** {resolved_supplier_name}\n"
+            success_msg += f"📎 **Files:** {len(file_paths)} attachments"
+            
+            # Show filenames if available
+            if filenames:
+                success_msg += f"\n📋 **Filenames:** {', '.join(filenames)}"
+            
+            # Identifier if present
+            if identifier and identifier_type:
+                success_msg += f"\n🔢 **{identifier_type.upper()}:** {identifier}"
+            
+            # Warning if default
+            if is_default:
+                success_msg += f"\n\n⚠️ **Note:** '{contract_type}' was not recognized. The contracts will be sent to our general members email ({supplier_email}) for manual processing."
+            
+            # Log the success
+            logger.info(f"Successfully sent {len(file_paths)} contracts to {resolved_supplier_name}")
+            
+            # Parse response if it contains additional info
+            try:
+                response_data = response.json()
+                if "message" in response_data:
+                    logger.info(f"API Response: {response_data['message']}")
+            except:
+                pass
+            
+            # Note about drive filing for multiple attachments
+            success_msg += "\n\n📁 **Note:** Drive filing for multiple attachments will be handled by the automation workflow."
+            
+            return success_msg
+        else:
+            logger.error(f"Failed to send multiple agreements. Status code: {response.status_code}")
+            return f"❌ Error: Failed to send {len(file_paths)} signed contracts to supplier. Status code: {response.status_code}"
+            
+    except Exception as e:
+        logger.error(f"Error sending multiple agreements request: {str(e)}")
+        return f"❌ Error: Failed to send {len(file_paths)} signed contracts - {str(e)}"
+    finally:
+        # Close all the files
+        for file_key, file_tuple in files.items():
+            try:
+                file_tuple[1].close()
+            except:
+                pass
+            
 # Utility function to get available contract types for API
 def get_available_contract_types() -> Dict[str, list]:
     """

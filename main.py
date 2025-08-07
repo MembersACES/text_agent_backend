@@ -46,6 +46,7 @@ from tools.document_generation import (
 )
 
 from tools.loa_generation import loa_generation_new
+from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_multiple
 
 load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -95,7 +96,22 @@ def verify_google_access_token(authorization: str = Header(...)):
         
         return {"access_token": access_token}
     except Exception as e:
-        logging.error(f"Access token verification failed: {str(e)}")
+        error_msg = str(e)
+        logging.error(f"Access token verification failed: {error_msg}")
+        
+        # Check for various token expiration scenarios
+        if any(phrase in error_msg.lower() for phrase in [
+            "token expired", 
+            "expired", 
+            "invalid token", 
+            "credentials expired",
+            "unauthorized"
+        ]):
+            raise HTTPException(
+                status_code=401,
+                detail="REAUTHENTICATION_REQUIRED"
+            )
+        
         raise HTTPException(status_code=401, detail="Invalid access token")
 
 def verify_google_token(authorization: str = Header(...)):
@@ -112,10 +128,17 @@ def verify_google_token(authorization: str = Header(...)):
         error_msg = str(e)
         logging.error(f"Token verification failed: {error_msg}")
         
-        if "Token expired" in error_msg:
+        # Check for various token expiration scenarios
+        if any(phrase in error_msg.lower() for phrase in [
+            "token expired", 
+            "expired", 
+            "invalid token", 
+            "token has expired",
+            "signature has expired"
+        ]):
             raise HTTPException(
                 status_code=401,
-                detail="REAUTHENTICATION_REQUIRED"  # Use a specific code
+                detail="REAUTHENTICATION_REQUIRED"
             )
         
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -401,62 +424,100 @@ class SignedAgreementRequest(BaseModel):
     contract_type: str
     agreement_type: str = "contract"
 
+from fastapi import Request
+
 @app.post("/api/signed-agreement-lodgement")
 async def signed_agreement_lodgement(
-    business_name: str = Form(...),
-    contract_type: str = Form(...),
-    agreement_type: str = Form("contract"),
-    file: UploadFile = File(...),
+    request: Request,
     user_info: dict = Depends(verify_google_token)
 ):
     """
-    Handle signed agreement lodgement with file upload
+    Handle signed agreement lodgement with dynamic file upload support
     """
-    logging.info(f"Received signed agreement request: business_name={business_name}, contract_type={contract_type}, agreement_type={agreement_type}, filename={file.filename}")
+    # Parse the multipart form data
+    form_data = await request.form()
     
-    # Validate file type
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    # Extract basic fields
+    business_name = form_data.get("business_name")
+    contract_type = form_data.get("contract_type")
+    agreement_type = form_data.get("agreement_type", "contract")
+    file_count = int(form_data.get("file_count", 1))
     
-    # Create a temporary file to save the uploaded content
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
-        try:
-            # Read and write file content
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-            
-            # Call the existing tool function
+    if not business_name or not contract_type:
+        raise HTTPException(status_code=400, detail="business_name and contract_type are required")
+    
+    logging.info(f"Received signed agreement request: business_name={business_name}, contract_type={contract_type}, agreement_type={agreement_type}, file_count={file_count}")
+    
+    # Collect all uploaded files
+    uploaded_files = []
+    filenames = []
+    
+    for key, value in form_data.items():
+        if key.startswith("file_") and hasattr(value, 'filename'):
+            # Validate file type
+            if not value.filename.lower().endswith('.pdf'):
+                raise HTTPException(status_code=400, detail=f"File ({value.filename}) is not a PDF. Only PDF files are accepted")
+            uploaded_files.append(value)
+            filenames.append(value.filename)
+    
+    if not uploaded_files:
+        raise HTTPException(status_code=400, detail="No valid files provided")
+    
+    temp_file_paths = []
+    try:
+        # Process each file
+        for file in uploaded_files:
+            # Create a temporary file for each upload
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_file:
+                content = await file.read()
+                temp_file.write(content)
+                temp_file_paths.append(temp_file.name)
+        
+        # Handle single file vs multiple files
+        if agreement_type == "contract_multiple_attachments":
+            # For multiple attachments, call the new function
+            result = send_supplier_signed_agreement_multiple(
+                file_paths=temp_file_paths,
+                business_name=business_name,
+                contract_type=contract_type,
+                agreement_type=agreement_type,
+                filenames=filenames
+            )
+        else:
+            # For single file, use existing function
             result = send_supplier_signed_agreement(
-                file_path=temp_file_path,
+                file_path=temp_file_paths[0],
                 business_name=business_name,
                 contract_type=contract_type,
                 agreement_type=agreement_type
             )
-            
-            # Structure the response for the frontend
-            response = {
-                "status": "success" if "✅" in result else "error",
-                "message": result,
-                "user_email": user_info.get("email"),
-                "contract_type": contract_type,
-                "business_name": business_name,
-                "agreement_type": agreement_type
-            }
-            
-            logging.info(f"Returning signed agreement response to frontend: {response}")
-            return response
-            
-        except Exception as e:
-            logging.error(f"Error processing signed agreement: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error processing agreement: {str(e)}")
         
-        finally:
-            # Clean up temporary file
+        # Structure the response for the frontend
+        response = {
+            "status": "success" if "✅" in result else "error",
+            "message": result,
+            "user_email": user_info.get("email"),
+            "contract_type": contract_type,
+            "business_name": business_name,
+            "agreement_type": agreement_type,
+            "file_count": len(uploaded_files),
+            "filenames": filenames
+        }
+        
+        logging.info(f"Returning signed agreement response to frontend: {response}")
+        return response
+        
+    except Exception as e:
+        logging.error(f"Error processing signed agreement: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing agreement: {str(e)}")
+    
+    finally:
+        # Clean up all temporary files
+        for temp_path in temp_file_paths:
             try:
-                os.unlink(temp_file_path)
+                os.unlink(temp_path)
             except Exception as e:
-                logging.warning(f"Could not delete temporary file: {str(e)}")
+                logging.warning(f"Could not delete temporary file {temp_path}: {str(e)}")
 
 # Also add an endpoint to get available contract types
 @app.get("/api/contract-types")
