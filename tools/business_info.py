@@ -111,6 +111,11 @@ def get_business_information(business_name: str) -> dict:
         formatted_response += "\n### Business Documents:\n"
         # Add business documents information
         business_documents = data.get('business_documents', {})
+        # Check if Initial Strategy file exists and add it to business_documents if missing
+        initial_strategy_id = file_ids_dict.get('Initial Strategy')
+        if initial_strategy_id and 'Initial Strategy' not in business_documents:
+            business_documents['Initial Strategy'] = True
+            
         if business_documents:
             for doc_name, status in business_documents.items():
                 if status:
