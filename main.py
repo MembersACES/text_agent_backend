@@ -74,6 +74,7 @@ app.add_middleware(
         "http://localhost:3000/solutions-strategy-generator",
         "https://acesagentinterface-672026052958.australia-southeast2.run.app/initial-strategy-generator",
         "http://localhost:3000/initial-strategy-generator",
+        "https://script.google.com/macros/s/AKfycbxyH9xOa11ZpHQ1R5MWygNOLZRof9VfELR6Zq_ByKxnIUvrJL2VMWJhoXlzg2g_nmHO/exec",
     ],
     allow_credentials=True,
     allow_methods=["*"],
