@@ -75,6 +75,9 @@ app.add_middleware(
         "https://acesagentinterface-672026052958.australia-southeast2.run.app/initial-strategy-generator",
         "http://localhost:3000/initial-strategy-generator",
         "https://script.google.com/macros/s/AKfycbxyH9xOa11ZpHQ1R5MWygNOLZRof9VfELR6Zq_ByKxnIUvrJL2VMWJhoXlzg2g_nmHO/exec",
+        "http://localhost:3000/quote-request",
+        "https://acesagentinterface-672026052958.australia-southeast2.run.app/quote-request",
+        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/quote-request",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -174,6 +177,11 @@ class NewLOAGeneration(BaseModel):
 
 class EOIGenerationRequest(DocumentGenerationRequest):
     expression_type: str
+
+class UtilityInfoRequest(BaseModel):
+    business_name: str
+    service_type: str
+    identifier: Optional[str]
 
 @app.post("/api/get-business-info")
 def get_business_info(
@@ -367,6 +375,53 @@ def get_robot_data(
     except Exception as e:
         logging.error(f"Robot data fetch failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error retrieving robot data: {str(e)}")
+
+@app.post("/api/get-utility-information")
+def get_utility_information(
+    request: UtilityInfoRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    logging.info(f"Received utility info request: {request}")
+
+    service_type = request.service_type.lower()
+
+    if service_type == "electricity_ci":
+        data = get_electricity_ci_latest_invoice_information(
+            business_name=request.business_name,
+            nmi=request.identifier
+        )
+    elif service_type == "electricity_sme":
+        data = get_electricity_sme_latest_invoice_information(
+            business_name=request.business_name,
+            nmi=request.identifier
+        )
+    elif service_type == "gas_ci":
+        data = get_gas_latest_invoice_information(
+            business_name=request.business_name,
+            mrin=request.identifier
+        )
+    elif service_type == "gas_sme":
+        data = get_gas_sme_latest_invoice_information(
+            business_name=request.business_name,
+            mrin=request.identifier
+        )
+    elif service_type == "waste":
+        data = get_waste_latest_invoice_information(
+            business_name=request.business_name,
+            customer_number=request.identifier
+        )
+    elif service_type == "oil":
+        data = get_oil_invoice_information(
+            account_name=request.business_name
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown service_type: {service_type}")
+
+    # Always add user email
+    data["user_email"] = user_info.get("email")
+
+    logging.info(f"Returning utility info for {service_type}: {data}")
+    return data
 
 @app.post("/api/drive-filing")
 def drive_filing_endpoint(
