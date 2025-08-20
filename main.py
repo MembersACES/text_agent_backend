@@ -20,6 +20,7 @@ import os
 import httpx
 from typing import Optional
 import json
+from fastapi import HTTPException, Depends
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -44,7 +45,7 @@ from tools.document_generation import (
     ghg_offer_generation,
     get_available_eoi_types
 )
-
+from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_multiple
 
@@ -182,6 +183,8 @@ class UtilityInfoRequest(BaseModel):
     business_name: str
     service_type: str
     identifier: Optional[str]
+
+
 
 @app.post("/api/get-business-info")
 def get_business_info(
@@ -483,6 +486,134 @@ class SignedAgreementRequest(BaseModel):
     agreement_type: str = "contract"
 
 from fastapi import Request
+
+# Define the updated request model
+class QuoteRequestData(BaseModel):
+    business_name: str
+    trading_as: Optional[str] = None
+    abn: Optional[str] = None
+    site_address: Optional[str] = None
+    client_name: Optional[str] = None
+    client_number: Optional[str] = None
+    client_email: Optional[str] = None
+    nmi: Optional[str] = None
+    mrin: Optional[str] = None
+    utility_type: str
+    quote_type: str
+    commission: str
+    start_date: str
+    offer_due: str
+    yearly_peak_est: int
+    yearly_shoulder_est: int
+    yearly_off_peak_est: int
+    yearly_consumption_est: int
+    current_retailer: Optional[str] = None
+    loa_file_id: Optional[str] = None
+    invoice_file_id: Optional[str] = None
+    interval_data_file_id: Optional[str] = None
+    user_email: Optional[str] = None
+    timestamp: Optional[str] = None
+
+@app.post("/api/send-quote-request")
+async def send_quote_request_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    user_info: dict = None
+):
+    # Get the request body
+    request_data = await request.json()
+    
+    # Check if it's an API key or Google token
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        
+        # Check if it's a simple API key (for Next.js API routes)
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            # Use session email from request_data if available
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            # Try to verify as Google token
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    try:
+        # Extract data from request_data (not request)
+        selected_retailers = request_data.get("selected_retailers", [])
+        business_name = request_data.get("business_name")
+        trading_as = request_data.get("trading_as", "")
+        abn = request_data.get("abn", "")
+        site_address = request_data.get("site_address", "")
+        client_name = request_data.get("client_name", "")
+        client_number = request_data.get("client_number", "")
+        client_email = request_data.get("client_email", "")
+        nmi = request_data.get("nmi")
+        mrin = request_data.get("mrin")
+        utility_type = request_data.get("utility_type", "")
+        quote_type = request_data.get("quote_type", "")
+        commission = request_data.get("commission", "0")
+        start_date = request_data.get("start_date", "")
+        offer_due = request_data.get("offer_due", "")
+        yearly_peak_est = request_data.get("yearly_peak_est", 0)
+        yearly_shoulder_est = request_data.get("yearly_shoulder_est", 0)
+        yearly_off_peak_est = request_data.get("yearly_off_peak_est", 0)
+        yearly_consumption_est = request_data.get("yearly_consumption_est", 0)
+        current_retailer = request_data.get("current_retailer", "")
+        loa_file_id = request_data.get("loa_file_id")
+        invoice_file_id = request_data.get("invoice_file_id")
+        interval_data_file_id = request_data.get("interval_data_file_id")
+        user_email = user_info.get("email")
+        
+        # Validate required fields
+        if not business_name:
+            raise HTTPException(status_code=400, detail="business_name is required")
+        
+        if not nmi and not mrin:
+            raise HTTPException(status_code=400, detail="Either nmi or mrin is required")
+        
+        if not selected_retailers:
+            raise HTTPException(status_code=400, detail="At least one retailer must be selected")
+        
+        # Send quote request
+        result = send_supplier_quote_request(
+            selected_retailers=selected_retailers,
+            business_name=business_name,
+            trading_as=trading_as,
+            abn=abn,
+            site_address=site_address,
+            client_name=client_name,
+            client_number=client_number,
+            client_email=client_email,
+            nmi=nmi,
+            mrin=mrin,
+            utility_type=utility_type,
+            utility_type_identifier=request_data.get("utility_type_identifier", ""),
+            retailer_type_identifier=request_data.get("retailer_type_identifier", ""),
+            quote_type=quote_type,
+            quote_details=request_data.get("quote_details", ""),
+            commission=commission,
+            start_date=start_date,
+            offer_due=offer_due,
+            yearly_peak_est=yearly_peak_est,
+            yearly_shoulder_est=yearly_shoulder_est,
+            yearly_off_peak_est=yearly_off_peak_est,
+            yearly_consumption_est=yearly_consumption_est,
+            current_retailer=current_retailer,
+            loa_file_id=loa_file_id,
+            invoice_file_id=invoice_file_id,
+            interval_data_file_id=interval_data_file_id,
+            user_email=user_email
+        )
+        
+        logging.info(f"Quote request completed successfully for {business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Quote request failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/signed-agreement-lodgement")
 async def signed_agreement_lodgement(
