@@ -20,22 +20,22 @@ QUOTE_RETAILER_EMAILS = {
     },
     "Origin C&I": {
         "name": "Origin C&I",
-        "email": "BusinessCustomers@originenergy.com.au, data.quote@fornrg.com",
+        "email": "Tenders@originenergy.com.au",
         "variants": ["Origin", "OriginEnergy"]
     },
     "Alinta C&I": {
         "name": "Alinta C&I",
-        "email": "ci.services@alintaenergy.com.au, data.quote@fornrg.com",
+        "email": "tenders@alintaenergy.com.au",
         "variants": ["Alinta Energy", "alintaenergy", "Alinta"]
     },
     "Shell C&I": {
         "name": "Shell C&I",
-        "email": "retailadmin@shellenergy.com.au, data.quote@fornrg.com",
+        "email": "Sales@shellenergy.com.au",
         "variants": ["Shell Energy Retail Pty Ltd", "Shell Energy", "Shell"]
     },
     "Momentum C&I": {
         "name": "Momentum C&I",
-        "email": "CIOperations@hydro.com.au, data.quote@fornrg.com",
+        "email": "tenders@momentum.com.au",
         "variants": ["Momentum Energy Pty Ltd", "Momentum Energy"]
     },
     "Origin SME": {
@@ -47,16 +47,6 @@ QUOTE_RETAILER_EMAILS = {
         "name": "Alinta SME",
         "email": "ci.services@alintaenergy.com.au, data.quote@fornrg.com",
         "variants": ["Alinta Energy", "alintaenergy", "Alinta"]
-    },
-    "Shell SME": {
-        "name": "Shell SME",
-        "email": "retailadmin@shellenergy.com.au, data.quote@fornrg.com",
-        "variants": ["Shell Energy Retail Pty Ltd", "Shell Energy", "Shell"]
-    },
-    "Momentum SME": {
-        "name": "Momentum SME",
-        "email": "CIOperations@hydro.com.au, data.quote@fornrg.com",
-        "variants": ["Momentum Energy Pty Ltd", "Momentum Energy"]
     },
     "Waste Provider 1": {
         "name": "Waste Provider 1",
