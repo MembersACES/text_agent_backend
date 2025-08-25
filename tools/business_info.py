@@ -159,6 +159,11 @@ def get_business_information(business_name: str) -> dict:
             else:
                 formatted_response += f"- **{sc_label}:** Not Available\n"
 
+        wip_file_id = file_ids_dict.get('WIP')
+        if wip_file_id:
+            wip_file_link = f"https://drive.google.com/file/d/{wip_file_id}/view"
+            processed_file_ids["business_WIP"] = wip_file_link
+        
         formatted_response += "\n### Linked Utilities and Retailers:"
 
         # Add linked utilities and their details
