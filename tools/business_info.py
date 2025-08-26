@@ -76,12 +76,39 @@ def get_business_information(business_name: str) -> dict:
         elif isinstance(file_ids_data, dict):
             file_ids_dict = file_ids_data
 
-        # Prepare LOA file link for Representative Details (use only the ID, not the direct link)
+        # Process file IDs for easy access by other functions
+        # Map N8N keys to expected keys
+        file_mapping = {
+            'LOA File ID': 'business_LOA',
+            'WIP': 'business_WIP',
+            'Floor Plan': 'business_Floor Plan (Exit Map)',
+            'Site Profiling': 'business_Site Profling',  # Note the typo in the original
+            'Service Fee Agreement': 'business_Service Fee Agreement',
+            'Initial Strategy': 'business_Initial Strategy',
+            'Cleaning Invoice': 'invoice_Cleaning',
+            'Telecommunication:': 'invoice_Telecommunication',
+            'Oil Invoice': 'invoice_Oil',
+            'SC C&I E': 'contract_C&I Electricity',
+            'SC SME E': 'contract_SME Electricity',
+            'SC C&I G': 'contract_C&I Gas',
+            'SC SME G': 'contract_SME Gas',
+            'SC Waste': 'contract_Waste',
+            'SC Oil': 'contract_Oil',
+            'SC DMA': 'contract_DMA',
+        }
+        
+        # Process all file IDs from N8N data
+        for n8n_key, mapped_key in file_mapping.items():
+            file_id = file_ids_dict.get(n8n_key)
+            if file_id and file_id.strip():  # Check if file_id exists and is not empty
+                file_link = f"https://drive.google.com/file/d/{file_id}/view"
+                processed_file_ids[mapped_key] = file_link
+
+        # Prepare LOA file link for Representative Details
         loa_file_id = file_ids_dict.get('LOA File ID')
         loa_file_link = None
-        if loa_file_id:
+        if loa_file_id and loa_file_id.strip():
             loa_file_link = f"https://drive.google.com/file/d/{loa_file_id}/view"
-            processed_file_ids["business_LOA"] = loa_file_link
 
         # Format the response message in a clear and organized way
         formatted_response = f"""Here is the information for {business_name}:
@@ -109,27 +136,32 @@ def get_business_information(business_name: str) -> dict:
             formatted_response += f"- **LOA:** Not Available\n"
 
         formatted_response += "\n### Business Documents:\n"
-        # Add business documents information
-        business_documents = data.get('business_documents', {})
+        
+        # Create business documents dict from available files
+        business_documents = {}
+        
+        # Check each document type based on N8N data
+        doc_checks = [
+            ('Initial Strategy', 'Initial Strategy'),
+            ('Site Profling', 'Site Profiling'),  # Note the typo handling
+            ('Service Fee Agreement', 'Service Fee Agreement'),
+            ('Floor Plan (Exit Map)', 'Floor Plan'),
+        ]
+        
+        for doc_name, n8n_key in doc_checks:
+            file_id = file_ids_dict.get(n8n_key)
+            business_documents[doc_name] = bool(file_id and file_id.strip())
+        
+        # Always show Initial Strategy as available (as per original logic)
         if 'Initial Strategy' not in business_documents:
             business_documents['Initial Strategy'] = True
             
         if business_documents:
             for doc_name, status in business_documents.items():
                 if status:
-                    # Correct potential typos and map to the right key in file_ids_data
-                    file_id_key = doc_name.replace(" (Exit Map)", "")
-                    if file_id_key == "Site Profling":
-                        file_id_key = "Site Profiling"
-                    
-                    # First, try to get a direct link
-                    file_link = file_ids_dict.get(f"{file_id_key} File ID Link")
-
-                    # If no direct link, try to get an ID and construct the link
-                    if not file_link:
-                        file_id = file_ids_dict.get(file_id_key)
-                        if file_id:
-                            file_link = f"https://drive.google.com/file/d/{file_id}/view"
+                    # Map document name to file ID key
+                    doc_key = f"business_{doc_name}"
+                    file_link = processed_file_ids.get(doc_key)
 
                     if file_link:
                         formatted_response += f"- **{doc_name}:** [In File]({file_link})\n"
@@ -153,32 +185,19 @@ def get_business_information(business_name: str) -> dict:
         formatted_response += "\n### Signed Contracts:\n"
         for sc_key, sc_label in sc_fields:
             sc_file_id = file_ids_dict.get(sc_key)
-            if sc_file_id:
+            if sc_file_id and sc_file_id.strip():
                 sc_link = f"https://drive.google.com/file/d/{sc_file_id}/view"
                 formatted_response += f"- **{sc_label}:** [In File]({sc_link})\n"
             else:
                 formatted_response += f"- **{sc_label}:** Not Available\n"
 
         wip_file_id = file_ids_dict.get('WIP')
-        if wip_file_id:
+        if wip_file_id and wip_file_id.strip():
             wip_file_link = f"https://drive.google.com/file/d/{wip_file_id}/view"
             processed_file_ids["business_WIP"] = wip_file_link
         
         formatted_response += "\n### Linked Utilities and Retailers:"
 
-          # --- NEW: Invoice links ---
-        cleaning_id = file_ids_dict.get("Cleaning Invoice")
-        if cleaning_id:
-            processed_file_ids["invoice_Cleaning"] = f"https://drive.google.com/file/d/{cleaning_id}/view"
-
-        telecom_id = file_ids_dict.get("Telecommunication:")
-        if telecom_id:
-            processed_file_ids["invoice_Telecommunication"] = f"https://drive.google.com/file/d/{telecom_id}/view"
-
-        oil_invoice_id = file_ids_dict.get("Oil Invoice")
-        if oil_invoice_id:
-            processed_file_ids["invoice_Oil"] = f"https://drive.google.com/file/d/{oil_invoice_id}/view"
-            
         # Add linked utilities and their details
         linked_utilities = data.get('Linked_Details', {}).get('linked_utilities', {})
         utility_retailers = data.get('Linked_Details', {}).get('utility_retailers', {})
@@ -186,112 +205,31 @@ def get_business_information(business_name: str) -> dict:
         if "Robot Number" in linked_utilities:
             linked_utilities["Robot"] = linked_utilities["Robot Number"]
         
-        # Handle C&I Electricity
-        if 'C&I Electricity' in linked_utilities:
-            formatted_response += "\n\n**C&I Electricity:**"
-            details = linked_utilities['C&I Electricity']
-            if isinstance(details, str):
-                formatted_response += f"\n- NMI: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'C&I Electricity' in utility_retailers:
-                retailers = utility_retailers['C&I Electricity']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
+        # Handle all utility types (keeping the original logic)
+        utility_types = [
+            ('C&I Electricity', 'NMI'),
+            ('SME Electricity', 'NMI'),
+            ('C&I Gas', 'MRIN'),
+            ('SME Gas', 'MRIN'),
+            ('Small Gas', 'MRIN'),
+            ('Waste', 'Account Number'),
+            ('Oil', 'Account Name'),
+        ]
 
-        # Handle SME Electricity
-        if 'SME Electricity' in linked_utilities:
-            formatted_response += "\n\n**SME Electricity:**"
-            details = linked_utilities['SME Electricity']
-            if isinstance(details, str):
-                formatted_response += f"\n- NMI: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'SME Electricity' in utility_retailers:
-                retailers = utility_retailers['SME Electricity']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
-
-        # Handle C&I Gas
-        if 'C&I Gas' in linked_utilities:
-            formatted_response += "\n\n**C&I Gas:**"
-            details = linked_utilities['C&I Gas']
-            if isinstance(details, str):
-                formatted_response += f"\n- MRIN: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'C&I Gas' in utility_retailers:
-                retailers = utility_retailers['C&I Gas']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
-
-        # Handle SME Gas
-        if 'SME Gas' in linked_utilities:
-            formatted_response += "\n\n**SME Gas:**"
-            details = linked_utilities['SME Gas']
-            if isinstance(details, str):
-                formatted_response += f"\n- MRIN: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'SME Gas' in utility_retailers:
-                retailers = utility_retailers['SME Gas']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
-
-        # Handle Small Gas (alternative name for SME Gas)
-        if 'Small Gas' in linked_utilities:
-            formatted_response += "\n\n**Small Gas:**"
-            details = linked_utilities['Small Gas']
-            if isinstance(details, str):
-                formatted_response += f"\n- MRIN: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'Small Gas' in utility_retailers:
-                retailers = utility_retailers['Small Gas']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
-
-        # Handle Waste
-        if 'Waste' in linked_utilities:
-            formatted_response += "\n\n**Waste:**"
-            details = linked_utilities['Waste']
-            if isinstance(details, str):
-                formatted_response += f"\n- Account Number: {details}"
-            elif isinstance(details, bool) and details:
-                formatted_response += "\n- Status: In File"
-            if 'Waste' in utility_retailers:
-                retailers = utility_retailers['Waste']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
-
-        # Handle Oil (formatted like other utilities)
-        if 'Oil' in linked_utilities:
-            formatted_response += "\n\n**Oil:**"
-            details = linked_utilities['Oil']
-            if isinstance(details, str):
-                formatted_response += f"\n- Account Name: {details}"
-            elif isinstance(details, list):
-                formatted_response += f"\n- Account Name: {', '.join(details)}"
-            elif isinstance(details, bool) and details:
-                formatted_response += f"\n- Status: In File"
-            if 'Oil' in utility_retailers:
-                retailers = utility_retailers['Oil']
-                if isinstance(retailers, list):
-                    formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                else:
-                    formatted_response += f"\n- Retailer: {retailers}"
+        for utility_type, identifier_type in utility_types:
+            if utility_type in linked_utilities:
+                formatted_response += f"\n\n**{utility_type}:**"
+                details = linked_utilities[utility_type]
+                if isinstance(details, str):
+                    formatted_response += f"\n- {identifier_type}: {details}"
+                elif isinstance(details, bool) and details:
+                    formatted_response += "\n- Status: In File"
+                if utility_type in utility_retailers:
+                    retailers = utility_retailers[utility_type]
+                    if isinstance(retailers, list):
+                        formatted_response += f"\n- Retailer: {', '.join(retailers)}"
+                    else:
+                        formatted_response += f"\n- Retailer: {retailers}"
 
         # Handle Robots section
         robot_number = linked_utilities.get('Robot Number')
@@ -336,37 +274,14 @@ def get_business_information(business_name: str) -> dict:
 """
 
         logger.info(f"Formatted response: {formatted_response}")
-        
-        # Process file IDs for easy access by other functions
-        
-        # Process business documents
-        for doc_name, status in business_documents.items():
-            if status:
-                file_id_key = doc_name.replace(" (Exit Map)", "")
-                if file_id_key == "Site Profling":
-                    file_id_key = "Site Profiling"
-                
-                file_link = file_ids_dict.get(f"{file_id_key} File ID Link")
-                if not file_link:
-                    file_id = file_ids_dict.get(file_id_key)
-                    if file_id:
-                        file_link = f"https://drive.google.com/file/d/{file_id}/view"
-                
-                if file_link:
-                    processed_file_ids[f"business_{doc_name}"] = file_link
-        
-        # Process signed contracts
-        for sc_key, sc_label in sc_fields:
-            sc_file_id = file_ids_dict.get(sc_key)
-            if sc_file_id:
-                sc_link = f"https://drive.google.com/file/d/{sc_file_id}/view"
-                processed_file_ids[f"contract_{sc_label}"] = sc_link
+        logger.info(f"Processed file IDs: {processed_file_ids}")
         
         # Return both the raw data and formatted output, plus processed file IDs
         return {
             **data,  # Include all raw data
             "_formatted_output": formatted_response,  # Add formatted output
-            "_processed_file_ids": processed_file_ids  # Add processed file IDs for other functions
+            "_processed_file_ids": processed_file_ids,  # Add processed file IDs for other functions
+            "business_documents": business_documents  # Add the business_documents dict
         }
 
     except requests.exceptions.RequestException as e:
