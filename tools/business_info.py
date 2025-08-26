@@ -166,6 +166,19 @@ def get_business_information(business_name: str) -> dict:
         
         formatted_response += "\n### Linked Utilities and Retailers:"
 
+          # --- NEW: Invoice links ---
+        cleaning_id = file_ids_dict.get("Cleaning Invoice")
+        if cleaning_id:
+            processed_file_ids["invoice_Cleaning"] = f"https://drive.google.com/file/d/{cleaning_id}/view"
+
+        telecom_id = file_ids_dict.get("Telecommunication:")
+        if telecom_id:
+            processed_file_ids["invoice_Telecommunication"] = f"https://drive.google.com/file/d/{telecom_id}/view"
+
+        oil_invoice_id = file_ids_dict.get("Oil Invoice")
+        if oil_invoice_id:
+            processed_file_ids["invoice_Oil"] = f"https://drive.google.com/file/d/{oil_invoice_id}/view"
+            
         # Add linked utilities and their details
         linked_utilities = data.get('Linked_Details', {}).get('linked_utilities', {})
         utility_retailers = data.get('Linked_Details', {}).get('utility_retailers', {})
