@@ -88,31 +88,82 @@ app.add_middleware(
 from fastapi import Header
 
 def verify_google_access_token(authorization: str = Header(...)):
+    """Verify Google access token for API access (needed for presentations)"""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     access_token = authorization.split("Bearer ")[1]
     
     try:
-        # For access tokens, we create credentials directly
         credentials = Credentials(token=access_token)
-        
-        # Test the credentials by making a simple API call
+        # Test with a minimal API call
         service = build('drive', 'v3', credentials=credentials)
         service.files().list(pageSize=1).execute()
         
         return {"access_token": access_token}
     except Exception as e:
-        error_msg = str(e)
-        logging.error(f"Access token verification failed: {error_msg}")
+        error_msg = str(e).lower()
+        logging.error(f"Access token verification failed: {e}")
         
-        # Check for various token expiration scenarios
+        # Be more restrictive - only trigger reauthentication for actual token expiry
+        if "token_expired" in error_msg or "expired_token" in error_msg:
+            raise HTTPException(
+                status_code=401,
+                detail="REAUTHENTICATION_REQUIRED"
+            )
+        
+        # For other errors, don't trigger reauthentication
+        raise HTTPException(status_code=401, detail="Token validation failed")
+        
+def verify_google_token(authorization: str = Header(...)):
+    """Verify Google ID token for user authentication"""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    token = authorization.split("Bearer ")[1]
+    
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        logging.info(f"Token verified for user: {idinfo.get('email')}")
+        return idinfo
+    except ValueError as e:
+        error_msg = str(e).lower()
+        logging.error(f"Token verification failed: {e}")
+        
+        # Only trigger reauthentication for specific token expiry cases
+        if "expired" in error_msg or "invalid token" in error_msg:
+            raise HTTPException(
+                status_code=401,
+                detail="REAUTHENTICATION_REQUIRED"
+            )
+        
+        # For other errors, return generic invalid token
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Optional: Access token verification (only if you need Google API access)
+def verify_google_access_token_optional(authorization: str = Header(...)):
+    """Verify Google access token - only use if you need API access"""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    access_token = authorization.split("Bearer ")[1]
+    
+    try:
+        credentials = Credentials(token=access_token)
+        # Test with a minimal API call
+        service = build('drive', 'v3', credentials=credentials)
+        service.files().list(pageSize=1).execute()
+        
+        return {"access_token": access_token}
+    except Exception as e:
+        error_msg = str(e).lower()
+        logging.error(f"Access token verification failed: {e}")
+        
+        # Be more specific about when to trigger reauthentication
         if any(phrase in error_msg.lower() for phrase in [
-            "token expired", 
-            "expired", 
-            "invalid token", 
-            "credentials expired",
-            "unauthorized"
+            "token_expired",
+            "signature has expired", 
+            "token has expired"
         ]):
             raise HTTPException(
                 status_code=401,
@@ -121,34 +172,10 @@ def verify_google_access_token(authorization: str = Header(...)):
         
         raise HTTPException(status_code=401, detail="Invalid access token")
 
-def verify_google_token(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid authorization format")
-    
-    token = authorization.split("Bearer ")[1]
-    
-    try:
-        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
-        logging.info(f"Decoded user info: {idinfo}")
-        return idinfo
-    except Exception as e:
-        error_msg = str(e)
-        logging.error(f"Token verification failed: {error_msg}")
-        
-        # Check for various token expiration scenarios
-        if any(phrase in error_msg.lower() for phrase in [
-            "token expired", 
-            "expired", 
-            "invalid token", 
-            "token has expired",
-            "signature has expired"
-        ]):
-            raise HTTPException(
-                status_code=401,
-                detail="REAUTHENTICATION_REQUIRED"
-            )
-        
-        raise HTTPException(status_code=401, detail="Invalid token")
+# Recommended: Use this for most endpoints
+def get_current_user(authorization: str = Header(...)):
+    """Get current authenticated user info"""
+    return verify_google_token(authorization)
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
@@ -1176,20 +1203,6 @@ def generate_presentation_pdf(drive_service, presentation_id: str) -> str:
     except Exception as e:
         logging.error(f"Error generating PDF: {str(e)}")
         return None
-
-@app.get("/api/google/oauth-start")
-async def google_oauth_start(scope: str = Query("presentations")):
-    """Start Google OAuth flow for Presentations"""
-    # You'll need to implement this based on your OAuth setup
-    # This is a placeholder - you'll need to configure Google OAuth
-    logging.info(f"Starting Google OAuth with scope: {scope}")
-    
-    # This should redirect to Google OAuth with appropriate scopes
-    google_oauth_url = f"https://accounts.google.com/oauth/authorize"
-    # Add your OAuth parameters here
-    
-    return {"oauth_url": google_oauth_url, "message": "Implement OAuth flow"}
-
 
 @app.get("/api/eoi-types")
 def get_eoi_types_endpoint(user_info: dict = Depends(verify_google_token)):
