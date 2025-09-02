@@ -116,13 +116,14 @@ def verify_google_access_token(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Token validation failed")
         
 def verify_google_token(authorization: str = Header(...)):
-    """Verify Google ID token for user authentication"""
+    """Verify Google ID token for basic user authentication"""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     token = authorization.split("Bearer ")[1]
     
     try:
+        # Use ID token verification for basic auth (no API access needed)
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Token verified for user: {idinfo.get('email')}")
         return idinfo
@@ -130,14 +131,9 @@ def verify_google_token(authorization: str = Header(...)):
         error_msg = str(e).lower()
         logging.error(f"Token verification failed: {e}")
         
-        # Only trigger reauthentication for specific token expiry cases
-        if "expired" in error_msg or "invalid token" in error_msg:
-            raise HTTPException(
-                status_code=401,
-                detail="REAUTHENTICATION_REQUIRED"
-            )
+        if "expired" in error_msg:
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
         
-        # For other errors, return generic invalid token
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
