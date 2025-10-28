@@ -70,7 +70,9 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
             'signed_SME_G': 'https://membersaces.app.n8n.cloud/webhook/signed_SMEG',
             'signed_WASTE': 'https://membersaces.app.n8n.cloud/webhook/signed_Waste',
             'signed_OIL': 'https://membersaces.app.n8n.cloud/webhook/signed_Oil',
-            'signed_DMA': 'https://membersaces.app.n8n.cloud/webhook/signed_DMA'
+            'signed_DMA': 'https://membersaces.app.n8n.cloud/webhook/signed_DMA',
+            'amortisation_excel': 'https://membersaces.app.n8n.cloud/webhook/amortisation_excel',
+            'amortisation_pdf': 'https://membersaces.app.n8n.cloud/webhook/amortisation_pdf'
         }
 
         if filing_type not in webhook_urls:

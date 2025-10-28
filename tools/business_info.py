@@ -82,7 +82,7 @@ def get_business_information(business_name: str) -> dict:
             'LOA File ID': 'business_LOA',
             'WIP': 'business_WIP',
             'Floor Plan': 'business_Floor Plan (Exit Map)',
-            'Site Profiling': 'business_Site Profling',  # Note the typo in the original
+            'Site Profiling': 'business_Site Profling',
             'Service Fee Agreement': 'business_Service Fee Agreement',
             'Initial Strategy': 'business_Initial Strategy',
             'Cleaning Invoice': 'invoice_Cleaning',
@@ -95,6 +95,8 @@ def get_business_information(business_name: str) -> dict:
             'SC Waste': 'contract_Waste',
             'SC Oil': 'contract_Oil',
             'SC DMA': 'contract_DMA',
+            'Amortisation Excel': 'business_amortisation_excel',
+            'Amortisation PDF': 'business_amortisation_pdf',
         }
         
         # Process all file IDs from N8N data
