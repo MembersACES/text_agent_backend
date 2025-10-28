@@ -6,3 +6,8 @@ requests
 python-multipart
 aiofiles
 requests
+httpx
+google-api-python-client
+packaging
+google-auth-oauthlib
+google-auth-httplib2

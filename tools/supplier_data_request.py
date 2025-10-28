@@ -319,7 +319,7 @@ EMAIL_TEMPLATES = {
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
-<p>Sofie</p>
+<p>Sophie</p>
 <p><b>Australian Circular Economy Solution</b></p>
 <p>470 St Kilda Road, Melbourne VIC 3004</p>
 <p>Ph: 1300 849 908 | Website: acesolutions.com.au</p>"""

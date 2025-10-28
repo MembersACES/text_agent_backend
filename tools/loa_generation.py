@@ -1,10 +1,8 @@
-from langchain_core.tools import tool
 import requests
 import datetime
 
 
-@tool
-def loa_generation(
+def loa_generation_new(
     business_name: str,
     abn: str,
     trading_as: str,
@@ -14,7 +12,6 @@ def loa_generation(
     email: str,
     contact_name: str,
     position: str,
-    client_folder_url: str,
 ) -> str:
     """Generate Letter of Authority (LOA) document for a business.
 
@@ -28,7 +25,6 @@ def loa_generation(
         email: Email address
         contact_name: Primary contact name
         position: Contact person's role
-        client_folder_url: Client's Google Drive folder URL
     """
 
     current_date = datetime.datetime.now()
@@ -46,7 +42,6 @@ def loa_generation(
             "email": email,
             "contact_name": contact_name,
             "position": position,
-            "client_folder_url": client_folder_url,
             "current_month": current_month,
             "current_year": current_year,
         },
@@ -55,10 +50,10 @@ def loa_generation(
     }
 
     response = requests.post(
-        "https://membersaces.app.n8n.cloud/webhook/document-generation-2", json=payload
+        "https://membersaces.app.n8n.cloud/webhook/document-generation-3", json=payload
     )
 
     data = response.json()
     document_link = data.get("document_link")
 
-    return f'The Letter of Agreement (LOA) for "{business_name}" has been successfully generated. You can access it here: {document_link} and this is the link of the Google Drive Folder: {client_folder_url}. If you need further assistance or details, please let me know!'
+    return f'The Letter of Agreement (LOA) for "{business_name}" has been successfully generated. You can access it here: {document_link}.'
