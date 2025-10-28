@@ -87,6 +87,14 @@ app.add_middleware(
 
 from fastapi import Header
 
+@app.get("/")
+async def root():
+    return {"status": "healthy", "service": "text-agent-backend"}
+
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+    
 def verify_google_access_token(authorization: str = Header(...)):
     """Verify Google access token for API access (needed for presentations)"""
     if not authorization.startswith("Bearer "):
