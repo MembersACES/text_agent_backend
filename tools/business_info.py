@@ -88,6 +88,7 @@ def get_business_information(business_name: str) -> dict:
             'Cleaning Invoice': 'invoice_Cleaning',
             'Telecommunication:': 'invoice_Telecommunication',
             'Oil Invoice': 'invoice_Oil',
+            'Water Invoice': 'invoice_Water',
             'SC C&I E': 'contract_C&I Electricity',
             'SC SME E': 'contract_SME Electricity',
             'SC C&I G': 'contract_C&I Gas',
