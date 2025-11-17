@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import mimetypes
 
-def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_url: str, filing_type: str) -> dict:
+def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_url: str, filing_type: str, contract_status: str = None) -> dict:
     """Process drive filing data and send to n8n webhook
     Args:
         file_bytes (bytes): File content in bytes
@@ -12,6 +12,7 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
         business_name (str): Name of the business
         gdrive_url (str): Google Drive folder URL
         filing_type (str): Type of filing (loa, savings, revenue, site_profiling, etc.)
+        contract_status (str): Contract status (e.g., "Signed via ACES", "Existing Contract")
     Returns:
         dict: Result of the filing process
     """
@@ -63,6 +64,9 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
             'timestamp': datetime.now().isoformat(),
             'new_filename': new_filename
         }
+
+        if contract_status:
+            data['contract_status'] = contract_status
 
         webhook_urls = {
             'loa': 'https://membersaces.app.n8n.cloud/webhook/loa_upload',

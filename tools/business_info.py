@@ -100,12 +100,29 @@ def get_business_information(business_name: str) -> dict:
             'Amortisation PDF': 'business_amortisation_pdf',
         }
         
+        # NEW: Status field mapping
+        status_mapping = {
+            'SC C&I E Status:': 'contract_C&I Electricity_status',
+            'SC SME E Status:': 'contract_SME Electricity_status',
+            'SC C&I G Status:': 'contract_C&I Gas_status',
+            'SC SME G Status:': 'contract_SME Gas_status',
+            'SC Waste Status:': 'contract_Waste_status',
+            'SC Oil Status:': 'contract_Oil_status',
+            'SC DMA Status:': 'contract_DMA_status',
+        }
+        
         # Process all file IDs from N8N data
         for n8n_key, mapped_key in file_mapping.items():
             file_id = file_ids_dict.get(n8n_key)
             if file_id and file_id.strip():  # Check if file_id exists and is not empty
                 file_link = f"https://drive.google.com/file/d/{file_id}/view"
                 processed_file_ids[mapped_key] = file_link
+        
+        # NEW: Process all status fields from N8N data
+        for n8n_key, mapped_key in status_mapping.items():
+            status_value = file_ids_dict.get(n8n_key)
+            if status_value and status_value.strip():  # Check if status exists and is not empty
+                processed_file_ids[mapped_key] = status_value
 
         # Prepare LOA file link for Representative Details
         loa_file_id = file_ids_dict.get('LOA File ID')
@@ -175,22 +192,25 @@ def get_business_information(business_name: str) -> dict:
         else:
             formatted_response += "- No business documents available\n"
 
-        # Add Signed Contracts section
+        # Add Signed Contracts section WITH STATUS
         sc_fields = [
-            ("SC C&I E", "C&I Electricity"),
-            ("SC SME E", "SME Electricity"),
-            ("SC C&I G", "C&I Gas"),
-            ("SC SME G", "SME Gas"),
-            ("SC Waste", "Waste"),
-            ("SC Oil", "Oil"),
-            ("SC DMA", "DMA"),
+            ("SC C&I E", "C&I Electricity", "SC C&I E Status:"),
+            ("SC SME E", "SME Electricity", "SC SME E Status:"),
+            ("SC C&I G", "C&I Gas", "SC C&I G Status:"),
+            ("SC SME G", "SME Gas", "SC SME G Status:"),
+            ("SC Waste", "Waste", "SC Waste Status:"),
+            ("SC Oil", "Oil", "SC Oil Status:"),
+            ("SC DMA", "DMA", "SC DMA Status:"),
         ]
         formatted_response += "\n### Signed Contracts:\n"
-        for sc_key, sc_label in sc_fields:
+        for sc_key, sc_label, status_key in sc_fields:
             sc_file_id = file_ids_dict.get(sc_key)
+            sc_status = file_ids_dict.get(status_key, "")
+            
             if sc_file_id and sc_file_id.strip():
                 sc_link = f"https://drive.google.com/file/d/{sc_file_id}/view"
-                formatted_response += f"- **{sc_label}:** [In File]({sc_link})\n"
+                status_text = f" ({sc_status})" if sc_status else ""
+                formatted_response += f"- **{sc_label}:** [In File]({sc_link}){status_text}\n"
             else:
                 formatted_response += f"- **{sc_label}:** Not Available\n"
 

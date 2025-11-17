@@ -462,6 +462,7 @@ def drive_filing_endpoint(
     business_name: str = Form(...),
     gdrive_url: str = Form(...),
     filing_type: str = Form(...),
+    contract_status: str = Form(None),
     file: UploadFile = File(...),
     user_info: dict = Depends(verify_google_token)
 ):
@@ -472,7 +473,8 @@ def drive_filing_endpoint(
         filename=file.filename,
         business_name=business_name,
         gdrive_url=gdrive_url,
-        filing_type=filing_type
+        filing_type=filing_type,
+        contract_status=contract_status
     )
     result["user_email"] = user_info.get("email")
     logging.info(f"Returning drive filing response to frontend: {result}")
