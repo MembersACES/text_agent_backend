@@ -18,7 +18,7 @@ import logging
 import tempfile
 import os
 import httpx
-from typing import Optional
+from typing import Optional, List
 import json
 from fastapi import HTTPException, Depends
 from google.oauth2.credentials import Credentials
@@ -49,6 +49,16 @@ from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_multiple
 
+# Database imports
+from database import get_db, init_db
+from models import Task, User
+from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse
+from sqlalchemy.orm import Session
+
+# Email and scheduler imports
+from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -56,6 +66,39 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 app = FastAPI()
+
+# Initialize scheduler
+scheduler = AsyncIOScheduler()
+
+# Wrapper function for scheduled task that creates its own DB session
+async def scheduled_check_due_tasks():
+    """Wrapper to create DB session for scheduled task"""
+    db = next(get_db())
+    try:
+        await check_due_tasks(db)
+    finally:
+        db.close()
+
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+    logging.info("Database initialized")
+    
+    # Start scheduler for daily task checks (7:00 AM daily)
+    scheduler.add_job(
+        scheduled_check_due_tasks,
+        "cron",
+        hour=7,
+        minute=0
+    )
+    scheduler.start()
+    logging.info("Task scheduler started (daily check at 7:00 AM)")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+    logging.info("Task scheduler stopped")
 
 app.add_middleware(
     CORSMiddleware,
@@ -176,10 +219,39 @@ def verify_google_access_token_optional(authorization: str = Header(...)):
         
         raise HTTPException(status_code=401, detail="Invalid access token")
 
+# Helper function to get or create user
+def get_or_create_user(db: Session, email: str, name: str = None, picture: str = None):
+    """Get or create a user in the database"""
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(email=email, name=name, picture=picture)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logging.info(f"Created new user: {email}")
+    return user
+
 # Recommended: Use this for most endpoints
 def get_current_user(authorization: str = Header(...)):
     """Get current authenticated user info"""
     return verify_google_token(authorization)
+
+# New dependency that verifies token AND ensures user exists in database
+def get_current_user_with_db(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get current authenticated user info and ensure they exist in database"""
+    idinfo = verify_google_token(authorization)
+    email = idinfo.get("email")
+    name = idinfo.get("name")
+    picture = idinfo.get("picture")
+    
+    # Auto-create user if they don't exist
+    user = get_or_create_user(db, email, name, picture)
+    
+    # Return both the idinfo (for compatibility) and user object
+    return {"idinfo": idinfo, "user": user}
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
@@ -1364,3 +1436,144 @@ def debug_google_token(
             "success": False,
             "message": f"Debug failed: {str(e)}"
         }
+
+# Task API Routes
+@app.post("/api/tasks", response_model=TaskResponse)
+async def create_task(
+    task: TaskCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Create a new task"""
+    logging.info(f"Received task creation request: {task.title}")
+    
+    user_info = user_data["idinfo"]
+    # Use the authenticated user's email as assigned_by if not provided
+    assigned_by = task.assigned_by or user_info.get("email")
+    
+    db_task = Task(
+        title=task.title,
+        description=task.description,
+        due_date=task.due_date,
+        status=task.status,
+        assigned_to=task.assigned_to,
+        assigned_by=assigned_by,
+        business_id=task.business_id
+    )
+    
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task created successfully: {db_task.id}")
+    
+    # Send email notification for new task
+    if task.assigned_to:
+        try:
+            await send_new_task_email(task.assigned_to, assigned_by, db_task, db)
+        except Exception as e:
+            logging.error(f"Failed to send new task email: {str(e)}")
+    
+    return db_task
+
+
+@app.get("/api/tasks/my", response_model=List[TaskResponse])
+def get_my_tasks(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks assigned to the current user"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    logging.info(f"Fetching tasks for user: {user_email}")
+    
+    tasks = db.query(Task).filter(Task.assigned_to == user_email).all()
+    
+    logging.info(f"Found {len(tasks)} tasks for user {user_email}")
+    return tasks
+
+
+@app.patch("/api/tasks/{task_id}/status", response_model=TaskResponse)
+async def update_task_status(
+    task_id: int,
+    status_update: TaskStatusUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update the status of a task"""
+    logging.info(f"Updating task {task_id} status to: {status_update.status}")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    old_status = db_task.status
+    db_task.status = status_update.status
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task {task_id} status updated successfully")
+    
+    # Send email notification if task is marked as completed
+    if status_update.status.lower() == "completed" and old_status.lower() != "completed":
+        if db_task.assigned_by and db_task.assigned_to:
+            try:
+                await send_task_completed_email(
+                    db_task.assigned_by,
+                    db_task.assigned_to,
+                    db_task,
+                    db
+                )
+            except Exception as e:
+                logging.error(f"Failed to send task completed email: {str(e)}")
+    
+    return db_task
+
+
+@app.get("/api/tasks/by-business/{business_id}", response_model=List[TaskResponse])
+def get_tasks_by_business(
+    business_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks for a specific business"""
+    logging.info(f"Fetching tasks for business_id: {business_id}")
+    
+    tasks = db.query(Task).filter(Task.business_id == business_id).all()
+    
+    logging.info(f"Found {len(tasks)} tasks for business_id {business_id}")
+    return tasks
+
+
+@app.get("/api/users", response_model=List[UserResponse])
+def list_users(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all users (for assign dropdown)"""
+    logging.info("Fetching all users")
+    
+    users = db.query(User).all()
+    
+    logging.info(f"Found {len(users)} users")
+    return users
+
+
+@app.post("/api/tasks/check-due")
+async def check_due_tasks_endpoint(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Manually trigger check for due/overdue tasks (for testing)"""
+    logging.info("Manual due tasks check triggered")
+    
+    try:
+        await check_due_tasks(db)
+        return {
+            "status": "success",
+            "message": "Due tasks check completed. Check logs for details."
+        }
+    except Exception as e:
+        logging.error(f"Error during due tasks check: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error checking due tasks: {str(e)}")

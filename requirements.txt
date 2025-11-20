@@ -11,3 +11,6 @@ google-api-python-client
 packaging
 google-auth-oauthlib
 google-auth-httplib2
+sqlalchemy
+aiosqlite
+apscheduler
