@@ -51,9 +51,10 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User
+from models import Task, User, TaskHistory
 from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse
 from sqlalchemy.orm import Session
+from utils.task_history import log_task_history
 
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
@@ -1448,8 +1449,10 @@ async def create_task(
     logging.info(f"Received task creation request: {task.title}")
     
     user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
     # Use the authenticated user's email as assigned_by if not provided
-    assigned_by = task.assigned_by or user_info.get("email")
+    assigned_by = task.assigned_by or current_user_email
     
     db_task = Task(
         title=task.title,
@@ -1466,6 +1469,12 @@ async def create_task(
     db.refresh(db_task)
     
     logging.info(f"Task created successfully: {db_task.id}")
+    
+    # Log task creation in history
+    log_task_history(
+        db, db_task.id, current_user_email,
+        action="task_created"
+    )
     
     # Send email notification for new task
     if task.assigned_to:
@@ -1503,10 +1512,17 @@ async def update_task_status(
     """Update the status of a task"""
     logging.info(f"Updating task {task_id} status to: {status_update.status}")
     
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
     db_task = db.query(Task).filter(Task.id == task_id).first()
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can update
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
     
     old_status = db_task.status
     db_task.status = status_update.status
@@ -1514,6 +1530,15 @@ async def update_task_status(
     db.refresh(db_task)
     
     logging.info(f"Task {task_id} status updated successfully")
+    
+    # Log status change in history
+    log_task_history(
+        db, task_id, current_user_email,
+        action="status_changed",
+        field="status",
+        old=old_status,
+        new=status_update.status
+    )
     
     # Send email notification if task is marked as completed
     if status_update.status.lower() == "completed" and old_status.lower() != "completed":
@@ -1528,6 +1553,104 @@ async def update_task_status(
             except Exception as e:
                 logging.error(f"Failed to send task completed email: {str(e)}")
     
+    return db_task
+
+
+@app.patch("/api/tasks/{task_id}", response_model=TaskResponse)
+async def update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update task fields (title, description, due_date, assigned_to, business_id)"""
+    logging.info(f"Updating task {task_id}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can update
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
+    
+    # If task is completed and being edited, reset to in_progress
+    if db_task.status.lower() == "completed":
+        log_task_history(
+            db, task_id, current_user_email,
+            action="status_changed",
+            field="status",
+            old=db_task.status,
+            new="in_progress"
+        )
+        db_task.status = "in_progress"
+        logging.info(f"Task {task_id} status reset from 'completed' to 'in_progress' due to edit")
+    
+    # Update title
+    if task_update.title is not None and task_update.title != db_task.title:
+        log_task_history(
+            db, task_id, current_user_email,
+            action="field_updated",
+            field="title",
+            old=db_task.title,
+            new=task_update.title
+        )
+        db_task.title = task_update.title
+    
+    # Update description
+    if task_update.description is not None and task_update.description != db_task.description:
+        log_task_history(
+            db, task_id, current_user_email,
+            action="field_updated",
+            field="description",
+            old=db_task.description,
+            new=task_update.description
+        )
+        db_task.description = task_update.description
+    
+    # Update due_date
+    if task_update.due_date is not None and task_update.due_date != db_task.due_date:
+        old_due_date_str = db_task.due_date.strftime("%Y-%m-%d %H:%M:%S") if db_task.due_date else None
+        new_due_date_str = task_update.due_date.strftime("%Y-%m-%d %H:%M:%S") if task_update.due_date else None
+        log_task_history(
+            db, task_id, current_user_email,
+            action="field_updated",
+            field="due_date",
+            old=old_due_date_str,
+            new=new_due_date_str
+        )
+        db_task.due_date = task_update.due_date
+    
+    # Update assigned_to
+    if task_update.assigned_to is not None and task_update.assigned_to != db_task.assigned_to:
+        log_task_history(
+            db, task_id, current_user_email,
+            action="field_updated",
+            field="assigned_to",
+            old=db_task.assigned_to,
+            new=task_update.assigned_to
+        )
+        db_task.assigned_to = task_update.assigned_to
+    
+    # Update business_id
+    if task_update.business_id is not None and task_update.business_id != db_task.business_id:
+        log_task_history(
+            db, task_id, current_user_email,
+            action="field_updated",
+            field="business_id",
+            old=db_task.business_id,
+            new=task_update.business_id
+        )
+        db_task.business_id = task_update.business_id
+    
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task {task_id} updated successfully")
     return db_task
 
 
@@ -1558,6 +1681,102 @@ def list_users(
     
     logging.info(f"Found {len(users)} users")
     return users
+
+@app.get("/api/tasks/assigned-by-me", response_model=List[TaskResponse])
+def get_tasks_assigned_by_me(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks created by the current user"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    logging.info(f"Fetching tasks assigned by user: {user_email}")
+    
+    tasks = db.query(Task).filter(Task.assigned_by == user_email).all()
+    
+    logging.info(f"Found {len(tasks)} tasks assigned by {user_email}")
+    return tasks
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Delete a task"""
+    logging.info(f"Deleting task {task_id}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can delete
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only delete tasks assigned to you or created by you.")
+    
+    # Log deletion in history before deleting
+    log_task_history(
+        db, task_id, current_user_email,
+        action="task_deleted"
+    )
+    
+    # Delete the task (history will be kept due to foreign key, or cascade if configured)
+    db.delete(db_task)
+    db.commit()
+    
+    logging.info(f"Task {task_id} deleted successfully by {current_user_email}")
+    return {"status": "success", "message": f"Task {task_id} deleted successfully"}
+
+
+@app.get("/api/tasks/all", response_model=List[TaskResponse])
+def get_all_tasks(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks"""
+    logging.info("Fetching all tasks")
+    
+    tasks = db.query(Task).all()
+    
+    logging.info(f"Found {len(tasks)} tasks")
+    return tasks
+
+
+@app.get("/api/tasks/{task_id}/history")
+def get_task_history(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get history for a specific task"""
+    logging.info(f"Fetching history for task {task_id}")
+    
+    # Verify task exists
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Get history ordered by creation time
+    history = db.query(TaskHistory).filter(
+        TaskHistory.task_id == task_id
+    ).order_by(TaskHistory.created_at.asc()).all()
+    
+    return [
+        {
+            "id": h.id,
+            "action": h.action,
+            "field": h.field,
+            "old_value": h.old_value,
+            "new_value": h.new_value,
+            "user_email": h.user_email,
+            "created_at": h.created_at.isoformat()
+        } for h in history
+    ]
 
 
 @app.post("/api/tasks/check-due")

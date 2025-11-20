@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
 from sqlalchemy.sql import func
 from datetime import datetime
 from database import Base
@@ -31,4 +31,17 @@ class Task(Base):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
     last_notification_sent_at = Column(DateTime, nullable=True)
+
+
+class TaskHistory(Base):
+    __tablename__ = "task_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    user_email = Column(String, nullable=True)
+    action = Column(String, nullable=False)  # e.g., "task_created", "status_changed", "field_updated"
+    field = Column(String, nullable=True)  # which field changed
+    old_value = Column(String, nullable=True)
+    new_value = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
