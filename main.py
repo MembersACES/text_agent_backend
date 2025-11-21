@@ -1,3 +1,5 @@
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
 from typing import List
 from fastapi import Header
@@ -6,7 +8,6 @@ from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
-from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build as google_build
 import tempfile
@@ -66,13 +67,13 @@ from utils.task_history import (
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 app = FastAPI()
+
 
 # Initialize scheduler
 scheduler = AsyncIOScheduler()
