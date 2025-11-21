@@ -1,9 +1,10 @@
 """
 Pydantic schemas for API requests and responses
 """
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 from typing import Optional
 from datetime import datetime
+from utils.timezone import to_melbourne_iso
 
 
 class TaskCreate(BaseModel):
@@ -43,6 +44,13 @@ class TaskResponse(BaseModel):
     updated_at: datetime
     last_notification_sent_at: Optional[datetime] = None
 
+    @field_serializer('created_at', 'updated_at', 'due_date', 'last_notification_sent_at')
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        """Convert UTC datetime to Melbourne timezone before serialization"""
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
     class Config:
         from_attributes = True
 
@@ -53,6 +61,11 @@ class UserResponse(BaseModel):
     name: Optional[str] = None
     picture: Optional[str] = None
     created_at: datetime
+
+    @field_serializer('created_at')
+    def serialize_datetime(self, dt: datetime, _info):
+        """Convert UTC datetime to Melbourne timezone before serialization"""
+        return to_melbourne_iso(dt)
 
     class Config:
         from_attributes = True

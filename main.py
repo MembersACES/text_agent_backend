@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
+from typing import List
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
@@ -54,7 +55,12 @@ from database import get_db, init_db
 from models import Task, User, TaskHistory
 from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse
 from sqlalchemy.orm import Session
-from utils.task_history import log_task_history
+from utils.task_history import (
+    log_task_created,
+    log_field_change,
+    log_status_change,
+    log_task_deleted,
+)
 
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
@@ -1471,10 +1477,7 @@ async def create_task(
     logging.info(f"Task created successfully: {db_task.id}")
     
     # Log task creation in history
-    log_task_history(
-        db, db_task.id, current_user_email,
-        action="task_created"
-    )
+    log_task_created(db, db_task.id, current_user_email)
     
     # Send email notification for new task
     if task.assigned_to:
@@ -1532,12 +1535,9 @@ async def update_task_status(
     logging.info(f"Task {task_id} status updated successfully")
     
     # Log status change in history
-    log_task_history(
+    log_status_change(
         db, task_id, current_user_email,
-        action="status_changed",
-        field="status",
-        old=old_status,
-        new=status_update.status
+        old_status, status_update.status
     )
     
     # Send email notification if task is marked as completed
@@ -1580,72 +1580,55 @@ async def update_task(
     
     # If task is completed and being edited, reset to in_progress
     if db_task.status.lower() == "completed":
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="status_changed",
-            field="status",
-            old=db_task.status,
-            new="in_progress"
+            "title", db_task.title, task_update.title
         )
         db_task.status = "in_progress"
         logging.info(f"Task {task_id} status reset from 'completed' to 'in_progress' due to edit")
     
     # Update title
     if task_update.title is not None and task_update.title != db_task.title:
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="field_updated",
-            field="title",
-            old=db_task.title,
-            new=task_update.title
+            "title", db_task.title, task_update.title
         )
         db_task.title = task_update.title
-    
+
     # Update description
     if task_update.description is not None and task_update.description != db_task.description:
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="field_updated",
-            field="description",
-            old=db_task.description,
-            new=task_update.description
+            "description", db_task.description, task_update.description
         )
         db_task.description = task_update.description
-    
+
     # Update due_date
     if task_update.due_date is not None and task_update.due_date != db_task.due_date:
         old_due_date_str = db_task.due_date.strftime("%Y-%m-%d %H:%M:%S") if db_task.due_date else None
         new_due_date_str = task_update.due_date.strftime("%Y-%m-%d %H:%M:%S") if task_update.due_date else None
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="field_updated",
-            field="due_date",
-            old=old_due_date_str,
-            new=new_due_date_str
+            "due_date", old_due_date_str, new_due_date_str
         )
         db_task.due_date = task_update.due_date
-    
+
     # Update assigned_to
     if task_update.assigned_to is not None and task_update.assigned_to != db_task.assigned_to:
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="field_updated",
-            field="assigned_to",
-            old=db_task.assigned_to,
-            new=task_update.assigned_to
+            "assigned_to", db_task.assigned_to, task_update.assigned_to
         )
         db_task.assigned_to = task_update.assigned_to
-    
+
     # Update business_id
     if task_update.business_id is not None and task_update.business_id != db_task.business_id:
-        log_task_history(
+        log_field_change(
             db, task_id, current_user_email,
-            action="field_updated",
-            field="business_id",
-            old=db_task.business_id,
-            new=task_update.business_id
+            "business_id", str(db_task.business_id), str(task_update.business_id)
         )
         db_task.business_id = task_update.business_id
+
     
     db.commit()
     db.refresh(db_task)
@@ -1720,10 +1703,7 @@ def delete_task(
         raise HTTPException(status_code=403, detail="You may only delete tasks assigned to you or created by you.")
     
     # Log deletion in history before deleting
-    log_task_history(
-        db, task_id, current_user_email,
-        action="task_deleted"
-    )
+    log_task_deleted(db, task_id, current_user_email)
     
     # Delete the task (history will be kept due to foreign key, or cascade if configured)
     db.delete(db_task)
@@ -1751,32 +1731,92 @@ def get_all_tasks(
 def get_task_history(
     task_id: int,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db),
+    page: int = Query(1, ge=1, description="Page number (starts at 1)"),
+    page_size: int = Query(50, ge=1, le=100, description="Number of items per page")
 ):
-    """Get history for a specific task"""
-    logging.info(f"Fetching history for task {task_id}")
+    """Get history for a specific task with pagination and batched edit grouping"""
+    from utils.timezone import to_melbourne_iso
+    from datetime import timedelta
+    
+    logging.info(f"Fetching history for task {task_id}, page {page}, page_size {page_size}")
     
     # Verify task exists
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    # Get history ordered by creation time
+    # Get total count
+    total_count = db.query(TaskHistory).filter(
+        TaskHistory.task_id == task_id
+    ).count()
+    
+    # Get history ordered by creation time (descending for pagination)
+    offset = (page - 1) * page_size
     history = db.query(TaskHistory).filter(
         TaskHistory.task_id == task_id
-    ).order_by(TaskHistory.created_at.asc()).all()
+    ).order_by(TaskHistory.created_at.desc()).offset(offset).limit(page_size).all()
     
-    return [
-        {
-            "id": h.id,
-            "action": h.action,
-            "field": h.field,
-            "old_value": h.old_value,
-            "new_value": h.new_value,
-            "user_email": h.user_email,
-            "created_at": h.created_at.isoformat()
-        } for h in history
-    ]
+    # Group batched edits (edits by same user within 5 seconds)
+    grouped_history = []
+    BATCH_WINDOW_SECONDS = 5
+    
+    for i, h in enumerate(history):
+        if i == 0:
+            # First item starts a new group
+            current_group = {
+                "id": h.id,
+                "action": h.action,
+                "fields": [{"field": h.field, "old_value": h.old_value, "new_value": h.new_value}] if h.field else [],
+                "user_email": h.user_email,
+                "created_at": to_melbourne_iso(h.created_at),
+                "is_batched": False
+            }
+            grouped_history.append(current_group)
+        else:
+            prev_h = history[i - 1]
+            time_diff = (prev_h.created_at - h.created_at).total_seconds()
+            
+            # Check if this edit should be grouped with previous
+            should_group = (
+                h.action == "field_updated" and
+                prev_h.action == "field_updated" and
+                h.user_email == prev_h.user_email and
+                time_diff <= BATCH_WINDOW_SECONDS
+            )
+            
+            if should_group:
+                # Add to previous group
+                current_group["fields"].append({
+                    "field": h.field,
+                    "old_value": h.old_value,
+                    "new_value": h.new_value
+                })
+                current_group["is_batched"] = True
+            else:
+                # Start new group
+                current_group = {
+                    "id": h.id,
+                    "action": h.action,
+                    "fields": [{"field": h.field, "old_value": h.old_value, "new_value": h.new_value}] if h.field else [],
+                    "user_email": h.user_email,
+                    "created_at": to_melbourne_iso(h.created_at),
+                    "is_batched": False
+                }
+                grouped_history.append(current_group)
+    
+    # Reverse to show oldest first
+    grouped_history.reverse()
+    
+    return {
+        "items": grouped_history,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total_count,
+            "total_pages": (total_count + page_size - 1) // page_size
+        }
+    }
 
 
 @app.post("/api/tasks/check-due")
