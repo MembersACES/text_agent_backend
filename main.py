@@ -1809,13 +1809,35 @@ def get_task_history(
     # Reverse to show oldest first
     grouped_history.reverse()
     
+    # ---- GROUP BY DATE FOR FRONTEND ----
+    from collections import defaultdict
+    from datetime import datetime
+
+    date_groups = defaultdict(list)
+
+    for item in grouped_history:
+        # item['created_at'] is already ISO Melbourne string
+        dt = datetime.fromisoformat(item["created_at"])
+        date_key = dt.strftime("%B %d, %Y")   # e.g. “November 21, 2025”
+        date_groups[date_key].append(item)
+
+    groups_list = [
+        {"date": date, "items": items}
+        for date, items in sorted(
+            date_groups.items(),
+            key=lambda x: datetime.strptime(x[0], "%B %d, %Y"),
+            reverse=True
+        )
+    ]
+
     return {
-        "items": grouped_history,
+        "groups": groups_list,
         "pagination": {
             "page": page,
             "page_size": page_size,
-            "total_items": total_count,
-            "total_pages": (total_count + page_size - 1) // page_size
+            "total": total_count,
+            "has_next": page * page_size < total_count,
+            "has_prev": page > 1
         }
     }
 
