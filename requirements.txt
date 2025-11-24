@@ -13,6 +13,6 @@ google-auth-oauthlib
 google-auth-httplib2
 google-cloud-storage
 sqlalchemy
-aiosqlite
+psycopg2-binary
 apscheduler
 pytz
