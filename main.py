@@ -53,8 +53,8 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User, TaskHistory, ClientStatusNote
-from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse, ClientStatusNoteCreate, ClientStatusNoteUpdate, ClientStatusNoteResponse
+from models import Task, User, TaskHistory
+from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse
 from sqlalchemy.orm import Session
 from utils.task_history import (
     log_task_created,
@@ -1859,75 +1859,3 @@ async def check_due_tasks_endpoint(
     except Exception as e:
         logging.error(f"Error during due tasks check: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error checking due tasks: {str(e)}")
-
-@app.post("/api/client-status", response_model=ClientStatusNoteResponse)
-def create_client_status_note(
-    note: ClientStatusNoteCreate,
-    db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
-):
-    """Create a new status note for a client"""
-    user_info = user_data["idinfo"]
-    current_user_email = user_info.get("email")
-    
-    logging.info(f"Creating status note for business: {note.business_name}")
-    
-    db_note = ClientStatusNote(
-        business_name=note.business_name,
-        note=note.note,
-        user_email=current_user_email
-    )
-    
-    db.add(db_note)
-    db.commit()
-    db.refresh(db_note)
-    
-    logging.info(f"Status note created successfully: {db_note.id}")
-    return db_note
-
-
-@app.get("/api/client-status/{business_name}", response_model=List[ClientStatusNoteResponse])
-def get_client_status_notes(
-    business_name: str,
-    db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
-):
-    """Get all status notes for a specific business"""
-    logging.info(f"Fetching status notes for business: {business_name}")
-    
-    notes = db.query(ClientStatusNote).filter(
-        ClientStatusNote.business_name == business_name
-    ).order_by(ClientStatusNote.created_at.desc()).all()
-    
-    logging.info(f"Found {len(notes)} status notes for {business_name}")
-    return notes
-
-
-@app.patch("/api/client-status/{note_id}", response_model=ClientStatusNoteResponse)
-def update_client_status_note(
-    note_id: int,
-    note_update: ClientStatusNoteUpdate,
-    db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
-):
-    """Update a status note (anyone can edit)"""
-    user_info = user_data["idinfo"]
-    current_user_email = user_info.get("email")
-    
-    logging.info(f"Updating status note {note_id}")
-    
-    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
-    
-    if not db_note:
-        raise HTTPException(status_code=404, detail="Status note not found")
-    
-    # Update the note
-    db_note.note = note_update.note
-    db_note.user_email = current_user_email  # Track who last edited
-    
-    db.commit()
-    db.refresh(db_note)
-    
-    logging.info(f"Status note {note_id} updated successfully")
-    return db_note#   R e b u i l d   t r i g g e r  
- 
