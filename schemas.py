@@ -70,3 +70,32 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+# Client Status Notes Schemas
+class ClientStatusNoteBase(BaseModel):
+    business_name: str
+    note: str
+
+
+class ClientStatusNoteCreate(ClientStatusNoteBase):
+    pass
+
+
+class ClientStatusNoteUpdate(BaseModel):
+    note: str
+
+
+class ClientStatusNoteResponse(ClientStatusNoteBase):
+    id: int
+    user_email: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    @field_serializer('created_at', 'updated_at')
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        """Convert UTC datetime to Melbourne timezone before serialization"""
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+    
+    class Config:
+        from_attributes = True
