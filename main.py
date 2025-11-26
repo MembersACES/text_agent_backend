@@ -1929,4 +1929,5 @@ def update_client_status_note(
     db.refresh(db_note)
     
     logging.info(f"Status note {note_id} updated successfully")
-    return db_note
+    return db_note#   R e b u i l d   t r i g g e r  
+ 
