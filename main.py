@@ -1948,3 +1948,18 @@ def delete_client_status_note(
     
     logging.info(f"Client status note {note_id} deleted")
     return {"status": "success", "message": "Note deleted"}
+
+@app.get("/api/client-status/debug/all")
+def debug_all_notes(db: Session = Depends(get_db)):
+    """Debug endpoint to see all notes"""
+    notes = db.query(ClientStatusNote).all()
+    return {
+        "count": len(notes), 
+        "notes": [{
+            "id": n.id, 
+            "business_name": n.business_name, 
+            "note": n.note[:100],
+            "user_email": n.user_email,
+            "created_at": str(n.created_at)
+        } for n in notes]
+    }
