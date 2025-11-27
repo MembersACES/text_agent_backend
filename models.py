@@ -44,3 +44,13 @@ class TaskHistory(Base):
     old_value = Column(String, nullable=True)
     new_value = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+class ClientStatusNote(Base):
+    __tablename__ = "client_status_notes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    business_name = Column(String(255), nullable=False, index=True)
+    note = Column(Text, nullable=False)
+    user_email = Column(String(255), nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

@@ -69,3 +69,28 @@ class UserResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class ClientStatusNoteCreate(BaseModel):
+    business_name: str
+    note: str
+
+
+class ClientStatusNoteUpdate(BaseModel):
+    note: str
+
+
+class ClientStatusNoteResponse(BaseModel):
+    id: int
+    business_name: str
+    note: str
+    user_email: str
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer('created_at', 'updated_at')
+    def serialize_datetime(self, dt: datetime, _info):
+        """Convert UTC datetime to Melbourne timezone before serialization"""
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True

@@ -53,8 +53,8 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User, TaskHistory
-from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse
+from models import Task, User, TaskHistory, ClientStatusNote
+from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse, ClientStatusNoteCreate, ClientStatusNoteUpdate, ClientStatusNoteResponse
 from sqlalchemy.orm import Session
 from utils.task_history import (
     log_task_created,
@@ -73,40 +73,6 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
 app = FastAPI()
-
-
-# Initialize scheduler
-scheduler = AsyncIOScheduler()
-
-# Wrapper function for scheduled task that creates its own DB session
-async def scheduled_check_due_tasks():
-    """Wrapper to create DB session for scheduled task"""
-    db = next(get_db())
-    try:
-        await check_due_tasks(db)
-    finally:
-        db.close()
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-    logging.info("Database initialized")
-    
-    # Start scheduler for daily task checks (7:00 AM daily)
-    scheduler.add_job(
-        scheduled_check_due_tasks,
-        "cron",
-        hour=7,
-        minute=0
-    )
-    scheduler.start()
-    logging.info("Task scheduler started (daily check at 7:00 AM)")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    scheduler.shutdown()
-    logging.info("Task scheduler stopped")
 
 app.add_middleware(
     CORSMiddleware,
@@ -1859,3 +1825,123 @@ async def check_due_tasks_endpoint(
     except Exception as e:
         logging.error(f"Error during due tasks check: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error checking due tasks: {str(e)}")
+
+
+# Client Status Note endpoints
+@app.post("/api/client-status", response_model=ClientStatusNoteResponse)
+def create_client_status_note(
+    note: ClientStatusNoteCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Create a new client status note"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    
+    logging.info(f"Creating client status note for {note.business_name}")
+    
+    db_note = ClientStatusNote(
+        business_name=note.business_name,
+        note=note.note,
+        user_email=user_email
+    )
+    
+    db.add(db_note)
+    db.commit()
+    db.refresh(db_note)
+    
+    logging.info(f"Client status note created: {db_note.id}")
+    return db_note
+
+
+@app.get("/api/client-status/{business_name}", response_model=List[ClientStatusNoteResponse])
+def get_client_status_notes(
+    business_name: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all status notes for a specific business"""
+    logging.info(f"Fetching client status notes for {business_name}")
+    
+    notes = db.query(ClientStatusNote).filter(
+        ClientStatusNote.business_name == business_name
+    ).order_by(ClientStatusNote.created_at.desc()).all()
+    
+    logging.info(f"Found {len(notes)} notes for {business_name}")
+    return notes
+
+
+@app.patch("/api/client-status/{note_id}", response_model=ClientStatusNoteResponse)
+def update_client_status_note(
+    note_id: int,
+    note_update: ClientStatusNoteUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update a client status note"""
+    user_info = user_data["idinfo"]
+    
+    logging.info(f"Updating client status note {note_id}")
+    
+    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    db_note.note = note_update.note
+    db.commit()
+    db.refresh(db_note)
+    
+    logging.info(f"Client status note {note_id} updated")
+    return db_note
+
+@app.delete("/api/client-status/{note_id}", response_model=dict)
+def delete_client_status_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Delete a client status note"""
+    logging.info(f"Deleting client status note {note_id}")
+    
+    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    db.delete(db_note)
+    db.commit()
+    
+    logging.info(f"Client status note {note_id} deleted")
+    return {"status": "success", "message": "Note deleted"}
+
+@app.get("/api/client-status/debug/all")
+def debug_all_notes(db: Session = Depends(get_db)):
+    """Debug endpoint to see all notes"""
+    notes = db.query(ClientStatusNote).all()
+    return {
+        "count": len(notes), 
+        "notes": [{
+            "id": n.id, 
+            "business_name": n.business_name, 
+            "note": n.note[:100],
+            "user_email": n.user_email,
+            "created_at": str(n.created_at)
+        } for n in notes]
+    }
+
+
+@app.post("/api/tasks/check-due-cron")
+async def check_due_tasks_cron(db: Session = Depends(get_db)):
+    """Cron endpoint for Cloud Scheduler - no auth required"""
+    logging.info("Cron job triggered: checking due tasks")
+    
+    try:
+        await check_due_tasks(db)
+        return {
+            "status": "success",
+            "message": "Due tasks check completed"
+        }
+    except Exception as e:
+        logging.error(f"Error during due tasks check: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
