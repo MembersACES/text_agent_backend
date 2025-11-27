@@ -74,40 +74,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 app = FastAPI()
 
-
-# Initialize scheduler
-scheduler = AsyncIOScheduler()
-
-# Wrapper function for scheduled task that creates its own DB session
-async def scheduled_check_due_tasks():
-    """Wrapper to create DB session for scheduled task"""
-    db = next(get_db())
-    try:
-        await check_due_tasks(db)
-    finally:
-        db.close()
-
-# Initialize database on startup
-@app.on_event("startup")
-async def startup_event():
-    init_db()
-    logging.info("Database initialized")
-    
-    # Start scheduler for daily task checks (7:00 AM daily)
-    scheduler.add_job(
-        scheduled_check_due_tasks,
-        "cron",
-        hour=7,
-        minute=0
-    )
-    scheduler.start()
-    logging.info("Task scheduler started (daily check at 7:00 AM)")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    scheduler.shutdown()
-    logging.info("Task scheduler stopped")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1963,3 +1929,19 @@ def debug_all_notes(db: Session = Depends(get_db)):
             "created_at": str(n.created_at)
         } for n in notes]
     }
+
+
+@app.post("/api/tasks/check-due-cron")
+async def check_due_tasks_cron(db: Session = Depends(get_db)):
+    """Cron endpoint for Cloud Scheduler - no auth required"""
+    logging.info("Cron job triggered: checking due tasks")
+    
+    try:
+        await check_due_tasks(db)
+        return {
+            "status": "success",
+            "message": "Due tasks check completed"
+        }
+    except Exception as e:
+        logging.error(f"Error during due tasks check: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
