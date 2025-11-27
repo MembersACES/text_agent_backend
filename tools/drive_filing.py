@@ -4,7 +4,7 @@ from datetime import datetime
 import os
 import mimetypes
 
-def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_url: str, filing_type: str) -> dict:
+def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_url: str, filing_type: str, contract_status: str = None) -> dict:
     """Process drive filing data and send to n8n webhook
     Args:
         file_bytes (bytes): File content in bytes
@@ -12,6 +12,7 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
         business_name (str): Name of the business
         gdrive_url (str): Google Drive folder URL
         filing_type (str): Type of filing (loa, savings, revenue, site_profiling, etc.)
+        contract_status (str): Contract status (e.g., "Signed via ACES", "Existing Contract")
     Returns:
         dict: Result of the filing process
     """
@@ -29,12 +30,20 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
             'signed_DMA': 'Signed Contract - DMA',
         }
 
+        invoice_display_names = {
+            'cleaning_invoice_upload': 'Cleaning Invoice',
+            'telecommunication_invoice_upload': 'Telecommunication Invoice',
+            'water_invoice_upload': 'Water Invoice',
+        }
+
         if filing_type in ['savings', 'revenue']:
             display_name = 'Service Fee Agreement'
         elif filing_type in signed_contract_display_names:
             display_name = signed_contract_display_names[filing_type]
+        elif filing_type in invoice_display_names:
+            display_name = invoice_display_names[filing_type]
         else:
-            display_name = filing_type.upper()
+            display_name = filing_type.replace('_', ' ').title()
 
         # Preserve original extension
         ext = filename.split('.')[-1]
@@ -56,6 +65,9 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
             'new_filename': new_filename
         }
 
+        if contract_status:
+            data['contract_status'] = contract_status
+
         webhook_urls = {
             'loa': 'https://membersaces.app.n8n.cloud/webhook/loa_upload',
             'savings': 'https://membersaces.app.n8n.cloud/webhook/savings_upload',
@@ -63,6 +75,7 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
             'site_profiling': 'https://membersaces.app.n8n.cloud/webhook/site_profiling',
             'cleaning_invoice_upload': 'https://membersaces.app.n8n.cloud/webhook/cleaning_invoice_upload',
             'telecommunication_invoice_upload': 'https://membersaces.app.n8n.cloud/webhook/telecommunication_invoice_upload',
+            'water_invoice_upload': 'https://membersaces.app.n8n.cloud/webhook/water_invoice_upload',
             'site_map_upload': 'https://membersaces.app.n8n.cloud/webhook/site_map_upload',
             'signed_CI_E': 'https://membersaces.app.n8n.cloud/webhook/signed_C&IE',
             'signed_SME_E': 'https://membersaces.app.n8n.cloud/webhook/signed_SMEE',
@@ -101,6 +114,8 @@ def drive_filing(file_bytes: bytes, filename: str, business_name: str, gdrive_ur
     except Exception as e:
         if filing_type in ['savings', 'revenue']:
             display_name = 'Service Fee Agreement'
+        elif filing_type in invoice_display_names:
+            display_name = invoice_display_names[filing_type]
         else:
-            display_name = filing_type.upper()
+            display_name = filing_type.replace('_', ' ').title()
         return {"status": "error", "message": f"Error processing {display_name} filing: {str(e)}"}

@@ -1,11 +1,13 @@
+from dotenv import load_dotenv
+load_dotenv()
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
+from typing import List
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
 from pydantic import BaseModel
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
-from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build as google_build
 import tempfile
@@ -18,7 +20,7 @@ import logging
 import tempfile
 import os
 import httpx
-from typing import Optional
+from typing import Optional, List
 import json
 from fastapi import HTTPException, Depends
 from google.oauth2.credentials import Credentials
@@ -49,7 +51,22 @@ from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_multiple
 
-load_dotenv()
+# Database imports
+from database import get_db, init_db
+from models import Task, User, TaskHistory, ClientStatusNote
+from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse, ClientStatusNoteCreate, ClientStatusNoteUpdate, ClientStatusNoteResponse
+from sqlalchemy.orm import Session
+from utils.task_history import (
+    log_task_created,
+    log_field_change,
+    log_status_change,
+    log_task_deleted,
+)
+
+# Email and scheduler imports
+from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
 # Configure logging
@@ -176,10 +193,39 @@ def verify_google_access_token_optional(authorization: str = Header(...)):
         
         raise HTTPException(status_code=401, detail="Invalid access token")
 
+# Helper function to get or create user
+def get_or_create_user(db: Session, email: str, name: str = None, picture: str = None):
+    """Get or create a user in the database"""
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        user = User(email=email, name=name, picture=picture)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        logging.info(f"Created new user: {email}")
+    return user
+
 # Recommended: Use this for most endpoints
 def get_current_user(authorization: str = Header(...)):
     """Get current authenticated user info"""
     return verify_google_token(authorization)
+
+# New dependency that verifies token AND ensures user exists in database
+def get_current_user_with_db(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get current authenticated user info and ensure they exist in database"""
+    idinfo = verify_google_token(authorization)
+    email = idinfo.get("email")
+    name = idinfo.get("name")
+    picture = idinfo.get("picture")
+    
+    # Auto-create user if they don't exist
+    user = get_or_create_user(db, email, name, picture)
+    
+    # Return both the idinfo (for compatibility) and user object
+    return {"idinfo": idinfo, "user": user}
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
@@ -462,6 +508,7 @@ def drive_filing_endpoint(
     business_name: str = Form(...),
     gdrive_url: str = Form(...),
     filing_type: str = Form(...),
+    contract_status: str = Form(None),
     file: UploadFile = File(...),
     user_info: dict = Depends(verify_google_token)
 ):
@@ -472,7 +519,8 @@ def drive_filing_endpoint(
         filename=file.filename,
         business_name=business_name,
         gdrive_url=gdrive_url,
-        filing_type=filing_type
+        filing_type=filing_type,
+        contract_status=contract_status
     )
     result["user_email"] = user_info.get("email")
     logging.info(f"Returning drive filing response to frontend: {result}")
@@ -1362,3 +1410,538 @@ def debug_google_token(
             "success": False,
             "message": f"Debug failed: {str(e)}"
         }
+
+# Task API Routes
+@app.post("/api/tasks", response_model=TaskResponse)
+async def create_task(
+    task: TaskCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Create a new task"""
+    logging.info(f"Received task creation request: {task.title}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    # Use the authenticated user's email as assigned_by if not provided
+    assigned_by = task.assigned_by or current_user_email
+    
+    db_task = Task(
+        title=task.title,
+        description=task.description,
+        due_date=task.due_date,
+        status=task.status,
+        assigned_to=task.assigned_to,
+        assigned_by=assigned_by,
+        business_id=task.business_id
+    )
+    
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task created successfully: {db_task.id}")
+    
+    # Log task creation in history
+    log_task_created(db, db_task.id, current_user_email)
+    
+    # Send email notification for new task
+    if task.assigned_to:
+        try:
+            await send_new_task_email(task.assigned_to, assigned_by, db_task, db)
+        except Exception as e:
+            logging.error(f"Failed to send new task email: {str(e)}")
+    
+    return db_task
+
+
+@app.get("/api/tasks/my", response_model=List[TaskResponse])
+def get_my_tasks(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks assigned to the current user"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    logging.info(f"Fetching tasks for user: {user_email}")
+    
+    tasks = db.query(Task).filter(Task.assigned_to == user_email).all()
+    
+    logging.info(f"Found {len(tasks)} tasks for user {user_email}")
+    return tasks
+
+
+@app.patch("/api/tasks/{task_id}/status", response_model=TaskResponse)
+async def update_task_status(
+    task_id: int,
+    status_update: TaskStatusUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update the status of a task"""
+    logging.info(f"Updating task {task_id} status to: {status_update.status}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can update
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
+    
+    old_status = db_task.status
+    db_task.status = status_update.status
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task {task_id} status updated successfully")
+    
+    # Log status change in history
+    log_status_change(
+        db, task_id, current_user_email,
+        old_status, status_update.status
+    )
+    
+    # Send email notification if task is marked as completed
+    if status_update.status.lower() == "completed" and old_status.lower() != "completed":
+        if db_task.assigned_by and db_task.assigned_to:
+            try:
+                await send_task_completed_email(
+                    db_task.assigned_by,
+                    db_task.assigned_to,
+                    db_task,
+                    db
+                )
+            except Exception as e:
+                logging.error(f"Failed to send task completed email: {str(e)}")
+    
+    return db_task
+
+
+@app.patch("/api/tasks/{task_id}", response_model=TaskResponse)
+async def update_task(
+    task_id: int,
+    task_update: TaskUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update task fields (title, description, due_date, assigned_to, business_id)"""
+    logging.info(f"Updating task {task_id}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can update
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
+    
+    # If task is completed and being edited, reset to in_progress
+    if db_task.status.lower() == "completed":
+        log_field_change(
+            db, task_id, current_user_email,
+            "title", db_task.title, task_update.title
+        )
+        db_task.status = "in_progress"
+        logging.info(f"Task {task_id} status reset from 'completed' to 'in_progress' due to edit")
+    
+    # Update title
+    if task_update.title is not None and task_update.title != db_task.title:
+        log_field_change(
+            db, task_id, current_user_email,
+            "title", db_task.title, task_update.title
+        )
+        db_task.title = task_update.title
+
+    # Update description
+    if task_update.description is not None and task_update.description != db_task.description:
+        log_field_change(
+            db, task_id, current_user_email,
+            "description", db_task.description, task_update.description
+        )
+        db_task.description = task_update.description
+
+    # Update due_date
+    if task_update.due_date is not None and task_update.due_date != db_task.due_date:
+        old_due_date_str = db_task.due_date.strftime("%Y-%m-%d %H:%M:%S") if db_task.due_date else None
+        new_due_date_str = task_update.due_date.strftime("%Y-%m-%d %H:%M:%S") if task_update.due_date else None
+        log_field_change(
+            db, task_id, current_user_email,
+            "due_date", old_due_date_str, new_due_date_str
+        )
+        db_task.due_date = task_update.due_date
+
+    # Update assigned_to
+    if task_update.assigned_to is not None and task_update.assigned_to != db_task.assigned_to:
+        log_field_change(
+            db, task_id, current_user_email,
+            "assigned_to", db_task.assigned_to, task_update.assigned_to
+        )
+        db_task.assigned_to = task_update.assigned_to
+
+    # Update business_id
+    if task_update.business_id is not None and task_update.business_id != db_task.business_id:
+        log_field_change(
+            db, task_id, current_user_email,
+            "business_id", str(db_task.business_id), str(task_update.business_id)
+        )
+        db_task.business_id = task_update.business_id
+
+    
+    db.commit()
+    db.refresh(db_task)
+    
+    logging.info(f"Task {task_id} updated successfully")
+    return db_task
+
+
+@app.get("/api/tasks/by-business/{business_id}", response_model=List[TaskResponse])
+def get_tasks_by_business(
+    business_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks for a specific business"""
+    logging.info(f"Fetching tasks for business_id: {business_id}")
+    
+    tasks = db.query(Task).filter(Task.business_id == business_id).all()
+    
+    logging.info(f"Found {len(tasks)} tasks for business_id {business_id}")
+    return tasks
+
+
+@app.get("/api/users", response_model=List[UserResponse])
+def list_users(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all users (for assign dropdown)"""
+    logging.info("Fetching all users")
+    
+    users = db.query(User).all()
+    
+    logging.info(f"Found {len(users)} users")
+    return users
+
+@app.get("/api/tasks/assigned-by-me", response_model=List[TaskResponse])
+def get_tasks_assigned_by_me(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks created by the current user"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    logging.info(f"Fetching tasks assigned by user: {user_email}")
+    
+    tasks = db.query(Task).filter(Task.assigned_by == user_email).all()
+    
+    logging.info(f"Found {len(tasks)} tasks assigned by {user_email}")
+    return tasks
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Delete a task"""
+    logging.info(f"Deleting task {task_id}")
+    
+    user_info = user_data["idinfo"]
+    current_user_email = user_info.get("email")
+    
+    db_task = db.query(Task).filter(Task.id == task_id).first()
+    
+    if not db_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Permission check: only assigned user or creator can delete
+    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
+        raise HTTPException(status_code=403, detail="You may only delete tasks assigned to you or created by you.")
+    
+    # Log deletion in history before deleting
+    log_task_deleted(db, task_id, current_user_email)
+    
+    # Delete the task (history will be kept due to foreign key, or cascade if configured)
+    db.delete(db_task)
+    db.commit()
+    
+    logging.info(f"Task {task_id} deleted successfully by {current_user_email}")
+    return {"status": "success", "message": f"Task {task_id} deleted successfully"}
+
+
+@app.get("/api/tasks/all", response_model=List[TaskResponse])
+def get_all_tasks(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all tasks"""
+    logging.info("Fetching all tasks")
+    
+    tasks = db.query(Task).all()
+    
+    logging.info(f"Found {len(tasks)} tasks")
+    return tasks
+
+
+@app.get("/api/tasks/{task_id}/history")
+def get_task_history(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+    page: int = Query(1, ge=1, description="Page number (starts at 1)"),
+    page_size: int = Query(50, ge=1, le=100, description="Number of items per page")
+):
+    """Get history for a specific task with pagination and batched edit grouping"""
+    from utils.timezone import to_melbourne_iso
+    from datetime import timedelta
+    
+    logging.info(f"Fetching history for task {task_id}, page {page}, page_size {page_size}")
+    
+    # Verify task exists
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Get total count
+    total_count = db.query(TaskHistory).filter(
+        TaskHistory.task_id == task_id
+    ).count()
+    
+    # Get history ordered by creation time (descending for pagination)
+    offset = (page - 1) * page_size
+    history = db.query(TaskHistory).filter(
+        TaskHistory.task_id == task_id
+    ).order_by(TaskHistory.created_at.desc()).offset(offset).limit(page_size).all()
+    
+    # Group batched edits (edits by same user within 5 seconds)
+    grouped_history = []
+    BATCH_WINDOW_SECONDS = 5
+    
+    for i, h in enumerate(history):
+        if i == 0:
+            # First item starts a new group
+            current_group = {
+                "id": h.id,
+                "action": h.action,
+                "fields": [{"field": h.field, "old_value": h.old_value, "new_value": h.new_value}] if h.field else [],
+                "user_email": h.user_email,
+                "created_at": to_melbourne_iso(h.created_at),
+                "is_batched": False
+            }
+            grouped_history.append(current_group)
+        else:
+            prev_h = history[i - 1]
+            time_diff = (prev_h.created_at - h.created_at).total_seconds()
+            
+            # Check if this edit should be grouped with previous
+            should_group = (
+                h.action == "field_updated" and
+                prev_h.action == "field_updated" and
+                h.user_email == prev_h.user_email and
+                time_diff <= BATCH_WINDOW_SECONDS
+            )
+            
+            if should_group:
+                # Add to previous group
+                current_group["fields"].append({
+                    "field": h.field,
+                    "old_value": h.old_value,
+                    "new_value": h.new_value
+                })
+                current_group["is_batched"] = True
+            else:
+                # Start new group
+                current_group = {
+                    "id": h.id,
+                    "action": h.action,
+                    "fields": [{"field": h.field, "old_value": h.old_value, "new_value": h.new_value}] if h.field else [],
+                    "user_email": h.user_email,
+                    "created_at": to_melbourne_iso(h.created_at),
+                    "is_batched": False
+                }
+                grouped_history.append(current_group)
+    
+    # Reverse to show oldest first
+    grouped_history.reverse()
+    
+    # ---- GROUP BY DATE FOR FRONTEND ----
+    from collections import defaultdict
+    from datetime import datetime
+
+    date_groups = defaultdict(list)
+
+    for item in grouped_history:
+        # item['created_at'] is already ISO Melbourne string
+        dt = datetime.fromisoformat(item["created_at"])
+        date_key = dt.strftime("%B %d, %Y")   # e.g. “November 21, 2025”
+        date_groups[date_key].append(item)
+
+    groups_list = [
+        {"date": date, "items": items}
+        for date, items in sorted(
+            date_groups.items(),
+            key=lambda x: datetime.strptime(x[0], "%B %d, %Y"),
+            reverse=True
+        )
+    ]
+
+    return {
+        "groups": groups_list,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total_count,
+            "has_next": page * page_size < total_count,
+            "has_prev": page > 1
+        }
+    }
+
+
+@app.post("/api/tasks/check-due")
+async def check_due_tasks_endpoint(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Manually trigger check for due/overdue tasks (for testing)"""
+    logging.info("Manual due tasks check triggered")
+    
+    try:
+        await check_due_tasks(db)
+        return {
+            "status": "success",
+            "message": "Due tasks check completed. Check logs for details."
+        }
+    except Exception as e:
+        logging.error(f"Error during due tasks check: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error checking due tasks: {str(e)}")
+
+
+# Client Status Note endpoints
+@app.post("/api/client-status", response_model=ClientStatusNoteResponse)
+def create_client_status_note(
+    note: ClientStatusNoteCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Create a new client status note"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+    
+    logging.info(f"Creating client status note for {note.business_name}")
+    
+    db_note = ClientStatusNote(
+        business_name=note.business_name,
+        note=note.note,
+        user_email=user_email
+    )
+    
+    db.add(db_note)
+    db.commit()
+    db.refresh(db_note)
+    
+    logging.info(f"Client status note created: {db_note.id}")
+    return db_note
+
+
+@app.get("/api/client-status/{business_name}", response_model=List[ClientStatusNoteResponse])
+def get_client_status_notes(
+    business_name: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Get all status notes for a specific business"""
+    logging.info(f"Fetching client status notes for {business_name}")
+    
+    notes = db.query(ClientStatusNote).filter(
+        ClientStatusNote.business_name == business_name
+    ).order_by(ClientStatusNote.created_at.desc()).all()
+    
+    logging.info(f"Found {len(notes)} notes for {business_name}")
+    return notes
+
+
+@app.patch("/api/client-status/{note_id}", response_model=ClientStatusNoteResponse)
+def update_client_status_note(
+    note_id: int,
+    note_update: ClientStatusNoteUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Update a client status note"""
+    user_info = user_data["idinfo"]
+    
+    logging.info(f"Updating client status note {note_id}")
+    
+    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    db_note.note = note_update.note
+    db.commit()
+    db.refresh(db_note)
+    
+    logging.info(f"Client status note {note_id} updated")
+    return db_note
+
+@app.delete("/api/client-status/{note_id}", response_model=dict)
+def delete_client_status_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Delete a client status note"""
+    logging.info(f"Deleting client status note {note_id}")
+    
+    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    db.delete(db_note)
+    db.commit()
+    
+    logging.info(f"Client status note {note_id} deleted")
+    return {"status": "success", "message": "Note deleted"}
+
+@app.get("/api/client-status/debug/all")
+def debug_all_notes(db: Session = Depends(get_db)):
+    """Debug endpoint to see all notes"""
+    notes = db.query(ClientStatusNote).all()
+    return {
+        "count": len(notes), 
+        "notes": [{
+            "id": n.id, 
+            "business_name": n.business_name, 
+            "note": n.note[:100],
+            "user_email": n.user_email,
+            "created_at": str(n.created_at)
+        } for n in notes]
+    }
+
+
+@app.post("/api/tasks/check-due-cron")
+async def check_due_tasks_cron(db: Session = Depends(get_db)):
+    """Cron endpoint for Cloud Scheduler - no auth required"""
+    logging.info("Cron job triggered: checking due tasks")
+    
+    try:
+        await check_due_tasks(db)
+        return {
+            "status": "success",
+            "message": "Due tasks check completed"
+        }
+    except Exception as e:
+        logging.error(f"Error during due tasks check: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
