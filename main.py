@@ -1928,3 +1928,23 @@ def update_client_status_note(
     
     logging.info(f"Client status note {note_id} updated")
     return db_note
+
+@app.delete("/api/client-status/{note_id}", response_model=dict)
+def delete_client_status_note(
+    note_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db)
+):
+    """Delete a client status note"""
+    logging.info(f"Deleting client status note {note_id}")
+    
+    db_note = db.query(ClientStatusNote).filter(ClientStatusNote.id == note_id).first()
+    
+    if not db_note:
+        raise HTTPException(status_code=404, detail="Note not found")
+    
+    db.delete(db_note)
+    db.commit()
+    
+    logging.info(f"Client status note {note_id} deleted")
+    return {"status": "success", "message": "Note deleted"}
