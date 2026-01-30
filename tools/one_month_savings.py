@@ -146,53 +146,57 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 "error": "Could not connect to Google Sheets - check logs for details"
             }
         
-        # Flatten line items for the sheet
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
+        # Each line item gets its own row
         line_items = invoice_data.get("line_items", [])
-        line_items_summary = "; ".join([
-            f"{item.get('solution_label', '')}: ${item.get('savings_amount', 0):.2f}"
-            for item in line_items
-        ]) if line_items else ""
         
-        # Prepare row data for Google Sheets
-        # Adjust column order to match your sheet structure
-        row_data = [
-            invoice_data.get("invoice_number", ""),
-            invoice_data.get("business_name", ""),
-            invoice_data.get("business_abn", ""),
-            invoice_data.get("contact_name", ""),
-            invoice_data.get("contact_email", ""),
-            invoice_data.get("invoice_date", ""),
-            invoice_data.get("due_date", ""),
-            line_items_summary,
-            f"{invoice_data.get('subtotal', 0):.2f}",
-            f"{invoice_data.get('total_gst', 0):.2f}",
-            f"{invoice_data.get('total_amount', 0):.2f}",
-            invoice_data.get("status", "Generated"),
-            invoice_data.get("created_at", ""),
-            json.dumps(invoice_data.get("line_items", []))  # Store full line items as JSON
-        ]
+        if not line_items:
+            logger.warning("No line items to log")
+            return {
+                "success": False,
+                "error": "No line items provided"
+            }
         
-        # Append row to sheet
+        # Prepare rows - one row per line item
+        rows_data = []
+        for item in line_items:
+            solution_label = item.get('solution_label', '').strip()
+            savings_amount = item.get('savings_amount', 0)
+            gst = savings_amount * 0.1 / 1.1  # Calculate GST (10% of total, so GST = total * 0.1 / 1.1)
+            total = savings_amount + gst
+            
+            row_data = [
+                invoice_data.get("business_name", ""),      # Column A: Member
+                solution_label,                              # Column B: Solution (no amount)
+                f"${savings_amount:.2f}",                    # Column C: Savings Amount
+                f"${gst:.2f}",                              # Column D: GST
+                f"${total:.2f}",                            # Column E: Total Invoice
+                invoice_data.get("invoice_number", ""),      # Column F: Invoice Number
+                invoice_data.get("due_date", ""),            # Column G: Due Date
+            ]
+            rows_data.append(row_data)
+        
+        # Append all rows to sheet
         body = {
-            'values': [row_data]
+            'values': rows_data
         }
         
         logger.info(f"Logging invoice {invoice_data.get('invoice_number')} to Google Sheets")
         logger.info(f"Sheet ID: {SHEET_ID}")
         logger.info(f"Sheet Name: {SHEET_NAME}")
-        logger.info(f"Row data columns: {len(row_data)}")
+        logger.info(f"Number of line items: {len(rows_data)}")
         
         try:
             result = service.spreadsheets().values().append(
                 spreadsheetId=SHEET_ID,
-                range=f"{SHEET_NAME}!A:Z",  # Append to end of sheet
+                range=f"{SHEET_NAME}!A:G",  # Append to columns A-G
                 valueInputOption='USER_ENTERED',
                 insertDataOption='INSERT_ROWS',
                 body=body
             ).execute()
             
             updated_rows = result.get('updates', {}).get('updatedRows', 'unknown')
-            logger.info(f"Invoice {invoice_data.get('invoice_number')} logged successfully to row {updated_rows}")
+            logger.info(f"Invoice {invoice_data.get('invoice_number')} logged successfully - {updated_rows} rows added")
             logger.info(f"API response: {result}")
         except HttpError as e:
             logger.error(f"Google Sheets API HttpError: {e.status_code} - {e.reason}")
@@ -321,10 +325,10 @@ def get_invoice_history(business_name: str) -> Dict:
             }
         
         # Read all data from the sheet
-        # Adjust range based on your sheet structure (assuming headers in row 1)
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"{SHEET_NAME}!A2:Z"  # Skip header row, read all data
+            range=f"{SHEET_NAME}!A2:G"  # Skip header row, read columns A-G
         ).execute()
         
         values = result.get('values', [])
@@ -336,72 +340,105 @@ def get_invoice_history(business_name: str) -> Dict:
                 "count": 0
             }
         
-        # Map column indices (adjust based on your sheet structure)
-        # Assuming columns: Invoice Number, Business Name, Business ABN, Contact Name, Contact Email,
-        # Invoice Date, Due Date, Services, Subtotal, GST, Total Amount, Status, Created At, Line Items JSON
-        invoices = []
+        logger.info(f"Processing {len(values)} rows from sheet")
+        logger.info(f"Searching for business: '{business_name}'")
         
-        for row in values:
-            # Ensure row has enough columns (pad with empty strings if needed)
-            while len(row) < 14:
+        # Group rows by invoice number (each row is a line item)
+        # Column mapping: 0=Member (Business Name), 1=Solution, 2=Savings Amount, 3=GST, 4=Total Invoice, 5=Invoice Number, 6=Due Date
+        invoice_dict = {}  # Key: invoice_number, Value: invoice data with line_items array
+        
+        for idx, row in enumerate(values):
+            # Ensure row has enough columns
+            while len(row) < 7:
                 row.append("")
             
-            # Filter by business name (assuming business name is in column B, index 1)
-            if len(row) > 1 and row[1].strip().lower() == business_name.strip().lower():
-                # Parse line items from JSON string (column 13, index 13)
-                line_items = []
-                if len(row) > 13 and row[13]:
-                    try:
-                        line_items_data = json.loads(row[13])
-                        line_items = [{"solution_label": item.get("solution_label", "")} for item in line_items_data]
-                    except:
-                        # If JSON parsing fails, try to parse from services column (column 8, index 8)
-                        if len(row) > 8 and row[8]:
-                            services = row[8].split(";")
-                            line_items = [{"solution_label": s.split(":")[0].strip()} for s in services if ":" in s]
+            # Filter by business name (column A, index 0)
+            row_business_name = row[0].strip() if len(row) > 0 else ""
+            search_business_name = business_name.strip()
+            
+            # Log first few rows for debugging
+            if idx < 3:
+                logger.info(f"Row {idx}: Business='{row_business_name}', Invoice='{row[5] if len(row) > 5 else 'N/A'}'")
+            
+            if len(row) > 0 and row_business_name.lower() == search_business_name.lower():
+                invoice_number = row[5].strip() if len(row) > 5 else ""
+                if not invoice_number:
+                    continue
                 
-                # Parse amounts
-                # Column mapping: 0=Invoice Number, 1=Business Name, 2=ABN, 3=Contact Name, 4=Email,
-                # 5=Invoice Date, 6=Due Date, 7=Services, 8=Subtotal, 9=GST, 10=Total Amount, 11=Status, 12=Created At, 13=Line Items JSON
-                total_amount = 0
-                if len(row) > 10 and row[10]:
+                # Parse solution (column B) - remove any amount that might be in it
+                solution = row[1].strip() if len(row) > 1 else ""
+                # Remove patterns like ": $2000.00" or ": 2000" from solution
+                solution = re.sub(r':\s*\$?[\d,]+\.?\d*', '', solution).strip()
+                
+                # Parse savings amount (column C)
+                savings_amount = 0
+                if len(row) > 2 and row[2]:
                     try:
-                        total_amount = float(str(row[10]).replace("$", "").replace(",", ""))
+                        savings_amount = float(str(row[2]).replace("$", "").replace(",", ""))
                     except:
                         pass
                 
-                subtotal = 0
-                if len(row) > 8 and row[8]:
+                # Parse GST (column D)
+                gst = 0
+                if len(row) > 3 and row[3]:
                     try:
-                        subtotal = float(str(row[8]).replace("$", "").replace(",", ""))
+                        gst = float(str(row[3]).replace("$", "").replace(",", ""))
                     except:
-                        subtotal = total_amount / 1.1 if total_amount > 0 else 0
+                        pass
                 
-                total_gst = 0
-                if len(row) > 9 and row[9]:
+                # Parse total invoice (column E)
+                total_amount = 0
+                if len(row) > 4 and row[4]:
                     try:
-                        total_gst = float(str(row[9]).replace("$", "").replace(",", ""))
+                        total_amount = float(str(row[4]).replace("$", "").replace(",", ""))
                     except:
-                        total_gst = total_amount * 0.1 / 1.1 if total_amount > 0 else 0
+                        # If total not provided, calculate from savings + GST
+                        total_amount = savings_amount + gst
                 
-                invoice = {
-                    "invoice_number": row[0] if len(row) > 0 else "",
-                    "business_name": row[1] if len(row) > 1 else "",
-                    "business_abn": row[2] if len(row) > 2 else "",
-                    "contact_name": row[3] if len(row) > 3 else "",
-                    "contact_email": row[4] if len(row) > 4 else "",
-                    "invoice_date": row[5] if len(row) > 5 else "",
-                    "due_date": row[6] if len(row) > 6 else "",
-                    "subtotal": subtotal,
-                    "total_gst": total_gst,
-                    "total_amount": total_amount,
-                    "status": row[11] if len(row) > 11 else "Generated",
-                    "created_at": row[12] if len(row) > 12 else "",
-                    "line_items": line_items
+                # Parse due date (column G, index 6)
+                due_date = row[6].strip() if len(row) > 6 else ""
+                
+                # Create line item
+                line_item = {
+                    "solution_label": solution,
+                    "savings_amount": savings_amount
                 }
-                invoices.append(invoice)
+                
+                # Group by invoice number
+                if invoice_number not in invoice_dict:
+                    invoice_dict[invoice_number] = {
+                        "invoice_number": invoice_number,
+                        "business_name": row_business_name,
+                        "business_abn": "",
+                        "contact_name": "",
+                        "contact_email": "",
+                        "invoice_date": "",
+                        "due_date": due_date,
+                        "subtotal": 0,
+                        "total_gst": 0,
+                        "total_amount": 0,
+                        "status": "Generated",
+                        "created_at": "",
+                        "line_items": []
+                    }
+                
+                # Add line item and accumulate amounts
+                invoice_dict[invoice_number]["line_items"].append(line_item)
+                invoice_dict[invoice_number]["subtotal"] += savings_amount
+                invoice_dict[invoice_number]["total_gst"] += gst
+                invoice_dict[invoice_number]["total_amount"] += total_amount if total_amount > 0 else (savings_amount + gst)
+        
+        # Convert dict to list
+        invoices = list(invoice_dict.values())
         
         logger.info(f"Found {len(invoices)} invoices for {business_name}")
+        if len(invoices) == 0:
+            logger.warning(f"No invoices found for business: '{business_name}'")
+            logger.warning(f"Total rows checked: {len(values)}")
+            if len(values) > 0:
+                sample_names = [row[0] if len(row) > 0 else 'N/A' for row in values[:5]]
+                logger.warning(f"Sample business names from sheet (column A): {sample_names}")
+        
         return {
             "invoices": invoices,
             "count": len(invoices)
