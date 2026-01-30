@@ -600,22 +600,32 @@ def get_next_sequential_invoice_number(business_name: Optional[str] = None) -> s
             # Get Google Sheets service
             service = get_sheets_service()
             if service:
-                # Read all invoice numbers from the sheet
+                # Read all invoice numbers from column F (index 5)
+                # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
+                logger.info("Reading all invoice numbers from column F to find the highest")
                 result = service.spreadsheets().values().get(
                     spreadsheetId=SHEET_ID,
-                    range=f"{SHEET_NAME}!A2:A"  # Read all invoice numbers (column A)
+                    range=f"{SHEET_NAME}!F2:F"  # Read all invoice numbers from column F
                 ).execute()
                 
                 values = result.get('values', [])
+                logger.info(f"Found {len(values)} rows with invoice numbers")
                 
                 # Extract numbers from all invoice numbers
+                unique_invoice_numbers = set()
                 for row in values:
                     if row and len(row) > 0:
                         inv_num = str(row[0]).strip()
-                        match = re.search(r'RA(\d+)', inv_num)
-                        if match:
-                            num = int(match.group(1))
-                            max_number = max(max_number, num)
+                        if inv_num:
+                            unique_invoice_numbers.add(inv_num)
+                            match = re.search(r'RA(\d+)', inv_num)
+                            if match:
+                                num = int(match.group(1))
+                                max_number = max(max_number, num)
+                                logger.info(f"Found invoice number: {inv_num} -> number: {num}")
+                
+                logger.info(f"Unique invoice numbers found: {len(unique_invoice_numbers)}")
+                logger.info(f"Highest invoice number: {max_number}")
             else:
                 logger.warning("Could not create Google Sheets service, using fallback")
                 if business_name:
