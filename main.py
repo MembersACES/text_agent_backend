@@ -1445,28 +1445,37 @@ async def log_invoice_endpoint(
     user_info: dict = None
 ):
     """Log an invoice to Google Sheets directly or via n8n webhook"""
+    logging.info("=== One Month Savings Invoice Log Endpoint Called ===")
+    
     # Get the request body
     request_data = await request.json()
+    logging.info(f"Request data keys: {list(request_data.keys())}")
+    logging.info(f"Invoice number: {request_data.get('invoice_number')}")
+    logging.info(f"Business name: {request_data.get('business_name')}")
     
     # Check if it's an API key or Google token
     if authorization.startswith("Bearer "):
         token = authorization.split("Bearer ")[1]
+        logging.info(f"Authorization token type: {'API Key' if token == os.getenv('BACKEND_API_KEY', 'test-key') else 'Google Token'}")
         
         # Check if it's a simple API key (for Next.js API routes)
         if token == os.getenv("BACKEND_API_KEY", "test-key"):
             # Use session email from request_data if available
             user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+            logging.info(f"Using API key authentication for user: {user_info.get('email')}")
         else:
             # Try to verify as Google token
             try:
                 user_info = verify_google_token(authorization)
+                logging.info(f"Google token verified for user: {user_info.get('email')}")
             except Exception as e:
                 logging.error(f"Token verification failed: {e}")
                 raise HTTPException(status_code=401, detail="Invalid Google token")
     else:
+        logging.error("Invalid authorization format - missing 'Bearer ' prefix")
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
-    logging.info(f"Received invoice log request: {request_data.get('invoice_number')} for {request_data.get('business_name')}")
+    logging.info(f"Processing invoice log request: {request_data.get('invoice_number')} for {request_data.get('business_name')}")
     
     try:
         invoice_data = {
@@ -1502,29 +1511,36 @@ async def get_invoice_history_endpoint(
     user_info: dict = None
 ):
     """Get invoice history for a business from Google Sheets directly or via n8n webhook"""
+    logging.info("=== One Month Savings Invoice History Endpoint Called ===")
+    
     # Get the request body
     request_data = await request.json()
+    logging.info(f"Request data: {request_data}")
     
     # Check if it's an API key or Google token
     if authorization.startswith("Bearer "):
         token = authorization.split("Bearer ")[1]
+        logging.info(f"Authorization token type: {'API Key' if token == os.getenv('BACKEND_API_KEY', 'test-key') else 'Google Token'}")
         
         # Check if it's a simple API key (for Next.js API routes)
         if token == os.getenv("BACKEND_API_KEY", "test-key"):
             # Use session email from request_data if available
             user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+            logging.info(f"Using API key authentication for user: {user_info.get('email')}")
         else:
             # Try to verify as Google token
             try:
                 user_info = verify_google_token(authorization)
+                logging.info(f"Google token verified for user: {user_info.get('email')}")
             except Exception as e:
                 logging.error(f"Token verification failed: {e}")
                 raise HTTPException(status_code=401, detail="Invalid Google token")
     else:
+        logging.error("Invalid authorization format - missing 'Bearer ' prefix")
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     business_name = request_data.get("business_name")
-    logging.info(f"Received invoice history request for: {business_name}")
+    logging.info(f"Fetching invoice history for business: {business_name}")
     
     try:
         result = get_invoice_history(business_name)
@@ -1544,29 +1560,36 @@ async def get_next_invoice_number_endpoint(
     user_info: dict = None
 ):
     """Get the next sequential invoice number"""
+    logging.info("=== One Month Savings Next Invoice Number Endpoint Called ===")
+    
     # Get the request body
     request_data = await request.json()
+    logging.info(f"Request data: {request_data}")
     
     # Check if it's an API key or Google token
     if authorization.startswith("Bearer "):
         token = authorization.split("Bearer ")[1]
+        logging.info(f"Authorization token type: {'API Key' if token == os.getenv('BACKEND_API_KEY', 'test-key') else 'Google Token'}")
         
         # Check if it's a simple API key (for Next.js API routes)
         if token == os.getenv("BACKEND_API_KEY", "test-key"):
             # Use session email from request_data if available
             user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+            logging.info(f"Using API key authentication for user: {user_info.get('email')}")
         else:
             # Try to verify as Google token
             try:
                 user_info = verify_google_token(authorization)
+                logging.info(f"Google token verified for user: {user_info.get('email')}")
             except Exception as e:
                 logging.error(f"Token verification failed: {e}")
                 raise HTTPException(status_code=401, detail="Invalid Google token")
     else:
+        logging.error("Invalid authorization format - missing 'Bearer ' prefix")
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     
     business_name = request_data.get("business_name")
-    logging.info(f"Received next invoice number request (business: {business_name or 'all'})")
+    logging.info(f"Generating next invoice number (business: {business_name or 'all'})")
     
     try:
         invoice_number = get_next_sequential_invoice_number(business_name)

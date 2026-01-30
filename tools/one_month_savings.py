@@ -31,28 +31,75 @@ N8N_HISTORY_WEBHOOK = "https://membersaces.app.n8n.cloud/webhook/one-month-savin
 def get_sheets_service():
     """Get Google Sheets service using service account credentials"""
     try:
+        logger.info("Attempting to create Google Sheets service...")
+        logger.info(f"SERVICE_ACCOUNT_FILE: {SERVICE_ACCOUNT_FILE}")
+        logger.info(f"SHEET_ID configured: {bool(SHEET_ID)}")
+        logger.info(f"SHEET_NAME: {SHEET_NAME}")
+        
+        # Check if file exists
+        file_exists = os.path.exists(SERVICE_ACCOUNT_FILE)
+        logger.info(f"Service account file exists: {file_exists}")
+        
+        # Check environment variable
+        service_account_info = os.getenv("SERVICE_ACCOUNT_JSON")
+        has_env_json = bool(service_account_info)
+        logger.info(f"SERVICE_ACCOUNT_JSON env var set: {has_env_json}")
+        
+        creds = None
+        
         # Load service account credentials
-        if os.path.exists(SERVICE_ACCOUNT_FILE):
-            creds = Credentials.from_service_account_file(
-                SERVICE_ACCOUNT_FILE,
-                scopes=['https://www.googleapis.com/auth/spreadsheets']
-            )
-        else:
-            # Try loading from environment variable (for Cloud Run)
-            service_account_info = os.getenv("SERVICE_ACCOUNT_JSON")
-            if service_account_info:
-                creds = Credentials.from_service_account_info(
-                    json.loads(service_account_info),
+        if file_exists:
+            logger.info(f"Loading service account from file: {SERVICE_ACCOUNT_FILE}")
+            try:
+                creds = Credentials.from_service_account_file(
+                    SERVICE_ACCOUNT_FILE,
                     scopes=['https://www.googleapis.com/auth/spreadsheets']
                 )
-            else:
-                logger.error("No service account credentials found")
+                logger.info("Successfully loaded service account from file")
+            except Exception as e:
+                logger.error(f"Error loading service account from file: {str(e)}")
+                logger.exception(e)
+        elif has_env_json:
+            logger.info("Loading service account from SERVICE_ACCOUNT_JSON environment variable")
+            try:
+                # Try to parse the JSON
+                if isinstance(service_account_info, str):
+                    json_data = json.loads(service_account_info)
+                else:
+                    json_data = service_account_info
+                
+                logger.info(f"Service account email from JSON: {json_data.get('client_email', 'NOT FOUND')}")
+                creds = Credentials.from_service_account_info(
+                    json_data,
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+                logger.info("Successfully loaded service account from environment variable")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in SERVICE_ACCOUNT_JSON: {str(e)}")
+                logger.error(f"JSON length: {len(service_account_info) if service_account_info else 0}")
                 return None
+            except Exception as e:
+                logger.error(f"Error loading service account from env var: {str(e)}")
+                logger.exception(e)
+                return None
+        else:
+            logger.error("No service account credentials found - neither file nor env var available")
+            logger.error(f"File path checked: {os.path.abspath(SERVICE_ACCOUNT_FILE)}")
+            logger.error(f"Environment variable SERVICE_ACCOUNT_JSON is: {type(service_account_info)}")
+            return None
         
+        if not creds:
+            logger.error("Failed to create credentials object")
+            return None
+        
+        logger.info("Building Google Sheets API service...")
         service = build('sheets', 'v4', credentials=creds)
+        logger.info("Google Sheets service created successfully")
         return service
+        
     except Exception as e:
         logger.error(f"Error creating Google Sheets service: {str(e)}")
+        logger.exception(e)
         return None
 
 
@@ -76,17 +123,27 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         
         if not SHEET_ID:
             logger.warning("SHEET_ID not configured, falling back to n8n")
+            logger.warning(f"ONE_MONTH_SAVINGS_SHEET_ID env var: {os.getenv('ONE_MONTH_SAVINGS_SHEET_ID', 'NOT SET')}")
             return _log_invoice_via_n8n(invoice_data)
+        
+        logger.info(f"Attempting to log invoice {invoice_data.get('invoice_number')} to sheet {SHEET_ID}")
         
         # Get Google Sheets service
         service = get_sheets_service()
         if not service:
-            logger.warning("Could not create Google Sheets service, falling back to n8n")
+            logger.error("Could not create Google Sheets service")
+            logger.error("Available environment variables:")
+            logger.error(f"  ONE_MONTH_SAVINGS_SHEET_ID: {bool(os.getenv('ONE_MONTH_SAVINGS_SHEET_ID'))}")
+            logger.error(f"  ONE_MONTH_SAVINGS_SHEET_NAME: {os.getenv('ONE_MONTH_SAVINGS_SHEET_NAME', 'NOT SET')}")
+            logger.error(f"  SERVICE_ACCOUNT_JSON: {bool(os.getenv('SERVICE_ACCOUNT_JSON'))}")
+            logger.error(f"  SERVICE_ACCOUNT_FILE: {SERVICE_ACCOUNT_FILE}")
+            
             if USE_N8N_FALLBACK:
+                logger.warning("Falling back to n8n webhook")
                 return _log_invoice_via_n8n(invoice_data)
             return {
                 "success": False,
-                "error": "Could not connect to Google Sheets"
+                "error": "Could not connect to Google Sheets - check logs for details"
             }
         
         # Flatten line items for the sheet
@@ -121,15 +178,31 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         }
         
         logger.info(f"Logging invoice {invoice_data.get('invoice_number')} to Google Sheets")
-        result = service.spreadsheets().values().append(
-            spreadsheetId=SHEET_ID,
-            range=f"{SHEET_NAME}!A:Z",  # Append to end of sheet
-            valueInputOption='USER_ENTERED',
-            insertDataOption='INSERT_ROWS',
-            body=body
-        ).execute()
+        logger.info(f"Sheet ID: {SHEET_ID}")
+        logger.info(f"Sheet Name: {SHEET_NAME}")
+        logger.info(f"Row data columns: {len(row_data)}")
         
-        logger.info(f"Invoice {invoice_data.get('invoice_number')} logged successfully to row {result.get('updates', {}).get('updatedRows', 'unknown')}")
+        try:
+            result = service.spreadsheets().values().append(
+                spreadsheetId=SHEET_ID,
+                range=f"{SHEET_NAME}!A:Z",  # Append to end of sheet
+                valueInputOption='USER_ENTERED',
+                insertDataOption='INSERT_ROWS',
+                body=body
+            ).execute()
+            
+            updated_rows = result.get('updates', {}).get('updatedRows', 'unknown')
+            logger.info(f"Invoice {invoice_data.get('invoice_number')} logged successfully to row {updated_rows}")
+            logger.info(f"API response: {result}")
+        except HttpError as e:
+            logger.error(f"Google Sheets API HttpError: {e.status_code} - {e.reason}")
+            logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
+            logger.exception(e)
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error writing to Google Sheets: {str(e)}")
+            logger.exception(e)
+            raise
         return {
             "success": True,
             "logged": True,
@@ -224,20 +297,28 @@ def get_invoice_history(business_name: str) -> Dict:
         
         if not SHEET_ID:
             logger.warning("SHEET_ID not configured, falling back to n8n")
+            logger.warning(f"ONE_MONTH_SAVINGS_SHEET_ID env var: {os.getenv('ONE_MONTH_SAVINGS_SHEET_ID', 'NOT SET')}")
             return _get_invoice_history_via_n8n(business_name)
+        
+        logger.info(f"Fetching invoice history for: {business_name}")
+        logger.info(f"Sheet ID: {SHEET_ID}, Sheet Name: {SHEET_NAME}")
         
         # Get Google Sheets service
         service = get_sheets_service()
         if not service:
-            logger.warning("Could not create Google Sheets service, falling back to n8n")
+            logger.error("Could not create Google Sheets service for history fetch")
+            logger.error("Available environment variables:")
+            logger.error(f"  ONE_MONTH_SAVINGS_SHEET_ID: {bool(os.getenv('ONE_MONTH_SAVINGS_SHEET_ID'))}")
+            logger.error(f"  ONE_MONTH_SAVINGS_SHEET_NAME: {os.getenv('ONE_MONTH_SAVINGS_SHEET_NAME', 'NOT SET')}")
+            logger.error(f"  SERVICE_ACCOUNT_JSON: {bool(os.getenv('SERVICE_ACCOUNT_JSON'))}")
+            
             if USE_N8N_FALLBACK:
+                logger.warning("Falling back to n8n webhook")
                 return _get_invoice_history_via_n8n(business_name)
             return {
                 "invoices": [],
-                "error": "Could not connect to Google Sheets"
+                "error": "Could not connect to Google Sheets - check logs for details"
             }
-        
-        logger.info(f"Fetching invoice history for: {business_name}")
         
         # Read all data from the sheet
         # Adjust range based on your sheet structure (assuming headers in row 1)
