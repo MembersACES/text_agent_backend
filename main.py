@@ -1456,6 +1456,9 @@ async def log_invoice_endpoint(
     logging.info(f"Request data keys: {list(request_data.keys())}")
     logging.info(f"Invoice number: {request_data.get('invoice_number')}")
     logging.info(f"Business name: {request_data.get('business_name')}")
+    logging.info(f"Invoice file ID received: {request_data.get('invoice_file_id')}")
+    logging.info(f"Invoice file ID type: {type(request_data.get('invoice_file_id'))}")
+    logging.info(f"Invoice file ID empty?: {not request_data.get('invoice_file_id')}")
     
     # Check if it's an API key or Google token
     if authorization.startswith("Bearer "):
@@ -1482,6 +1485,17 @@ async def log_invoice_endpoint(
     logging.info(f"Processing invoice log request: {request_data.get('invoice_number')} for {request_data.get('business_name')}")
     
     try:
+        invoice_file_id = request_data.get("invoice_file_id", "") or request_data.get("file_id", "")
+        
+        if not invoice_file_id:
+            logging.warning(f"⚠️ WARNING: Invoice {request_data.get('invoice_number')} is being logged WITHOUT a file_id!")
+            logging.warning(f"⚠️ This means the PDF upload may have failed or the file_id was not returned.")
+            logging.warning(f"⚠️ Request data keys: {list(request_data.keys())}")
+            logging.warning(f"⚠️ invoice_file_id value: {request_data.get('invoice_file_id')}")
+            logging.warning(f"⚠️ file_id value: {request_data.get('file_id')}")
+        else:
+            logging.info(f"✅ Invoice {request_data.get('invoice_number')} has file_id: {invoice_file_id}")
+        
         invoice_data = {
             "invoice_number": request_data.get("invoice_number"),
             "business_name": request_data.get("business_name"),
@@ -1496,7 +1510,7 @@ async def log_invoice_endpoint(
             "total_amount": request_data.get("total_amount", 0),
             "status": request_data.get("status", "Generated"),
             "created_at": request_data.get("created_at"),
-            "invoice_file_id": request_data.get("invoice_file_id", "")
+            "invoice_file_id": invoice_file_id
         }
         
         result = log_invoice_to_sheets(invoice_data)
@@ -1770,13 +1784,26 @@ async def upload_invoice_pdf_endpoint(
         file_url = f"https://drive.google.com/file/d/{file_id}/view"
         
         logging.info(f"PDF uploaded successfully. File ID: {file_id}")
+        logging.info(f"File ID type: {type(file_id)}")
+        logging.info(f"File ID length: {len(file_id) if file_id else 0}")
         
-        return {
+        if not file_id:
+            logging.error("❌ CRITICAL: Upload succeeded but file_id is None or empty!")
+            raise HTTPException(
+                status_code=500,
+                detail="Upload succeeded but file_id was not returned"
+            )
+        
+        response_data = {
             "success": True,
             "file_id": file_id,
             "file_url": file_url,
             "message": f"Invoice PDF uploaded successfully to {business_name}'s Google Drive"
         }
+        
+        logging.info(f"Returning upload response: {json.dumps({k: v for k, v in response_data.items() if k != 'message'}, indent=2)}")
+        
+        return response_data
         
     except HTTPException:
         raise

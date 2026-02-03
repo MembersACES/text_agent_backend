@@ -137,10 +137,6 @@ def get_drive_service():
                     scopes=['https://www.googleapis.com/auth/drive']
                 )
                 logger.info("Successfully loaded service account from file for Drive")
-                # Log service account email for folder sharing reference
-                if hasattr(creds, 'service_account_email'):
-                    logger.info(f"Service account email: {creds.service_account_email}")
-                    logger.info(f"To grant folder access, share the invoice storage folder with: {creds.service_account_email}")
             except Exception as e:
                 logger.error(f"Error loading service account from file: {str(e)}")
                 return None
@@ -152,11 +148,6 @@ def get_drive_service():
                     json_data = json.loads(service_account_info)
                 else:
                     json_data = service_account_info
-                
-                # Log service account email before creating credentials
-                service_account_email = json_data.get('client_email', 'unknown')
-                logger.info(f"Service account email: {service_account_email}")
-                logger.info(f"To grant folder access, share the invoice storage folder with: {service_account_email}")
                 
                 creds = Credentials.from_service_account_info(
                     json_data,
@@ -379,17 +370,12 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         logger.error(f"Google Drive API error uploading PDF: {e.status_code} - {e.reason}")
         logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
         if e.status_code == 403:
-            if 'insufficientParentPermissions' in str(e) or 'insufficientPermissions' in str(e):
-                logger.error("Service account does not have write permissions to the folder.")
-                logger.error("To fix: Share the invoice storage folder with the service account email and grant 'Editor' permissions.")
-                logger.error(f"Folder ID: {folder_id}")
-            elif 'insufficient authentication scopes' in str(e):
-                logger.error("Service account does not have Google Drive permissions.")
-                logger.error("Check that the service account has the 'https://www.googleapis.com/auth/drive' scope.")
+            if 'insufficientPermissions' in str(e) or 'insufficient authentication scopes' in str(e):
+                logger.error("Access token does not have Google Drive permissions.")
+                logger.error("User needs to sign out and sign back in to grant Drive access.")
             elif 'storageQuotaExceeded' in str(e):
                 logger.error("Service accounts cannot upload to My Drive folders. The folder must be in a Google Shared Drive (Team Drive).")
                 logger.error("To fix: Move the folder to a Shared Drive or create the folder in a Shared Drive.")
-                logger.error("Alternatively, use the user's OAuth token to upload to My Drive folders.")
         logger.exception(e)
         return None
     except Exception as e:
@@ -485,6 +471,13 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         logger.info(f"Sheet Name: {SHEET_NAME}")
         logger.info(f"Number of line items: {len(rows_data)}")
         logger.info(f"Invoice File ID: {invoice_file_id}")
+        logger.info(f"Invoice File ID type: {type(invoice_file_id)}")
+        logger.info(f"Invoice File ID empty?: {not invoice_file_id}")
+        logger.info(f"Invoice File ID length: {len(invoice_file_id) if invoice_file_id else 0}")
+        
+        # Log first row data to verify file ID is included
+        if rows_data:
+            logger.info(f"First row data (including file ID in column H): {rows_data[0]}")
         
         try:
             result = service.spreadsheets().values().append(
