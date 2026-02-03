@@ -53,7 +53,11 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 from tools.one_month_savings import (
     log_invoice_to_sheets,
     get_invoice_history,
-    get_next_sequential_invoice_number
+    get_next_sequential_invoice_number,
+    get_or_create_subfolder,
+    upload_pdf_to_drive,
+    extract_folder_id_from_url,
+    get_drive_service
 )
 
 # Database imports
@@ -1491,7 +1495,8 @@ async def log_invoice_endpoint(
             "total_gst": request_data.get("total_gst", 0),
             "total_amount": request_data.get("total_amount", 0),
             "status": request_data.get("status", "Generated"),
-            "created_at": request_data.get("created_at")
+            "created_at": request_data.get("created_at"),
+            "invoice_file_id": request_data.get("invoice_file_id", "")
         }
         
         result = log_invoice_to_sheets(invoice_data)
@@ -1605,6 +1610,180 @@ async def get_next_invoice_number_endpoint(
     except Exception as e:
         logging.error(f"Error generating invoice number: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating invoice number: {str(e)}")
+
+
+class UploadInvoicePDFRequest(BaseModel):
+    pdf_base64: str  # PDF as base64 encoded string
+    filename: str
+    client_folder_url: str
+    invoice_number: str
+    business_name: str
+
+@app.post("/api/one-month-savings/upload-pdf")
+async def upload_invoice_pdf_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    user_info: dict = None
+):
+    """Upload invoice PDF to Google Drive folder"""
+    logging.info("=== One Month Savings Upload PDF Endpoint Called ===")
+    
+    # Get the request body
+    request_data = await request.json()
+    logging.info(f"Request data keys: {list(request_data.keys())}")
+    
+    # For Drive upload, we accept either API key or Google access token
+    # Access tokens are different from ID tokens - we don't verify them as ID tokens
+    # Instead, we'll use the access token directly for Drive API calls
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        logging.info(f"Authorization token type: {'API Key' if token == os.getenv('BACKEND_API_KEY', 'test-key') else 'Google Access Token'}")
+        
+        # Check if it's a simple API key (for Next.js API routes)
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            # Use session email from request_data if available
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+            logging.info(f"Using API key authentication for user: {user_info.get('email')}")
+        else:
+            # For access tokens, we don't verify as ID tokens
+            # We'll validate the token when we use it with the Drive API
+            # Extract user email from request data if available
+            user_info = {"email": request_data.get("user_email", "unknown@example.com")}
+            logging.info(f"Using Google access token for user: {user_info.get('email')}")
+    else:
+        logging.error("Invalid authorization format - missing 'Bearer ' prefix")
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    
+    try:
+        import base64
+        
+        pdf_base64 = request_data.get("pdf_base64")
+        filename = request_data.get("filename")
+        invoice_number = request_data.get("invoice_number")
+        business_name = request_data.get("business_name")
+        
+        if not pdf_base64 or not filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing required fields: pdf_base64 and filename"
+            )
+        
+        logging.info(f"Uploading PDF for invoice {invoice_number} (business: {business_name})")
+        
+        # Decode base64 PDF
+        pdf_bytes = base64.b64decode(pdf_base64)
+        logging.info(f"Decoded PDF, size: {len(pdf_bytes)} bytes")
+        
+        # Use fixed folder ID from environment variable or default
+        from tools.one_month_savings import INVOICE_STORAGE_FOLDER_ID
+        folder_id = INVOICE_STORAGE_FOLDER_ID
+        
+        if not folder_id:
+            raise HTTPException(
+                status_code=500,
+                detail="Invoice storage folder ID not configured"
+            )
+        
+        logging.info(f"Using invoice storage folder ID: {folder_id}")
+        
+        # Try user's OAuth token first (works for My Drive folders)
+        # If that fails, fall back to service account (works for Shared Drives)
+        file_id = None
+        access_token = None
+        refresh_token = request_data.get("refresh_token")
+        
+        logging.info(f"Authorization header present: {bool(authorization)}")
+        logging.info(f"Refresh token present: {bool(refresh_token)}")
+        
+        if authorization.startswith("Bearer "):
+            token = authorization.split("Bearer ")[1]
+            if token != os.getenv("BACKEND_API_KEY", "test-key"):
+                access_token = token
+                logging.info(f"Access token extracted (length: {len(access_token) if access_token else 0})")
+            else:
+                logging.info("Token is API key, not user OAuth token")
+        else:
+            logging.warning("Authorization header does not start with 'Bearer '")
+        
+        # First, try with user's OAuth token (for My Drive folders)
+        if access_token:
+            try:
+                logging.info("Attempting upload with user's OAuth token (for My Drive folders)")
+                from google.oauth2.credentials import Credentials as UserCredentials
+                
+                client_id = os.getenv("GOOGLE_CLIENT_ID")
+                client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+                token_uri = "https://oauth2.googleapis.com/token"
+                
+                if not client_id or not client_secret:
+                    logging.warning("Google OAuth credentials not configured, skipping user token attempt")
+                else:
+                    user_creds = UserCredentials(
+                        token=access_token,
+                        refresh_token=refresh_token,
+                        token_uri=token_uri,
+                        client_id=client_id,
+                        client_secret=client_secret
+                    )
+                    user_drive_service = build('drive', 'v3', credentials=user_creds)
+                    logging.info(f"Created Drive service with user credentials, attempting upload to folder {folder_id}")
+                    file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, user_drive_service)
+                    if file_id:
+                        logging.info("Successfully uploaded using user's OAuth token")
+                    else:
+                        logging.warning("Upload with user token returned None (check logs above for error details)")
+            except Exception as e:
+                logging.warning(f"Upload with user token failed with exception: {str(e)}")
+                logging.exception(e)
+                logging.info("Will try service account as fallback")
+        else:
+            logging.info("No access token available, skipping user token attempt")
+        
+        # If user token failed or wasn't available, try service account (for Shared Drives)
+        if not file_id:
+            logging.info("Attempting upload with service account (for Shared Drives)")
+            drive_service = get_drive_service()
+            
+            if not drive_service:
+                error_msg = (
+                    "Failed to create Google Drive service. "
+                    "Service account not configured properly. "
+                    "Please check your service account credentials."
+                )
+                logging.error(error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+            file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, drive_service)
+            
+            if not file_id:
+                # Provide helpful error message based on the error type
+                user_email = request_data.get("user_email", "your Google account")
+                error_msg = (
+                    f"Failed to upload PDF to Google Drive. "
+                    f"The invoice storage folder (ID: {folder_id}) is not accessible. "
+                    f"To fix: Open the folder in Google Drive and share it with '{user_email}' with 'Editor' permissions. "
+                    f"Alternatively, if using a Shared Drive, add the service account to the Shared Drive with 'Content Manager' role."
+                )
+                logging.error(error_msg)
+                raise HTTPException(status_code=403, detail=error_msg)
+        
+        file_url = f"https://drive.google.com/file/d/{file_id}/view"
+        
+        logging.info(f"PDF uploaded successfully. File ID: {file_id}")
+        
+        return {
+            "success": True,
+            "file_id": file_id,
+            "file_url": file_url,
+            "message": f"Invoice PDF uploaded successfully to {business_name}'s Google Drive"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error uploading PDF: {str(e)}")
+        logging.exception(e)
+        raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
 
 # Task API Routes
 @app.post("/api/tasks", response_model=TaskResponse)
