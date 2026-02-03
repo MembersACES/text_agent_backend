@@ -1495,7 +1495,8 @@ async def log_invoice_endpoint(
             "total_gst": request_data.get("total_gst", 0),
             "total_amount": request_data.get("total_amount", 0),
             "status": request_data.get("status", "Generated"),
-            "created_at": request_data.get("created_at")
+            "created_at": request_data.get("created_at"),
+            "invoice_file_id": request_data.get("invoice_file_id", "")
         }
         
         result = log_invoice_to_sheets(invoice_data)
@@ -1685,62 +1686,86 @@ async def upload_invoice_pdf_endpoint(
         
         logging.info(f"Using invoice storage folder ID: {folder_id}")
         
-        # Use the user's Google access token instead of service account
-        # This allows uploads to regular My Drive folders (no Shared Drive needed)
+        # Try user's OAuth token first (works for My Drive folders)
+        # If that fails, fall back to service account (works for Shared Drives)
+        file_id = None
         access_token = None
         refresh_token = request_data.get("refresh_token")
+        
+        logging.info(f"Authorization header present: {bool(authorization)}")
+        logging.info(f"Refresh token present: {bool(refresh_token)}")
         
         if authorization.startswith("Bearer "):
             token = authorization.split("Bearer ")[1]
             if token != os.getenv("BACKEND_API_KEY", "test-key"):
                 access_token = token
+                logging.info(f"Access token extracted (length: {len(access_token) if access_token else 0})")
+            else:
+                logging.info("Token is API key, not user OAuth token")
+        else:
+            logging.warning("Authorization header does not start with 'Bearer '")
         
-        if not access_token:
-            raise HTTPException(
-                status_code=401,
-                detail="Valid Google access token required for Drive upload"
-            )
+        # First, try with user's OAuth token (for My Drive folders)
+        if access_token:
+            try:
+                logging.info("Attempting upload with user's OAuth token (for My Drive folders)")
+                from google.oauth2.credentials import Credentials as UserCredentials
+                
+                client_id = os.getenv("GOOGLE_CLIENT_ID")
+                client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+                token_uri = "https://oauth2.googleapis.com/token"
+                
+                if not client_id or not client_secret:
+                    logging.warning("Google OAuth credentials not configured, skipping user token attempt")
+                else:
+                    user_creds = UserCredentials(
+                        token=access_token,
+                        refresh_token=refresh_token,
+                        token_uri=token_uri,
+                        client_id=client_id,
+                        client_secret=client_secret
+                    )
+                    user_drive_service = build('drive', 'v3', credentials=user_creds)
+                    logging.info(f"Created Drive service with user credentials, attempting upload to folder {folder_id}")
+                    file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, user_drive_service)
+                    if file_id:
+                        logging.info("Successfully uploaded using user's OAuth token")
+                    else:
+                        logging.warning("Upload with user token returned None (check logs above for error details)")
+            except Exception as e:
+                logging.warning(f"Upload with user token failed with exception: {str(e)}")
+                logging.exception(e)
+                logging.info("Will try service account as fallback")
+        else:
+            logging.info("No access token available, skipping user token attempt")
         
-        logging.info(f"Using access token (length: {len(access_token) if access_token else 0})")
-        logging.info(f"Has refresh token: {bool(refresh_token)}")
-        
-        # Create Drive service using user's token with refresh capability
-        from google.oauth2.credentials import Credentials as UserCredentials
-        
-        # Get OAuth2 client credentials from environment
-        client_id = os.getenv("GOOGLE_CLIENT_ID")
-        client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-        token_uri = "https://oauth2.googleapis.com/token"
-        
-        if not client_id or not client_secret:
-            raise HTTPException(
-                status_code=500,
-                detail="Google OAuth credentials not configured"
-            )
-        
-        # Construct credentials with all required fields for token refresh
-        user_creds = UserCredentials(
-            token=access_token,
-            refresh_token=refresh_token,
-            token_uri=token_uri,
-            client_id=client_id,
-            client_secret=client_secret
-        )
-        
-        drive_service = build('drive', 'v3', credentials=user_creds)
-        
-        logging.info("Created Drive service using user's access token with refresh capability")
-        
-        # Upload PDF directly to the fixed folder (no subfolder)
-        file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, drive_service)
-        
+        # If user token failed or wasn't available, try service account (for Shared Drives)
         if not file_id:
-            # Check if it was a scope/permission error
-            # The upload_pdf_to_drive function logs the error, so we can provide a helpful message
-            raise HTTPException(
-                status_code=403,
-                detail="Failed to upload PDF to Google Drive. Your access token does not have Google Drive permissions. Please sign out completely and sign back in to grant Drive access."
-            )
+            logging.info("Attempting upload with service account (for Shared Drives)")
+            drive_service = get_drive_service()
+            
+            if not drive_service:
+                error_msg = (
+                    "Failed to create Google Drive service. "
+                    "Service account not configured properly. "
+                    "Please check your service account credentials."
+                )
+                logging.error(error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
+            
+            file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, drive_service)
+            
+            if not file_id:
+                # Provide helpful error message based on the error type
+                user_email = request_data.get("user_email", "your Google account")
+                error_msg = (
+                    f"Failed to upload PDF to Google Drive. "
+                    f"The invoice storage folder (ID: {folder_id}) is not accessible. "
+                    f"To fix: Open the folder in Google Drive and share it with '{user_email}' with 'Editor' permissions. "
+                    f"Alternatively, if using a Shared Drive, add the service account to the Shared Drive with 'Content Manager' role."
+                )
+                logging.error(error_msg)
+                raise HTTPException(status_code=403, detail=error_msg)
         
         file_url = f"https://drive.google.com/file/d/{file_id}/view"
         

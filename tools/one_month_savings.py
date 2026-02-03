@@ -137,6 +137,10 @@ def get_drive_service():
                     scopes=['https://www.googleapis.com/auth/drive']
                 )
                 logger.info("Successfully loaded service account from file for Drive")
+                # Log service account email for folder sharing reference
+                if hasattr(creds, 'service_account_email'):
+                    logger.info(f"Service account email: {creds.service_account_email}")
+                    logger.info(f"To grant folder access, share the invoice storage folder with: {creds.service_account_email}")
             except Exception as e:
                 logger.error(f"Error loading service account from file: {str(e)}")
                 return None
@@ -148,6 +152,11 @@ def get_drive_service():
                     json_data = json.loads(service_account_info)
                 else:
                     json_data = service_account_info
+                
+                # Log service account email before creating credentials
+                service_account_email = json_data.get('client_email', 'unknown')
+                logger.info(f"Service account email: {service_account_email}")
+                logger.info(f"To grant folder access, share the invoice storage folder with: {service_account_email}")
                 
                 creds = Credentials.from_service_account_info(
                     json_data,
@@ -370,12 +379,17 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         logger.error(f"Google Drive API error uploading PDF: {e.status_code} - {e.reason}")
         logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
         if e.status_code == 403:
-            if 'insufficientPermissions' in str(e) or 'insufficient authentication scopes' in str(e):
-                logger.error("Access token does not have Google Drive permissions.")
-                logger.error("User needs to sign out and sign back in to grant Drive access.")
+            if 'insufficientParentPermissions' in str(e) or 'insufficientPermissions' in str(e):
+                logger.error("Service account does not have write permissions to the folder.")
+                logger.error("To fix: Share the invoice storage folder with the service account email and grant 'Editor' permissions.")
+                logger.error(f"Folder ID: {folder_id}")
+            elif 'insufficient authentication scopes' in str(e):
+                logger.error("Service account does not have Google Drive permissions.")
+                logger.error("Check that the service account has the 'https://www.googleapis.com/auth/drive' scope.")
             elif 'storageQuotaExceeded' in str(e):
                 logger.error("Service accounts cannot upload to My Drive folders. The folder must be in a Google Shared Drive (Team Drive).")
                 logger.error("To fix: Move the folder to a Shared Drive or create the folder in a Shared Drive.")
+                logger.error("Alternatively, use the user's OAuth token to upload to My Drive folders.")
         logger.exception(e)
         return None
     except Exception as e:
@@ -427,7 +441,7 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 "error": "Could not connect to Google Sheets - check logs for details"
             }
         
-        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID
         # Each line item gets its own row
         line_items = invoice_data.get("line_items", [])
         
@@ -437,6 +451,9 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 "success": False,
                 "error": "No line items provided"
             }
+        
+        # Get invoice file ID (same for all line items of the same invoice)
+        invoice_file_id = invoice_data.get("invoice_file_id", "")
         
         # Prepare rows - one row per line item
         rows_data = []
@@ -454,6 +471,7 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 f"${total:.2f}",                            # Column E: Total Invoice
                 invoice_data.get("invoice_number", ""),      # Column F: Invoice Number
                 invoice_data.get("due_date", ""),            # Column G: Due Date
+                invoice_file_id,                             # Column H: Invoice ID (File ID from Drive)
             ]
             rows_data.append(row_data)
         
@@ -466,11 +484,12 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         logger.info(f"Sheet ID: {SHEET_ID}")
         logger.info(f"Sheet Name: {SHEET_NAME}")
         logger.info(f"Number of line items: {len(rows_data)}")
+        logger.info(f"Invoice File ID: {invoice_file_id}")
         
         try:
             result = service.spreadsheets().values().append(
                 spreadsheetId=SHEET_ID,
-                range=f"{SHEET_NAME}!A:G",  # Append to columns A-G
+                range=f"{SHEET_NAME}!A:H",  # Append to columns A-H (added Invoice ID column)
                 valueInputOption='USER_ENTERED',
                 insertDataOption='INSERT_ROWS',
                 body=body
@@ -537,7 +556,8 @@ def _log_invoice_via_n8n(invoice_data: Dict) -> Dict:
             "total_amount": f"{invoice_data.get('total_amount', 0):.2f}",
             "status": invoice_data.get("status", "Generated"),
             "created_at": invoice_data.get("created_at"),
-            "line_items_json": str(invoice_data.get("line_items", []))
+            "line_items_json": str(invoice_data.get("line_items", [])),
+            "invoice_file_id": invoice_data.get("invoice_file_id", "")
         }
         
         response = requests.post(N8N_LOG_WEBHOOK, json=sheet_payload, timeout=30)
@@ -606,11 +626,11 @@ def get_invoice_history(business_name: str) -> Dict:
             }
         
         # Read all data from the sheet
-        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID
         # Use UNFORMATTED_VALUE to get raw numbers instead of formatted strings
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"{SHEET_NAME}!A2:G",  # Skip header row, read columns A-G
+            range=f"{SHEET_NAME}!A2:H",  # Skip header row, read columns A-H (added Invoice ID column)
             valueRenderOption='UNFORMATTED_VALUE'  # Get raw values, not formatted strings
         ).execute()
         
@@ -627,12 +647,12 @@ def get_invoice_history(business_name: str) -> Dict:
         logger.info(f"Searching for business: '{business_name}'")
         
         # Group rows by invoice number (each row is a line item)
-        # Column mapping: 0=Member (Business Name), 1=Solution, 2=Savings Amount, 3=GST, 4=Total Invoice, 5=Invoice Number, 6=Due Date
+        # Column mapping: 0=Member (Business Name), 1=Solution, 2=Savings Amount, 3=GST, 4=Total Invoice, 5=Invoice Number, 6=Due Date, 7=Invoice ID
         invoice_dict = {}  # Key: invoice_number, Value: invoice data with line_items array
         
         for idx, row in enumerate(values):
-            # Ensure row has enough columns
-            while len(row) < 7:
+            # Ensure row has enough columns (now 8 columns including Invoice ID)
+            while len(row) < 8:
                 row.append("")
             
             # Filter by business name (column A, index 0)
@@ -739,6 +759,11 @@ def get_invoice_history(business_name: str) -> Dict:
                     # String date - use as is
                     due_date = str(due_date_raw).strip()
                 
+                # Parse invoice file ID (column H, index 7)
+                invoice_file_id = ""
+                if len(row) > 7 and row[7] is not None:
+                    invoice_file_id = str(row[7]).strip()
+                
                 # Create line item
                 line_item = {
                     "solution_label": solution,
@@ -760,7 +785,8 @@ def get_invoice_history(business_name: str) -> Dict:
                         "total_amount": 0,
                         "status": "Generated",
                         "created_at": "",
-                        "line_items": []
+                        "line_items": [],
+                        "invoice_file_id": invoice_file_id  # Include file ID from column H
                     }
                 
                 # Add line item and accumulate amounts
@@ -775,6 +801,10 @@ def get_invoice_history(business_name: str) -> Dict:
                 invoice_dict[invoice_number]["total_gst"] = current_gst + float(gst)
                 calculated_total = float(total_amount) if total_amount > 0 else (float(savings_amount) + float(gst))
                 invoice_dict[invoice_number]["total_amount"] = current_total + calculated_total
+                
+                # Update invoice_file_id if this row has one (in case it wasn't set initially)
+                if invoice_file_id and not invoice_dict[invoice_number].get("invoice_file_id"):
+                    invoice_dict[invoice_number]["invoice_file_id"] = invoice_file_id
                 
                 logger.info(f"Accumulated for {invoice_number}: savings={savings_amount}, gst={gst}, total_line={calculated_total}")
                 logger.info(f"Running totals: subtotal={invoice_dict[invoice_number]['subtotal']}, gst={invoice_dict[invoice_number]['total_gst']}, total={invoice_dict[invoice_number]['total_amount']}")
@@ -880,7 +910,8 @@ def _get_invoice_history_via_n8n(business_name: str) -> Dict:
                 "total_amount": amount,
                 "status": row.get("Status") or row.get("status") or "Generated",
                 "created_at": row.get("Created At") or row.get("created_at") or "",
-                "line_items": [{"solution_label": solution.strip()}] if solution else []
+                "line_items": [{"solution_label": solution.strip()}] if solution else [],
+                "invoice_file_id": row.get("Invoice ID") or row.get("invoice_file_id") or ""
             }
             invoices.append(invoice)
         
