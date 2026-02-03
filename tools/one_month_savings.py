@@ -478,8 +478,11 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         # Log first row data to verify file ID is included
         if rows_data:
             logger.info(f"First row data (including file ID in column H): {rows_data[0]}")
+            logger.info(f"First row column H (index 7): '{rows_data[0][7] if len(rows_data[0]) > 7 else 'MISSING'}'")
+            logger.info(f"All rows to be written: {rows_data}")
         
         try:
+            logger.info(f"Writing {len(rows_data)} rows to sheet {SHEET_ID}, range {SHEET_NAME}!A:H")
             result = service.spreadsheets().values().append(
                 spreadsheetId=SHEET_ID,
                 range=f"{SHEET_NAME}!A:H",  # Append to columns A-H (added Invoice ID column)
@@ -489,8 +492,26 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
             ).execute()
             
             updated_rows = result.get('updates', {}).get('updatedRows', 'unknown')
+            updated_range = result.get('updates', {}).get('updatedRange', 'unknown')
             logger.info(f"Invoice {invoice_data.get('invoice_number')} logged successfully - {updated_rows} rows added")
+            logger.info(f"Updated range: {updated_range}")
             logger.info(f"API response: {result}")
+            
+            # Verify the data was written correctly by reading it back
+            if updated_range and updated_range != 'unknown':
+                logger.info(f"Verifying written data by reading back from range: {updated_range}")
+                verify_result = service.spreadsheets().values().get(
+                    spreadsheetId=SHEET_ID,
+                    range=updated_range,
+                    valueRenderOption='UNFORMATTED_VALUE'
+                ).execute()
+                verify_values = verify_result.get('values', [])
+                if verify_values:
+                    logger.info(f"Verified: Read back {len(verify_values)} rows")
+                    if len(verify_values[0]) > 7:
+                        logger.info(f"Verified: First row column H contains: '{verify_values[0][7]}'")
+                    else:
+                        logger.warning(f"Verified: First row only has {len(verify_values[0])} columns, column H missing!")
         except HttpError as e:
             logger.error(f"Google Sheets API HttpError: {e.status_code} - {e.reason}")
             logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
@@ -754,8 +775,19 @@ def get_invoice_history(business_name: str) -> Dict:
                 
                 # Parse invoice file ID (column H, index 7)
                 invoice_file_id = ""
-                if len(row) > 7 and row[7] is not None:
-                    invoice_file_id = str(row[7]).strip()
+                logger.info(f"Row {idx} length: {len(row)}, checking for file_id in column H (index 7)")
+                if len(row) > 7:
+                    logger.info(f"Row {idx} column H (index 7) value: {row[7]}, type: {type(row[7])}")
+                    if row[7] is not None:
+                        invoice_file_id = str(row[7]).strip()
+                        logger.info(f"Row {idx} extracted file_id: '{invoice_file_id}' (length: {len(invoice_file_id)})")
+                    else:
+                        logger.warning(f"Row {idx} column H is None")
+                else:
+                    logger.warning(f"Row {idx} has only {len(row)} columns, column H (index 7) not present")
+                    # Ensure row has 8 columns for consistency
+                    while len(row) < 8:
+                        row.append("")
                 
                 # Create line item
                 line_item = {
@@ -796,8 +828,15 @@ def get_invoice_history(business_name: str) -> Dict:
                 invoice_dict[invoice_number]["total_amount"] = current_total + calculated_total
                 
                 # Update invoice_file_id if this row has one (in case it wasn't set initially)
-                if invoice_file_id and not invoice_dict[invoice_number].get("invoice_file_id"):
-                    invoice_dict[invoice_number]["invoice_file_id"] = invoice_file_id
+                if invoice_file_id:
+                    if not invoice_dict[invoice_number].get("invoice_file_id"):
+                        logger.info(f"Setting file_id '{invoice_file_id}' for invoice {invoice_number} (first time)")
+                        invoice_dict[invoice_number]["invoice_file_id"] = invoice_file_id
+                    elif invoice_dict[invoice_number].get("invoice_file_id") != invoice_file_id:
+                        logger.warning(f"Invoice {invoice_number} has different file_id in different rows! Existing: '{invoice_dict[invoice_number].get('invoice_file_id')}', New: '{invoice_file_id}'")
+                else:
+                    if invoice_number not in invoice_dict or not invoice_dict[invoice_number].get("invoice_file_id"):
+                        logger.warning(f"Row {idx} for invoice {invoice_number} has no file_id in column H")
                 
                 logger.info(f"Accumulated for {invoice_number}: savings={savings_amount}, gst={gst}, total_line={calculated_total}")
                 logger.info(f"Running totals: subtotal={invoice_dict[invoice_number]['subtotal']}, gst={invoice_dict[invoice_number]['total_gst']}, total={invoice_dict[invoice_number]['total_amount']}")
@@ -805,6 +844,9 @@ def get_invoice_history(business_name: str) -> Dict:
         # Convert dict to list and ensure all amounts are numbers, not strings
         invoices = []
         for inv in invoice_dict.values():
+            # Log file_id status for each invoice
+            file_id_status = inv.get("invoice_file_id", "")
+            logger.info(f"Invoice {inv.get('invoice_number')} final file_id: '{file_id_status}' (empty: {not file_id_status})")
             # Ensure all numeric fields are actually numbers (handle strings with $ signs)
             # Convert to string first, then clean and convert to float
             def clean_float(value):
@@ -826,7 +868,12 @@ def get_invoice_history(business_name: str) -> Dict:
             inv["total_gst"] = clean_float(inv.get("total_gst", 0))
             inv["total_amount"] = clean_float(inv.get("total_amount", 0))
             
-            logger.info(f"Final invoice {inv['invoice_number']}: subtotal={inv['subtotal']}, gst={inv['total_gst']}, total={inv['total_amount']}")
+            # Ensure invoice_file_id is always present in response (even if empty)
+            if "invoice_file_id" not in inv:
+                inv["invoice_file_id"] = ""
+                logger.warning(f"Invoice {inv['invoice_number']} missing invoice_file_id field, setting to empty string")
+            
+            logger.info(f"Final invoice {inv['invoice_number']}: subtotal={inv['subtotal']}, gst={inv['total_gst']}, total={inv['total_amount']}, file_id='{inv.get('invoice_file_id', 'MISSING')}'")
             invoices.append(inv)
         
         logger.info(f"Found {len(invoices)} invoices for {business_name}")
