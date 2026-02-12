@@ -37,6 +37,7 @@ from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_info
 from tools.get_gas_sme_latest_invoice_information import get_gas_sme_latest_invoice_information
 from tools.get_waste_latest_invoice_information import get_waste_latest_invoice_information
 from tools.get_oil_invoice_information import get_oil_invoice_information
+from tools.get_cleaning_invoice_information import get_cleaning_invoice_information
 from tools.supplier_data_request import supplier_data_request
 from tools.drive_filing import drive_filing
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement
@@ -299,6 +300,9 @@ class WasteInvoiceRequest(BaseModel):
 class OilInvoiceRequest(BaseModel):
     business_name: Optional[str] = None
 
+class CleaningInvoiceRequest(BaseModel):
+    business_name: Optional[str] = None
+
 class DataRequest(BaseModel):
     business_name: str
     supplier_name: str
@@ -429,6 +433,22 @@ def get_oil_info(
     )
     data["user_email"] = user_info.get("email")
     logging.info(f"Returning oil info to frontend: {data}")
+    return data
+
+@app.post("/api/get-cleaning-info")
+def get_cleaning_info(
+    request: CleaningInvoiceRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    if not request.business_name:
+        raise HTTPException(status_code=400, detail="business_name is required")
+
+    logging.info(f"Received cleaning info request: business_name={request.business_name}")
+    data = get_cleaning_invoice_information(
+        account_name=request.business_name
+    )
+    data["user_email"] = user_info.get("email")
+    logging.info(f"Returning cleaning info to frontend: {data}")
     return data
 
 @app.post("/api/get-robot-data")
