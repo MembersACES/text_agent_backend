@@ -1,2 +1,13 @@
 .env
 service-account-key.json
+# Python
+__pycache__/
+*.pyc
+
+# Runtime outputs
+storage/
+runs.json
+
+# Virtual env
+.venv/
+venv/
