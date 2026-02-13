@@ -50,6 +50,7 @@ from tools.document_generation import (
 )
 from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
+from tools.service_agreement_generation import service_agreement_generation_new
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_multiple
 from tools.one_month_savings import (
     log_invoice_to_sheets,
@@ -1342,6 +1343,147 @@ def generate_loa_new_endpoint(
             "document_link": None,
             "user_email": user_info.get("email")
         }
+
+@app.post("/api/generate-service-agreement-new")
+def generate_service_agreement_new_endpoint(
+    request: NewLOAGeneration,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Service Fee Agreement document for new clients (without client folder URL)"""
+    logging.info(f"Received new Service Agreement generation request for: {request.business_name}")
+    
+    try:
+        
+        result_message = service_agreement_generation_new(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+        )
+        
+        # Parse the message to extract document link
+        document_link = None
+        if "You can access it here:" in result_message:
+            link_start = result_message.find("You can access it here:") + len("You can access it here:")
+            link_end = result_message.rfind(".")  # Find the LAST period in the message
+            if link_end != -1:
+                document_link = result_message[link_start:link_end].strip()
+        
+        # Create the structured response
+        result = {
+            "status": "success",
+            "message": f'The Service Fee Agreement for "{request.business_name}" has been successfully generated.',
+            "document_link": document_link,
+            "user_email": user_info.get("email")
+        }
+        
+        logging.info(f"New Service Agreement generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating new Service Agreement for {request.business_name}: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error generating Service Agreement: {str(e)}",
+            "document_link": None,
+            "user_email": user_info.get("email")
+        }
+
+@app.post("/api/generate-loa-sfa-new")
+def generate_loa_sfa_new_endpoint(
+    request: NewLOAGeneration,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate both LOA and Service Fee Agreement documents for new clients (without client folder URL)"""
+    logging.info(f"Received LOA and SFA generation request for: {request.business_name}")
+    
+    loa_document_link = None
+    sfa_document_link = None
+    errors = []
+    
+    # Generate LOA document
+    try:
+        logging.info(f"Generating LOA for: {request.business_name}")
+        loa_result_message = loa_generation_new(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+        )
+        
+        # Parse the LOA message to extract document link
+        if "You can access it here:" in loa_result_message:
+            link_start = loa_result_message.find("You can access it here:") + len("You can access it here:")
+            link_end = loa_result_message.rfind(".")  # Find the LAST period in the message
+            if link_end != -1:
+                loa_document_link = loa_result_message[link_start:link_end].strip()
+        
+        logging.info(f"LOA generation completed for: {request.business_name}")
+    except Exception as e:
+        error_msg = f"Error generating LOA: {str(e)}"
+        logging.error(f"Error generating LOA for {request.business_name}: {str(e)}")
+        errors.append(error_msg)
+    
+    # Generate SFA document
+    try:
+        logging.info(f"Generating SFA for: {request.business_name}")
+        sfa_result_message = service_agreement_generation_new(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+        )
+        
+        # Parse the SFA message to extract document link
+        if "You can access it here:" in sfa_result_message:
+            link_start = sfa_result_message.find("You can access it here:") + len("You can access it here:")
+            link_end = sfa_result_message.rfind(".")  # Find the LAST period in the message
+            if link_end != -1:
+                sfa_document_link = sfa_result_message[link_start:link_end].strip()
+        
+        logging.info(f"SFA generation completed for: {request.business_name}")
+    except Exception as e:
+        error_msg = f"Error generating SFA: {str(e)}"
+        logging.error(f"Error generating SFA for {request.business_name}: {str(e)}")
+        errors.append(error_msg)
+    
+    # Determine overall status
+    if loa_document_link and sfa_document_link:
+        status = "success"
+        message = f'Both Letter of Authority and Service Fee Agreement for "{request.business_name}" have been successfully generated.'
+    elif loa_document_link or sfa_document_link:
+        status = "partial_success"
+        message = f'One document generated for "{request.business_name}". ' + " ".join(errors)
+    else:
+        status = "error"
+        message = f'Failed to generate documents for "{request.business_name}". ' + " ".join(errors)
+    
+    # Create the structured response
+    result = {
+        "status": status,
+        "message": message,
+        "loa_document_link": loa_document_link,
+        "sfa_document_link": sfa_document_link,
+        "user_email": user_info.get("email")
+    }
+    
+    logging.info(f"LOA and SFA generation completed for: {request.business_name} - LOA: {bool(loa_document_link)}, SFA: {bool(sfa_document_link)}")
+    return result
 
 def extract_google_drive_id(url: str) -> str:
     """Extract Google Drive file/folder ID from URL"""
