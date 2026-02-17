@@ -1,19 +1,187 @@
 import requests
 import logging
+import os
+import json
+from typing import Optional, Dict
+from dotenv import load_dotenv
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Load environment variables
+backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(backend_root, '.env')
+load_dotenv(dotenv_path=env_path)
+
+logger = logging.getLogger(__name__)
+
+# Google Sheets configuration for file IDs
+FILE_IDS_SHEET_ID = os.getenv("FILE_IDS_SHEET_ID", "1l_ShkAcpS1HBqX8EdXLEVmn3pkliVGwsskkkI0GlLho")
+FILE_IDS_SHEET_NAME = os.getenv("FILE_IDS_SHEET_NAME", "Data from Airtable")  # Sheet name or can use GID
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service-account-key.json")
+
+def get_sheets_service():
+    """Get Google Sheets service using service account credentials"""
+    try:
+        logger.info("Attempting to create Google Sheets service for file IDs...")
+        
+        # Check if file exists
+        file_exists = os.path.exists(SERVICE_ACCOUNT_FILE)
+        
+        # Check environment variable
+        service_account_info = os.getenv("SERVICE_ACCOUNT_JSON")
+        has_env_json = bool(service_account_info)
+        
+        creds = None
+        
+        # Load service account credentials
+        if file_exists:
+            logger.info(f"Loading service account from file: {SERVICE_ACCOUNT_FILE}")
+            try:
+                creds = Credentials.from_service_account_file(
+                    SERVICE_ACCOUNT_FILE,
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+                logger.info("Successfully loaded service account from file")
+            except Exception as e:
+                logger.error(f"Error loading service account from file: {str(e)}")
+                return None
+        elif has_env_json:
+            logger.info("Loading service account from SERVICE_ACCOUNT_JSON environment variable")
+            try:
+                # Try to parse the JSON
+                if isinstance(service_account_info, str):
+                    json_data = json.loads(service_account_info)
+                else:
+                    json_data = service_account_info
+                
+                creds = Credentials.from_service_account_info(
+                    json_data,
+                    scopes=['https://www.googleapis.com/auth/spreadsheets']
+                )
+                logger.info("Successfully loaded service account from environment variable")
+            except json.JSONDecodeError as e:
+                logger.error(f"Invalid JSON in SERVICE_ACCOUNT_JSON: {str(e)}")
+                return None
+            except Exception as e:
+                logger.error(f"Error loading service account from env var: {str(e)}")
+                return None
+        else:
+            logger.error("No service account credentials found - neither file nor env var available")
+            return None
+        
+        if not creds:
+            logger.error("Failed to create credentials object")
+            return None
+        
+        logger.info("Building Google Sheets API service...")
+        service = build('sheets', 'v4', credentials=creds)
+        logger.info("Google Sheets service created successfully")
+        return service
+        
+    except Exception as e:
+        logger.error(f"Error creating Google Sheets service: {str(e)}")
+        return None
 
 def get_file_ids(business_name: str) -> dict:
-    webhook_url = "https://membersaces.app.n8n.cloud/webhook/return_fileIDs"
-    payload = {"business_name": business_name}
-    try:
-        response = requests.post(webhook_url, json=payload)
-        if response.status_code == 200:
-            file_ids_data = response.json()
-            if isinstance(file_ids_data, list) and file_ids_data:
-                return file_ids_data[0]
-            elif isinstance(file_ids_data, dict):
-                return file_ids_data
+    """
+    Get file IDs directly from Google Sheets instead of n8n webhook.
+    Reads from the 'Data from Airtable' sheet and filters by business name.
+    
+    Args:
+        business_name: Name of the business to look up
+        
+    Returns:
+        Dictionary with file IDs and status fields, or empty dict if not found/error
+    """
+    if not business_name:
+        logger.warning("get_file_ids called with empty business_name")
         return {}
-    except Exception:
+    
+    logger.info(f"Fetching file IDs from Google Sheets for: {business_name}")
+    logger.info(f"Sheet ID: {FILE_IDS_SHEET_ID}, Sheet Name: {FILE_IDS_SHEET_NAME}")
+    
+    # Get Google Sheets service
+    service = get_sheets_service()
+    if not service:
+        logger.error("Could not create Google Sheets service")
+        logger.warning("Falling back to empty dict - file IDs will not be available")
+        return {}
+    
+    try:
+        # Read all data from the sheet (including header row)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=FILE_IDS_SHEET_ID,
+            range=f"{FILE_IDS_SHEET_NAME}!A:ZZ",  # Read all columns
+        ).execute()
+        
+        values = result.get('values', [])
+        
+        if not values or len(values) < 2:  # Need at least header + 1 data row
+            logger.info(f"No data found in sheet for {business_name}")
+            return {}
+        
+        # First row is the header - find the "Business Name" column index
+        header_row = values[0]
+        business_name_col_idx = None
+        
+        for idx, header in enumerate(header_row):
+            if header and str(header).strip().lower() == "business name":
+                business_name_col_idx = idx
+                break
+        
+        if business_name_col_idx is None:
+            logger.error("Could not find 'Business Name' column in sheet")
+            return {}
+        
+        logger.info(f"Found 'Business Name' column at index {business_name_col_idx}")
+        
+        # Search for the matching business name in data rows
+        matching_row = None
+        search_business_name = business_name.strip()
+        
+        for row_idx, row in enumerate(values[1:], start=2):  # Start from row 2 (skip header)
+            # Ensure row has enough columns
+            while len(row) <= business_name_col_idx:
+                row.append("")
+            
+            row_business_name = str(row[business_name_col_idx]).strip() if row[business_name_col_idx] else ""
+            
+            # Case-insensitive match
+            if row_business_name.lower() == search_business_name.lower():
+                matching_row = row
+                logger.info(f"Found matching row at index {row_idx} for business: {row_business_name}")
+                break
+        
+        if not matching_row:
+            logger.info(f"No matching row found for business: {business_name}")
+            return {}
+        
+        # Convert row to dictionary using header row as keys
+        # Pad matching_row to match header length
+        while len(matching_row) < len(header_row):
+            matching_row.append("")
+        
+        file_ids_dict = {}
+        for idx, header in enumerate(header_row):
+            if idx < len(matching_row):
+                value = matching_row[idx]
+                # Only include non-empty values
+                if value and str(value).strip():
+                    file_ids_dict[str(header).strip()] = str(value).strip()
+        
+        logger.info(f"Successfully retrieved file IDs from Google Sheets. Found {len(file_ids_dict)} fields")
+        return file_ids_dict
+        
+    except HttpError as e:
+        logger.error(f"Google Sheets API HttpError: {e.status_code} - {e.reason}")
+        if e.status_code == 404:
+            logger.error(f"Sheet not found. Check that FILE_IDS_SHEET_ID and FILE_IDS_SHEET_NAME are correct")
+            logger.error(f"Also ensure the service account has access to the sheet")
+        return {}
+    except Exception as e:
+        logger.error(f"Unexpected error reading from Google Sheets: {str(e)}")
+        logger.exception(e)
         return {}
 
 def get_business_information(business_name: str) -> dict:
