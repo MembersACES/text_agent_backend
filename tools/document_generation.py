@@ -347,3 +347,69 @@ def ghg_offer_generation(
 def get_available_eoi_types():
     """Get all available Expression of Interest types."""
     return [e.value[0] for e in ExpressionOfInterestType]
+
+class EngagementFormType(Enum):
+    TELECOMMUNICATION = (
+        "Telecommunication",
+        "1vrZFrCUyS_6qlcpsSdJqNabIRrEuqd4VfDOLjbN3QiU",
+    )
+    VIC_CDS_SCHEME = (
+        "VIC CDS Scheme",
+        "1dbI51gtl6uUwsdBVtdxVabpfN3olCu5gPA5jvyVfesM",
+    )
+    GHG = (
+        "GHG",
+        "1RuIz4FwgsyWorTFrfGLkeq5nHf5HAEFqGf1pPBmQ6mY",
+    )
+    REFERRAL_DISTRIBUTION_PROGRAM = (
+        "Referral Distribution Program",
+        "1Brif45hiE650wdy-JWYd2oZ3Elfcwqiw4tapnUeFx0A",
+    )
+
+def engagement_form_generation(
+    business_name: str,
+    abn: str,
+    trading_as: str,
+    postal_address: str,
+    site_address: str,
+    telephone: str,
+    email: str,
+    contact_name: str,
+    position: str,
+    engagement_form_type: str,
+    client_folder_url: str,
+) -> Dict[str, Any]:
+    """Generate Engagement Form for a specific business with detailed information."""
+    
+    try:
+        # Convert string to enum key format
+        enum_key = engagement_form_type.upper().replace(" ", "_").replace("-", "_")
+        enum_type = EngagementFormType[enum_key]
+        engagement_form_type_name, engagement_form_type_template_id = enum_type.value
+    except KeyError:
+        valid_types = [e.value[0] for e in EngagementFormType]
+        return {
+            "status": "error",
+            "message": f"Invalid engagement form type. Must be one of: {', '.join(valid_types)}",
+            "document_link": None
+        }
+
+    return generate_document(
+        business_name=business_name,
+        abn=abn,
+        trading_as=trading_as,
+        postal_address=postal_address,
+        site_address=site_address,
+        telephone=telephone,
+        email=email,
+        contact_name=contact_name,
+        position=position,
+        client_folder_url=client_folder_url,
+        template_id=engagement_form_type_template_id,
+        document_type=f"{engagement_form_type_name} Engagement Form"
+    )
+
+# Utility function to get available Engagement Form types
+def get_available_engagement_form_types():
+    """Get all available Engagement Form types."""
+    return [e.value[0] for e in EngagementFormType]

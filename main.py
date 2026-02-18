@@ -46,7 +46,9 @@ from tools.document_generation import (
     service_fee_agreement_generation,
     expression_of_interest_generation,
     ghg_offer_generation,
-    get_available_eoi_types
+    get_available_eoi_types,
+    engagement_form_generation,
+    get_available_engagement_form_types
 )
 from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
@@ -266,6 +268,9 @@ class NewLOAGeneration(BaseModel):
 
 class EOIGenerationRequest(DocumentGenerationRequest):
     expression_type: str
+
+class EngagementFormGenerationRequest(DocumentGenerationRequest):
+    engagement_form_type: str
 
 class UtilityInfoRequest(BaseModel):
     business_name: str
@@ -925,6 +930,37 @@ def generate_eoi_endpoint(
         logging.error(f"Error generating EOI for {request.business_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating EOI: {str(e)}")
 
+@app.post("/api/generate-engagement-form")
+def generate_engagement_form_endpoint(
+    request: EngagementFormGenerationRequest,
+    user_info: dict = Depends(verify_google_token)
+):
+    """Generate Engagement Form document"""
+    logging.info(f"Received Engagement Form generation request for: {request.business_name}, type: {request.engagement_form_type}")
+    
+    try:
+        result = engagement_form_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            engagement_form_type=request.engagement_form_type,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"Engagement Form generation completed for: {request.business_name}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating Engagement Form for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating Engagement Form: {str(e)}")
+
 @app.post("/api/generate-ghg-offer")
 def generate_ghg_offer_endpoint(
     request: DocumentGenerationRequest,
@@ -1291,6 +1327,14 @@ def get_eoi_types_endpoint(user_info: dict = Depends(verify_google_token)):
     """Get available Expression of Interest types"""
     return {
         "eoi_types": get_available_eoi_types(),
+        "user_email": user_info.get("email")
+    }
+
+@app.get("/api/engagement-form-types")
+def get_engagement_form_types_endpoint(user_info: dict = Depends(verify_google_token)):
+    """Get available Engagement Form types"""
+    return {
+        "engagement_form_types": get_available_engagement_form_types(),
         "user_email": user_info.get("email")
     }
 
