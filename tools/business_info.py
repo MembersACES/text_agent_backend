@@ -184,6 +184,51 @@ def get_file_ids(business_name: str) -> dict:
         logger.exception(e)
         return {}
 
+
+# Base 1 Landing Page Responses sheet (interface form submissions)
+BASE1_LANDING_SHEET_ID = os.getenv("BASE1_LANDING_SHEET_ID", "1FNQXlecyp-qrzao2TOzbndKoCfUPGFN_HgbkNmAs0jw")
+BASE1_LANDING_SHEET_NAME = os.getenv("BASE1_LANDING_SHEET_NAME", "Landing Page Responses")
+
+
+def get_base1_landing_responses() -> list:
+    """
+    Get all rows from the Base 1 Landing Page Responses Google Sheet.
+    Returns a list of dicts (one per row) with columns: Company Name, Contact Name,
+    Contact Email, Contact Number, State, Timestamp, Additional Notes, Base 1 Review.
+    Email HTML column is excluded from the response.
+    """
+    service = get_sheets_service()
+    if not service:
+        logger.error("Could not create Google Sheets service for Base 1 landing responses")
+        return []
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=BASE1_LANDING_SHEET_ID,
+            range=f"'{BASE1_LANDING_SHEET_NAME}'!A:I",
+        ).execute()
+        rows = result.get("values", [])
+        if not rows:
+            return []
+        headers = [str(h).strip() for h in rows[0]]
+        exclude = {"Email HTML", "email_html"}
+        out = []
+        for row in rows[1:]:
+            obj = {}
+            for i, key in enumerate(headers):
+                if key in exclude:
+                    continue
+                obj[key] = row[i] if i < len(row) else ""
+            out.append(obj)
+        return out
+    except HttpError as e:
+        logger.error(f"Google Sheets API error reading Base 1 landing responses: {e.resp.status_code} - {e.reason}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error reading Base 1 landing responses: {str(e)}")
+        logger.exception(e)
+        return []
+
+
 def get_business_information(business_name: str) -> dict:
     """
     Get the business information including:

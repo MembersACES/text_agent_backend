@@ -33,7 +33,7 @@ import csv
 import io
 
 # Adjust this import if your function is in a different location
-from tools.business_info import get_business_information
+from tools.business_info import get_business_information, get_base1_landing_responses
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -948,6 +948,21 @@ def get_contract_types(user_info: dict = Depends(verify_google_token)):
         "eois": eois,
         "user_email": user_info.get("email")
     }
+
+
+@app.get("/api/base1-landing-responses")
+def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Get Base 1 Landing Page Responses from Google Sheet (Landing Page Responses tab).
+    Returns rows without the Email HTML column. Requires Google auth.
+    """
+    try:
+        rows = get_base1_landing_responses()
+        return {"rows": rows, "user_email": user_info.get("email")}
+    except Exception as e:
+        logging.error(f"Error fetching Base 1 landing responses: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load Base 1 landing responses")
+
 
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
