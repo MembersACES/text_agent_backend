@@ -126,23 +126,56 @@ def on_startup() -> None:
     """
     init_db()
 
+# CORS: allow these origins so error responses (e.g. 500) can include CORS headers
+CORS_ORIGINS = [
+    "https://acesagentinterface-672026052958.australia-southeast2.run.app",
+    "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
+    "https://acesagentinterface-672026052958.australia-southeast7.run.app",
+    "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://script.google.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app",
-        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
-        "https://acesagentinterface-672026052958.australia-southeast7.run.app",
-        "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://script.google.com",
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 from fastapi import Header
+from starlette.requests import Request as StarletteRequest
+
+def _cors_headers_for_origin(origin: Optional[str]) -> Dict[str, str]:
+    """Return CORS headers for a response if origin is allowed (so 500/error responses still allow CORS)."""
+    if not origin or origin not in CORS_ORIGINS:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+    }
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: StarletteRequest, exc: Exception):
+    """Ensure every response (including 500 and 4xx) includes CORS headers."""
+    origin = request.headers.get("origin")
+    headers = _cors_headers_for_origin(origin)
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers,
+        )
+    logging.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=headers,
+    )
 
 @app.get("/")
 async def root():
@@ -199,6 +232,9 @@ def verify_google_token(authorization: str = Header(...)):
         if "expired" in error_msg:
             raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
         
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        logging.error(f"Token verification error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
