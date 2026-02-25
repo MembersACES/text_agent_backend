@@ -34,4 +34,6 @@ class OfferActivityType(str, Enum):
     GHG_OFFER = "ghg_offer"
     ENGAGEMENT_FORM = "engagement_form"
     DISCREPANCY_EMAIL_SENT = "discrepancy_email_sent"
+    DMA_REVIEW_GENERATED = "dma_review_generated"
+    DMA_EMAIL_SENT = "dma_email_sent"
 

@@ -862,6 +862,13 @@ async def send_quote_request_endpoint(
                     activity_type=OfferActivityType.QUOTE_REQUEST,
                     document_link=result.get("document_link") if isinstance(result, dict) else None,
                     external_id=result.get("quote_request_id") if isinstance(result, dict) else None,
+                    metadata={
+                        "utility_type": utility_type or None,
+                        "utility_type_identifier": request_data.get("utility_type_identifier", "") or None,
+                        "nmi": nmi or None,
+                        "mrin": mrin or None,
+                        "source": "quote_request_page",
+                    },
                     created_by=user_email,
                 )
             except Exception as act_e:
@@ -1138,7 +1145,10 @@ def generate_engagement_form_endpoint(
                         client=client,
                         activity_type=OfferActivityType.ENGAGEMENT_FORM,
                         document_link=result.get("document_link"),
-                        metadata={"form_type": request.engagement_form_type},
+                        metadata={
+                            "form_type": request.engagement_form_type,
+                            "source": "document_generation_page",
+                        },
                         created_by=user_info.get("email"),
                     )
             except Exception as act_e:
@@ -1196,6 +1206,10 @@ def generate_ghg_offer_endpoint(
                         client=client,
                         activity_type=OfferActivityType.GHG_OFFER,
                         document_link=doc_link,
+                        metadata={
+                            "utility_type": "electricity",
+                            "source": "document_generation_page",
+                        },
                         created_by=user_info.get("email"),
                     )
             except Exception as act_e:
@@ -3388,6 +3402,12 @@ def post_offer_activity(
     if offer.client_id:
         client = db.query(Client).filter(Client.id == offer.client_id).first()
     created_by = body.created_by or (user_data.get("email") if user_data else None)
+    # Normalise/augment metadata so utility context is always present where possible.
+    metadata = dict(body.metadata or {}) if body.metadata is not None else {}
+    if "utility_type" not in metadata and getattr(offer, "utility_type", None):
+        metadata["utility_type"] = offer.utility_type
+    if "utility_type_identifier" not in metadata and getattr(offer, "utility_type_identifier", None):
+        metadata["utility_type_identifier"] = offer.utility_type_identifier
     activity = create_offer_activity(
         db,
         offer=offer,
@@ -3395,7 +3415,7 @@ def post_offer_activity(
         activity_type=body.activity_type,
         document_link=body.document_link,
         external_id=body.external_id,
-        metadata=body.metadata,
+        metadata=metadata,
         created_by=created_by,
     )
     return OfferActivityResponse.model_validate(activity)
