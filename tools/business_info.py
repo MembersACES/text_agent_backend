@@ -194,7 +194,7 @@ def get_base1_landing_responses() -> list:
     """
     Get all rows from the Base 1 Landing Page Responses Google Sheet.
     Returns a list of dicts (one per row) with columns: Company Name, Contact Name,
-    Contact Email, Contact Number, State, Timestamp, Additional Notes, Base 1 Review.
+    Contact Email, Contact Number, State, Timestamp, Google Drive Folder, Base 1 Review, Utility Types.
     Email HTML column is excluded from the response.
     """
     service = get_sheets_service()
@@ -204,7 +204,7 @@ def get_base1_landing_responses() -> list:
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=BASE1_LANDING_SHEET_ID,
-            range=f"'{BASE1_LANDING_SHEET_NAME}'!A:I",
+            range=f"'{BASE1_LANDING_SHEET_NAME}'!A:J",
         ).execute()
         rows = result.get("values", [])
         if not rows:
