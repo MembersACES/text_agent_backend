@@ -61,11 +61,11 @@ CONTRACT_EMAIL_MAPPINGS = {
     },
     "Alinta C&I Electricity": {
         "name": "Alinta",
-        "email": "Andrew.Barnes@alintaenergy.com.au, Moulee.Siriharan@alintaenergy.com.au, data.quote@fornrg.com"
+        "email": "Andrew.Barnes@alintaenergy.com.au, Lewis.Chase@alintaenergy.com.au, Cindy.Ho@alintaenergy.com.au, business@acesolutions.com.au, data.quote@fornrg.com"
     },
     "Alinta C&I Gas": {
         "name": "Alinta",
-        "email": "Andrew.Barnes@alintaenergy.com.au, Moulee.Siriharan@alintaenergy.com.au, data.quote@fornrg.com"
+        "email": "Andrew.Barnes@alintaenergy.com.au, Lewis.Chase@alintaenergy.com.au, Cindy.Ho@alintaenergy.com.au, business@acesolutions.com.au, data.quote@fornrg.com"
     },
     "Other": {
         "name": "Other",
