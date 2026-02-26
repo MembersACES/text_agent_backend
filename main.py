@@ -98,7 +98,7 @@ from services.crm import (
     get_or_create_offer_for_activity,
 )
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from utils.task_history import (
     log_task_created,
     log_field_change,
@@ -1138,6 +1138,7 @@ def generate_engagement_form_endpoint(
                     offer = get_or_create_offer_for_activity(
                         db, client.id, request.business_name, "engagement_form",
                         created_by=user_info.get("email"),
+                        utility_type_identifier="Engagement form",
                     )
                     create_offer_activity(
                         db,
@@ -1198,6 +1199,7 @@ def generate_ghg_offer_endpoint(
                     offer = get_or_create_offer_for_activity(
                         db, client.id, request.business_name, "ghg",
                         created_by=user_info.get("email"),
+                        utility_type_identifier="Electricity",
                     )
                     doc_link = result.get("document_link")
                     create_offer_activity(
@@ -3200,8 +3202,124 @@ def create_client_note_for_id(
     return db_note
 
 
+def _parse_activity_metadata(meta_raw):  # noqa: ANN001
+    """Parse activity metadata from DB (may be JSON string)."""
+    if meta_raw is None:
+        return None
+    if isinstance(meta_raw, dict):
+        return meta_raw
+    if isinstance(meta_raw, str):
+        try:
+            return json.loads(meta_raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
+    """Map activity_type to display prefix: Base 2, DMA, or Comparison."""
+    if not activity_type:
+        return None
+    at = (activity_type or "").strip().lower()
+    if at == "base2_review":
+        return "Base 2"
+    if at in ("dma_review_generated", "dma_email_sent"):
+        return "DMA"
+    if at == "comparison":
+        return "Comparison"
+    return None
+
+
+def _get_offer_source_prefix_from_activities(db: Session, offer: Offer) -> Optional[str]:
+    """Return the source prefix (Base 2, DMA, Comparison) from the offer's most recent relevant activity."""
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    for a in activities:
+        prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if prefix:
+            return prefix
+    return None
+
+
+def _derived_offer_fields_from_activities(db: Session, offer: Offer) -> dict:
+    """
+    When an offer has no utility_type/identifier set, derive from its activities' metadata
+    so the list and detail pages show data (e.g. Gas, NMI) from Base 2 / comparison runs.
+    Also sets source_prefix (Base 2, DMA, Comparison) for utility_display.
+    """
+    out = {}
+    if offer.utility_type or offer.utility_type_identifier or offer.identifier:
+        return out
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    utility_type = None
+    utility_type_identifier = None
+    identifier = None
+    source_prefix = None
+    for a in activities:
+        meta = _parse_activity_metadata(getattr(a, "metadata_", None))
+        if not meta:
+            continue
+        if utility_type is None and meta.get("utility_type"):
+            utility_type = (meta.get("utility_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type is None and meta.get("comparison_type"):
+            utility_type = (meta.get("comparison_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type_identifier is None and meta.get("utility_type_identifier"):
+            utility_type_identifier = (meta.get("utility_type_identifier") or "").strip()
+        if identifier is None:
+            id_val = (
+                meta.get("nmi")
+                or meta.get("mrin")
+                or meta.get("identifier")
+                or meta.get("account_number")
+                or meta.get("account_name")
+            )
+            if id_val:
+                identifier = str(id_val).strip()
+        if utility_type and identifier and utility_type_identifier and source_prefix is not None:
+            break
+    if utility_type:
+        raw = (utility_type or "").lower()
+        if not utility_type_identifier:
+            utility_type_identifier = (
+                "Electricity" if raw == "electricity"
+                else "Gas" if raw == "gas"
+                else "Waste" if raw == "waste"
+                else "Oil" if raw == "oil"
+                else "Cleaning" if raw == "cleaning"
+                else "DMA" if raw == "dma"
+                else utility_type
+            )
+        out["utility_type"] = utility_type
+        out["utility_type_identifier"] = utility_type_identifier
+        if source_prefix is None:
+            source_prefix = _activity_type_to_source_prefix(
+                activities[0].activity_type if activities else None
+            )
+        out["source_prefix"] = source_prefix
+    if identifier:
+        out["identifier"] = identifier
+    return out
+
+
 def _offer_to_response(db: Session, offer: Offer) -> OfferResponse:
-    """Build OfferResponse with derived is_existing_client from linked client stage."""
+    """Build OfferResponse with derived is_existing_client from linked client stage.
+    When offer has no utility/identifier, derive from activities so list and detail show data.
+    Sets utility_display as 'Base 2 Gas' / 'DMA Electricity' / 'Comparison Gas' when source is known."""
     is_existing = False
     if offer.client_id:
         client = db.query(Client).filter(Client.id == offer.client_id).first()
@@ -3209,9 +3327,32 @@ def _offer_to_response(db: Session, offer: Offer) -> OfferResponse:
             stage_val = (client.stage or "").strip().lower()
             if stage_val in (s.value for s in POST_WIN_STAGES):
                 is_existing = True
-    return OfferResponse.model_validate(offer).model_copy(
+    base = OfferResponse.model_validate(offer).model_copy(
         update={"is_existing_client": is_existing}
     )
+    utility_display = base.utility_type_identifier or base.utility_type
+    if not offer.utility_type and not offer.utility_type_identifier and not offer.identifier:
+        derived = _derived_offer_fields_from_activities(db, offer)
+        if derived:
+            label = derived.get("utility_type_identifier") or derived.get("utility_type")
+            prefix = derived.get("source_prefix")
+            if prefix and label:
+                utility_display = f"{prefix} {label}"
+            elif label:
+                utility_display = label
+            base = base.model_copy(update={
+                "utility_type": derived.get("utility_type") or base.utility_type,
+                "utility_type_identifier": derived.get("utility_type_identifier") or base.utility_type_identifier,
+                "identifier": derived.get("identifier") or base.identifier,
+            })
+    else:
+        # Offer has utility data; still add source prefix from activities if present
+        prefix = _get_offer_source_prefix_from_activities(db, offer)
+        if prefix and utility_display:
+            utility_display = f"{prefix} {utility_display}"
+    if utility_display:
+        base = base.model_copy(update={"utility_display": utility_display})
+    return base
 
 
 @app.post("/api/offers", response_model=OfferResponse)
@@ -3247,6 +3388,8 @@ def create_offer(
 def list_offers(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
@@ -3255,7 +3398,7 @@ def list_offers(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    """List offers, optionally filtered by client, status, date range, or mine (by client owner). When limit/offset set, returns { items, total }."""
+    """List offers, optionally filtered by client, status, utility, identifier, date range, or mine (by client owner). When limit/offset set, returns { items, total }."""
     from datetime import datetime as dt
     from datetime import timedelta
     logging.info("Listing offers")
@@ -3270,6 +3413,16 @@ def list_offers(
             query = query.filter(Offer.id == -1)
     if status is not None:
         query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -3299,6 +3452,8 @@ def list_offers(
 def export_offers_csv(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
@@ -3319,6 +3474,16 @@ def export_offers_csv(
             query = query.filter(Offer.id == -1)
     if status is not None:
         query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -3623,7 +3788,7 @@ def activities_report_list(
     from datetime import timedelta
     logging.info("Listing activities for report")
     query = (
-        db.query(OfferActivity, Offer.business_name)
+        db.query(OfferActivity, Offer)
         .join(Offer, OfferActivity.offer_id == Offer.id)
     )
     if client_id is not None:
@@ -3649,19 +3814,26 @@ def activities_report_list(
         .limit(limit)
         .all()
     )
-    return [
-        ActivityReportItem(
-            id=act.id,
-            offer_id=act.offer_id,
-            client_id=act.client_id,
-            business_name=business_name,
-            activity_type=act.activity_type,
-            document_link=act.document_link,
-            created_at=act.created_at,
-            created_by=act.created_by,
+    out = []
+    for act, offer in rows:
+        resp = _offer_to_response(db, offer)
+        offer_display = (resp.utility_display or "Offer")
+        if resp.identifier:
+            offer_display = f"{offer_display} {resp.identifier}"
+        out.append(
+            ActivityReportItem(
+                id=act.id,
+                offer_id=act.offer_id,
+                client_id=act.client_id,
+                business_name=offer.business_name,
+                activity_type=act.activity_type,
+                document_link=act.document_link,
+                created_at=act.created_at,
+                created_by=act.created_by,
+                offer_display=offer_display or None,
+            )
         )
-        for act, business_name in rows
-    ]
+    return out
 
 
 @app.get("/api/reports/activities/summary")

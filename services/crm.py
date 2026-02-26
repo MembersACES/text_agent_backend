@@ -188,6 +188,8 @@ def get_or_create_offer_for_activity(
     business_name: str,
     utility_type: str,
     created_by: Optional[str] = None,
+    utility_type_identifier: Optional[str] = None,
+    identifier: Optional[str] = None,
 ) -> Offer:
     """
     Find an existing offer for this client + utility type, or create a minimal one.
@@ -210,6 +212,8 @@ def get_or_create_offer_for_activity(
         client_id=client_id,
         business_name=business_name,
         utility_type=utility_type,
+        utility_type_identifier=utility_type_identifier or None,
+        identifier=identifier or None,
         status=OfferStatus.REQUESTED.value,
         created_by=created_by,
     )

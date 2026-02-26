@@ -186,6 +186,8 @@ class OfferResponse(BaseModel):
     utility_type: Optional[str] = None
     utility_type_identifier: Optional[str] = None
     identifier: Optional[str] = None
+    # Display: "Base 2 Gas", "DMA Electricity", "Comparison Gas" (source + utility) for Utility column
+    utility_display: Optional[str] = None
     status: OfferStatus
     estimated_value: Optional[int] = None
     created_by: Optional[str] = None
@@ -278,6 +280,8 @@ class ActivityReportItem(BaseModel):
     document_link: Optional[str] = None
     created_at: datetime
     created_by: Optional[str] = None
+    # Full label "Base 2 Gas 5321568754" (source + utility + identifier) for Offer column
+    offer_display: Optional[str] = None
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime, _info):
