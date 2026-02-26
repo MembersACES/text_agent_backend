@@ -1007,6 +1007,138 @@ def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google
         raise HTTPException(status_code=500, detail="Failed to load Base 1 landing responses")
 
 
+@app.get("/api/base1-leads")
+def get_base1_leads_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Lead pipeline view backed by Base 1 runs.
+
+    - Source rows: Base 1 Landing Page Responses sheet (via get_base1_landing_responses)
+    - Filters out businesses that already exist as CRM clients (by business_name or primary_contact_email)
+    - Groups by Company Name so each business appears once (most recent run wins)
+    - Enriches with a simple lead status from ClientStatusNote where note_type='lead_status'
+      (latest note per business), defaulting to "New" when none exists.
+
+    Returns:
+        {
+          "rows": [
+            {
+              "id": str,  # stable per business (company name)
+              "company_name": str,
+              "contact_name": str | null,
+              "contact_email": str | null,
+              "contact_number": str | null,
+              "state": str | null,
+              "timestamp": str | null,
+              "drive_folder_url": str | null,
+              "base1_review_url": str | null,
+              "utility_types": str | null,
+              "status": str,  # e.g. "New", "Contacted", "Qualified", "Not a fit"
+            },
+            ...
+          ],
+          "user_email": str | null,
+        }
+    """
+    try:
+        # 1) Load raw Base 1 rows from Google Sheet
+        raw_rows = get_base1_landing_responses() or []
+
+        # 2) Build lookup sets for existing CRM members to filter out
+        existing_clients = db.query(Client.business_name, Client.primary_contact_email).all()
+        existing_names = {
+            (c.business_name or "").strip().lower()
+            for c in existing_clients
+            if c.business_name
+        }
+        existing_emails = {
+            (c.primary_contact_email or "").strip().lower()
+            for c in existing_clients
+            if c.primary_contact_email
+        }
+
+        # 3) Group Base 1 rows by Company Name and keep the most recent by Timestamp
+        grouped_by_company: dict[str, dict] = {}
+        for row in raw_rows:
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+
+            email = (row.get("Contact Email") or "").strip()
+            # Skip if this company or email is already a CRM member
+            if company.lower() in existing_names or (email and email.lower() in existing_emails):
+                continue
+
+            key = company.lower()
+            current = grouped_by_company.get(key)
+            ts = row.get("Timestamp") or ""
+            if current is None:
+                grouped_by_company[key] = row
+            else:
+                # Prefer the row with the latest timestamp (lexicographically; sheet timestamps are ISO-like)
+                current_ts = current.get("Timestamp") or ""
+                if ts > current_ts:
+                    grouped_by_company[key] = row
+
+        # Nothing left after filtering
+        if not grouped_by_company:
+            return {"rows": [], "user_email": user_info.get("email")}
+
+        # 4) Fetch latest lead_status note per business in one query
+        company_names = [row.get("Company Name") or "" for row in grouped_by_company.values()]
+        # Strip blanks
+        company_names = [name for name in (n.strip() for n in company_names) if name]
+
+        status_by_business: dict[str, str] = {}
+        if company_names:
+            notes_q = (
+                db.query(ClientStatusNote)
+                .filter(
+                    ClientStatusNote.business_name.in_(company_names),
+                    ClientStatusNote.note_type == "lead_status",
+                )
+                .order_by(ClientStatusNote.business_name.asc(), ClientStatusNote.created_at.desc())
+            )
+            for n in notes_q.all():
+                name = (n.business_name or "").strip()
+                # First (most recent per business) wins thanks to ordering
+                if name and name not in status_by_business:
+                    status_by_business[name] = (n.note or "").strip() or "New"
+
+        # 5) Build response rows
+        rows = []
+        for key, row in grouped_by_company.items():
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+            status = status_by_business.get(company, "New")
+
+            rows.append(
+                {
+                    "id": company,  # stable id per business for frontend grouping
+                    "company_name": company,
+                    "contact_name": (row.get("Contact Name") or "").strip() or None,
+                    "contact_email": (row.get("Contact Email") or "").strip() or None,
+                    "contact_number": (row.get("Contact Number") or "").strip() or None,
+                    "state": (row.get("State") or "").strip() or None,
+                    "timestamp": (row.get("Timestamp") or "").strip() or None,
+                    "drive_folder_url": (row.get("Google Drive Folder") or "").strip() or None,
+                    "base1_review_url": (row.get("Base 1 Review") or "").strip() or None,
+                    "utility_types": (row.get("Utility Types") or "").strip() or None,
+                    "status": status or "New",
+                }
+            )
+
+        return {"rows": rows, "user_email": user_info.get("email")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error building Base 1 leads: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load Base 1 leads")
+
+
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
     request: DocumentGenerationRequest,
@@ -3027,6 +3159,75 @@ def update_client(
     return db_client
 
 
+@app.delete("/api/clients/{client_id}", response_model=dict)
+def delete_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a client and all dependent CRM records.
+
+    This removes:
+    - Offer activities for this client's offers (and any activities directly linked by client_id)
+    - Offers linked to this client
+    - Client status notes linked by client_id
+    - Tasks linked to this client, plus their TaskHistory entries
+    Finally, deletes the Client row itself.
+    """
+    logging.info(f"Deleting client {client_id} and dependent records")
+
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # 1) Offers and offer activities
+    offer_ids = [
+        o.id
+        for o in db.query(Offer.id)
+        .filter(Offer.client_id == client_id)
+        .all()
+    ]
+    if offer_ids:
+        db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+    # Also remove any activities that reference this client directly
+    db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    db.query(Offer).filter(Offer.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 2) Tasks and task history
+    task_ids = [
+        t.id
+        for t in db.query(Task.id)
+        .filter(Task.client_id == client_id)
+        .all()
+    ]
+    if task_ids:
+        db.query(TaskHistory).filter(TaskHistory.task_id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(Task).filter(Task.id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+
+    # 3) Client status notes linked by client_id
+    db.query(ClientStatusNote).filter(ClientStatusNote.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 4) Finally, delete the client itself
+    db.delete(client)
+    db.commit()
+
+    logging.info(f"Client {client_id} and dependent records deleted")
+    return {"status": "success", "message": "Client and related data deleted"}
+
+
 @app.post("/api/clients/search", response_model=List[ClientResponse])
 def search_clients(
     search: ClientSearchRequest,
@@ -3638,6 +3839,44 @@ def update_offer_status(
         new_status=status_update.status,
     )
     return _offer_to_response(db, updated)
+
+
+@app.delete("/api/offers/{offer_id}", response_model=dict)
+def delete_offer(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a single offer and its dependent records.
+
+    This removes:
+    - OfferActivity rows for this offer
+    - ClientStatusNote rows linked via related_offer_id for this offer
+    Finally, deletes the Offer row.
+    """
+    logging.info(f"Deleting offer {offer_id} and dependent records")
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    # Delete activities for this offer
+    db.query(OfferActivity).filter(OfferActivity.offer_id == offer_id).delete(
+        synchronize_session=False
+    )
+
+    # Delete notes that are explicitly linked to this offer
+    db.query(ClientStatusNote).filter(
+        ClientStatusNote.related_offer_id == offer_id
+    ).delete(synchronize_session=False)
+
+    # Delete the offer itself
+    db.delete(offer)
+    db.commit()
+
+    logging.info(f"Offer {offer_id} and dependent records deleted")
+    return {"status": "success", "message": "Offer and related data deleted"}
 
 
 @app.get("/api/reports/clients/offer-counts")
