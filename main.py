@@ -354,7 +354,8 @@ class OfferStatusUpdateRequest(BaseModel):
 
 
 class ClientBulkUpdateRequest(BaseModel):
-    client_ids: List[int]
+    # Accept arbitrary JSON values here; we'll coerce to ints explicitly
+    client_ids: List[object]
     owner_email: Optional[str] = None
     stage: Optional[ClientStage] = None
 
@@ -3282,35 +3283,78 @@ def global_search(
     return {"clients": client_list, "offers": offer_list}
 
 
-@app.patch("/api/clients/bulk", response_model=List[ClientResponse])
+@app.patch("/api/client-bulk-update", response_model=List[ClientResponse])
 def bulk_update_clients(
     body: ClientBulkUpdateRequest,
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
     """Bulk update clients: set owner_email and/or stage for the given client IDs. For stage changes, history is recorded."""
+    logging.info(
+        "[CRM] bulk_update_clients called with body=%s",
+        body.model_dump(mode="json"),
+    )
     if not body.client_ids:
+        logging.info("[CRM] bulk_update_clients: empty client_ids, returning []")
         return []
+
     user_email = (user_data.get("idinfo") or {}).get("email") or ""
-    updated = []
-    for client_id in body.client_ids:
+
+    # Coerce all client_ids to integers and fail fast with a clear error
+    try:
+        client_ids = [int(raw_id) for raw_id in body.client_ids]
+    except (TypeError, ValueError) as exc:
+        logging.error(
+            "[CRM] bulk_update_clients: failed to coerce client_ids=%r (types=%r): %s",
+            body.client_ids,
+            [type(x) for x in body.client_ids],
+            exc,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid client_ids: all client_ids must be integers.",
+        )
+    updated: List[Client] = []
+    any_changes = False
+
+    for client_id in client_ids:
         client = db.query(Client).filter(Client.id == client_id).first()
         if not client:
             continue
+
         if body.owner_email is not None:
             client.owner_email = body.owner_email.strip() or None
+            any_changes = True
+
         if body.stage is not None:
             update_client_stage_with_history(
                 db=db,
                 client_id=client_id,
                 new_stage=body.stage,
                 user_email=user_email,
+                commit=False,
             )
-        else:
-            db.commit()
-        db.refresh(client)
+            any_changes = True
+
         updated.append(client)
-    return [ClientResponse.model_validate(c) for c in updated]
+
+    logging.info(
+        "[CRM] bulk_update_clients: any_changes=%s, client_ids=%s, stage=%s, owner_email=%s, user_email=%s",
+        any_changes,
+        client_ids,
+        body.stage,
+        body.owner_email,
+        user_email,
+    )
+
+    if any_changes:
+        db.commit()
+        for client in updated:
+            db.refresh(client)
+
+    return [
+        ClientResponse.model_validate(c).model_dump(mode="json") for c in updated
+    ]
 
 
 @app.patch("/api/clients/{client_id}/stage", response_model=ClientResponse)

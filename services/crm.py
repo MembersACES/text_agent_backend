@@ -65,6 +65,8 @@ def update_client_stage_with_history(
     client_id: int,
     new_stage: ClientStage,
     user_email: str,
+    *,
+    commit: bool = True,
 ) -> Client:
     """
     Update a client's stage and append a structured ClientStatusNote entry.
@@ -96,8 +98,9 @@ def update_client_stage_with_history(
         )
         db.add(stage_note)
 
-    db.commit()
-    db.refresh(client)
+    if commit:
+        db.commit()
+        db.refresh(client)
     return client
 
 
