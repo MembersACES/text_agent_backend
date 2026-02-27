@@ -88,8 +88,15 @@ from schemas import (
     OfferActivityCreate,
     OfferActivityResponse,
     ActivityReportItem,
+    OfferPipelineStage as OfferPipelineStageSchema,
 )
-from crm_enums import ClientStage, OfferStatus, OfferActivityType, POST_WIN_STAGES
+from crm_enums import (
+    ClientStage,
+    OfferStatus,
+    OfferActivityType,
+    OfferPipelineStage,
+    POST_WIN_STAGES,
+)
 from services.crm import (
     upsert_client_from_business_info,
     update_client_stage_with_history,
@@ -109,6 +116,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -351,6 +359,10 @@ class ClientStageUpdateRequest(BaseModel):
 
 class OfferStatusUpdateRequest(BaseModel):
     status: OfferStatus
+
+
+class OfferPipelineStageUpdateRequest(BaseModel):
+    pipeline_stage: OfferPipelineStageSchema
 
 
 class ClientBulkUpdateRequest(BaseModel):
@@ -669,35 +681,104 @@ def drive_filing_endpoint(
 @app.post("/api/data-request")
 def data_request(
     request: DataRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     logging.info(f"Received data request: {request}")
     service_type = request.request_type
-    account_identifier = request.details or ""
+    account_identifier = (request.details or "").strip()
 
-    # Map service_type to identifier_type
+    # Map service_type to identifier_type and utility context
     if service_type in ["electricity_ci", "electricity_sme"]:
         identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = (
+            "C&I Electricity" if service_type == "electricity_ci" else "SME Electricity"
+        )
     elif service_type in ["gas_ci", "gas_sme"]:
         identifier_type = "MRIN"
+        utility_type = "gas"
+        utility_type_identifier = "C&I Gas" if service_type == "gas_ci" else "SME Gas"
     elif service_type == "waste":
         identifier_type = "account_number"
+        utility_type = "waste"
+        utility_type_identifier = "Waste"
     else:
-        identifier_type = "NMI"  # default fallback
+        # Fallback to electricity/NMI if an unknown type sneaks through
+        identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = "Electricity"
 
-    result = supplier_data_request(
+    raw_result = supplier_data_request(
         supplier_name=request.supplier_name,
         business_name=request.business_name,
         service_type=service_type,
         account_identifier=account_identifier,
-        identifier_type=identifier_type
+        identifier_type=identifier_type,
     )
-    if isinstance(result, dict):
-        result["user_email"] = user_info.get("email")
-    else:
-        result = {"status": "error", "message": result, "user_email": user_info.get("email")}
-    logging.info(f"Returning data request response to frontend: {result}")
-    return result
+
+    # Determine success based on the human-readable message
+    message = str(raw_result or "").strip()
+    is_success = message.startswith("✅") or "Data request successfully sent" in message
+
+    # On success, upsert client, ensure offer, and record an offer activity
+    if is_success and request.business_name:
+        try:
+            user_email = user_info.get("email")
+
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=request.business_name,
+                external_business_id=None,
+                primary_contact_email=None,
+                gdrive_folder_url=None,
+            )
+
+            offer = None
+            if client:
+                offer = get_or_create_offer_for_activity(
+                    db=db,
+                    client_id=client.id,
+                    business_name=request.business_name,
+                    utility_type=utility_type,
+                    utility_type_identifier=utility_type_identifier,
+                    identifier=account_identifier or None,
+                    created_by=user_email,
+                )
+
+            if offer:
+                metadata = {
+                    "service_type": service_type,
+                    "utility_type": utility_type,
+                    "utility_type_identifier": utility_type_identifier,
+                    "identifier_type": identifier_type,
+                    "identifier": account_identifier or None,
+                    "supplier_name": request.supplier_name,
+                    "source": "data_request_page",
+                }
+                try:
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.DATA_REQUEST,
+                        metadata=metadata,
+                        created_by=user_email,
+                    )
+                except Exception as act_e:
+                    logging.warning(
+                        "Failed to create DATA_REQUEST offer activity: %s", act_e
+                    )
+        except Exception as crm_e:
+            logging.error("Failed to record CRM data for data request: %s", crm_e)
+
+    response_payload = {
+        "status": "success" if is_success else "error",
+        "message": message,
+        "user_email": user_info.get("email"),
+    }
+    logging.info(f"Returning data request response to frontend: {response_payload}")
+    return response_payload
 
 class SignedAgreementRequest(BaseModel):
     business_name: str
@@ -3616,7 +3697,12 @@ def create_offer(
         utility_type=offer.utility_type,
         utility_type_identifier=offer.utility_type_identifier,
         identifier=offer.identifier,
-        status=offer.status or "requested",
+        status=(offer.status or OfferStatus.REQUESTED).value
+        if isinstance(offer.status, OfferStatus)
+        else (offer.status or OfferStatus.REQUESTED.value),
+        pipeline_stage=offer.pipeline_stage.value
+        if isinstance(getattr(offer, "pipeline_stage", None), OfferPipelineStageSchema)
+        else getattr(offer, "pipeline_stage", None),
         estimated_value=offer.estimated_value,
         created_by=user_email,
         external_record_id=offer.external_record_id,
@@ -3855,13 +3941,23 @@ def update_offer(
     if offer_update.identifier is not None:
         db_offer.identifier = offer_update.identifier
     if offer_update.status is not None:
-        db_offer.status = offer_update.status
+        db_offer.status = (
+            offer_update.status.value
+            if isinstance(offer_update.status, OfferStatus)
+            else str(offer_update.status)
+        )
     if offer_update.estimated_value is not None:
         db_offer.estimated_value = offer_update.estimated_value
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
         db_offer.document_link = offer_update.document_link
+    if offer_update.pipeline_stage is not None:
+        db_offer.pipeline_stage = (
+            offer_update.pipeline_stage.value
+            if isinstance(offer_update.pipeline_stage, OfferPipelineStageSchema)
+            else str(offer_update.pipeline_stage)
+        )
 
     db.commit()
     db.refresh(db_offer)
@@ -3883,6 +3979,52 @@ def update_offer_status(
         new_status=status_update.status,
     )
     return _offer_to_response(db, updated)
+
+
+@app.patch("/api/offers/{offer_id}/pipeline-stage", response_model=OfferResponse)
+def update_offer_pipeline_stage(
+    offer_id: int,
+    body: OfferPipelineStageUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Update the detailed pipeline stage for an offer.
+
+    For terminal pipeline stages (contract_accepted / lost) we delegate to status
+    propagation so that client lifecycle remains consistent.
+    """
+    logging.info(
+        "Updating offer %s pipeline_stage to %s", offer_id, body.pipeline_stage
+    )
+
+    stage = body.pipeline_stage
+    if stage in (
+        OfferPipelineStageSchema.CONTRACT_ACCEPTED,
+        OfferPipelineStageSchema.LOST,
+    ):
+        status = (
+            OfferStatus.ACCEPTED
+            if stage == OfferPipelineStageSchema.CONTRACT_ACCEPTED
+            else OfferStatus.LOST
+        )
+        updated = update_offer_status_and_propagate_client_stage(
+            db=db,
+            offer_id=offer_id,
+            new_status=status,
+        )
+        return _offer_to_response(db, updated)
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    offer.pipeline_stage = (
+        stage.value if isinstance(stage, OfferPipelineStageSchema) else str(stage)
+    )
+    db.commit()
+    db.refresh(offer)
+    return _offer_to_response(db, offer)
 
 
 @app.delete("/api/offers/{offer_id}", response_model=dict)

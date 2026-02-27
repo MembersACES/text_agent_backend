@@ -1,10 +1,10 @@
-﻿"""
+"""
 Database configuration with Cloud SQL (PostgreSQL) support
 Automatically switches between SQLite (local dev) and PostgreSQL (production)
 """
 import os
 import logging
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.declarative import declarative_base
 from dotenv import load_dotenv
@@ -50,5 +50,26 @@ def get_db():
         db.close()
 
 def init_db():
+    """
+    Initialise database tables and apply simple, safe migrations needed for new fields.
+
+    For now this includes:
+    - Adding offers.pipeline_stage if it does not exist (used for the detailed offer pipeline).
+    """
     Base.metadata.create_all(bind=engine)
     logging.info("✅ Database tables initialized")
+
+    # Lightweight migration: ensure offers.pipeline_stage exists.
+    try:
+        inspector = inspect(engine)
+        columns = [col["name"] for col in inspector.get_columns("offers")]
+        if "pipeline_stage" not in columns:
+            logging.info("Adding missing offers.pipeline_stage column")
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE offers ADD COLUMN pipeline_stage VARCHAR(50)")
+                )
+            logging.info("✅ Added offers.pipeline_stage column")
+    except Exception as e:
+        # Don't block startup if this fails; log and continue.
+        logging.warning("Could not ensure offers.pipeline_stage column: %s", e)

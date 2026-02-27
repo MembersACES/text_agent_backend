@@ -91,6 +91,9 @@ class Offer(Base):
     utility_type_identifier = Column(String(100), nullable=True)
     identifier = Column(String(255), nullable=True)
     status = Column(String(50), nullable=False, default="requested")
+    # Detailed, linear pipeline stage for this offer (comparison → engagement → contract).
+    # Kept as a simple string for compatibility; see OfferPipelineStage enum for allowed values.
+    pipeline_stage = Column(String(50), nullable=True)
     estimated_value = Column(Integer, nullable=True)
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
