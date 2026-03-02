@@ -23,14 +23,17 @@ import httpx
 from typing import Optional, List, Dict
 import json
 from fastapi import HTTPException, Depends
+from fastapi.responses import JSONResponse, Response
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import uuid
 import google.auth
+import csv
+import io
 
 # Adjust this import if your function is in a different location
-from tools.business_info import get_business_information
+from tools.business_info import get_business_information, get_base1_landing_responses
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -46,7 +49,9 @@ from tools.document_generation import (
     service_fee_agreement_generation,
     expression_of_interest_generation,
     ghg_offer_generation,
-    get_available_eoi_types
+    get_available_eoi_types,
+    engagement_form_generation,
+    get_available_engagement_form_types
 )
 from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
@@ -64,9 +69,43 @@ from tools.one_month_savings import (
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User, TaskHistory, ClientStatusNote
-from schemas import TaskCreate, TaskUpdate, TaskStatusUpdate, TaskResponse, UserResponse, ClientStatusNoteCreate, ClientStatusNoteUpdate, ClientStatusNoteResponse
+from models import Task, User, TaskHistory, ClientStatusNote, Client, Offer, OfferActivity
+from schemas import (
+    TaskCreate,
+    TaskUpdate,
+    TaskStatusUpdate,
+    TaskResponse,
+    UserResponse,
+    ClientStatusNoteCreate,
+    ClientStatusNoteUpdate,
+    ClientStatusNoteResponse,
+    ClientCreate,
+    ClientUpdate,
+    ClientResponse,
+    OfferCreate,
+    OfferUpdate,
+    OfferResponse,
+    OfferActivityCreate,
+    OfferActivityResponse,
+    ActivityReportItem,
+    OfferPipelineStage as OfferPipelineStageSchema,
+)
+from crm_enums import (
+    ClientStage,
+    OfferStatus,
+    OfferActivityType,
+    OfferPipelineStage,
+    POST_WIN_STAGES,
+)
+from services.crm import (
+    upsert_client_from_business_info,
+    update_client_stage_with_history,
+    update_offer_status_and_propagate_client_stage,
+    create_offer_activity,
+    get_or_create_offer_for_activity,
+)
 from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
 from utils.task_history import (
     log_task_created,
     log_field_change,
@@ -77,6 +116,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -85,35 +125,65 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 app = FastAPI()
 
+
+@app.on_event("startup")
+def on_startup() -> None:
+    """
+    Ensure all SQLAlchemy models (including new CRM tables like 'clients' and 'offers')
+    are created in the configured database on application startup.
+    """
+    init_db()
+
+# CORS: allow these origins so error responses (e.g. 500) can include CORS headers
+CORS_ORIGINS = [
+    "https://acesagentinterface-672026052958.australia-southeast2.run.app",
+    "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
+    "https://acesagentinterface-672026052958.australia-southeast7.run.app",
+    "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://script.google.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app",
-        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
-        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/canva-pitch-deck",
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app/canva-pitch-deck",
-        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/document-lodgement",
-        "http://localhost:3000",
-        "http://localhost:3000/signed-agreement-lodgement",
-        "http://localhost:3000/document-generation",
-        "http://localhost:3000/new-client-loa",
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app/google-presentations",
-        "http://localhost:3000/google-presentations",
-         "https://acesagentinterface-672026052958.australia-southeast2.run.app/solutions-strategy-generator",
-        "http://localhost:3000/solutions-strategy-generator",
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app/initial-strategy-generator",
-        "http://localhost:3000/initial-strategy-generator",
-        "https://script.google.com/macros/s/AKfycbxyH9xOa11ZpHQ1R5MWygNOLZRof9VfELR6Zq_ByKxnIUvrJL2VMWJhoXlzg2g_nmHO/exec",
-        "http://localhost:3000/quote-request",
-        "https://acesagentinterface-672026052958.australia-southeast2.run.app/quote-request",
-        "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app/quote-request",
-    ],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 from fastapi import Header
+from starlette.requests import Request as StarletteRequest
+
+def _cors_headers_for_origin(origin: Optional[str]) -> Dict[str, str]:
+    """Return CORS headers for a response if origin is allowed (so 500/error responses still allow CORS)."""
+    if not origin or origin not in CORS_ORIGINS:
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Access-Control-Allow-Methods": "*",
+        "Access-Control-Allow-Headers": "*",
+    }
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: StarletteRequest, exc: Exception):
+    """Ensure every response (including 500 and 4xx) includes CORS headers."""
+    origin = request.headers.get("origin")
+    headers = _cors_headers_for_origin(origin)
+    if isinstance(exc, HTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=headers,
+        )
+    logging.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+        headers=headers,
+    )
 
 @app.get("/")
 async def root():
@@ -170,6 +240,9 @@ def verify_google_token(authorization: str = Header(...)):
         if "expired" in error_msg:
             raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
         
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        logging.error(f"Token verification error: {e}")
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
@@ -267,22 +340,71 @@ class NewLOAGeneration(BaseModel):
 class EOIGenerationRequest(DocumentGenerationRequest):
     expression_type: str
 
+class EngagementFormGenerationRequest(DocumentGenerationRequest):
+    engagement_form_type: str
+
 class UtilityInfoRequest(BaseModel):
     business_name: str
     service_type: str
     identifier: Optional[str]
 
 
+class ClientSearchRequest(BaseModel):
+    query: str
+
+
+class ClientStageUpdateRequest(BaseModel):
+    stage: ClientStage
+
+
+class OfferStatusUpdateRequest(BaseModel):
+    status: OfferStatus
+
+
+class OfferPipelineStageUpdateRequest(BaseModel):
+    pipeline_stage: OfferPipelineStageSchema
+
+
+class ClientBulkUpdateRequest(BaseModel):
+    # Accept arbitrary JSON values here; we'll coerce to ints explicitly
+    client_ids: List[object]
+    owner_email: Optional[str] = None
+    stage: Optional[ClientStage] = None
+
+
 
 @app.post("/api/get-business-info")
 def get_business_info(
     request: BusinessInfoRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     logging.info(f"Received business info request: {request}")
     result = get_business_information(request.business_name)
     if isinstance(result, dict):
         result["user_email"] = user_info.get("email")
+        try:
+            business_details = result.get("business_details", {}) or {}
+            contact_info = result.get("contact_information", {}) or {}
+            gdrive_info = result.get("gdrive", {}) or {}
+
+            business_name = business_details.get("name") or request.business_name
+            external_business_id = result.get("record_ID")
+            primary_contact_email = contact_info.get("email")
+            gdrive_folder_url = gdrive_info.get("folder_url")
+
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=business_name,
+                external_business_id=external_business_id,
+                primary_contact_email=primary_contact_email,
+                gdrive_folder_url=gdrive_folder_url,
+            )
+            if client:
+                result["client_id"] = client.id
+        except Exception as e:
+            logging.error(f"Error upserting Client from business info: {str(e)}")
+
     logging.info(f"Returning response to frontend: {result}")
     return result
 
@@ -559,35 +681,104 @@ def drive_filing_endpoint(
 @app.post("/api/data-request")
 def data_request(
     request: DataRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     logging.info(f"Received data request: {request}")
     service_type = request.request_type
-    account_identifier = request.details or ""
+    account_identifier = (request.details or "").strip()
 
-    # Map service_type to identifier_type
+    # Map service_type to identifier_type and utility context
     if service_type in ["electricity_ci", "electricity_sme"]:
         identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = (
+            "C&I Electricity" if service_type == "electricity_ci" else "SME Electricity"
+        )
     elif service_type in ["gas_ci", "gas_sme"]:
         identifier_type = "MRIN"
+        utility_type = "gas"
+        utility_type_identifier = "C&I Gas" if service_type == "gas_ci" else "SME Gas"
     elif service_type == "waste":
         identifier_type = "account_number"
+        utility_type = "waste"
+        utility_type_identifier = "Waste"
     else:
-        identifier_type = "NMI"  # default fallback
+        # Fallback to electricity/NMI if an unknown type sneaks through
+        identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = "Electricity"
 
-    result = supplier_data_request(
+    raw_result = supplier_data_request(
         supplier_name=request.supplier_name,
         business_name=request.business_name,
         service_type=service_type,
         account_identifier=account_identifier,
-        identifier_type=identifier_type
+        identifier_type=identifier_type,
     )
-    if isinstance(result, dict):
-        result["user_email"] = user_info.get("email")
-    else:
-        result = {"status": "error", "message": result, "user_email": user_info.get("email")}
-    logging.info(f"Returning data request response to frontend: {result}")
-    return result
+
+    # Determine success based on the human-readable message
+    message = str(raw_result or "").strip()
+    is_success = message.startswith("✅") or "Data request successfully sent" in message
+
+    # On success, upsert client, ensure offer, and record an offer activity
+    if is_success and request.business_name:
+        try:
+            user_email = user_info.get("email")
+
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=request.business_name,
+                external_business_id=None,
+                primary_contact_email=None,
+                gdrive_folder_url=None,
+            )
+
+            offer = None
+            if client:
+                offer = get_or_create_offer_for_activity(
+                    db=db,
+                    client_id=client.id,
+                    business_name=request.business_name,
+                    utility_type=utility_type,
+                    utility_type_identifier=utility_type_identifier,
+                    identifier=account_identifier or None,
+                    created_by=user_email,
+                )
+
+            if offer:
+                metadata = {
+                    "service_type": service_type,
+                    "utility_type": utility_type,
+                    "utility_type_identifier": utility_type_identifier,
+                    "identifier_type": identifier_type,
+                    "identifier": account_identifier or None,
+                    "supplier_name": request.supplier_name,
+                    "source": "data_request_page",
+                }
+                try:
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.DATA_REQUEST,
+                        metadata=metadata,
+                        created_by=user_email,
+                    )
+                except Exception as act_e:
+                    logging.warning(
+                        "Failed to create DATA_REQUEST offer activity: %s", act_e
+                    )
+        except Exception as crm_e:
+            logging.error("Failed to record CRM data for data request: %s", crm_e)
+
+    response_payload = {
+        "status": "success" if is_success else "error",
+        "message": message,
+        "user_email": user_info.get("email"),
+    }
+    logging.info(f"Returning data request response to frontend: {response_payload}")
+    return response_payload
 
 class SignedAgreementRequest(BaseModel):
     business_name: str
@@ -627,7 +818,8 @@ class QuoteRequestData(BaseModel):
 async def send_quote_request_endpoint(
     request: Request,
     authorization: str = Header(...),
-    user_info: dict = None
+    user_info: dict = None,
+    db: Session = Depends(get_db),
 ):
     # Get the request body
     request_data = await request.json()
@@ -718,6 +910,54 @@ async def send_quote_request_endpoint(
         )
         
         logging.info(f"Quote request completed successfully for {business_name}")
+
+        # Try to record an Offer in the CRM database
+        try:
+            identifier = nmi or mrin or ""
+            client = None
+            if business_name:
+                client = (
+                    db.query(Client)
+                    .filter(Client.business_name == business_name)
+                    .first()
+                )
+
+            db_offer = Offer(
+                client_id=client.id if client else None,
+                business_name=business_name,
+                utility_type=utility_type,
+                utility_type_identifier=request_data.get("utility_type_identifier", ""),
+                identifier=identifier,
+                status="requested",
+                estimated_value=yearly_consumption_est or None,
+                created_by=user_email,
+            )
+            db.add(db_offer)
+            db.commit()
+            db.refresh(db_offer)
+            # Record offer activity so it shows on the offer detail page
+            try:
+                create_offer_activity(
+                    db,
+                    offer=db_offer,
+                    client=client,
+                    activity_type=OfferActivityType.QUOTE_REQUEST,
+                    document_link=result.get("document_link") if isinstance(result, dict) else None,
+                    external_id=result.get("quote_request_id") if isinstance(result, dict) else None,
+                    metadata={
+                        "utility_type": utility_type or None,
+                        "utility_type_identifier": request_data.get("utility_type_identifier", "") or None,
+                        "nmi": nmi or None,
+                        "mrin": mrin or None,
+                        "source": "quote_request_page",
+                    },
+                    created_by=user_email,
+                )
+            except Exception as act_e:
+                logging.warning(f"Failed to create quote_request activity for offer: {act_e}")
+        except Exception as e:
+            logging.error(f"Failed to create Offer record for quote request: {e}")
+
         return result
         
     except Exception as e:
@@ -834,6 +1074,153 @@ def get_contract_types(user_info: dict = Depends(verify_google_token)):
         "user_email": user_info.get("email")
     }
 
+
+@app.get("/api/base1-landing-responses")
+def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Get Base 1 Landing Page Responses from Google Sheet (Landing Page Responses tab).
+    Returns rows without the Email HTML column. Requires Google auth.
+    """
+    try:
+        rows = get_base1_landing_responses()
+        return {"rows": rows, "user_email": user_info.get("email")}
+    except Exception as e:
+        logging.error(f"Error fetching Base 1 landing responses: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load Base 1 landing responses")
+
+
+@app.get("/api/base1-leads")
+def get_base1_leads_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Lead pipeline view backed by Base 1 runs.
+
+    - Source rows: Base 1 Landing Page Responses sheet (via get_base1_landing_responses)
+    - Filters out businesses that already exist as CRM clients (by business_name or primary_contact_email)
+    - Groups by Company Name so each business appears once (most recent run wins)
+    - Enriches with a simple lead status from ClientStatusNote where note_type='lead_status'
+      (latest note per business), defaulting to "New" when none exists.
+
+    Returns:
+        {
+          "rows": [
+            {
+              "id": str,  # stable per business (company name)
+              "company_name": str,
+              "contact_name": str | null,
+              "contact_email": str | null,
+              "contact_number": str | null,
+              "state": str | null,
+              "timestamp": str | null,
+              "drive_folder_url": str | null,
+              "base1_review_url": str | null,
+              "utility_types": str | null,
+              "status": str,  # e.g. "New", "Contacted", "Qualified", "Not a fit"
+            },
+            ...
+          ],
+          "user_email": str | null,
+        }
+    """
+    try:
+        # 1) Load raw Base 1 rows from Google Sheet
+        raw_rows = get_base1_landing_responses() or []
+
+        # 2) Build lookup sets for existing CRM members to filter out
+        existing_clients = db.query(Client.business_name, Client.primary_contact_email).all()
+        existing_names = {
+            (c.business_name or "").strip().lower()
+            for c in existing_clients
+            if c.business_name
+        }
+        existing_emails = {
+            (c.primary_contact_email or "").strip().lower()
+            for c in existing_clients
+            if c.primary_contact_email
+        }
+
+        # 3) Group Base 1 rows by Company Name and keep the most recent by Timestamp
+        grouped_by_company: dict[str, dict] = {}
+        for row in raw_rows:
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+
+            email = (row.get("Contact Email") or "").strip()
+            # Skip if this company or email is already a CRM member
+            if company.lower() in existing_names or (email and email.lower() in existing_emails):
+                continue
+
+            key = company.lower()
+            current = grouped_by_company.get(key)
+            ts = row.get("Timestamp") or ""
+            if current is None:
+                grouped_by_company[key] = row
+            else:
+                # Prefer the row with the latest timestamp (lexicographically; sheet timestamps are ISO-like)
+                current_ts = current.get("Timestamp") or ""
+                if ts > current_ts:
+                    grouped_by_company[key] = row
+
+        # Nothing left after filtering
+        if not grouped_by_company:
+            return {"rows": [], "user_email": user_info.get("email")}
+
+        # 4) Fetch latest lead_status note per business in one query
+        company_names = [row.get("Company Name") or "" for row in grouped_by_company.values()]
+        # Strip blanks
+        company_names = [name for name in (n.strip() for n in company_names) if name]
+
+        status_by_business: dict[str, str] = {}
+        if company_names:
+            notes_q = (
+                db.query(ClientStatusNote)
+                .filter(
+                    ClientStatusNote.business_name.in_(company_names),
+                    ClientStatusNote.note_type == "lead_status",
+                )
+                .order_by(ClientStatusNote.business_name.asc(), ClientStatusNote.created_at.desc())
+            )
+            for n in notes_q.all():
+                name = (n.business_name or "").strip()
+                # First (most recent per business) wins thanks to ordering
+                if name and name not in status_by_business:
+                    status_by_business[name] = (n.note or "").strip() or "New"
+
+        # 5) Build response rows
+        rows = []
+        for key, row in grouped_by_company.items():
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+            status = status_by_business.get(company, "New")
+
+            rows.append(
+                {
+                    "id": company,  # stable id per business for frontend grouping
+                    "company_name": company,
+                    "contact_name": (row.get("Contact Name") or "").strip() or None,
+                    "contact_email": (row.get("Contact Email") or "").strip() or None,
+                    "contact_number": (row.get("Contact Number") or "").strip() or None,
+                    "state": (row.get("State") or "").strip() or None,
+                    "timestamp": (row.get("Timestamp") or "").strip() or None,
+                    "drive_folder_url": (row.get("Google Drive Folder") or "").strip() or None,
+                    "base1_review_url": (row.get("Base 1 Review") or "").strip() or None,
+                    "utility_types": (row.get("Utility Types") or "").strip() or None,
+                    "status": status or "New",
+                }
+            )
+
+        return {"rows": rows, "user_email": user_info.get("email")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error building Base 1 leads: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load Base 1 leads")
+
+
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
     request: DocumentGenerationRequest,
@@ -925,10 +1312,73 @@ def generate_eoi_endpoint(
         logging.error(f"Error generating EOI for {request.business_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating EOI: {str(e)}")
 
+@app.post("/api/generate-engagement-form")
+def generate_engagement_form_endpoint(
+    request: EngagementFormGenerationRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Generate Engagement Form document"""
+    logging.info(f"Received Engagement Form generation request for: {request.business_name}, type: {request.engagement_form_type}")
+    
+    try:
+        result = engagement_form_generation(
+            business_name=request.business_name,
+            abn=request.abn,
+            trading_as=request.trading_as,
+            postal_address=request.postal_address,
+            site_address=request.site_address,
+            telephone=request.telephone,
+            email=request.email,
+            contact_name=request.contact_name,
+            position=request.position,
+            engagement_form_type=request.engagement_form_type,
+            client_folder_url=request.client_folder_url,
+        )
+        
+        result["user_email"] = user_info.get("email")
+        logging.info(f"Engagement Form generation completed for: {request.business_name}")
+        # Record offer activity when generation succeeds (additive; does not change response)
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "engagement_form",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Engagement form",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.ENGAGEMENT_FORM,
+                        document_link=result.get("document_link"),
+                        metadata={
+                            "form_type": request.engagement_form_type,
+                            "source": "document_generation_page",
+                        },
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create engagement_form activity: {act_e}")
+        return result
+        
+    except Exception as e:
+        logging.error(f"Error generating Engagement Form for {request.business_name}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating Engagement Form: {str(e)}")
+
 @app.post("/api/generate-ghg-offer")
 def generate_ghg_offer_endpoint(
     request: DocumentGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate GHG Offer document"""
     logging.info(f"Received GHG Offer generation request for: {request.business_name}")
@@ -949,6 +1399,37 @@ def generate_ghg_offer_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"GHG Offer generation completed for: {request.business_name}")
+        # Record offer activity when generation succeeds (additive; does not change response)
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "ghg",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Electricity",
+                    )
+                    doc_link = result.get("document_link")
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.GHG_OFFER,
+                        document_link=doc_link,
+                        metadata={
+                            "utility_type": "electricity",
+                            "source": "document_generation_page",
+                        },
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create ghg_offer activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1291,6 +1772,14 @@ def get_eoi_types_endpoint(user_info: dict = Depends(verify_google_token)):
     """Get available Expression of Interest types"""
     return {
         "eoi_types": get_available_eoi_types(),
+        "user_email": user_info.get("email")
+    }
+
+@app.get("/api/engagement-form-types")
+def get_engagement_form_types_endpoint(user_info: dict = Depends(verify_google_token)):
+    """Get available Engagement Form types"""
+    return {
+        "engagement_form_types": get_available_engagement_form_types(),
         "user_email": user_info.get("email")
     }
 
@@ -1997,7 +2486,9 @@ async def create_task(
         status=task.status,
         assigned_to=task.assigned_to,
         assigned_by=assigned_by,
-        business_id=task.business_id
+        business_id=task.business_id,
+        client_id=task.client_id,
+        category=task.category or "task",
     )
     
     db.add(db_task)
@@ -2093,7 +2584,7 @@ async def update_task(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db)
 ):
-    """Update task fields (title, description, due_date, assigned_to, business_id)"""
+    """Update task fields (title, description, due_date, assigned_to, business_id, client_id, category)"""
     logging.info(f"Updating task {task_id}")
     
     user_info = user_data["idinfo"]
@@ -2159,6 +2650,22 @@ async def update_task(
         )
         db_task.business_id = task_update.business_id
 
+    # Update client_id
+    if task_update.client_id is not None and task_update.client_id != db_task.client_id:
+        log_field_change(
+            db, task_id, current_user_email,
+            "client_id", str(db_task.client_id), str(task_update.client_id)
+        )
+        db_task.client_id = task_update.client_id
+
+    # Update category
+    if task_update.category is not None and task_update.category != db_task.category:
+        log_field_change(
+            db, task_id, current_user_email,
+            "category", db_task.category, task_update.category
+        )
+        db_task.category = task_update.category
+
     
     db.commit()
     db.refresh(db_task)
@@ -2179,6 +2686,21 @@ def get_tasks_by_business(
     tasks = db.query(Task).filter(Task.business_id == business_id).all()
     
     logging.info(f"Found {len(tasks)} tasks for business_id {business_id}")
+    return tasks
+
+
+@app.get("/api/clients/{client_id}/tasks", response_model=List[TaskResponse])
+def get_tasks_by_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Get all tasks for a specific client"""
+    logging.info(f"Fetching tasks for client_id: {client_id}")
+
+    tasks = db.query(Task).filter(Task.client_id == client_id).all()
+
+    logging.info(f"Found {len(tasks)} tasks for client_id {client_id}")
     return tasks
 
 
@@ -2405,8 +2927,11 @@ def create_client_status_note(
     
     db_note = ClientStatusNote(
         business_name=note.business_name,
+        client_id=note.client_id,
         note=note.note,
-        user_email=user_email
+        user_email=user_email,
+        note_type=note.note_type or "general",
+        related_task_id=note.related_task_id,
     )
     
     db.add(db_note)
@@ -2452,6 +2977,8 @@ def update_client_status_note(
         raise HTTPException(status_code=404, detail="Note not found")
     
     db_note.note = note_update.note
+    if note_update.note_type is not None:
+        db_note.note_type = note_update.note_type
     db.commit()
     db.refresh(db_note)
     
@@ -2487,8 +3014,10 @@ def debug_all_notes(db: Session = Depends(get_db)):
         "notes": [{
             "id": n.id, 
             "business_name": n.business_name, 
+            "client_id": n.client_id,
             "note": n.note[:100],
             "user_email": n.user_email,
+            "note_type": n.note_type,
             "created_at": str(n.created_at)
         } for n in notes]
     }
@@ -2508,3 +3037,1277 @@ async def check_due_tasks_cron(db: Session = Depends(get_db)):
     except Exception as e:
         logging.error(f"Error during due tasks check: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# ---- CRM: Clients, Offers, and Pipeline ----
+
+
+@app.post("/api/clients", response_model=ClientResponse)
+def create_client(
+    client: ClientCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create a new client record"""
+    logging.info(f"Creating client: {client.business_name}")
+
+    existing = (
+        db.query(Client)
+        .filter(Client.business_name == client.business_name)
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail="Client with this business name already exists",
+        )
+
+    db_client = Client(
+        business_name=client.business_name,
+        external_business_id=client.external_business_id,
+        primary_contact_email=client.primary_contact_email,
+        gdrive_folder_url=client.gdrive_folder_url,
+        stage=client.stage or "lead",
+        owner_email=client.owner_email or (user_data.get("idinfo") or {}).get("email"),
+    )
+    db.add(db_client)
+    db.commit()
+    db.refresh(db_client)
+
+    logging.info(f"Client created with id {db_client.id}")
+    return db_client
+
+
+@app.get("/api/clients")
+def list_clients(
+    query: Optional[str] = Query(None, description="Search by business name (partial match)"),
+    stage: Optional[str] = Query(None, description="Filter by client stage"),
+    created_after: Optional[str] = Query(None, description="Filter clients created on or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
+    mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
+    limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
+    offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients).
+    When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
+    """
+    from datetime import datetime as dt
+    from datetime import timedelta
+    logging.info("Listing clients")
+    q = (query or "").strip()
+
+    base_query = db.query(Client)
+    if q:
+        pattern = f"%{q}%"
+        base_query = base_query.filter(Client.business_name.ilike(pattern))
+    if stage is not None and stage.strip():
+        base_query = base_query.filter(Client.stage == stage.strip())
+    if mine:
+        user_email = (user_data.get("idinfo") or {}).get("email")
+        if user_email:
+            base_query = base_query.filter(Client.owner_email == user_email)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            base_query = base_query.filter(Client.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            base_query = base_query.filter(Client.created_at < end_inclusive)
+        except ValueError:
+            pass
+
+    ordered = base_query.order_by(Client.business_name.asc())
+    if limit is not None or offset is not None:
+        total = ordered.count()
+        off = offset or 0
+        lim = limit or 20
+        clients = ordered.offset(off).limit(lim).all()
+        items = [ClientResponse.model_validate(c).model_dump(mode="json") for c in clients]
+        return JSONResponse(content={"items": items, "total": total})
+    clients = ordered.all()
+    return [ClientResponse.model_validate(c) for c in clients]
+
+
+@app.get("/api/clients/export")
+def export_clients_csv(
+    query: Optional[str] = Query(None, description="Search by business name (partial match)"),
+    stage: Optional[str] = Query(None, description="Filter by client stage"),
+    created_after: Optional[str] = Query(None, description="Filter clients created on or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
+    mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Export clients as CSV using the same filters as list_clients (no limit; all matching rows)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+    q = (query or "").strip()
+    base_query = db.query(Client)
+    if q:
+        pattern = f"%{q}%"
+        base_query = base_query.filter(Client.business_name.ilike(pattern))
+    if stage is not None and stage.strip():
+        base_query = base_query.filter(Client.stage == stage.strip())
+    if mine:
+        user_email = (user_data.get("idinfo") or {}).get("email")
+        if user_email:
+            base_query = base_query.filter(Client.owner_email == user_email)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            base_query = base_query.filter(Client.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            base_query = base_query.filter(Client.created_at < end_inclusive)
+        except ValueError:
+            pass
+    clients = base_query.order_by(Client.business_name.asc()).all()
+    rows_data = [ClientResponse.model_validate(c).model_dump(mode="json") for c in clients]
+    if not rows_data:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "business_name", "external_business_id", "primary_contact_email", "gdrive_folder_url", "stage", "stage_changed_at", "owner_email", "created_at", "updated_at"])
+        csv_content = buf.getvalue()
+    else:
+        keys = list(rows_data[0].keys())
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(keys)
+        for r in rows_data:
+            w.writerow([r.get(k) for k in keys])
+        csv_content = buf.getvalue()
+    return Response(
+        content=csv_content.encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=clients_export.csv"},
+    )
+
+
+@app.get("/api/clients/{client_id}", response_model=ClientResponse)
+def get_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Get a single client by id"""
+    logging.info(f"Fetching client {client_id}")
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return client
+
+
+@app.patch("/api/clients/{client_id}", response_model=ClientResponse)
+def update_client(
+    client_id: int,
+    client_update: ClientUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update client details"""
+    logging.info(f"Updating client {client_id}")
+    db_client = db.query(Client).filter(Client.id == client_id).first()
+    if not db_client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    if client_update.business_name is not None:
+        db_client.business_name = client_update.business_name
+    if client_update.external_business_id is not None:
+        db_client.external_business_id = client_update.external_business_id
+    if client_update.primary_contact_email is not None:
+        db_client.primary_contact_email = client_update.primary_contact_email
+    if client_update.gdrive_folder_url is not None:
+        db_client.gdrive_folder_url = client_update.gdrive_folder_url
+    if client_update.owner_email is not None:
+        db_client.owner_email = client_update.owner_email
+    if client_update.stage is not None and client_update.stage != db_client.stage:
+        db_client.stage = client_update.stage
+        db_client.stage_changed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(db_client)
+    logging.info(f"Client {client_id} updated")
+    return db_client
+
+
+@app.delete("/api/clients/{client_id}", response_model=dict)
+def delete_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a client and all dependent CRM records.
+
+    This removes:
+    - Offer activities for this client's offers (and any activities directly linked by client_id)
+    - Offers linked to this client
+    - Client status notes linked by client_id
+    - Tasks linked to this client, plus their TaskHistory entries
+    Finally, deletes the Client row itself.
+    """
+    logging.info(f"Deleting client {client_id} and dependent records")
+
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # 1) Offers and offer activities
+    offer_ids = [
+        o.id
+        for o in db.query(Offer.id)
+        .filter(Offer.client_id == client_id)
+        .all()
+    ]
+    if offer_ids:
+        db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+    # Also remove any activities that reference this client directly
+    db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    db.query(Offer).filter(Offer.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 2) Tasks and task history
+    task_ids = [
+        t.id
+        for t in db.query(Task.id)
+        .filter(Task.client_id == client_id)
+        .all()
+    ]
+    if task_ids:
+        db.query(TaskHistory).filter(TaskHistory.task_id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(Task).filter(Task.id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+
+    # 3) Client status notes linked by client_id
+    db.query(ClientStatusNote).filter(ClientStatusNote.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 4) Finally, delete the client itself
+    db.delete(client)
+    db.commit()
+
+    logging.info(f"Client {client_id} and dependent records deleted")
+    return {"status": "success", "message": "Client and related data deleted"}
+
+
+@app.post("/api/clients/search", response_model=List[ClientResponse])
+def search_clients(
+    search: ClientSearchRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """LEGACY: Search clients by business name substring. Prefer GET /api/clients?query=... for new code."""
+    logging.info(f"Searching clients with query: {search.query}")
+    q = search.query.strip()
+    if not q:
+        return []
+    pattern = f"%{q}%"
+    clients = (
+        db.query(Client)
+        .filter(Client.business_name.ilike(pattern))
+        .order_by(Client.business_name.asc())
+        .all()
+    )
+    return clients
+
+
+@app.get("/api/search")
+def global_search(
+    q: str = Query(..., min_length=1),
+    limit: int = Query(8, ge=1, le=20),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Global search for command palette: returns clients (by business_name) and offers (by business_name or identifier)."""
+    q_clean = (q or "").strip()
+    if not q_clean:
+        return {"clients": [], "offers": []}
+    pattern = f"%{q_clean}%"
+    clients = (
+        db.query(Client)
+        .filter(Client.business_name.ilike(pattern))
+        .order_by(Client.business_name.asc())
+        .limit(limit)
+        .all()
+    )
+    offers = (
+        db.query(Offer)
+        .filter(
+            (Offer.business_name.ilike(pattern)) | (Offer.identifier.ilike(pattern))
+        )
+        .order_by(Offer.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    client_list = [ClientResponse.model_validate(c).model_dump(mode="json") for c in clients]
+    offer_list = [_offer_to_response(db, o).model_dump(mode="json") for o in offers]
+    return {"clients": client_list, "offers": offer_list}
+
+
+@app.patch("/api/client-bulk-update", response_model=List[ClientResponse])
+def bulk_update_clients(
+    body: ClientBulkUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Bulk update clients: set owner_email and/or stage for the given client IDs. For stage changes, history is recorded."""
+    logging.info(
+        "[CRM] bulk_update_clients called with body=%s",
+        body.model_dump(mode="json"),
+    )
+    if not body.client_ids:
+        logging.info("[CRM] bulk_update_clients: empty client_ids, returning []")
+        return []
+
+    user_email = (user_data.get("idinfo") or {}).get("email") or ""
+
+    # Coerce all client_ids to integers and fail fast with a clear error
+    try:
+        client_ids = [int(raw_id) for raw_id in body.client_ids]
+    except (TypeError, ValueError) as exc:
+        logging.error(
+            "[CRM] bulk_update_clients: failed to coerce client_ids=%r (types=%r): %s",
+            body.client_ids,
+            [type(x) for x in body.client_ids],
+            exc,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid client_ids: all client_ids must be integers.",
+        )
+    updated: List[Client] = []
+    any_changes = False
+
+    for client_id in client_ids:
+        client = db.query(Client).filter(Client.id == client_id).first()
+        if not client:
+            continue
+
+        if body.owner_email is not None:
+            client.owner_email = body.owner_email.strip() or None
+            any_changes = True
+
+        if body.stage is not None:
+            update_client_stage_with_history(
+                db=db,
+                client_id=client_id,
+                new_stage=body.stage,
+                user_email=user_email,
+                commit=False,
+            )
+            any_changes = True
+
+        updated.append(client)
+
+    logging.info(
+        "[CRM] bulk_update_clients: any_changes=%s, client_ids=%s, stage=%s, owner_email=%s, user_email=%s",
+        any_changes,
+        client_ids,
+        body.stage,
+        body.owner_email,
+        user_email,
+    )
+
+    if any_changes:
+        db.commit()
+        for client in updated:
+            db.refresh(client)
+
+    return [
+        ClientResponse.model_validate(c).model_dump(mode="json") for c in updated
+    ]
+
+
+@app.patch("/api/clients/{client_id}/stage", response_model=ClientResponse)
+def update_client_stage(
+    client_id: int,
+    stage_update: ClientStageUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update a client's pipeline stage."""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+
+    logging.info(f"Updating client {client_id} stage to {stage_update.stage}")
+    return update_client_stage_with_history(
+        db=db,
+        client_id=client_id,
+        new_stage=stage_update.stage,
+        user_email=user_email,
+    )
+
+
+@app.get("/api/clients/{client_id}/activities", response_model=List[OfferActivityResponse])
+def list_client_activities(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List offer activities for all offers belonging to this client, newest first."""
+    # Verify client exists
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    activities = (
+        db.query(OfferActivity)
+        .join(Offer, OfferActivity.offer_id == Offer.id)
+        .filter(Offer.client_id == client_id)
+        .order_by(OfferActivity.created_at.desc())
+        .all()
+    )
+    return [OfferActivityResponse.model_validate(a) for a in activities]
+
+
+@app.get("/api/clients/{client_id}/notes", response_model=List[ClientStatusNoteResponse])
+def get_client_notes_by_id(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Get all notes for a client by id"""
+    logging.info(f"Fetching notes for client_id {client_id}")
+    notes = (
+        db.query(ClientStatusNote)
+        .filter(ClientStatusNote.client_id == client_id)
+        .order_by(ClientStatusNote.created_at.desc())
+        .all()
+    )
+    return notes
+
+
+@app.post("/api/clients/{client_id}/notes", response_model=ClientStatusNoteResponse)
+def create_client_note_for_id(
+    client_id: int,
+    note: ClientStatusNoteCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create a client note for a given client id"""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+
+    db_client = db.query(Client).filter(Client.id == client_id).first()
+    if not db_client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    logging.info(f"Creating note for client_id {client_id}")
+
+    db_note = ClientStatusNote(
+        business_name=db_client.business_name,
+        client_id=client_id,
+        note=note.note,
+        user_email=user_email,
+        note_type=note.note_type or "general",
+        related_task_id=note.related_task_id,
+        related_offer_id=note.related_offer_id,
+    )
+    db.add(db_note)
+    db.commit()
+    db.refresh(db_note)
+    return db_note
+
+
+def _parse_activity_metadata(meta_raw):  # noqa: ANN001
+    """Parse activity metadata from DB (may be JSON string)."""
+    if meta_raw is None:
+        return None
+    if isinstance(meta_raw, dict):
+        return meta_raw
+    if isinstance(meta_raw, str):
+        try:
+            return json.loads(meta_raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
+    """Map activity_type to display prefix: Base 2, DMA, or Comparison."""
+    if not activity_type:
+        return None
+    at = (activity_type or "").strip().lower()
+    if at == "base2_review":
+        return "Base 2"
+    if at in ("dma_review_generated", "dma_email_sent"):
+        return "DMA"
+    if at == "comparison":
+        return "Comparison"
+    return None
+
+
+def _get_offer_source_prefix_from_activities(db: Session, offer: Offer) -> Optional[str]:
+    """Return the source prefix (Base 2, DMA, Comparison) from the offer's most recent relevant activity."""
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    for a in activities:
+        prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if prefix:
+            return prefix
+    return None
+
+
+def _derived_offer_fields_from_activities(db: Session, offer: Offer) -> dict:
+    """
+    When an offer has no utility_type/identifier set, derive from its activities' metadata
+    so the list and detail pages show data (e.g. Gas, NMI) from Base 2 / comparison runs.
+    Also sets source_prefix (Base 2, DMA, Comparison) for utility_display.
+    """
+    out = {}
+    if offer.utility_type or offer.utility_type_identifier or offer.identifier:
+        return out
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    utility_type = None
+    utility_type_identifier = None
+    identifier = None
+    source_prefix = None
+    for a in activities:
+        meta = _parse_activity_metadata(getattr(a, "metadata_", None))
+        if not meta:
+            continue
+        if utility_type is None and meta.get("utility_type"):
+            utility_type = (meta.get("utility_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type is None and meta.get("comparison_type"):
+            utility_type = (meta.get("comparison_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type_identifier is None and meta.get("utility_type_identifier"):
+            utility_type_identifier = (meta.get("utility_type_identifier") or "").strip()
+        if identifier is None:
+            id_val = (
+                meta.get("nmi")
+                or meta.get("mrin")
+                or meta.get("identifier")
+                or meta.get("account_number")
+                or meta.get("account_name")
+            )
+            if id_val:
+                identifier = str(id_val).strip()
+        if utility_type and identifier and utility_type_identifier and source_prefix is not None:
+            break
+    if utility_type:
+        raw = (utility_type or "").lower()
+        if not utility_type_identifier:
+            utility_type_identifier = (
+                "Electricity" if raw == "electricity"
+                else "Gas" if raw == "gas"
+                else "Waste" if raw == "waste"
+                else "Oil" if raw == "oil"
+                else "Cleaning" if raw == "cleaning"
+                else "DMA" if raw == "dma"
+                else utility_type
+            )
+        out["utility_type"] = utility_type
+        out["utility_type_identifier"] = utility_type_identifier
+        if source_prefix is None:
+            source_prefix = _activity_type_to_source_prefix(
+                activities[0].activity_type if activities else None
+            )
+        out["source_prefix"] = source_prefix
+    if identifier:
+        out["identifier"] = identifier
+    return out
+
+
+def _offer_to_response(db: Session, offer: Offer) -> OfferResponse:
+    """Build OfferResponse with derived is_existing_client from linked client stage.
+    When offer has no utility/identifier, derive from activities so list and detail show data.
+    Sets utility_display as 'Base 2 Gas' / 'DMA Electricity' / 'Comparison Gas' when source is known."""
+    is_existing = False
+    if offer.client_id:
+        client = db.query(Client).filter(Client.id == offer.client_id).first()
+        if client and (client.stage or "").strip():
+            stage_val = (client.stage or "").strip().lower()
+            if stage_val in (s.value for s in POST_WIN_STAGES):
+                is_existing = True
+    base = OfferResponse.model_validate(offer).model_copy(
+        update={"is_existing_client": is_existing}
+    )
+    utility_display = base.utility_type_identifier or base.utility_type
+    if not offer.utility_type and not offer.utility_type_identifier and not offer.identifier:
+        derived = _derived_offer_fields_from_activities(db, offer)
+        if derived:
+            label = derived.get("utility_type_identifier") or derived.get("utility_type")
+            prefix = derived.get("source_prefix")
+            if prefix and label:
+                utility_display = f"{prefix} {label}"
+            elif label:
+                utility_display = label
+            base = base.model_copy(update={
+                "utility_type": derived.get("utility_type") or base.utility_type,
+                "utility_type_identifier": derived.get("utility_type_identifier") or base.utility_type_identifier,
+                "identifier": derived.get("identifier") or base.identifier,
+            })
+    else:
+        # Offer has utility data; still add source prefix from activities if present
+        prefix = _get_offer_source_prefix_from_activities(db, offer)
+        if prefix and utility_display:
+            utility_display = f"{prefix} {utility_display}"
+    if utility_display:
+        base = base.model_copy(update={"utility_display": utility_display})
+    return base
+
+
+@app.post("/api/offers", response_model=OfferResponse)
+def create_offer(
+    offer: OfferCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create a new offer (quote request record). Valid for any client stage (including Won/Existing client)."""
+    user_info = user_data["idinfo"]
+    user_email = user_info.get("email")
+
+    db_offer = Offer(
+        client_id=offer.client_id,
+        business_name=offer.business_name,
+        utility_type=offer.utility_type,
+        utility_type_identifier=offer.utility_type_identifier,
+        identifier=offer.identifier,
+        status=(offer.status or OfferStatus.REQUESTED).value
+        if isinstance(offer.status, OfferStatus)
+        else (offer.status or OfferStatus.REQUESTED.value),
+        pipeline_stage=offer.pipeline_stage.value
+        if isinstance(getattr(offer, "pipeline_stage", None), OfferPipelineStageSchema)
+        else getattr(offer, "pipeline_stage", None),
+        estimated_value=offer.estimated_value,
+        created_by=user_email,
+        external_record_id=offer.external_record_id,
+        document_link=offer.document_link,
+    )
+    db.add(db_offer)
+    db.commit()
+    db.refresh(db_offer)
+    logging.info(f"Offer created with id {db_offer.id}")
+    return _offer_to_response(db, db_offer)
+
+
+@app.get("/api/offers")
+def list_offers(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
+    created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
+    mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
+    limit: Optional[int] = Query(None, description="Max number of offers to return (enables paginated response with total)"),
+    offset: Optional[int] = Query(None, description="Number of offers to skip (use with limit)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List offers, optionally filtered by client, status, utility, identifier, date range, or mine (by client owner). When limit/offset set, returns { items, total }."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+    logging.info("Listing offers")
+    query = db.query(Offer)
+    if client_id is not None:
+        query = query.filter(Offer.client_id == client_id)
+    if mine:
+        user_email = (user_data.get("idinfo") or {}).get("email")
+        if user_email:
+            query = query.join(Client, Offer.client_id == Client.id).filter(Client.owner_email == user_email)
+        else:
+            query = query.filter(Offer.id == -1)
+    if status is not None:
+        query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(Offer.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(Offer.created_at < end_inclusive)
+        except ValueError:
+            pass
+    ordered = query.order_by(Offer.created_at.desc())
+    if limit is not None or offset is not None:
+        total = ordered.count()
+        off = offset or 0
+        lim = limit or 20
+        offers = ordered.offset(off).limit(lim).all()
+        items = [_offer_to_response(db, o) for o in offers]
+        return JSONResponse(content={"items": [r.model_dump(mode="json") for r in items], "total": total})
+    offers = ordered.all()
+    return [_offer_to_response(db, o) for o in offers]
+
+
+@app.get("/api/offers/export")
+def export_offers_csv(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
+    created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
+    mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Export offers as CSV using the same filters as list_offers (no limit; all matching rows)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+    query = db.query(Offer)
+    if client_id is not None:
+        query = query.filter(Offer.client_id == client_id)
+    if mine:
+        user_email = (user_data.get("idinfo") or {}).get("email")
+        if user_email:
+            query = query.join(Client, Offer.client_id == Client.id).filter(Client.owner_email == user_email)
+        else:
+            query = query.filter(Offer.id == -1)
+    if status is not None:
+        query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(Offer.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(Offer.created_at < end_inclusive)
+        except ValueError:
+            pass
+    offers = query.order_by(Offer.created_at.desc()).all()
+    rows_data = [_offer_to_response(db, o).model_dump(mode="json") for o in offers]
+    if not rows_data:
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id", "client_id", "business_name", "utility_type", "utility_type_identifier", "identifier", "status", "estimated_value", "created_by", "external_record_id", "document_link", "created_at", "updated_at", "is_existing_client"])
+        csv_content = buf.getvalue()
+    else:
+        keys = list(rows_data[0].keys())
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(keys)
+        for r in rows_data:
+            w.writerow([r.get(k) for k in keys])
+        csv_content = buf.getvalue()
+    return Response(
+        content=csv_content.encode("utf-8-sig"),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=offers_export.csv"},
+    )
+
+
+@app.get("/api/offers/{offer_id}", response_model=OfferResponse)
+def get_offer(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Get a single offer."""
+    logging.info(f"Fetching offer {offer_id}")
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    return _offer_to_response(db, offer)
+
+
+@app.get("/api/offers/{offer_id}/activities", response_model=List[OfferActivityResponse])
+def list_offer_activities(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List activities for an offer, newest first."""
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer_id)
+        .order_by(OfferActivity.created_at.desc())
+        .all()
+    )
+    return [OfferActivityResponse.model_validate(a) for a in activities]
+
+
+@app.post("/api/offers/{offer_id}/activities", response_model=OfferActivityResponse)
+def post_offer_activity(
+    offer_id: int,
+    body: OfferActivityCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create an activity for an offer (e.g. discrepancy_email_sent from UI, or from other flows)."""
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    client = None
+    if offer.client_id:
+        client = db.query(Client).filter(Client.id == offer.client_id).first()
+    created_by = body.created_by or (user_data.get("email") if user_data else None)
+    # Normalise/augment metadata so utility context is always present where possible.
+    metadata = dict(body.metadata or {}) if body.metadata is not None else {}
+    if "utility_type" not in metadata and getattr(offer, "utility_type", None):
+        metadata["utility_type"] = offer.utility_type
+    if "utility_type_identifier" not in metadata and getattr(offer, "utility_type_identifier", None):
+        metadata["utility_type_identifier"] = offer.utility_type_identifier
+    activity = create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=body.activity_type,
+        document_link=body.document_link,
+        external_id=body.external_id,
+        metadata=metadata,
+        created_by=created_by,
+    )
+    return OfferActivityResponse.model_validate(activity)
+
+
+@app.patch("/api/offers/{offer_id}", response_model=OfferResponse)
+def update_offer(
+    offer_id: int,
+    offer_update: OfferUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update an offer"""
+    logging.info(f"Updating offer {offer_id}")
+    db_offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not db_offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    if offer_update.client_id is not None:
+        db_offer.client_id = offer_update.client_id
+    if offer_update.business_name is not None:
+        db_offer.business_name = offer_update.business_name
+    if offer_update.utility_type is not None:
+        db_offer.utility_type = offer_update.utility_type
+    if offer_update.utility_type_identifier is not None:
+        db_offer.utility_type_identifier = offer_update.utility_type_identifier
+    if offer_update.identifier is not None:
+        db_offer.identifier = offer_update.identifier
+    if offer_update.status is not None:
+        db_offer.status = (
+            offer_update.status.value
+            if isinstance(offer_update.status, OfferStatus)
+            else str(offer_update.status)
+        )
+    if offer_update.estimated_value is not None:
+        db_offer.estimated_value = offer_update.estimated_value
+    if offer_update.external_record_id is not None:
+        db_offer.external_record_id = offer_update.external_record_id
+    if offer_update.document_link is not None:
+        db_offer.document_link = offer_update.document_link
+    if offer_update.pipeline_stage is not None:
+        db_offer.pipeline_stage = (
+            offer_update.pipeline_stage.value
+            if isinstance(offer_update.pipeline_stage, OfferPipelineStageSchema)
+            else str(offer_update.pipeline_stage)
+        )
+
+    db.commit()
+    db.refresh(db_offer)
+    return _offer_to_response(db, db_offer)
+
+
+@app.patch("/api/offers/{offer_id}/status", response_model=OfferResponse)
+def update_offer_status(
+    offer_id: int,
+    status_update: OfferStatusUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update only the status of an offer and optionally move client stage."""
+    logging.info(f"Updating offer {offer_id} status to {status_update.status}")
+    updated = update_offer_status_and_propagate_client_stage(
+        db=db,
+        offer_id=offer_id,
+        new_status=status_update.status,
+    )
+    return _offer_to_response(db, updated)
+
+
+@app.patch("/api/offers/{offer_id}/pipeline-stage", response_model=OfferResponse)
+def update_offer_pipeline_stage(
+    offer_id: int,
+    body: OfferPipelineStageUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Update the detailed pipeline stage for an offer.
+
+    For terminal pipeline stages (contract_accepted / lost) we delegate to status
+    propagation so that client lifecycle remains consistent.
+    """
+    logging.info(
+        "Updating offer %s pipeline_stage to %s", offer_id, body.pipeline_stage
+    )
+
+    stage = body.pipeline_stage
+    if stage in (
+        OfferPipelineStageSchema.CONTRACT_ACCEPTED,
+        OfferPipelineStageSchema.LOST,
+    ):
+        status = (
+            OfferStatus.ACCEPTED
+            if stage == OfferPipelineStageSchema.CONTRACT_ACCEPTED
+            else OfferStatus.LOST
+        )
+        updated = update_offer_status_and_propagate_client_stage(
+            db=db,
+            offer_id=offer_id,
+            new_status=status,
+        )
+        return _offer_to_response(db, updated)
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    offer.pipeline_stage = (
+        stage.value if isinstance(stage, OfferPipelineStageSchema) else str(stage)
+    )
+    db.commit()
+    db.refresh(offer)
+    return _offer_to_response(db, offer)
+
+
+@app.delete("/api/offers/{offer_id}", response_model=dict)
+def delete_offer(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a single offer and its dependent records.
+
+    This removes:
+    - OfferActivity rows for this offer
+    - ClientStatusNote rows linked via related_offer_id for this offer
+    Finally, deletes the Offer row.
+    """
+    logging.info(f"Deleting offer {offer_id} and dependent records")
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    # Delete activities for this offer
+    db.query(OfferActivity).filter(OfferActivity.offer_id == offer_id).delete(
+        synchronize_session=False
+    )
+
+    # Delete notes that are explicitly linked to this offer
+    db.query(ClientStatusNote).filter(
+        ClientStatusNote.related_offer_id == offer_id
+    ).delete(synchronize_session=False)
+
+    # Delete the offer itself
+    db.delete(offer)
+    db.commit()
+
+    logging.info(f"Offer {offer_id} and dependent records deleted")
+    return {"status": "success", "message": "Offer and related data deleted"}
+
+
+@app.get("/api/reports/clients/offer-counts")
+def clients_offer_counts(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Return map of client_id (as string) to offer count for pipeline cards."""
+    rows = (
+        db.query(Offer.client_id, func.count(Offer.id))
+        .filter(Offer.client_id.isnot(None))
+        .group_by(Offer.client_id)
+        .all()
+    )
+    return {str(client_id): count for client_id, count in rows}
+
+
+@app.get("/api/reports/pipeline/summary")
+def pipeline_summary(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Simple summary of clients by stage for CRM dashboard widgets."""
+    logging.info("Generating pipeline summary")
+
+    total_clients = db.query(func.count(Client.id)).scalar() or 0
+
+    rows = (
+        db.query(Client.stage, func.count(Client.id))
+        .group_by(Client.stage)
+        .all()
+    )
+    raw_counts = {stage or ClientStage.LEAD.value: count or 0 for stage, count in rows}
+
+    by_stage = [
+        {"stage": stage.value, "count": raw_counts.get(stage.value, 0)}
+        for stage in ClientStage
+    ]
+
+    won_count = raw_counts.get(ClientStage.WON.value, 0)
+    lost_count = raw_counts.get(ClientStage.LOST.value, 0)
+
+    return {
+        "total_clients": total_clients,
+        "by_stage": by_stage,
+        "won_count": won_count,
+        "lost_count": lost_count,
+    }
+
+
+@app.get("/api/reports/pipeline/won-lost-by-period")
+def won_lost_by_period(
+    period: Optional[str] = Query("month", description="Grouping period: 'month' (default) or 'year'"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Read-only report: count of clients that moved to won or lost, grouped by period (month or year). Uses stage_changed_at (fallback updated_at)."""
+    from collections import defaultdict
+    period_format = "%Y-%m" if (period or "month").lower() == "month" else "%Y"
+    period_expr = func.strftime(
+        period_format,
+        func.coalesce(Client.stage_changed_at, Client.updated_at),
+    )
+    rows = (
+        db.query(period_expr.label("period"), Client.stage, func.count(Client.id))
+        .filter(Client.stage.in_([ClientStage.WON.value, ClientStage.LOST.value]))
+        .group_by(period_expr, Client.stage)
+        .all()
+    )
+    by_period = defaultdict(lambda: {"won": 0, "lost": 0})
+    for p, stage, count in rows:
+        if stage == ClientStage.WON.value:
+            by_period[p]["won"] = count
+        elif stage == ClientStage.LOST.value:
+            by_period[p]["lost"] = count
+    result = [
+        {"period": p, "won": by_period[p]["won"], "lost": by_period[p]["lost"]}
+        for p in sorted(by_period.keys(), reverse=True)
+    ]
+    return result
+
+
+@app.get("/api/reports/tasks/summary")
+def tasks_summary(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Simple summary of tasks by status and basic due metrics."""
+    logging.info("Generating tasks summary")
+
+    total_tasks = db.query(func.count(Task.id)).scalar() or 0
+
+    rows = (
+        db.query(Task.status, func.count(Task.id))
+        .group_by(Task.status)
+        .all()
+    )
+    by_status = {status or "unknown": count or 0 for status, count in rows}
+
+    now = datetime.utcnow()
+    overdue = (
+        db.query(func.count(Task.id))
+        .filter(
+            Task.due_date.isnot(None),
+            Task.due_date < now,
+            func.lower(Task.status) != "completed",
+        )
+        .scalar()
+        or 0
+    )
+
+    # Due today (based on UTC date)
+    start_of_day = datetime(now.year, now.month, now.day)
+    end_of_day = datetime(now.year, now.month, now.day, 23, 59, 59)
+    due_today = (
+        db.query(func.count(Task.id))
+        .filter(
+            Task.due_date.isnot(None),
+            Task.due_date >= start_of_day,
+            Task.due_date <= end_of_day,
+            func.lower(Task.status) != "completed",
+        )
+        .scalar()
+        or 0
+    )
+
+    return {
+        "total_tasks": total_tasks,
+        "by_status": by_status,
+        "overdue": overdue,
+        "due_today": due_today,
+    }
+
+
+@app.get("/api/reports/activities/list", response_model=List[ActivityReportItem])
+def activities_report_list(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    activity_type: Optional[str] = Query(None, description="Filter by activity type"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List offer activities with optional filters, newest first. Includes business_name from offer."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+    logging.info("Listing activities for report")
+    query = (
+        db.query(OfferActivity, Offer)
+        .join(Offer, OfferActivity.offer_id == Offer.id)
+    )
+    if client_id is not None:
+        query = query.filter(Offer.client_id == client_id)
+    if activity_type is not None and activity_type.strip():
+        query = query.filter(OfferActivity.activity_type == activity_type.strip())
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(OfferActivity.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(OfferActivity.created_at < end_inclusive)
+        except ValueError:
+            pass
+    rows = (
+        query.order_by(OfferActivity.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    out = []
+    for act, offer in rows:
+        resp = _offer_to_response(db, offer)
+        offer_display = (resp.utility_display or "Offer")
+        if resp.identifier:
+            offer_display = f"{offer_display} {resp.identifier}"
+        out.append(
+            ActivityReportItem(
+                id=act.id,
+                offer_id=act.offer_id,
+                client_id=act.client_id,
+                business_name=offer.business_name,
+                activity_type=act.activity_type,
+                document_link=act.document_link,
+                created_at=act.created_at,
+                created_by=act.created_by,
+                offer_display=offer_display or None,
+            )
+        )
+    return out
+
+
+@app.get("/api/reports/activities/summary")
+def activities_summary(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Counts of offer activities by activity_type for dashboard/reports."""
+    logging.info("Generating activities summary")
+    total = db.query(func.count(OfferActivity.id)).scalar() or 0
+    rows = (
+        db.query(OfferActivity.activity_type, func.count(OfferActivity.id))
+        .group_by(OfferActivity.activity_type)
+        .all()
+    )
+    by_type = {activity_type: count for activity_type, count in rows}
+    return {"total": total, "by_type": by_type}
+
+
+@app.get("/api/reports/offers/summary")
+def offers_summary(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Simple summary of offers for CRM dashboard widgets."""
+    logging.info("Generating offers summary")
+
+    total_offers = db.query(func.count(Offer.id)).scalar() or 0
+
+    rows = (
+        db.query(Offer.status, func.count(Offer.id))
+        .group_by(Offer.status)
+        .all()
+    )
+    raw_counts = {status or OfferStatus.REQUESTED.value: count or 0 for status, count in rows}
+
+    by_status = {status.value: raw_counts.get(status.value, 0) for status in OfferStatus}
+
+    accepted = by_status.get(OfferStatus.ACCEPTED.value, 0)
+    lost = by_status.get(OfferStatus.LOST.value, 0)
+
+    win_rate = 0.0
+    if accepted + lost > 0:
+        win_rate = accepted / float(accepted + lost)
+
+    return {
+        "total_offers": total_offers,
+        "by_status": by_status,
+        "accepted": accepted,
+        "lost": lost,
+        "win_rate": win_rate,
+    }
