@@ -1224,7 +1224,8 @@ def get_base1_leads_endpoint(
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
     request: DocumentGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Letter of Authority document"""
     logging.info(f"Received LOA generation request for: {request.business_name}")
@@ -1245,6 +1246,33 @@ def generate_loa_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"LOA generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=result.get("document_link"),
+                        metadata={"source": "document_generation_page"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create LOA activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1254,7 +1282,8 @@ def generate_loa_endpoint(
 @app.post("/api/generate-service-agreement")
 def generate_service_agreement_endpoint(
     request: DocumentGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Service Fee Agreement document"""
     logging.info(f"Received Service Agreement generation request for: {request.business_name}")
@@ -1275,6 +1304,33 @@ def generate_service_agreement_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"Service Agreement generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=result.get("document_link"),
+                        metadata={"source": "document_generation_page"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create service_agreement activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1284,7 +1340,8 @@ def generate_service_agreement_endpoint(
 @app.post("/api/generate-eoi")
 def generate_eoi_endpoint(
     request: EOIGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Expression of Interest document"""
     logging.info(f"Received EOI generation request for: {request.business_name}, type: {request.expression_type}")
@@ -1306,6 +1363,36 @@ def generate_eoi_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"EOI generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "eoi",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Expression of Interest",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.EOI,
+                        document_link=result.get("document_link"),
+                        metadata={
+                            "expression_type": request.expression_type,
+                            "source": "document_generation_page",
+                        },
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create EOI activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1786,7 +1873,8 @@ def get_engagement_form_types_endpoint(user_info: dict = Depends(verify_google_t
 @app.post("/api/generate-loa-new")
 def generate_loa_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Letter of Authority document for new clients (without client folder URL)"""
     logging.info(f"Received new LOA generation request for: {request.business_name}")
@@ -1822,6 +1910,33 @@ def generate_loa_new_endpoint(
         }
         
         logging.info(f"New LOA generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=document_link,
+                        metadata={"source": "document_generation_page", "variant": "new"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create LOA activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1836,7 +1951,8 @@ def generate_loa_new_endpoint(
 @app.post("/api/generate-service-agreement-new")
 def generate_service_agreement_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Service Fee Agreement document for new clients (without client folder URL)"""
     logging.info(f"Received new Service Agreement generation request for: {request.business_name}")
@@ -1872,6 +1988,33 @@ def generate_service_agreement_new_endpoint(
         }
         
         logging.info(f"New Service Agreement generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=document_link,
+                        metadata={"source": "document_generation_page", "variant": "new"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create service_agreement activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1886,7 +2029,8 @@ def generate_service_agreement_new_endpoint(
 @app.post("/api/generate-loa-sfa-new")
 def generate_loa_sfa_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate both LOA and Service Fee Agreement documents for new clients (without client folder URL)"""
     logging.info(f"Received LOA and SFA generation request for: {request.business_name}")
@@ -1971,6 +2115,50 @@ def generate_loa_sfa_new_endpoint(
         "user_email": user_info.get("email")
     }
     
+    # Record CRM activity for each document generated
+    if status in ("success", "partial_success") and (loa_document_link or sfa_document_link):
+        try:
+            client = upsert_client_from_business_info(
+                db,
+                business_name=request.business_name,
+                external_business_id=None,
+                primary_contact_email=request.email or None,
+                gdrive_folder_url=None,
+            )
+            if client:
+                if loa_document_link:
+                    offer_loa = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer_loa,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=loa_document_link,
+                        metadata={"source": "document_generation_page", "variant": "loa_sfa_new"},
+                        created_by=user_info.get("email"),
+                    )
+                if sfa_document_link:
+                    offer_sfa = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer_sfa,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=sfa_document_link,
+                        metadata={"source": "document_generation_page", "variant": "loa_sfa_new"},
+                        created_by=user_info.get("email"),
+                    )
+        except Exception as act_e:
+            logging.warning(f"Failed to create LOA/SFA activity: {act_e}")
+    
     logging.info(f"LOA and SFA generation completed for: {request.business_name} - LOA: {bool(loa_document_link)}, SFA: {bool(sfa_document_link)}")
     return result
 
@@ -1994,7 +2182,8 @@ def extract_google_drive_id(url: str) -> str:
 def generate_strategy_presentation_real_endpoint(
     request: StrategyPresentationRequest,
     authorization: str = Header(...),
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     try:
         # Your Apps Script Web App URL
@@ -2018,6 +2207,42 @@ def generate_strategy_presentation_real_endpoint(
         
         if response.status_code == 200:
             result = response.json()
+            # Record CRM activity when strategy presentation is generated
+            business_name = (request.businessInfo.get("businessName") or
+                            request.businessInfo.get("business_name") or "").strip()
+            if business_name and (result.get("success") is True or result.get("document_link") or result.get("documentLink")):
+                try:
+                    ext_id = request.businessInfo.get("record_ID")
+                    if ext_id is not None:
+                        ext_id = str(ext_id)
+                    client = upsert_client_from_business_info(
+                        db,
+                        business_name=business_name,
+                        external_business_id=ext_id,
+                        primary_contact_email=request.businessInfo.get("email"),
+                        gdrive_folder_url=client_folder_url or None,
+                    )
+                    if client:
+                        doc_link = result.get("document_link") or result.get("documentLink")
+                        offer = get_or_create_offer_for_activity(
+                            db, client.id, business_name, "solution_presentation",
+                            created_by=user_info.get("email"),
+                            utility_type_identifier="Solution presentation",
+                        )
+                        create_offer_activity(
+                            db,
+                            offer=offer,
+                            client=client,
+                            activity_type=OfferActivityType.SOLUTION_PRESENTATION,
+                            document_link=doc_link,
+                            metadata={
+                                "selected_strategies": request.selectedStrategies,
+                                "source": "document_generation_page",
+                            },
+                            created_by=user_info.get("email"),
+                        )
+                except Exception as act_e:
+                    logging.warning(f"Failed to create solution_presentation activity: {act_e}")
             return result
         else:
             return {
