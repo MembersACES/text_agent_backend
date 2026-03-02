@@ -88,8 +88,15 @@ from schemas import (
     OfferActivityCreate,
     OfferActivityResponse,
     ActivityReportItem,
+    OfferPipelineStage as OfferPipelineStageSchema,
 )
-from crm_enums import ClientStage, OfferStatus, OfferActivityType, POST_WIN_STAGES
+from crm_enums import (
+    ClientStage,
+    OfferStatus,
+    OfferActivityType,
+    OfferPipelineStage,
+    POST_WIN_STAGES,
+)
 from services.crm import (
     upsert_client_from_business_info,
     update_client_stage_with_history,
@@ -98,7 +105,7 @@ from services.crm import (
     get_or_create_offer_for_activity,
 )
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from utils.task_history import (
     log_task_created,
     log_field_change,
@@ -109,6 +116,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from datetime import datetime
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -353,8 +361,13 @@ class OfferStatusUpdateRequest(BaseModel):
     status: OfferStatus
 
 
+class OfferPipelineStageUpdateRequest(BaseModel):
+    pipeline_stage: OfferPipelineStageSchema
+
+
 class ClientBulkUpdateRequest(BaseModel):
-    client_ids: List[int]
+    # Accept arbitrary JSON values here; we'll coerce to ints explicitly
+    client_ids: List[object]
     owner_email: Optional[str] = None
     stage: Optional[ClientStage] = None
 
@@ -668,35 +681,104 @@ def drive_filing_endpoint(
 @app.post("/api/data-request")
 def data_request(
     request: DataRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     logging.info(f"Received data request: {request}")
     service_type = request.request_type
-    account_identifier = request.details or ""
+    account_identifier = (request.details or "").strip()
 
-    # Map service_type to identifier_type
+    # Map service_type to identifier_type and utility context
     if service_type in ["electricity_ci", "electricity_sme"]:
         identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = (
+            "C&I Electricity" if service_type == "electricity_ci" else "SME Electricity"
+        )
     elif service_type in ["gas_ci", "gas_sme"]:
         identifier_type = "MRIN"
+        utility_type = "gas"
+        utility_type_identifier = "C&I Gas" if service_type == "gas_ci" else "SME Gas"
     elif service_type == "waste":
         identifier_type = "account_number"
+        utility_type = "waste"
+        utility_type_identifier = "Waste"
     else:
-        identifier_type = "NMI"  # default fallback
+        # Fallback to electricity/NMI if an unknown type sneaks through
+        identifier_type = "NMI"
+        utility_type = "electricity"
+        utility_type_identifier = "Electricity"
 
-    result = supplier_data_request(
+    raw_result = supplier_data_request(
         supplier_name=request.supplier_name,
         business_name=request.business_name,
         service_type=service_type,
         account_identifier=account_identifier,
-        identifier_type=identifier_type
+        identifier_type=identifier_type,
     )
-    if isinstance(result, dict):
-        result["user_email"] = user_info.get("email")
-    else:
-        result = {"status": "error", "message": result, "user_email": user_info.get("email")}
-    logging.info(f"Returning data request response to frontend: {result}")
-    return result
+
+    # Determine success based on the human-readable message
+    message = str(raw_result or "").strip()
+    is_success = message.startswith("✅") or "Data request successfully sent" in message
+
+    # On success, upsert client, ensure offer, and record an offer activity
+    if is_success and request.business_name:
+        try:
+            user_email = user_info.get("email")
+
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=request.business_name,
+                external_business_id=None,
+                primary_contact_email=None,
+                gdrive_folder_url=None,
+            )
+
+            offer = None
+            if client:
+                offer = get_or_create_offer_for_activity(
+                    db=db,
+                    client_id=client.id,
+                    business_name=request.business_name,
+                    utility_type=utility_type,
+                    utility_type_identifier=utility_type_identifier,
+                    identifier=account_identifier or None,
+                    created_by=user_email,
+                )
+
+            if offer:
+                metadata = {
+                    "service_type": service_type,
+                    "utility_type": utility_type,
+                    "utility_type_identifier": utility_type_identifier,
+                    "identifier_type": identifier_type,
+                    "identifier": account_identifier or None,
+                    "supplier_name": request.supplier_name,
+                    "source": "data_request_page",
+                }
+                try:
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.DATA_REQUEST,
+                        metadata=metadata,
+                        created_by=user_email,
+                    )
+                except Exception as act_e:
+                    logging.warning(
+                        "Failed to create DATA_REQUEST offer activity: %s", act_e
+                    )
+        except Exception as crm_e:
+            logging.error("Failed to record CRM data for data request: %s", crm_e)
+
+    response_payload = {
+        "status": "success" if is_success else "error",
+        "message": message,
+        "user_email": user_info.get("email"),
+    }
+    logging.info(f"Returning data request response to frontend: {response_payload}")
+    return response_payload
 
 class SignedAgreementRequest(BaseModel):
     business_name: str
@@ -1007,6 +1089,138 @@ def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google
         raise HTTPException(status_code=500, detail="Failed to load Base 1 landing responses")
 
 
+@app.get("/api/base1-leads")
+def get_base1_leads_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Lead pipeline view backed by Base 1 runs.
+
+    - Source rows: Base 1 Landing Page Responses sheet (via get_base1_landing_responses)
+    - Filters out businesses that already exist as CRM clients (by business_name or primary_contact_email)
+    - Groups by Company Name so each business appears once (most recent run wins)
+    - Enriches with a simple lead status from ClientStatusNote where note_type='lead_status'
+      (latest note per business), defaulting to "New" when none exists.
+
+    Returns:
+        {
+          "rows": [
+            {
+              "id": str,  # stable per business (company name)
+              "company_name": str,
+              "contact_name": str | null,
+              "contact_email": str | null,
+              "contact_number": str | null,
+              "state": str | null,
+              "timestamp": str | null,
+              "drive_folder_url": str | null,
+              "base1_review_url": str | null,
+              "utility_types": str | null,
+              "status": str,  # e.g. "New", "Contacted", "Qualified", "Not a fit"
+            },
+            ...
+          ],
+          "user_email": str | null,
+        }
+    """
+    try:
+        # 1) Load raw Base 1 rows from Google Sheet
+        raw_rows = get_base1_landing_responses() or []
+
+        # 2) Build lookup sets for existing CRM members to filter out
+        existing_clients = db.query(Client.business_name, Client.primary_contact_email).all()
+        existing_names = {
+            (c.business_name or "").strip().lower()
+            for c in existing_clients
+            if c.business_name
+        }
+        existing_emails = {
+            (c.primary_contact_email or "").strip().lower()
+            for c in existing_clients
+            if c.primary_contact_email
+        }
+
+        # 3) Group Base 1 rows by Company Name and keep the most recent by Timestamp
+        grouped_by_company: dict[str, dict] = {}
+        for row in raw_rows:
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+
+            email = (row.get("Contact Email") or "").strip()
+            # Skip if this company or email is already a CRM member
+            if company.lower() in existing_names or (email and email.lower() in existing_emails):
+                continue
+
+            key = company.lower()
+            current = grouped_by_company.get(key)
+            ts = row.get("Timestamp") or ""
+            if current is None:
+                grouped_by_company[key] = row
+            else:
+                # Prefer the row with the latest timestamp (lexicographically; sheet timestamps are ISO-like)
+                current_ts = current.get("Timestamp") or ""
+                if ts > current_ts:
+                    grouped_by_company[key] = row
+
+        # Nothing left after filtering
+        if not grouped_by_company:
+            return {"rows": [], "user_email": user_info.get("email")}
+
+        # 4) Fetch latest lead_status note per business in one query
+        company_names = [row.get("Company Name") or "" for row in grouped_by_company.values()]
+        # Strip blanks
+        company_names = [name for name in (n.strip() for n in company_names) if name]
+
+        status_by_business: dict[str, str] = {}
+        if company_names:
+            notes_q = (
+                db.query(ClientStatusNote)
+                .filter(
+                    ClientStatusNote.business_name.in_(company_names),
+                    ClientStatusNote.note_type == "lead_status",
+                )
+                .order_by(ClientStatusNote.business_name.asc(), ClientStatusNote.created_at.desc())
+            )
+            for n in notes_q.all():
+                name = (n.business_name or "").strip()
+                # First (most recent per business) wins thanks to ordering
+                if name and name not in status_by_business:
+                    status_by_business[name] = (n.note or "").strip() or "New"
+
+        # 5) Build response rows
+        rows = []
+        for key, row in grouped_by_company.items():
+            company = (row.get("Company Name") or "").strip()
+            if not company:
+                continue
+            status = status_by_business.get(company, "New")
+
+            rows.append(
+                {
+                    "id": company,  # stable id per business for frontend grouping
+                    "company_name": company,
+                    "contact_name": (row.get("Contact Name") or "").strip() or None,
+                    "contact_email": (row.get("Contact Email") or "").strip() or None,
+                    "contact_number": (row.get("Contact Number") or "").strip() or None,
+                    "state": (row.get("State") or "").strip() or None,
+                    "timestamp": (row.get("Timestamp") or "").strip() or None,
+                    "drive_folder_url": (row.get("Google Drive Folder") or "").strip() or None,
+                    "base1_review_url": (row.get("Base 1 Review") or "").strip() or None,
+                    "utility_types": (row.get("Utility Types") or "").strip() or None,
+                    "status": status or "New",
+                }
+            )
+
+        return {"rows": rows, "user_email": user_info.get("email")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error building Base 1 leads: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to load Base 1 leads")
+
+
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
     request: DocumentGenerationRequest,
@@ -1138,6 +1352,7 @@ def generate_engagement_form_endpoint(
                     offer = get_or_create_offer_for_activity(
                         db, client.id, request.business_name, "engagement_form",
                         created_by=user_info.get("email"),
+                        utility_type_identifier="Engagement form",
                     )
                     create_offer_activity(
                         db,
@@ -1198,6 +1413,7 @@ def generate_ghg_offer_endpoint(
                     offer = get_or_create_offer_for_activity(
                         db, client.id, request.business_name, "ghg",
                         created_by=user_info.get("email"),
+                        utility_type_identifier="Electricity",
                     )
                     doc_link = result.get("document_link")
                     create_offer_activity(
@@ -3025,6 +3241,75 @@ def update_client(
     return db_client
 
 
+@app.delete("/api/clients/{client_id}", response_model=dict)
+def delete_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a client and all dependent CRM records.
+
+    This removes:
+    - Offer activities for this client's offers (and any activities directly linked by client_id)
+    - Offers linked to this client
+    - Client status notes linked by client_id
+    - Tasks linked to this client, plus their TaskHistory entries
+    Finally, deletes the Client row itself.
+    """
+    logging.info(f"Deleting client {client_id} and dependent records")
+
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    # 1) Offers and offer activities
+    offer_ids = [
+        o.id
+        for o in db.query(Offer.id)
+        .filter(Offer.client_id == client_id)
+        .all()
+    ]
+    if offer_ids:
+        db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+    # Also remove any activities that reference this client directly
+    db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    db.query(Offer).filter(Offer.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 2) Tasks and task history
+    task_ids = [
+        t.id
+        for t in db.query(Task.id)
+        .filter(Task.client_id == client_id)
+        .all()
+    ]
+    if task_ids:
+        db.query(TaskHistory).filter(TaskHistory.task_id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(Task).filter(Task.id.in_(task_ids)).delete(
+            synchronize_session=False
+        )
+
+    # 3) Client status notes linked by client_id
+    db.query(ClientStatusNote).filter(ClientStatusNote.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
+    # 4) Finally, delete the client itself
+    db.delete(client)
+    db.commit()
+
+    logging.info(f"Client {client_id} and dependent records deleted")
+    return {"status": "success", "message": "Client and related data deleted"}
+
+
 @app.post("/api/clients/search", response_model=List[ClientResponse])
 def search_clients(
     search: ClientSearchRequest,
@@ -3079,35 +3364,78 @@ def global_search(
     return {"clients": client_list, "offers": offer_list}
 
 
-@app.patch("/api/clients/bulk", response_model=List[ClientResponse])
+@app.patch("/api/client-bulk-update", response_model=List[ClientResponse])
 def bulk_update_clients(
     body: ClientBulkUpdateRequest,
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
     """Bulk update clients: set owner_email and/or stage for the given client IDs. For stage changes, history is recorded."""
+    logging.info(
+        "[CRM] bulk_update_clients called with body=%s",
+        body.model_dump(mode="json"),
+    )
     if not body.client_ids:
+        logging.info("[CRM] bulk_update_clients: empty client_ids, returning []")
         return []
+
     user_email = (user_data.get("idinfo") or {}).get("email") or ""
-    updated = []
-    for client_id in body.client_ids:
+
+    # Coerce all client_ids to integers and fail fast with a clear error
+    try:
+        client_ids = [int(raw_id) for raw_id in body.client_ids]
+    except (TypeError, ValueError) as exc:
+        logging.error(
+            "[CRM] bulk_update_clients: failed to coerce client_ids=%r (types=%r): %s",
+            body.client_ids,
+            [type(x) for x in body.client_ids],
+            exc,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid client_ids: all client_ids must be integers.",
+        )
+    updated: List[Client] = []
+    any_changes = False
+
+    for client_id in client_ids:
         client = db.query(Client).filter(Client.id == client_id).first()
         if not client:
             continue
+
         if body.owner_email is not None:
             client.owner_email = body.owner_email.strip() or None
+            any_changes = True
+
         if body.stage is not None:
             update_client_stage_with_history(
                 db=db,
                 client_id=client_id,
                 new_stage=body.stage,
                 user_email=user_email,
+                commit=False,
             )
-        else:
-            db.commit()
-        db.refresh(client)
+            any_changes = True
+
         updated.append(client)
-    return [ClientResponse.model_validate(c) for c in updated]
+
+    logging.info(
+        "[CRM] bulk_update_clients: any_changes=%s, client_ids=%s, stage=%s, owner_email=%s, user_email=%s",
+        any_changes,
+        client_ids,
+        body.stage,
+        body.owner_email,
+        user_email,
+    )
+
+    if any_changes:
+        db.commit()
+        for client in updated:
+            db.refresh(client)
+
+    return [
+        ClientResponse.model_validate(c).model_dump(mode="json") for c in updated
+    ]
 
 
 @app.patch("/api/clients/{client_id}/stage", response_model=ClientResponse)
@@ -3200,8 +3528,124 @@ def create_client_note_for_id(
     return db_note
 
 
+def _parse_activity_metadata(meta_raw):  # noqa: ANN001
+    """Parse activity metadata from DB (may be JSON string)."""
+    if meta_raw is None:
+        return None
+    if isinstance(meta_raw, dict):
+        return meta_raw
+    if isinstance(meta_raw, str):
+        try:
+            return json.loads(meta_raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
+    """Map activity_type to display prefix: Base 2, DMA, or Comparison."""
+    if not activity_type:
+        return None
+    at = (activity_type or "").strip().lower()
+    if at == "base2_review":
+        return "Base 2"
+    if at in ("dma_review_generated", "dma_email_sent"):
+        return "DMA"
+    if at == "comparison":
+        return "Comparison"
+    return None
+
+
+def _get_offer_source_prefix_from_activities(db: Session, offer: Offer) -> Optional[str]:
+    """Return the source prefix (Base 2, DMA, Comparison) from the offer's most recent relevant activity."""
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(20)
+        .all()
+    )
+    for a in activities:
+        prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if prefix:
+            return prefix
+    return None
+
+
+def _derived_offer_fields_from_activities(db: Session, offer: Offer) -> dict:
+    """
+    When an offer has no utility_type/identifier set, derive from its activities' metadata
+    so the list and detail pages show data (e.g. Gas, NMI) from Base 2 / comparison runs.
+    Also sets source_prefix (Base 2, DMA, Comparison) for utility_display.
+    """
+    out = {}
+    if offer.utility_type or offer.utility_type_identifier or offer.identifier:
+        return out
+    activities = (
+        db.query(OfferActivity)
+        .filter(OfferActivity.offer_id == offer.id)
+        .order_by(OfferActivity.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    utility_type = None
+    utility_type_identifier = None
+    identifier = None
+    source_prefix = None
+    for a in activities:
+        meta = _parse_activity_metadata(getattr(a, "metadata_", None))
+        if not meta:
+            continue
+        if utility_type is None and meta.get("utility_type"):
+            utility_type = (meta.get("utility_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type is None and meta.get("comparison_type"):
+            utility_type = (meta.get("comparison_type") or "").strip()
+            if source_prefix is None:
+                source_prefix = _activity_type_to_source_prefix(getattr(a, "activity_type", None))
+        if utility_type_identifier is None and meta.get("utility_type_identifier"):
+            utility_type_identifier = (meta.get("utility_type_identifier") or "").strip()
+        if identifier is None:
+            id_val = (
+                meta.get("nmi")
+                or meta.get("mrin")
+                or meta.get("identifier")
+                or meta.get("account_number")
+                or meta.get("account_name")
+            )
+            if id_val:
+                identifier = str(id_val).strip()
+        if utility_type and identifier and utility_type_identifier and source_prefix is not None:
+            break
+    if utility_type:
+        raw = (utility_type or "").lower()
+        if not utility_type_identifier:
+            utility_type_identifier = (
+                "Electricity" if raw == "electricity"
+                else "Gas" if raw == "gas"
+                else "Waste" if raw == "waste"
+                else "Oil" if raw == "oil"
+                else "Cleaning" if raw == "cleaning"
+                else "DMA" if raw == "dma"
+                else utility_type
+            )
+        out["utility_type"] = utility_type
+        out["utility_type_identifier"] = utility_type_identifier
+        if source_prefix is None:
+            source_prefix = _activity_type_to_source_prefix(
+                activities[0].activity_type if activities else None
+            )
+        out["source_prefix"] = source_prefix
+    if identifier:
+        out["identifier"] = identifier
+    return out
+
+
 def _offer_to_response(db: Session, offer: Offer) -> OfferResponse:
-    """Build OfferResponse with derived is_existing_client from linked client stage."""
+    """Build OfferResponse with derived is_existing_client from linked client stage.
+    When offer has no utility/identifier, derive from activities so list and detail show data.
+    Sets utility_display as 'Base 2 Gas' / 'DMA Electricity' / 'Comparison Gas' when source is known."""
     is_existing = False
     if offer.client_id:
         client = db.query(Client).filter(Client.id == offer.client_id).first()
@@ -3209,9 +3653,32 @@ def _offer_to_response(db: Session, offer: Offer) -> OfferResponse:
             stage_val = (client.stage or "").strip().lower()
             if stage_val in (s.value for s in POST_WIN_STAGES):
                 is_existing = True
-    return OfferResponse.model_validate(offer).model_copy(
+    base = OfferResponse.model_validate(offer).model_copy(
         update={"is_existing_client": is_existing}
     )
+    utility_display = base.utility_type_identifier or base.utility_type
+    if not offer.utility_type and not offer.utility_type_identifier and not offer.identifier:
+        derived = _derived_offer_fields_from_activities(db, offer)
+        if derived:
+            label = derived.get("utility_type_identifier") or derived.get("utility_type")
+            prefix = derived.get("source_prefix")
+            if prefix and label:
+                utility_display = f"{prefix} {label}"
+            elif label:
+                utility_display = label
+            base = base.model_copy(update={
+                "utility_type": derived.get("utility_type") or base.utility_type,
+                "utility_type_identifier": derived.get("utility_type_identifier") or base.utility_type_identifier,
+                "identifier": derived.get("identifier") or base.identifier,
+            })
+    else:
+        # Offer has utility data; still add source prefix from activities if present
+        prefix = _get_offer_source_prefix_from_activities(db, offer)
+        if prefix and utility_display:
+            utility_display = f"{prefix} {utility_display}"
+    if utility_display:
+        base = base.model_copy(update={"utility_display": utility_display})
+    return base
 
 
 @app.post("/api/offers", response_model=OfferResponse)
@@ -3230,7 +3697,12 @@ def create_offer(
         utility_type=offer.utility_type,
         utility_type_identifier=offer.utility_type_identifier,
         identifier=offer.identifier,
-        status=offer.status or "requested",
+        status=(offer.status or OfferStatus.REQUESTED).value
+        if isinstance(offer.status, OfferStatus)
+        else (offer.status or OfferStatus.REQUESTED.value),
+        pipeline_stage=offer.pipeline_stage.value
+        if isinstance(getattr(offer, "pipeline_stage", None), OfferPipelineStageSchema)
+        else getattr(offer, "pipeline_stage", None),
         estimated_value=offer.estimated_value,
         created_by=user_email,
         external_record_id=offer.external_record_id,
@@ -3247,6 +3719,8 @@ def create_offer(
 def list_offers(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
@@ -3255,7 +3729,7 @@ def list_offers(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    """List offers, optionally filtered by client, status, date range, or mine (by client owner). When limit/offset set, returns { items, total }."""
+    """List offers, optionally filtered by client, status, utility, identifier, date range, or mine (by client owner). When limit/offset set, returns { items, total }."""
     from datetime import datetime as dt
     from datetime import timedelta
     logging.info("Listing offers")
@@ -3270,6 +3744,16 @@ def list_offers(
             query = query.filter(Offer.id == -1)
     if status is not None:
         query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -3299,6 +3783,8 @@ def list_offers(
 def export_offers_csv(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     status: Optional[str] = Query(None, description="Filter by status"),
+    utility: Optional[str] = Query(None, description="Filter by utility type or label (substring match)"),
+    identifier: Optional[str] = Query(None, description="Filter by identifier (substring match, e.g. NMI/MIRN)"),
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
@@ -3319,6 +3805,16 @@ def export_offers_csv(
             query = query.filter(Offer.id == -1)
     if status is not None:
         query = query.filter(Offer.status == status)
+    if utility and utility.strip():
+        term = f"%{utility.strip()}%"
+        query = query.filter(
+            or_(
+                Offer.utility_type.ilike(term),
+                Offer.utility_type_identifier.ilike(term),
+            )
+        )
+    if identifier and identifier.strip():
+        query = query.filter(Offer.identifier.ilike(f"%{identifier.strip()}%"))
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -3445,13 +3941,23 @@ def update_offer(
     if offer_update.identifier is not None:
         db_offer.identifier = offer_update.identifier
     if offer_update.status is not None:
-        db_offer.status = offer_update.status
+        db_offer.status = (
+            offer_update.status.value
+            if isinstance(offer_update.status, OfferStatus)
+            else str(offer_update.status)
+        )
     if offer_update.estimated_value is not None:
         db_offer.estimated_value = offer_update.estimated_value
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
         db_offer.document_link = offer_update.document_link
+    if offer_update.pipeline_stage is not None:
+        db_offer.pipeline_stage = (
+            offer_update.pipeline_stage.value
+            if isinstance(offer_update.pipeline_stage, OfferPipelineStageSchema)
+            else str(offer_update.pipeline_stage)
+        )
 
     db.commit()
     db.refresh(db_offer)
@@ -3473,6 +3979,90 @@ def update_offer_status(
         new_status=status_update.status,
     )
     return _offer_to_response(db, updated)
+
+
+@app.patch("/api/offers/{offer_id}/pipeline-stage", response_model=OfferResponse)
+def update_offer_pipeline_stage(
+    offer_id: int,
+    body: OfferPipelineStageUpdateRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Update the detailed pipeline stage for an offer.
+
+    For terminal pipeline stages (contract_accepted / lost) we delegate to status
+    propagation so that client lifecycle remains consistent.
+    """
+    logging.info(
+        "Updating offer %s pipeline_stage to %s", offer_id, body.pipeline_stage
+    )
+
+    stage = body.pipeline_stage
+    if stage in (
+        OfferPipelineStageSchema.CONTRACT_ACCEPTED,
+        OfferPipelineStageSchema.LOST,
+    ):
+        status = (
+            OfferStatus.ACCEPTED
+            if stage == OfferPipelineStageSchema.CONTRACT_ACCEPTED
+            else OfferStatus.LOST
+        )
+        updated = update_offer_status_and_propagate_client_stage(
+            db=db,
+            offer_id=offer_id,
+            new_status=status,
+        )
+        return _offer_to_response(db, updated)
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    offer.pipeline_stage = (
+        stage.value if isinstance(stage, OfferPipelineStageSchema) else str(stage)
+    )
+    db.commit()
+    db.refresh(offer)
+    return _offer_to_response(db, offer)
+
+
+@app.delete("/api/offers/{offer_id}", response_model=dict)
+def delete_offer(
+    offer_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a single offer and its dependent records.
+
+    This removes:
+    - OfferActivity rows for this offer
+    - ClientStatusNote rows linked via related_offer_id for this offer
+    Finally, deletes the Offer row.
+    """
+    logging.info(f"Deleting offer {offer_id} and dependent records")
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    # Delete activities for this offer
+    db.query(OfferActivity).filter(OfferActivity.offer_id == offer_id).delete(
+        synchronize_session=False
+    )
+
+    # Delete notes that are explicitly linked to this offer
+    db.query(ClientStatusNote).filter(
+        ClientStatusNote.related_offer_id == offer_id
+    ).delete(synchronize_session=False)
+
+    # Delete the offer itself
+    db.delete(offer)
+    db.commit()
+
+    logging.info(f"Offer {offer_id} and dependent records deleted")
+    return {"status": "success", "message": "Offer and related data deleted"}
 
 
 @app.get("/api/reports/clients/offer-counts")
@@ -3623,7 +4213,7 @@ def activities_report_list(
     from datetime import timedelta
     logging.info("Listing activities for report")
     query = (
-        db.query(OfferActivity, Offer.business_name)
+        db.query(OfferActivity, Offer)
         .join(Offer, OfferActivity.offer_id == Offer.id)
     )
     if client_id is not None:
@@ -3649,19 +4239,26 @@ def activities_report_list(
         .limit(limit)
         .all()
     )
-    return [
-        ActivityReportItem(
-            id=act.id,
-            offer_id=act.offer_id,
-            client_id=act.client_id,
-            business_name=business_name,
-            activity_type=act.activity_type,
-            document_link=act.document_link,
-            created_at=act.created_at,
-            created_by=act.created_by,
+    out = []
+    for act, offer in rows:
+        resp = _offer_to_response(db, offer)
+        offer_display = (resp.utility_display or "Offer")
+        if resp.identifier:
+            offer_display = f"{offer_display} {resp.identifier}"
+        out.append(
+            ActivityReportItem(
+                id=act.id,
+                offer_id=act.offer_id,
+                client_id=act.client_id,
+                business_name=offer.business_name,
+                activity_type=act.activity_type,
+                document_link=act.document_link,
+                created_at=act.created_at,
+                created_by=act.created_by,
+                offer_display=offer_display or None,
+            )
         )
-        for act, business_name in rows
-    ]
+    return out
 
 
 @app.get("/api/reports/activities/summary")

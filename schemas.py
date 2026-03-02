@@ -6,7 +6,7 @@ from typing import Optional, List, Any
 from datetime import datetime
 import json
 from utils.timezone import to_melbourne_iso
-from crm_enums import ClientStage, OfferStatus, OfferActivityType
+from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 
 
 class TaskCreate(BaseModel):
@@ -123,6 +123,33 @@ class ClientCreate(BaseModel):
     stage: Optional[ClientStage] = ClientStage.LEAD
     owner_email: Optional[str] = None
 
+    @field_validator("stage", mode="before")
+    @classmethod
+    def _normalize_stage(cls, v: Optional[str]) -> Optional[ClientStage]:
+        """
+        Accept legacy granular stages and normalise them into the coarse lifecycle.
+
+        This keeps API compatibility for existing data while moving towards a simpler
+        relationship lifecycle model.
+        """
+        if v is None:
+            return v
+        if isinstance(v, ClientStage):
+            return v
+        raw = str(v).strip().lower()
+        if not raw:
+            return None
+        # Legacy granular stages all map to QUALIFIED.
+        if raw in {
+            "loa_signed",
+            "data_collected",
+            "analysis_in_progress",
+            "offer_sent",
+        }:
+            return ClientStage.QUALIFIED
+        # Pass through known coarse stages; Pydantic will validate.
+        return ClientStage(raw)
+
 
 class ClientUpdate(BaseModel):
     business_name: Optional[str] = None
@@ -131,6 +158,25 @@ class ClientUpdate(BaseModel):
     gdrive_folder_url: Optional[str] = None
     stage: Optional[ClientStage] = None
     owner_email: Optional[str] = None
+
+    @field_validator("stage", mode="before")
+    @classmethod
+    def _normalize_stage(cls, v: Optional[str]) -> Optional[ClientStage]:
+        if v is None:
+            return v
+        if isinstance(v, ClientStage):
+            return v
+        raw = str(v).strip().lower()
+        if not raw:
+            return None
+        if raw in {
+            "loa_signed",
+            "data_collected",
+            "analysis_in_progress",
+            "offer_sent",
+        }:
+            return ClientStage.QUALIFIED
+        return ClientStage(raw)
 
 
 class ClientResponse(BaseModel):
@@ -154,6 +200,30 @@ class ClientResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator("stage", mode="before")
+    @classmethod
+    def _normalize_stage(cls, v: Optional[str]) -> ClientStage:
+        """
+        Normalise legacy granular stages when reading from ORM.
+        """
+        if isinstance(v, ClientStage):
+            return v
+        raw = str(v or "").strip().lower()
+        if not raw:
+            return ClientStage.LEAD
+        if raw in {
+            "loa_signed",
+            "data_collected",
+            "analysis_in_progress",
+            "offer_sent",
+        }:
+            return ClientStage.QUALIFIED
+        try:
+            return ClientStage(raw)
+        except ValueError:
+            # Fallback for truly unexpected historic values.
+            return ClientStage.LEAD
+
 
 class OfferCreate(BaseModel):
     client_id: Optional[int] = None
@@ -162,6 +232,8 @@ class OfferCreate(BaseModel):
     utility_type_identifier: Optional[str] = None
     identifier: Optional[str] = None
     status: Optional[OfferStatus] = OfferStatus.REQUESTED
+    # Optional explicit pipeline stage when creating offers manually.
+    pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
@@ -174,6 +246,7 @@ class OfferUpdate(BaseModel):
     utility_type_identifier: Optional[str] = None
     identifier: Optional[str] = None
     status: Optional[OfferStatus] = None
+    pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
@@ -186,7 +259,10 @@ class OfferResponse(BaseModel):
     utility_type: Optional[str] = None
     utility_type_identifier: Optional[str] = None
     identifier: Optional[str] = None
+    # Display: "Base 2 Gas", "DMA Electricity", "Comparison Gas" (source + utility) for Utility column
+    utility_display: Optional[str] = None
     status: OfferStatus
+    pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
@@ -278,6 +354,8 @@ class ActivityReportItem(BaseModel):
     document_link: Optional[str] = None
     created_at: datetime
     created_by: Optional[str] = None
+    # Full label "Base 2 Gas 5321568754" (source + utility + identifier) for Offer column
+    offer_display: Optional[str] = None
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime, _info):

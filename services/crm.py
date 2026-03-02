@@ -5,7 +5,13 @@ import json
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from crm_enums import ClientStage, OfferStatus, OfferActivityType, POST_WIN_STAGES
+from crm_enums import (
+    ClientStage,
+    OfferStatus,
+    OfferActivityType,
+    OfferPipelineStage,
+    POST_WIN_STAGES,
+)
 from models import Client, Offer, ClientStatusNote, OfferActivity
 
 
@@ -65,6 +71,8 @@ def update_client_stage_with_history(
     client_id: int,
     new_stage: ClientStage,
     user_email: str,
+    *,
+    commit: bool = True,
 ) -> Client:
     """
     Update a client's stage and append a structured ClientStatusNote entry.
@@ -96,8 +104,9 @@ def update_client_stage_with_history(
         )
         db.add(stage_note)
 
-    db.commit()
-    db.refresh(client)
+    if commit:
+        db.commit()
+        db.refresh(client)
     return client
 
 
@@ -124,6 +133,12 @@ def update_offer_status_and_propagate_client_stage(
         new_status
     )
     offer.status = status_value
+
+    # Keep pipeline stage aligned with coarse status for terminal outcomes.
+    if new_status == OfferStatus.ACCEPTED:
+        offer.pipeline_stage = OfferPipelineStage.CONTRACT_ACCEPTED.value
+    elif new_status == OfferStatus.LOST:
+        offer.pipeline_stage = OfferPipelineStage.LOST.value
 
     if offer.client_id:
         client = db.query(Client).filter(Client.id == offer.client_id).first()
@@ -177,6 +192,106 @@ def create_offer_activity(
     )
     activity.metadata_ = meta_str
     db.add(activity)
+
+    # Advance offer.pipeline_stage based on key structured activity events.
+    # We only move forwards along the defined order; we never move backwards.
+    ACTIVITY_TO_STAGE = {
+        OfferActivityType.COMPARISON: OfferPipelineStage.COMPARISON_SENT,
+        OfferActivityType.ENGAGEMENT_FORM: OfferPipelineStage.ENGAGEMENT_FORM_SENT,
+        OfferActivityType.ENGAGEMENT_FORM_SIGNED: OfferPipelineStage.ENGAGEMENT_FORM_SIGNED,
+        OfferActivityType.CONTRACT_REQUESTED: OfferPipelineStage.CONTRACT_REQUESTED,
+        OfferActivityType.CONTRACT_RECEIVED: OfferPipelineStage.CONTRACT_RECEIVED,
+        OfferActivityType.CONTRACT_SENT_FOR_SIGNING: OfferPipelineStage.CONTRACT_SENT_FOR_SIGNING,
+        OfferActivityType.CONTRACT_SIGNED_LODGED: OfferPipelineStage.CONTRACT_SIGNED_LODGED,
+    }
+
+    PIPELINE_ORDER = {
+        OfferPipelineStage.COMPARISON_SENT: 10,
+        OfferPipelineStage.ENGAGEMENT_FORM_SENT: 20,
+        OfferPipelineStage.ENGAGEMENT_FORM_SIGNED: 30,
+        OfferPipelineStage.CONTRACT_REQUESTED: 40,
+        OfferPipelineStage.CONTRACT_RECEIVED: 50,
+        OfferPipelineStage.CONTRACT_SENT_FOR_SIGNING: 60,
+        OfferPipelineStage.CONTRACT_SIGNED_LODGED: 70,
+        OfferPipelineStage.CONTRACT_ACCEPTED: 80,
+        OfferPipelineStage.LOST: 90,
+    }
+
+    target_stage = ACTIVITY_TO_STAGE.get(activity_type)
+    if target_stage is not None:
+        current_raw = offer.pipeline_stage or ""
+        try:
+            current_stage = (
+                OfferPipelineStage(current_raw)
+                if current_raw
+                else None
+            )
+        except ValueError:
+            current_stage = None
+
+        current_order = PIPELINE_ORDER.get(current_stage, 0)
+        target_order = PIPELINE_ORDER.get(target_stage, 0)
+        if target_order > current_order:
+            offer.pipeline_stage = target_stage.value
+
+    # Auto-update offer.status based on key activity events, keeping client
+    # lifecycle and coarse status aligned with the offer micro-pipeline.
+    #
+    # - When we send a proposal/comparison/engagement form, move from
+    #   requested → awaiting_response.
+    # - When the engagement form is signed or a contract is lodged, treat the
+    #   offer as accepted (unless it's already accepted/lost) and reuse the
+    #   existing propagation logic so the linked client moves to WON.
+    current_status_raw = offer.status or OfferStatus.REQUESTED.value
+    try:
+        current_status = OfferStatus(current_status_raw)
+    except ValueError:
+        current_status = None
+
+    # 1) Proposal sent → awaiting_response (only from requested).
+    PROPOSAL_SENT_TYPES = {
+        OfferActivityType.COMPARISON,
+        OfferActivityType.GHG_OFFER,
+        OfferActivityType.ENGAGEMENT_FORM,
+    }
+    if (
+        activity_type in PROPOSAL_SENT_TYPES
+        and current_status == OfferStatus.REQUESTED
+    ):
+        offer.status = OfferStatus.AWAITING_RESPONSE.value
+        current_status = OfferStatus.AWAITING_RESPONSE
+
+    # 2) Signed artefacts → accepted (unless already accepted/lost).
+    ACCEPTING_ACTIVITY_TYPES = {
+        OfferActivityType.ENGAGEMENT_FORM_SIGNED,
+        OfferActivityType.CONTRACT_SIGNED_LODGED,
+    }
+    if current_status not in (OfferStatus.ACCEPTED, OfferStatus.LOST):
+        # If pipeline has already been manually advanced to CONTRACT_ACCEPTED
+        # we also treat the offer as accepted.
+        pipeline_raw = offer.pipeline_stage or ""
+        try:
+            pipeline_stage = (
+                OfferPipelineStage(pipeline_raw) if pipeline_raw else None
+            )
+        except ValueError:
+            pipeline_stage = None
+
+        should_accept = activity_type in ACCEPTING_ACTIVITY_TYPES or (
+            pipeline_stage == OfferPipelineStage.CONTRACT_ACCEPTED
+        )
+
+        if should_accept:
+            # Reuse centralised propagation so client.stage and terminal
+            # pipeline state stay consistent across all entry points.
+            update_offer_status_and_propagate_client_stage(
+                db=db,
+                offer_id=offer.id,
+                new_status=OfferStatus.ACCEPTED,
+            )
+            # Refresh the in-memory offer so callers see the latest values.
+            db.refresh(offer)
+
     db.commit()
     db.refresh(activity)
     return activity
@@ -188,6 +303,8 @@ def get_or_create_offer_for_activity(
     business_name: str,
     utility_type: str,
     created_by: Optional[str] = None,
+    utility_type_identifier: Optional[str] = None,
+    identifier: Optional[str] = None,
 ) -> Offer:
     """
     Find an existing offer for this client + utility type, or create a minimal one.
@@ -210,6 +327,8 @@ def get_or_create_offer_for_activity(
         client_id=client_id,
         business_name=business_name,
         utility_type=utility_type,
+        utility_type_identifier=utility_type_identifier or None,
+        identifier=identifier or None,
         status=OfferStatus.REQUESTED.value,
         created_by=created_by,
     )
