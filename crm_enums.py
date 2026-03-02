@@ -63,4 +63,7 @@ class OfferActivityType(str, Enum):
     DISCREPANCY_EMAIL_SENT = "discrepancy_email_sent"
     DMA_REVIEW_GENERATED = "dma_review_generated"
     DMA_EMAIL_SENT = "dma_email_sent"
+    # User-added from offer page (no pipeline/status side effects)
+    MANUAL_DOCUMENT = "manual_document"
+    MANUAL_ACTIVITY = "manual_activity"
 
