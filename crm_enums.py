@@ -63,4 +63,13 @@ class OfferActivityType(str, Enum):
     DISCREPANCY_EMAIL_SENT = "discrepancy_email_sent"
     DMA_REVIEW_GENERATED = "dma_review_generated"
     DMA_EMAIL_SENT = "dma_email_sent"
+    # Document generation (EOI, LOA, Service Agreement, Solution presentation)
+    EOI = "eoi"
+    LOA = "loa"
+    SERVICE_AGREEMENT = "service_agreement"
+    SOLUTION_PRESENTATION = "solution_presentation"
+    # User-added from offer page (no pipeline/status side effects)
+    MANUAL_DOCUMENT = "manual_document"
+    MANUAL_ACTIVITY = "manual_activity"
+    ONE_MONTH_SAVINGS_INVOICE = "one_month_savings_invoice"
 

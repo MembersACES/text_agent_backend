@@ -365,6 +365,11 @@ class EngagementFormType(Enum):
         "Referral Distribution Program",
         "1Brif45hiE650wdy-JWYd2oZ3Elfcwqiw4tapnUeFx0A",
     )
+    ERA_ROBOTIC_REFERRAL_PROGRAM = (
+        "ERA Robotic Referral Program",
+        "1Brif45hiE650wdy-JWYd2oZ3Elfcwqiw4tapnUeFx0A"
+    )
+
 
 def engagement_form_generation(
     business_name: str,
