@@ -60,6 +60,7 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 from tools.one_month_savings import (
     log_invoice_to_sheets,
     get_invoice_history,
+    update_invoice_status,
     get_next_sequential_invoice_number,
     get_or_create_subfolder,
     upload_pdf_to_drive,
@@ -2322,7 +2323,8 @@ class NextInvoiceNumberRequest(BaseModel):
 async def log_invoice_endpoint(
     request: Request,
     authorization: str = Header(...),
-    user_info: dict = None
+    user_info: dict = None,
+    db: Session = Depends(get_db),
 ):
     """Log an invoice to Google Sheets directly or via n8n webhook"""
     logging.info("=== One Month Savings Invoice Log Endpoint Called ===")
@@ -2391,6 +2393,56 @@ async def log_invoice_endpoint(
         
         result = log_invoice_to_sheets(invoice_data)
         result["user_email"] = user_info.get("email")
+
+        # Best-effort: also create a CRM activity so the invoice appears on the member timeline.
+        try:
+            business_name = invoice_data.get("business_name") or ""
+            contact_email = invoice_data.get("contact_email") or None
+
+            if business_name:
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name=business_name,
+                    external_business_id=None,
+                    primary_contact_email=contact_email,
+                    gdrive_folder_url=None,
+                )
+
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db=db,
+                        client_id=client.id,
+                        business_name=client.business_name,
+                        utility_type="one_month_savings",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="1st Month Savings Invoice",
+                        identifier=invoice_data.get("invoice_number"),
+                    )
+
+                    metadata = {
+                        "source": "one_month_savings",
+                        "invoice_number": invoice_data.get("invoice_number"),
+                        "total_amount": invoice_data.get("total_amount"),
+                        "due_date": invoice_data.get("due_date"),
+                        "line_items": invoice_data.get("line_items", []),
+                        "invoice_file_id": invoice_data.get("invoice_file_id"),
+                    }
+
+                    create_offer_activity(
+                        db=db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.ONE_MONTH_SAVINGS_INVOICE,
+                        document_link=None,
+                        external_id=None,
+                        metadata=metadata,
+                        created_by=user_info.get("email"),
+                    )
+        except Exception as e:
+            logging.error(
+                f"Failed to create CRM activity for 1st Month Savings invoice "
+                f"{invoice_data.get('invoice_number')}: {e}"
+            )
         
         logging.info(f"Invoice logging completed: {result.get('success')}")
         return result
@@ -2447,6 +2499,45 @@ async def get_invoice_history_endpoint(
     except Exception as e:
         logging.error(f"Error fetching invoice history: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching invoice history: {str(e)}")
+
+
+@app.patch("/api/one-month-savings/status")
+async def update_invoice_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    user_info: dict = None
+):
+    """Update the status of a 1st Month Savings invoice (Generated / Sent / Paid)."""
+    logging.info("=== One Month Savings Update Status Endpoint Called ===")
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(
+            status_code=400,
+            detail="business_name, invoice_number and status are required"
+        )
+    result = update_invoice_status(business_name, invoice_number, status)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400 if "No matching" in str(result.get("error", "")) else 500,
+            detail=result.get("error", "Failed to update status")
+        )
+    return result
+
 
 @app.post("/api/one-month-savings/next-invoice-number")
 async def get_next_invoice_number_endpoint(

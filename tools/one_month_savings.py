@@ -427,7 +427,7 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 "error": "Could not connect to Google Sheets - check logs for details"
             }
         
-        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID, I=Status
         # Each line item gets its own row
         line_items = invoice_data.get("line_items", [])
         
@@ -438,8 +438,9 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 "error": "No line items provided"
             }
         
-        # Get invoice file ID (same for all line items of the same invoice)
+        # Get invoice file ID and status (same for all line items of the same invoice)
         invoice_file_id = invoice_data.get("invoice_file_id", "")
+        status = invoice_data.get("status", "Generated")
         
         # Prepare rows - one row per line item
         rows_data = []
@@ -458,6 +459,7 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
                 invoice_data.get("invoice_number", ""),      # Column F: Invoice Number
                 invoice_data.get("due_date", ""),            # Column G: Due Date
                 invoice_file_id,                             # Column H: Invoice ID (File ID from Drive)
+                status,                                      # Column I: Status (Generated / Sent / Paid)
             ]
             rows_data.append(row_data)
         
@@ -471,6 +473,7 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         logger.info(f"Sheet Name: {SHEET_NAME}")
         logger.info(f"Number of line items: {len(rows_data)}")
         logger.info(f"Invoice File ID: {invoice_file_id}")
+        logger.info(f"Status: {status}")
         logger.info(f"Invoice File ID type: {type(invoice_file_id)}")
         logger.info(f"Invoice File ID empty?: {not invoice_file_id}")
         logger.info(f"Invoice File ID length: {len(invoice_file_id) if invoice_file_id else 0}")
@@ -482,10 +485,10 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
             logger.info(f"All rows to be written: {rows_data}")
         
         try:
-            logger.info(f"Writing {len(rows_data)} rows to sheet {SHEET_ID}, range {SHEET_NAME}!A:H")
+            logger.info(f"Writing {len(rows_data)} rows to sheet {SHEET_ID}, range {SHEET_NAME}!A:I")
             result = service.spreadsheets().values().append(
                 spreadsheetId=SHEET_ID,
-                range=f"{SHEET_NAME}!A:H",  # Append to columns A-H (added Invoice ID column)
+                range=f"{SHEET_NAME}!A:I",  # Append to columns A-I (including Status)
                 valueInputOption='USER_ENTERED',
                 insertDataOption='INSERT_ROWS',
                 body=body
@@ -640,11 +643,11 @@ def get_invoice_history(business_name: str) -> Dict:
             }
         
         # Read all data from the sheet
-        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID
+        # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date, H=Invoice ID, I=Status
         # Use UNFORMATTED_VALUE to get raw numbers instead of formatted strings
         result = service.spreadsheets().values().get(
             spreadsheetId=SHEET_ID,
-            range=f"{SHEET_NAME}!A2:H",  # Skip header row, read columns A-H (added Invoice ID column)
+            range=f"{SHEET_NAME}!A2:I",  # Skip header row, read columns A-I (including Status)
             valueRenderOption='UNFORMATTED_VALUE'  # Get raw values, not formatted strings
         ).execute()
         
@@ -661,12 +664,12 @@ def get_invoice_history(business_name: str) -> Dict:
         logger.info(f"Searching for business: '{business_name}'")
         
         # Group rows by invoice number (each row is a line item)
-        # Column mapping: 0=Member (Business Name), 1=Solution, 2=Savings Amount, 3=GST, 4=Total Invoice, 5=Invoice Number, 6=Due Date, 7=Invoice ID
+        # Column mapping: 0=Member, 1=Solution, 2=Savings Amount, 3=GST, 4=Total Invoice, 5=Invoice Number, 6=Due Date, 7=Invoice ID, 8=Status
         invoice_dict = {}  # Key: invoice_number, Value: invoice data with line_items array
         
         for idx, row in enumerate(values):
-            # Ensure row has enough columns (now 8 columns including Invoice ID)
-            while len(row) < 8:
+            # Ensure row has enough columns (now 9 columns including Status)
+            while len(row) < 9:
                 row.append("")
             
             # Filter by business name (column A, index 0)
@@ -785,9 +788,14 @@ def get_invoice_history(business_name: str) -> Dict:
                         logger.warning(f"Row {idx} column H is None")
                 else:
                     logger.warning(f"Row {idx} has only {len(row)} columns, column H (index 7) not present")
-                    # Ensure row has 8 columns for consistency
-                    while len(row) < 8:
+                    # Ensure row has 9 columns for consistency
+                    while len(row) < 9:
                         row.append("")
+                
+                # Parse status (column I, index 8)
+                status_value = "Generated"
+                if len(row) > 8 and row[8] is not None and str(row[8]).strip():
+                    status_value = str(row[8]).strip()
                 
                 # Create line item
                 line_item = {
@@ -808,7 +816,7 @@ def get_invoice_history(business_name: str) -> Dict:
                         "subtotal": 0,
                         "total_gst": 0,
                         "total_amount": 0,
-                        "status": "Generated",
+                        "status": status_value,
                         "created_at": "",
                         "line_items": [],
                         "invoice_file_id": invoice_file_id  # Include file ID from column H
@@ -907,6 +915,59 @@ def get_invoice_history(business_name: str) -> Dict:
             "invoices": [],
             "error": f"Failed to fetch history: {str(e)}"
         }
+
+
+def update_invoice_status(business_name: str, invoice_number: str, new_status: str) -> Dict:
+    """
+    Update the status of all rows for a given invoice in the sheet.
+    Status must be one of: Generated, Sent, Paid.
+    
+    Returns:
+        Dict with success bool and updated_rows count or error message.
+    """
+    allowed = ("Generated", "Sent", "Paid")
+    if new_status not in allowed:
+        return {"success": False, "error": f"Status must be one of: {', '.join(allowed)}"}
+    if not business_name or not invoice_number:
+        return {"success": False, "error": "business_name and invoice_number are required"}
+    try:
+        service = get_sheets_service()
+        if not service:
+            return {"success": False, "error": "Could not connect to Google Sheets"}
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{SHEET_NAME}!A2:I",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        values = result.get("values", [])
+        business_name_clean = business_name.strip().lower()
+        invoice_number_clean = invoice_number.strip()
+        sheet_rows_to_update = []
+        for idx, row in enumerate(values):
+            while len(row) < 9:
+                row.append("")
+            row_business = (str(row[0]).strip() if row[0] is not None else "").lower()
+            row_invoice = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
+            if row_business == business_name_clean and row_invoice == invoice_number_clean:
+                sheet_rows_to_update.append(idx + 2)
+        if not sheet_rows_to_update:
+            return {"success": False, "error": "No matching rows found for this invoice"}
+        data = [
+            {"range": f"{SHEET_NAME}!I{r}:I{r}", "values": [[new_status]]}
+            for r in sheet_rows_to_update
+        ]
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": data},
+        ).execute()
+        logger.info(f"Updated status to '{new_status}' for invoice {invoice_number} ({len(sheet_rows_to_update)} rows)")
+        return {"success": True, "updated_rows": len(sheet_rows_to_update)}
+    except HttpError as e:
+        logger.error(f"Google Sheets API error updating status: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.exception(e)
+        return {"success": False, "error": str(e)}
 
 
 def _get_invoice_history_via_n8n(business_name: str) -> Dict:

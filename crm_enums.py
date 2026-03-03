@@ -71,4 +71,5 @@ class OfferActivityType(str, Enum):
     # User-added from offer page (no pipeline/status side effects)
     MANUAL_DOCUMENT = "manual_document"
     MANUAL_ACTIVITY = "manual_activity"
+    ONE_MONTH_SAVINGS_INVOICE = "one_month_savings_invoice"
 
