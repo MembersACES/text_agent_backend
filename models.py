@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Float
 from sqlalchemy.sql import func
 from datetime import datetime
 from database import Base
@@ -95,6 +95,10 @@ class Offer(Base):
     # Kept as a simple string for compatibility; see OfferPipelineStage enum for allowed values.
     pipeline_stage = Column(String(50), nullable=True)
     estimated_value = Column(Integer, nullable=True)
+    # From Base 2 / comparison (e.g. DMA): optional so other webhooks don't need to send
+    annual_savings = Column(Float, nullable=True)
+    current_cost = Column(Float, nullable=True)
+    new_cost = Column(Float, nullable=True)
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
     document_link = Column(Text, nullable=True)
@@ -119,3 +123,68 @@ class OfferActivity(Base):
     metadata_ = Column("metadata", JSON_COLUMN_TYPE, nullable=True)  # JSON stored as text if needed
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     created_by = Column(String(255), nullable=True)
+
+
+class StrategyItem(Base):
+    """
+    Normalised rows for the Strategy & WIP template per client and year.
+
+    Each record represents a single line item in one of the sections
+    (e.g. Past Achievements Annual, In Progress, Objective, Advocate, Summary).
+    """
+
+    __tablename__ = "strategy_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
+    year = Column(Integer, nullable=False, index=True)
+    # Section key, e.g. "past_achievements_annual", "in_progress", "objective", "advocate", "summary"
+    section = Column(String(50), nullable=False, index=True)
+    # For ordering within a section
+    row_index = Column(Integer, nullable=False, default=0)
+
+    member_level_solutions = Column(String(255), nullable=True)
+    details = Column(String(255), nullable=True)  # e.g. year label in Past Achievements
+    solution_type = Column(String(100), nullable=True)
+    sdg = Column(String(50), nullable=True)
+    key_results = Column(Text, nullable=True)
+
+    solution_details_1 = Column(Text, nullable=True)
+    solution_details_2 = Column(Text, nullable=True)
+    solution_details_3 = Column(Text, nullable=True)
+
+    engagement_form = Column(String(100), nullable=True)
+    contract_signed = Column(String(100), nullable=True)
+
+    # Monetary fields – stored as floats for flexibility (amounts may be fractional).
+    saving_achieved = Column(Float, nullable=True)
+    new_revenue_achieved = Column(Float, nullable=True)
+    est_saving_pa = Column(Float, nullable=True)
+    est_revenue_pa = Column(Float, nullable=True)
+    est_sav_rev_over_duration = Column(Float, nullable=True)
+
+    # Dates – stored as datetimes; UI can send ISO date strings.
+    saving_start_date = Column(DateTime, nullable=True)
+    new_revenue_start_date = Column(DateTime, nullable=True)
+    est_start_date = Column(DateTime, nullable=True)
+
+    est_sav_kpi_achieved = Column(String(50), nullable=True)
+
+    priority = Column(String(50), nullable=True)
+    status = Column(String(50), nullable=True)
+
+    # Link to CRM: when this row was auto-created from an offer/activity, we store references
+    # so status updates can be applied and the UI can link to the offer.
+    offer_id = Column(Integer, ForeignKey("offers.id"), nullable=True, index=True)
+    offer_activity_id = Column(Integer, ForeignKey("offer_activities.id"), nullable=True, index=True, unique=True)
+    activity_type = Column(String(50), nullable=True, index=True)  # e.g. "engagement_form", "comparison"
+    # When True: still linked to offer but hidden from Strategy & WIP list/export (offer remains tracked).
+    excluded_from_wip = Column(Integer, nullable=False, default=0)  # SQLite boolean as 0/1
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(
+        DateTime,
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

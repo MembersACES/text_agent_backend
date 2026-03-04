@@ -248,6 +248,9 @@ class OfferUpdate(BaseModel):
     status: Optional[OfferStatus] = None
     pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
+    annual_savings: Optional[float] = None
+    current_cost: Optional[float] = None
+    new_cost: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -264,6 +267,9 @@ class OfferResponse(BaseModel):
     status: OfferStatus
     pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
+    annual_savings: Optional[float] = None
+    current_cost: Optional[float] = None
+    new_cost: Optional[float] = None
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
@@ -360,3 +366,108 @@ class ActivityReportItem(BaseModel):
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime, _info):
         return to_melbourne_iso(dt)
+
+
+# --- Strategy & WIP (per-client strategy items) ---
+
+
+class StrategyItemBase(BaseModel):
+    year: int
+    section: str  # e.g. "past_achievements_annual", "in_progress", "objective", "advocate", "summary"
+    row_index: int = 0
+
+    member_level_solutions: Optional[str] = None
+    details: Optional[str] = None
+    solution_type: Optional[str] = None
+    sdg: Optional[str] = None
+    key_results: Optional[str] = None
+
+    solution_details_1: Optional[str] = None
+    solution_details_2: Optional[str] = None
+    solution_details_3: Optional[str] = None
+
+    engagement_form: Optional[str] = None
+    contract_signed: Optional[str] = None
+
+    saving_achieved: Optional[float] = None
+    new_revenue_achieved: Optional[float] = None
+    est_saving_pa: Optional[float] = None
+    est_revenue_pa: Optional[float] = None
+    est_sav_rev_over_duration: Optional[float] = None
+
+    saving_start_date: Optional[datetime] = None
+    new_revenue_start_date: Optional[datetime] = None
+    est_start_date: Optional[datetime] = None
+
+    est_sav_kpi_achieved: Optional[str] = None
+
+    priority: Optional[str] = None
+    status: Optional[str] = None
+
+    offer_id: Optional[int] = None
+    activity_type: Optional[str] = None
+    excluded_from_wip: bool = False
+
+
+class StrategyItemCreate(StrategyItemBase):
+    """Body for creating a strategy item. client_id comes from path."""
+
+
+class StrategyItemUpdate(BaseModel):
+    year: Optional[int] = None
+    section: Optional[str] = None
+    row_index: Optional[int] = None
+
+    member_level_solutions: Optional[str] = None
+    details: Optional[str] = None
+    solution_type: Optional[str] = None
+    sdg: Optional[str] = None
+    key_results: Optional[str] = None
+
+    solution_details_1: Optional[str] = None
+    solution_details_2: Optional[str] = None
+    solution_details_3: Optional[str] = None
+
+    engagement_form: Optional[str] = None
+    contract_signed: Optional[str] = None
+
+    saving_achieved: Optional[float] = None
+    new_revenue_achieved: Optional[float] = None
+    est_saving_pa: Optional[float] = None
+    est_revenue_pa: Optional[float] = None
+    est_sav_rev_over_duration: Optional[float] = None
+
+    saving_start_date: Optional[datetime] = None
+    new_revenue_start_date: Optional[datetime] = None
+    est_start_date: Optional[datetime] = None
+
+    est_sav_kpi_achieved: Optional[str] = None
+
+    priority: Optional[str] = None
+    status: Optional[str] = None
+
+    excluded_from_wip: Optional[bool] = None
+
+
+class StrategyItemResponse(StrategyItemBase):
+    id: int
+    client_id: int
+    offer_id: Optional[int] = None
+    activity_type: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer(
+        "saving_start_date",
+        "new_revenue_start_date",
+        "est_start_date",
+        "created_at",
+        "updated_at",
+    )
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True

@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status
 from typing import List
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,7 +70,16 @@ from tools.one_month_savings import (
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User, TaskHistory, ClientStatusNote, Client, Offer, OfferActivity
+from models import (
+    Task,
+    User,
+    TaskHistory,
+    ClientStatusNote,
+    Client,
+    Offer,
+    OfferActivity,
+    StrategyItem,
+)
 from schemas import (
     TaskCreate,
     TaskUpdate,
@@ -90,6 +99,9 @@ from schemas import (
     OfferActivityResponse,
     ActivityReportItem,
     OfferPipelineStage as OfferPipelineStageSchema,
+    StrategyItemCreate,
+    StrategyItemUpdate,
+    StrategyItemResponse,
 )
 from crm_enums import (
     ClientStage,
@@ -104,6 +116,8 @@ from services.crm import (
     update_offer_status_and_propagate_client_stage,
     create_offer_activity,
     get_or_create_offer_for_activity,
+    sync_strategy_status_from_offer,
+    sync_strategy_items_from_crm,
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
@@ -3321,6 +3335,406 @@ def delete_client_status_note(
     logging.info(f"Client status note {note_id} deleted")
     return {"status": "success", "message": "Note deleted"}
 
+
+# ---------------------------------------------------------------------------
+# Strategy & WIP – per-client strategy items
+# ---------------------------------------------------------------------------
+
+
+def _format_date_for_csv(value):
+    """Format datetime or date string for CSV (YYYY-MM-DD)."""
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    s = str(value).strip()
+    if len(s) >= 10:
+        return s[:10]
+    return s
+
+
+def _float_for_csv(value):
+    """Format float for CSV; empty if None."""
+    if value is None:
+        return ""
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _str_for_csv(value):
+    """String for CSV; empty if None."""
+    return "" if value is None else str(value).strip()
+
+
+def _build_strategy_wip_csv(items: List, client, year: int) -> str:
+    """
+    Build Strategy & WIP CSV in the same format as the boss's template.
+    items: list of StrategyItem for this client/year, ordered by section, row_index.
+    client: Client model (for business_name).
+    """
+    from datetime import datetime
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    # Empty rows 1–4
+    for _ in range(4):
+        writer.writerow([""] * 13)
+    # Header
+    business_name = (client.business_name or "Business Member Detail").strip()
+    writer.writerow([business_name] + [""] * 12)
+    now = datetime.utcnow()
+    writer.writerow([f"Strategy {year} Update {now.strftime('%m')}.{year}"] + [""] * 12)
+    writer.writerow([""] * 13)
+
+    section_order = [
+        "past_achievements_annual",
+        "in_progress",
+        "objective",
+        "advocate",
+        "summary",
+    ]
+    section_titles = {
+        "past_achievements_annual": "▶  Past Achievements Annual",
+        "in_progress": "▶  In Progress",
+        "objective": "▶  Objective",
+        "advocate": "▶  Advocate",
+        "summary": "▶  Summary",
+    }
+    past_achievements_header = [
+        "Member Level / Solutions",
+        "Details",
+        "SDG",
+        "Key results",
+        "Solutions Details",
+        "Solutions Details",
+        "Solutions Details",
+        " Saving Achieved",
+        " New Revenue Achieved",
+        "Saving Start Date",
+        " New Revenue  Start Date",
+        "Priority",
+        "Status",
+    ]
+    in_progress_header = [
+        "Member Level / Solutions",
+        "Solution type",
+        "SDG",
+        "Key results",
+        "Engagement Form ",
+        "Contract Signed",
+        "Est. saving achieved p.a.",
+        "Est. revenue achieved p.a.",
+        "Est. sav/rev over duration",
+        "Est. start date",
+        "Est. sav. KPI achieved",
+        "Priority",
+        "Status",
+    ]
+
+    by_section = {}
+    for item in items:
+        key = (item.section or "").strip() or "in_progress"
+        if key not in by_section:
+            by_section[key] = []
+        by_section[key].append(item)
+
+    for section_key in section_order:
+        writer.writerow([section_titles.get(section_key, f"▶  {section_key}")] + [""] * 12)
+        rows = by_section.get(section_key, [])
+        rows = sorted(rows, key=lambda r: (r.row_index, r.id))
+
+        if section_key == "past_achievements_annual":
+            writer.writerow(past_achievements_header)
+            total_saving = 0.0
+            total_revenue = 0.0
+            for r in rows:
+                s_ach = r.saving_achieved if r.saving_achieved is not None else 0
+                r_ach = r.new_revenue_achieved if r.new_revenue_achieved is not None else 0
+                total_saving += float(s_ach)
+                total_revenue += float(r_ach)
+                writer.writerow([
+                    _str_for_csv(r.member_level_solutions),
+                    _str_for_csv(r.details),
+                    _str_for_csv(r.sdg),
+                    _str_for_csv(r.key_results),
+                    _str_for_csv(r.solution_details_1),
+                    _str_for_csv(r.solution_details_2),
+                    _str_for_csv(r.solution_details_3),
+                    _float_for_csv(r.saving_achieved),
+                    _float_for_csv(r.new_revenue_achieved),
+                    _format_date_for_csv(r.saving_start_date),
+                    _format_date_for_csv(r.new_revenue_start_date),
+                    _str_for_csv(r.priority),
+                    _str_for_csv(r.status),
+                ])
+            writer.writerow(["", "", "", "Net Total", "", "", "", _float_for_csv(total_saving), _float_for_csv(total_revenue), "", "", "", ""])
+        else:
+            writer.writerow(in_progress_header)
+            total_sav = 0.0
+            total_rev = 0.0
+            total_dur = 0.0
+            for r in rows:
+                s = r.est_saving_pa if r.est_saving_pa is not None else 0
+                rev = r.est_revenue_pa if r.est_revenue_pa is not None else 0
+                d = r.est_sav_rev_over_duration if r.est_sav_rev_over_duration is not None else 0
+                total_sav += float(s)
+                total_rev += float(rev)
+                total_dur += float(d)
+                writer.writerow([
+                    _str_for_csv(r.member_level_solutions),
+                    _str_for_csv(r.solution_type),
+                    _str_for_csv(r.sdg),
+                    _str_for_csv(r.key_results),
+                    _str_for_csv(r.engagement_form),
+                    _str_for_csv(r.contract_signed),
+                    _float_for_csv(r.est_saving_pa),
+                    _float_for_csv(r.est_revenue_pa),
+                    _float_for_csv(r.est_sav_rev_over_duration),
+                    _format_date_for_csv(r.est_start_date),
+                    _str_for_csv(r.est_sav_kpi_achieved),
+                    _str_for_csv(r.priority),
+                    _str_for_csv(r.status),
+                ])
+            writer.writerow(["", "", "", "Net Total", "", "", _float_for_csv(total_sav), _float_for_csv(total_rev), _float_for_csv(total_dur), "", "", "", ""])
+
+    return buf.getvalue()
+
+
+@app.get(
+    "/api/clients/{client_id}/strategy-items/export-csv",
+    response_class=Response,
+)
+def export_strategy_items_csv(
+    client_id: int,
+    year: int = Query(..., description="Strategy year to export"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Download Strategy & WIP for the client and year as CSV in the boss's template format.
+    """
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    query = db.query(StrategyItem).filter(StrategyItem.client_id == client_id, StrategyItem.year == year)
+    # Exclude items hidden from WIP for CSV export
+    query = query.filter(
+        (StrategyItem.excluded_from_wip == 0) | (StrategyItem.excluded_from_wip.is_(None))
+    )
+    items = (
+        query.order_by(
+            StrategyItem.section.asc(),
+            StrategyItem.row_index.asc(),
+            StrategyItem.id.asc(),
+        )
+        .all()
+    )
+    csv_content = _build_strategy_wip_csv(items, client, year)
+    filename = f"Strategy-WIP-{client_id}-{year}.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/api/clients/{client_id}/strategy-items",
+    response_model=List[StrategyItemResponse],
+)
+def list_strategy_items_for_client(
+    client_id: int,
+    year: Optional[int] = Query(None, description="Filter by strategy year"),
+    excluded: Optional[int] = Query(0, description="0 = only included in WIP (default), 1 = only excluded (removed from WIP)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    List Strategy & WIP items for a client (optionally filtered by year).
+    By default returns only items included in WIP (excluded_from_wip=0).
+    Use excluded=1 to list items that were "removed from WIP" (so UI can show "Include in WIP").
+    """
+    logging.info(f"Listing strategy items for client_id={client_id}, year={year}, excluded={excluded}")
+
+    query = db.query(StrategyItem).filter(StrategyItem.client_id == client_id)
+    if year is not None:
+        query = query.filter(StrategyItem.year == year)
+    if excluded == 1:
+        query = query.filter(StrategyItem.excluded_from_wip == 1)
+    else:
+        query = query.filter(
+            (StrategyItem.excluded_from_wip == 0) | (StrategyItem.excluded_from_wip.is_(None))
+        )
+
+    items = (
+        query.order_by(
+            StrategyItem.section.asc(),
+            StrategyItem.row_index.asc(),
+            StrategyItem.id.asc(),
+        )
+        .all()
+    )
+    return items
+
+
+@app.post(
+    "/api/clients/{client_id}/strategy-items/sync-from-crm",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+)
+def sync_strategy_items_from_crm_endpoint(
+    client_id: int,
+    year: Optional[int] = Query(None, description="Strategy year to backfill (default: current year)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Backfill Strategy & WIP from this client's existing offers and activities.
+    Creates a strategy row for each relevant activity (engagement form, comparison,
+    DMA review, etc.) that does not already have one. Idempotent for existing rows.
+    """
+    logging.info("Syncing strategy items from CRM for client_id=%s, year=%s", client_id, year)
+    created = sync_strategy_items_from_crm(db, client_id=client_id, year=year)
+    db.commit()
+    logging.info("Sync from CRM created %s strategy items for client_id=%s", created, client_id)
+    return {"created": created, "message": f"Added {created} row(s) from existing offers and activities."}
+
+
+@app.post(
+    "/api/clients/{client_id}/strategy-items",
+    response_model=StrategyItemResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_strategy_item_for_client(
+    client_id: int,
+    item: StrategyItemCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Create a new Strategy & WIP item for a client.
+
+    The client_id is taken from the path; the body describes the row contents.
+    """
+    logging.info(
+        "Creating strategy item for client_id=%s, section=%s, year=%s",
+        client_id,
+        item.section,
+        item.year,
+    )
+
+    db_item = StrategyItem(
+        client_id=client_id,
+        year=item.year,
+        section=item.section,
+        row_index=item.row_index,
+        member_level_solutions=item.member_level_solutions,
+        details=item.details,
+        solution_type=item.solution_type,
+        sdg=item.sdg,
+        key_results=item.key_results,
+        solution_details_1=item.solution_details_1,
+        solution_details_2=item.solution_details_2,
+        solution_details_3=item.solution_details_3,
+        engagement_form=item.engagement_form,
+        contract_signed=item.contract_signed,
+        saving_achieved=item.saving_achieved,
+        new_revenue_achieved=item.new_revenue_achieved,
+        est_saving_pa=item.est_saving_pa,
+        est_revenue_pa=item.est_revenue_pa,
+        est_sav_rev_over_duration=item.est_sav_rev_over_duration,
+        saving_start_date=item.saving_start_date,
+        new_revenue_start_date=item.new_revenue_start_date,
+        est_start_date=item.est_start_date,
+        est_sav_kpi_achieved=item.est_sav_kpi_achieved,
+        priority=item.priority,
+        status=item.status,
+    )
+
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+
+    logging.info("Created strategy item id=%s for client_id=%s", db_item.id, client_id)
+    return db_item
+
+
+@app.patch(
+    "/api/strategy-items/{item_id}",
+    response_model=StrategyItemResponse,
+)
+def update_strategy_item(
+    item_id: int,
+    update: StrategyItemUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Update an existing Strategy & WIP item.
+    When est_saving_pa or saving_achieved is updated and the item is linked to an offer,
+    the offer's annual_savings is updated so offer CRM and WIP stay in sync.
+    """
+    logging.info("Updating strategy item id=%s", item_id)
+
+    db_item = db.query(StrategyItem).filter(StrategyItem.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    update_data = update.model_dump(exclude_unset=True)
+    # Coerce excluded_from_wip bool to 0/1 for SQLite
+    if "excluded_from_wip" in update_data:
+        update_data["excluded_from_wip"] = 1 if update_data["excluded_from_wip"] else 0
+
+    for field, value in update_data.items():
+        setattr(db_item, field, value)
+
+    # Cross-sync: if this item is linked to an offer and we updated savings, push to offer
+    if db_item.offer_id and ("est_saving_pa" in update_data or "saving_achieved" in update_data):
+        offer = db.query(Offer).filter(Offer.id == db_item.offer_id).first()
+        if offer:
+            # Prefer est_saving_pa (in-progress) else saving_achieved (past)
+            val = db_item.est_saving_pa if "est_saving_pa" in update_data else db_item.saving_achieved
+            if val is not None:
+                try:
+                    offer.annual_savings = float(val)
+                except (TypeError, ValueError):
+                    pass
+            elif "est_saving_pa" in update_data or "saving_achieved" in update_data:
+                offer.annual_savings = None
+
+    db.commit()
+    db.refresh(db_item)
+
+    logging.info("Updated strategy item id=%s", item_id)
+    return db_item
+
+
+@app.delete(
+    "/api/strategy-items/{item_id}",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+)
+def delete_strategy_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a Strategy & WIP item.
+    """
+    logging.info("Deleting strategy item id=%s", item_id)
+
+    db_item = db.query(StrategyItem).filter(StrategyItem.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    db.delete(db_item)
+    db.commit()
+
+    logging.info("Deleted strategy item id=%s", item_id)
+    return {"status": "success", "message": "Strategy item deleted"}
+
 @app.get("/api/client-status/debug/all")
 def debug_all_notes(db: Session = Depends(get_db)):
     """Debug endpoint to see all notes"""
@@ -4264,6 +4678,12 @@ def update_offer(
         )
     if offer_update.estimated_value is not None:
         db_offer.estimated_value = offer_update.estimated_value
+    if offer_update.annual_savings is not None:
+        db_offer.annual_savings = offer_update.annual_savings
+    if offer_update.current_cost is not None:
+        db_offer.current_cost = offer_update.current_cost
+    if offer_update.new_cost is not None:
+        db_offer.new_cost = offer_update.new_cost
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
@@ -4274,6 +4694,11 @@ def update_offer(
             if isinstance(offer_update.pipeline_stage, OfferPipelineStageSchema)
             else str(offer_update.pipeline_stage)
         )
+
+    if offer_update.status is not None:
+        sync_strategy_status_from_offer(db, db_offer)
+    if offer_update.annual_savings is not None or offer_update.estimated_value is not None:
+        sync_strategy_status_from_offer(db, db_offer)
 
     db.commit()
     db.refresh(db_offer)
