@@ -64,9 +64,11 @@ from tools.one_month_savings import (
     get_next_sequential_invoice_number,
     get_or_create_subfolder,
     upload_pdf_to_drive,
+    upload_file_to_drive,
     extract_folder_id_from_url,
-    get_drive_service
+    get_drive_service,
 )
+from tools.one_month_savings_calculation import calculate_one_month_savings
 
 # Database imports
 from database import get_db, init_db
@@ -79,6 +81,7 @@ from models import (
     Offer,
     OfferActivity,
     StrategyItem,
+    Testimonial,
 )
 from schemas import (
     TaskCreate,
@@ -102,6 +105,9 @@ from schemas import (
     StrategyItemCreate,
     StrategyItemUpdate,
     StrategyItemResponse,
+    TestimonialResponse,
+    TestimonialUpdate,
+    TestimonialCheckApprovedResponse,
 )
 from crm_enums import (
     ClientStage,
@@ -2515,6 +2521,47 @@ async def get_invoice_history_endpoint(
         raise HTTPException(status_code=500, detail=f"Error fetching invoice history: {str(e)}")
 
 
+@app.post("/api/one-month-savings/calculate")
+async def calculate_one_month_savings_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Calculate 1-month savings from Member ACES Data sheet by identifier and utility type."""
+    logging.info("=== One Month Savings Calculate Endpoint Called ===")
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token != os.getenv("BACKEND_API_KEY", "test-key"):
+            try:
+                verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+
+    identifier = request_data.get("identifier")
+    utility_type = request_data.get("utility_type")
+    agreement_start_month = request_data.get("agreement_start_month")
+    business_name = request_data.get("business_name")
+    if not identifier or not utility_type or not agreement_start_month:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required fields: identifier, utility_type, agreement_start_month",
+        )
+    try:
+        result = calculate_one_month_savings(
+            identifier=identifier,
+            utility_type=utility_type,
+            agreement_start_month=agreement_start_month,
+            business_name=business_name,
+        )
+        return result
+    except Exception as e:
+        logging.exception("Error calculating one month savings")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.patch("/api/one-month-savings/status")
 async def update_invoice_status_endpoint(
     request: Request,
@@ -2792,6 +2839,160 @@ async def upload_invoice_pdf_endpoint(
         logging.error(f"Error uploading PDF: {str(e)}")
         logging.exception(e)
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+# --- Testimonials API (member testimonials, optional link to 1st Month Savings) ---
+
+TESTIMONIAL_STORAGE_FOLDER_ID = os.getenv("TESTIMONIAL_STORAGE_FOLDER_ID", "")
+
+
+@app.get("/api/testimonials", response_model=List[TestimonialResponse])
+async def list_testimonials(
+    business_name: str = Query(..., description="Business name to list testimonials for"),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """List testimonials for a business (by business_name)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    items = db.query(Testimonial).filter(
+        func.lower(Testimonial.business_name) == business_name.strip().lower()
+    ).order_by(Testimonial.created_at.desc()).all()
+    return [TestimonialResponse.model_validate(t) for t in items]
+
+
+@app.get("/api/testimonials/check-approved", response_model=TestimonialCheckApprovedResponse)
+async def check_testimonial_approved(
+    business_name: str = Query(..., description="Business name to check"),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Check if the business has at least one Approved testimonial (for soft guard before 1st Month Savings invoice)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    approved = db.query(Testimonial).filter(
+        func.lower(Testimonial.business_name) == business_name.strip().lower(),
+        Testimonial.status == "Approved",
+    ).count()
+    return TestimonialCheckApprovedResponse(has_approved=approved > 0, count=approved)
+
+
+@app.post("/api/testimonials/upload", response_model=TestimonialResponse)
+async def upload_testimonial(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    business_name: str = Form(...),
+    invoice_number: Optional[str] = Form(None),
+    status: Optional[str] = Form("Draft"),
+    gdrive_folder_url: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Upload a testimonial document. File is stored in Drive (client folder or fallback), metadata in DB."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    filename = (file.filename or "document").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    allowed = (".pdf", ".docx", ".doc")
+    if not any(filename.lower().endswith(ext) for ext in allowed):
+        raise HTTPException(status_code=400, detail="File must be PDF or Word (.pdf, .docx, .doc)")
+    status_val = (status or "Draft").strip()
+    if status_val not in ("Draft", "Sent for approval", "Approved"):
+        status_val = "Draft"
+    folder_id = None
+    if gdrive_folder_url and gdrive_folder_url.strip():
+        folder_id = extract_folder_id_from_url(gdrive_folder_url.strip())
+    if not folder_id and TESTIMONIAL_STORAGE_FOLDER_ID:
+        folder_id = TESTIMONIAL_STORAGE_FOLDER_ID
+    if not folder_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Client Google Drive folder URL is required, or set TESTIMONIAL_STORAGE_FOLDER_ID for a fallback folder.",
+        )
+    testimonials_subfolder_id = get_or_create_subfolder(
+        get_drive_service(), folder_id, "Testimonials"
+    )
+    if not testimonials_subfolder_id:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not create or access Testimonials subfolder in Drive.",
+        )
+    contents = await file.read()
+    file_id = upload_file_to_drive(
+        contents,
+        filename,
+        testimonials_subfolder_id,
+        mimetype=None,
+        drive_service=get_drive_service(),
+    )
+    if not file_id:
+        raise HTTPException(status_code=500, detail="Failed to upload file to Drive.")
+    testimonial = Testimonial(
+        business_name=business_name.strip(),
+        file_name=filename,
+        file_id=file_id,
+        invoice_number=invoice_number.strip() if invoice_number and invoice_number.strip() else None,
+        status=status_val,
+    )
+    db.add(testimonial)
+    db.commit()
+    db.refresh(testimonial)
+    return TestimonialResponse.model_validate(testimonial)
+
+
+@app.patch("/api/testimonials/{testimonial_id}", response_model=TestimonialResponse)
+async def update_testimonial(
+    testimonial_id: int,
+    body: TestimonialUpdate,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Update testimonial status and/or linked invoice number."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    if body.status is not None:
+        if body.status.strip() in ("Draft", "Sent for approval", "Approved"):
+            testimonial.status = body.status.strip()
+    if body.invoice_number is not None:
+        testimonial.invoice_number = body.invoice_number.strip() or None
+    db.commit()
+    db.refresh(testimonial)
+    return TestimonialResponse.model_validate(testimonial)
+
 
 # Task API Routes
 @app.post("/api/tasks", response_model=TaskResponse)

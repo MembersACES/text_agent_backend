@@ -188,3 +188,20 @@ class StrategyItem(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class Testimonial(Base):
+    """
+    Member testimonial document (e.g. 1-page savings confirmation).
+    Optional link to a 1st Month Savings invoice. Status: Draft, Sent for approval, Approved.
+    """
+    __tablename__ = "testimonials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_name = Column(String(255), nullable=False, index=True)
+    file_name = Column(String(512), nullable=False)
+    file_id = Column(String(255), nullable=False)  # Google Drive file ID
+    invoice_number = Column(String(100), nullable=True, index=True)  # Optional link to 1st Month Savings
+    status = Column(String(50), nullable=False, default="Draft", index=True)  # Draft | Sent for approval | Approved
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

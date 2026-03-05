@@ -471,3 +471,38 @@ class StrategyItemResponse(StrategyItemBase):
 
     class Config:
         from_attributes = True
+
+
+# --- Testimonials (member savings testimonials, optional link to 1st Month Savings invoice) ---
+
+TESTIMONIAL_STATUSES = ("Draft", "Sent for approval", "Approved")
+
+
+class TestimonialResponse(BaseModel):
+    id: int
+    business_name: str
+    file_name: str
+    file_id: str
+    invoice_number: Optional[str] = None
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class TestimonialUpdate(BaseModel):
+    status: Optional[str] = None
+    invoice_number: Optional[str] = None
+
+
+class TestimonialCheckApprovedResponse(BaseModel):
+    has_approved: bool
+    count: int = 0
