@@ -51,7 +51,8 @@ from tools.document_generation import (
     ghg_offer_generation,
     get_available_eoi_types,
     engagement_form_generation,
-    get_available_engagement_form_types
+    get_available_engagement_form_types,
+    generate_testimonial_document,
 )
 from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
@@ -69,6 +70,8 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.testimonial_solution_content import get_merged_content, save_override
+from tools.testimonial_examples import get_testimonials_for_solution_type
 
 # Database imports
 from database import get_db, init_db
@@ -108,6 +111,8 @@ from schemas import (
     TestimonialResponse,
     TestimonialUpdate,
     TestimonialCheckApprovedResponse,
+    TestimonialSolutionContentItem,
+    TestimonialSolutionContentUpdate,
 )
 from crm_enums import (
     ClientStage,
@@ -2902,9 +2907,19 @@ async def upload_testimonial(
     invoice_number: Optional[str] = Form(None),
     status: Optional[str] = Form("Draft"),
     gdrive_folder_url: Optional[str] = Form(None),
+    testimonial_type: Optional[str] = Form(None),
+    testimonial_solution_type_id: Optional[str] = Form(None),
+    testimonial_savings: Optional[str] = Form(None),
     db: Session = Depends(get_db),
 ):
-    """Upload a testimonial document. File is stored in Drive (client folder or fallback), metadata in DB."""
+    """
+    Upload a testimonial document via n8n.
+
+    Instead of uploading directly with the service account (which has no storage quota),
+    this endpoint forwards the file + metadata to an n8n webhook, which handles the
+    actual Drive upload and returns the created file ID. We then log that file as a
+    Testimonial row in the CRM.
+    """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -2924,40 +2939,70 @@ async def upload_testimonial(
     status_val = (status or "Draft").strip()
     if status_val not in ("Draft", "Sent for approval", "Approved"):
         status_val = "Draft"
-    folder_id = None
-    if gdrive_folder_url and gdrive_folder_url.strip():
-        folder_id = extract_folder_id_from_url(gdrive_folder_url.strip())
-    if not folder_id and TESTIMONIAL_STORAGE_FOLDER_ID:
-        folder_id = TESTIMONIAL_STORAGE_FOLDER_ID
-    if not folder_id:
-        raise HTTPException(
-            status_code=400,
-            detail="Client Google Drive folder URL is required, or set TESTIMONIAL_STORAGE_FOLDER_ID for a fallback folder.",
+
+    # Prefer the explicit client folder URL; fall back to TESTIMONIAL_STORAGE_FOLDER_ID if set.
+    drive_folder = (gdrive_folder_url or "").strip() or TESTIMONIAL_STORAGE_FOLDER_ID
+
+    # Forward to n8n webhook which handles the actual Drive upload.
+    try:
+        contents = await file.read()
+        files = {
+            "file": (filename, contents, file.content_type or "application/octet-stream"),
+        }
+        norm_testimonial_type = (testimonial_type or "").strip()
+        norm_solution_type_id = (testimonial_solution_type_id or "").strip()
+        norm_savings = (testimonial_savings or "").strip()
+        data = {
+            "business_name": business_name.strip(),
+            "drive_folder": drive_folder,
+            "upload_type": "testimonial",
+            # Always include these keys so they are visible in n8n even if blank
+            "testimonial_type": norm_testimonial_type,
+            "testimonial_solution_type_id": norm_solution_type_id,
+            "testimonial_savings": norm_savings,
+        }
+        if invoice_number and invoice_number.strip():
+            data["invoice_number"] = invoice_number.strip()
+
+        logging.info(f"Calling testimonial-upload webhook with data: {data}")
+
+        resp = requests.post(
+            "https://membersaces.app.n8n.cloud/webhook/testimonial-upload",
+            data=data,
+            files=files,
+            timeout=60,
         )
-    testimonials_subfolder_id = get_or_create_subfolder(
-        get_drive_service(), folder_id, "Testimonials"
-    )
-    if not testimonials_subfolder_id:
+    except Exception as e:
+        logging.error(f"Error calling testimonial-upload webhook: {e}")
+        raise HTTPException(status_code=500, detail="Failed to call testimonial upload workflow.")
+
+    if resp.status_code != 200:
+        logging.error(f"testimonial-upload webhook failed: {resp.status_code} - {resp.text}")
         raise HTTPException(
             status_code=500,
-            detail="Could not create or access Testimonials subfolder in Drive.",
+            detail="Testimonial upload workflow failed.",
         )
-    contents = await file.read()
-    file_id = upload_file_to_drive(
-        contents,
-        filename,
-        testimonials_subfolder_id,
-        mimetype=None,
-        drive_service=get_drive_service(),
-    )
+
+    try:
+        result_json = resp.json()
+    except Exception:
+        logging.error("testimonial-upload webhook did not return JSON.")
+        raise HTTPException(status_code=500, detail="Testimonial upload workflow returned invalid response.")
+
+    file_id = result_json.get("file_id")
     if not file_id:
-        raise HTTPException(status_code=500, detail="Failed to upload file to Drive.")
+        logging.error(f"testimonial-upload webhook missing file_id in response: {result_json}")
+        raise HTTPException(status_code=500, detail="Testimonial upload workflow did not return file_id.")
+
     testimonial = Testimonial(
         business_name=business_name.strip(),
         file_name=filename,
         file_id=file_id,
         invoice_number=invoice_number.strip() if invoice_number and invoice_number.strip() else None,
         status=status_val,
+        testimonial_type=norm_testimonial_type or None,
+        testimonial_solution_type_id=norm_solution_type_id or None,
+        testimonial_savings=norm_savings or None,
     )
     db.add(testimonial)
     db.commit()
@@ -2992,6 +3037,152 @@ async def update_testimonial(
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)
+
+
+# --- Testimonial solution content (defaults in code, overridable via API) ---
+
+
+@app.get("/api/testimonials/solution-content", response_model=List[TestimonialSolutionContentItem])
+async def list_testimonial_solution_content(
+    solution_type: Optional[str] = Query(None, description="Filter to one solution type"),
+    authorization: str = Header(...),
+):
+    """List merged testimonial content for all solution types, or one if solution_type is provided."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if solution_type:
+        merged = get_merged_content(solution_type)
+        if not merged:
+            raise HTTPException(status_code=404, detail=f"Unknown solution_type: {solution_type}")
+        return [TestimonialSolutionContentItem(**merged)]
+    items = get_merged_content(None)
+    return [TestimonialSolutionContentItem(**item) for item in items]
+
+
+@app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
+async def update_testimonial_solution_content(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Save overrides for one solution type. Body: solution_type (required) + any content fields."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    st = body.get("solution_type")
+    if not st or not isinstance(st, str):
+        raise HTTPException(status_code=400, detail="solution_type is required")
+    payload = {k: v for k, v in body.items() if k != "solution_type"}
+    try:
+        merged = save_override(st.strip(), payload)
+        return TestimonialSolutionContentItem(**merged)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/testimonials/examples", response_model=List[TestimonialResponse])
+async def get_testimonial_examples_for_solution_type(
+    solution_type: str = Query(..., description="testimonial_solution_type_id to filter by"),
+    limit: int = Query(5, ge=1, le=20),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Return recent testimonials for a given testimonial solution type (for content page examples)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    items = get_testimonials_for_solution_type(db, solution_type_id=solution_type, limit=limit)
+    return [TestimonialResponse.model_validate(t) for t in items]
+
+@app.post("/api/testimonials/generate-document")
+async def generate_testimonial_document_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Generate a testimonial document from the template via n8n. Body: business info + solution_type + savings_amount."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    business_name = (body.get("business_name") or "").strip()
+    solution_type_id = (body.get("solution_type") or "").strip()
+    savings_amount = body.get("savings_amount")
+    if not business_name or not solution_type_id:
+        raise HTTPException(status_code=400, detail="business_name and solution_type are required")
+    try:
+        savings_val = float(savings_amount) if savings_amount is not None else 0.0
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="savings_amount must be a number")
+    result = generate_testimonial_document(
+        business_name=business_name,
+        trading_as=(body.get("trading_as") or "").strip(),
+        contact_name=(body.get("contact_name") or "").strip(),
+        position=(body.get("position") or "").strip(),
+        email=(body.get("email") or "").strip(),
+        telephone=(body.get("telephone") or "").strip(),
+        client_folder_url=(body.get("client_folder_url") or "").strip(),
+        solution_type_id=solution_type_id,
+        savings_amount=savings_val,
+        abn=(body.get("abn") or "").strip(),
+        postal_address=(body.get("postal_address") or "").strip(),
+        site_address=(body.get("site_address") or "").strip(),
+    )
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=500 if "timeout" in (result.get("message") or "").lower() else 400,
+            detail=result.get("message", "Generation failed"),
+        )
+    # If n8n returned a document link, try to log this as a Testimonial row in the CRM.
+    document_link = result.get("document_link")
+    if document_link:
+        try:
+            # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
+            file_id = extract_folder_id_from_url(document_link)
+            if file_id:
+                file_name = f"Testimonial - {business_name}" if business_name else "Testimonial"
+                testimonial = Testimonial(
+                    business_name=business_name.strip(),
+                    file_name=file_name,
+                    file_id=file_id,
+                    invoice_number=None,
+                    status="Draft",
+                    testimonial_type=result.get("testimonial_type") or None,
+                    testimonial_solution_type_id=solution_type_id or None,
+                    testimonial_savings=str(savings_val) if savings_val is not None else None,
+                )
+                db.add(testimonial)
+                db.commit()
+                db.refresh(testimonial)
+                result["testimonial_id"] = testimonial.id
+        except Exception as e:
+            logging.error(f"Failed to create Testimonial record from generated document: {e}")
+    return result
 
 
 # Task API Routes

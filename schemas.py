@@ -485,6 +485,9 @@ class TestimonialResponse(BaseModel):
     file_id: str
     invoice_number: Optional[str] = None
     status: str
+    testimonial_type: Optional[str] = None
+    testimonial_solution_type_id: Optional[str] = None
+    testimonial_savings: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -506,3 +509,40 @@ class TestimonialUpdate(BaseModel):
 class TestimonialCheckApprovedResponse(BaseModel):
     has_approved: bool
     count: int = 0
+
+
+# --- Testimonial solution content (for doc template placeholders, overridable via API) ---
+
+
+class TestimonialSolutionContentUpdate(BaseModel):
+    """Fields that can be updated per solution type (all optional)."""
+    key_outcome_metrics: Optional[str] = None
+    key_challenge_of_solution: Optional[str] = None
+    key_approach_of_solution: Optional[str] = None
+    key_outcome_of_solution: Optional[str] = None
+    key_outcome_dotpoints_1: Optional[str] = None
+    key_outcome_dotpoints_2: Optional[str] = None
+    key_outcome_dotpoints_3: Optional[str] = None
+    key_outcome_dotpoints_4: Optional[str] = None
+    key_outcome_dotpoints_5: Optional[str] = None
+    conclusion: Optional[str] = None
+    esg_scope_for_solution: Optional[str] = None
+    sdg_impact_for_solution: Optional[str] = None
+
+
+class TestimonialSolutionContentItem(BaseModel):
+    """Merged content for one solution type (defaults + overrides)."""
+    solution_type: str
+    solution_type_label: str
+    key_outcome_metrics: str = ""
+    key_challenge_of_solution: str = ""
+    key_approach_of_solution: str = ""
+    key_outcome_of_solution: str = ""
+    key_outcome_dotpoints_1: str = ""
+    key_outcome_dotpoints_2: str = ""
+    key_outcome_dotpoints_3: str = ""
+    key_outcome_dotpoints_4: str = ""
+    key_outcome_dotpoints_5: str = ""
+    conclusion: str = ""
+    esg_scope_for_solution: str = ""
+    sdg_impact_for_solution: str = ""

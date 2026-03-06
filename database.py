@@ -115,3 +115,21 @@ def init_db():
                 logging.info("✅ Added strategy_items.excluded_from_wip column")
     except Exception as e:
         logging.warning("Could not ensure strategy_items columns: %s", e)
+
+    # Testimonials: ensure testimonial_type, testimonial_solution_type_id, testimonial_savings exist (added after initial table).
+    try:
+        insp = inspect(engine)
+        if "testimonials" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("testimonials")]
+            for col_name, col_type in [
+                ("testimonial_type", "VARCHAR(255)"),
+                ("testimonial_solution_type_id", "VARCHAR(100)"),
+                ("testimonial_savings", "VARCHAR(255)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing testimonials.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE testimonials ADD COLUMN {col_name} {col_type}"))
+                    logging.info("✅ Added testimonials.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure testimonials columns: %s", e)

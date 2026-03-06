@@ -203,5 +203,8 @@ class Testimonial(Base):
     file_id = Column(String(255), nullable=False)  # Google Drive file ID
     invoice_number = Column(String(100), nullable=True, index=True)  # Optional link to 1st Month Savings
     status = Column(String(50), nullable=False, default="Draft", index=True)  # Draft | Sent for approval | Approved
+    testimonial_type = Column(String(255), nullable=True)  # e.g. C&I Electricity Reviews
+    testimonial_solution_type_id = Column(String(100), nullable=True)  # e.g. ci_electricity
+    testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
