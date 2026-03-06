@@ -24,6 +24,28 @@ class Client(Base):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    # Advocate / referral: member who referred this lead, or business name if lead not yet in CRM
+    referred_by_client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)
+    referred_by_business_name = Column(String(255), nullable=True)  # when lead hasn't eventuated
+    referred_by_active = Column(Integer, nullable=False, default=1)  # 1=active, 0=inactive
+
+
+class ClientReferral(Base):
+    """
+    Multiple advocate/referral links per client. This client (the lead) was referred by
+    one or more members (advocate_client_id) and/or we track business names (advocate_business_name)
+    when the lead hasn't eventuated yet.
+    """
+    __tablename__ = "client_referrals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)  # the lead who was referred
+    advocate_client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)  # member who referred
+    advocate_business_name = Column(String(255), nullable=True)  # when lead not yet in CRM
+    active = Column(Integer, nullable=False, default=1)  # 1=active, 0=inactive
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
 
 class User(Base):
     __tablename__ = "users"

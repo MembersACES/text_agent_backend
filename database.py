@@ -133,3 +133,26 @@ def init_db():
                     logging.info("✅ Added testimonials.%s column", col_name)
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
+
+    # Clients: advocate / referral fields (referred by another member or business name + active flag)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "referred_by_client_id" not in cols:
+                logging.info("Adding missing clients.referred_by_client_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_client_id INTEGER"))
+                logging.info("✅ Added clients.referred_by_client_id column")
+            if "referred_by_business_name" not in cols:
+                logging.info("Adding missing clients.referred_by_business_name column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_business_name VARCHAR(255)"))
+                logging.info("✅ Added clients.referred_by_business_name column")
+            if "referred_by_active" not in cols:
+                logging.info("Adding missing clients.referred_by_active column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_active INTEGER NOT NULL DEFAULT 1"))
+                logging.info("✅ Added clients.referred_by_active column")
+    except Exception as e:
+        logging.warning("Could not ensure clients advocate columns: %s", e)

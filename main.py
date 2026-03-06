@@ -81,6 +81,7 @@ from models import (
     TaskHistory,
     ClientStatusNote,
     Client,
+    ClientReferral,
     Offer,
     OfferActivity,
     StrategyItem,
@@ -98,6 +99,9 @@ from schemas import (
     ClientCreate,
     ClientUpdate,
     ClientResponse,
+    ClientReferralCreate,
+    ClientReferralUpdate,
+    ClientReferralResponse,
     OfferCreate,
     OfferUpdate,
     OfferResponse,
@@ -409,27 +413,30 @@ def get_business_info(
     result = get_business_information(request.business_name)
     if isinstance(result, dict):
         result["user_email"] = user_info.get("email")
-        try:
-            business_details = result.get("business_details", {}) or {}
-            contact_info = result.get("contact_information", {}) or {}
-            gdrive_info = result.get("gdrive", {}) or {}
+        # Only create/update CRM member when get-business-info actually returned business data
+        # (e.g. from n8n). Avoid creating stub profiles when the search finds nothing.
+        business_details = result.get("business_details", {}) or {}
+        if business_details.get("name"):
+            try:
+                contact_info = result.get("contact_information", {}) or {}
+                gdrive_info = result.get("gdrive", {}) or {}
 
-            business_name = business_details.get("name") or request.business_name
-            external_business_id = result.get("record_ID")
-            primary_contact_email = contact_info.get("email")
-            gdrive_folder_url = gdrive_info.get("folder_url")
+                business_name = business_details.get("name") or request.business_name
+                external_business_id = result.get("record_ID")
+                primary_contact_email = contact_info.get("email")
+                gdrive_folder_url = gdrive_info.get("folder_url")
 
-            client = upsert_client_from_business_info(
-                db=db,
-                business_name=business_name,
-                external_business_id=external_business_id,
-                primary_contact_email=primary_contact_email,
-                gdrive_folder_url=gdrive_folder_url,
-            )
-            if client:
-                result["client_id"] = client.id
-        except Exception as e:
-            logging.error(f"Error upserting Client from business info: {str(e)}")
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name=business_name,
+                    external_business_id=external_business_id,
+                    primary_contact_email=primary_contact_email,
+                    gdrive_folder_url=gdrive_folder_url,
+                )
+                if client:
+                    result["client_id"] = client.id
+            except Exception as e:
+                logging.error(f"Error upserting Client from business info: {str(e)}")
 
     logging.info(f"Returning response to frontend: {result}")
     return result
@@ -4327,7 +4334,12 @@ def get_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    return client
+    resp = ClientResponse.model_validate(client)
+    if getattr(client, "referred_by_client_id", None):
+        advocate = db.query(Client).filter(Client.id == client.referred_by_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
+    return resp
 
 
 @app.patch("/api/clients/{client_id}", response_model=ClientResponse)
@@ -4353,6 +4365,13 @@ def update_client(
         db_client.gdrive_folder_url = client_update.gdrive_folder_url
     if client_update.owner_email is not None:
         db_client.owner_email = client_update.owner_email
+    update_payload = client_update.model_dump(exclude_unset=True)
+    if "referred_by_client_id" in update_payload:
+        db_client.referred_by_client_id = client_update.referred_by_client_id
+    if "referred_by_business_name" in update_payload:
+        db_client.referred_by_business_name = client_update.referred_by_business_name
+    if "referred_by_active" in update_payload:
+        db_client.referred_by_active = 1 if client_update.referred_by_active else 0
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
@@ -4360,7 +4379,105 @@ def update_client(
     db.commit()
     db.refresh(db_client)
     logging.info(f"Client {client_id} updated")
-    return db_client
+    resp = ClientResponse.model_validate(db_client)
+    if getattr(db_client, "referred_by_client_id", None):
+        advocate = db.query(Client).filter(Client.id == db_client.referred_by_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
+    return resp
+
+
+@app.get("/api/clients/{client_id}/referrals", response_model=List[ClientReferralResponse])
+def list_client_referrals(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List all advocate/referral entries for this client (the lead)."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    refs = db.query(ClientReferral).filter(ClientReferral.client_id == client_id).order_by(ClientReferral.id).all()
+    out = []
+    for r in refs:
+        resp = ClientReferralResponse.model_validate(r)
+        if r.advocate_client_id:
+            advocate = db.query(Client).filter(Client.id == r.advocate_client_id).first()
+            if advocate:
+                resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+        out.append(resp)
+    return out
+
+
+@app.post("/api/clients/{client_id}/referrals", response_model=ClientReferralResponse)
+def create_client_referral(
+    client_id: int,
+    body: ClientReferralCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Add an advocate/referral entry for this client."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    ref = ClientReferral(
+        client_id=client_id,
+        advocate_client_id=body.advocate_client_id,
+        advocate_business_name=(body.advocate_business_name or "").strip() or None,
+        active=1 if (body.active if body.active is not None else True) else 0,
+    )
+    db.add(ref)
+    db.commit()
+    db.refresh(ref)
+    resp = ClientReferralResponse.model_validate(ref)
+    if ref.advocate_client_id:
+        advocate = db.query(Client).filter(Client.id == ref.advocate_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+    return resp
+
+
+@app.patch("/api/client-referrals/{referral_id}", response_model=ClientReferralResponse)
+def update_client_referral(
+    referral_id: int,
+    body: ClientReferralUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update an advocate/referral entry."""
+    ref = db.query(ClientReferral).filter(ClientReferral.id == referral_id).first()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Referral not found")
+    payload = body.model_dump(exclude_unset=True)
+    if "advocate_business_name" in payload:
+        ref.advocate_business_name = (payload["advocate_business_name"] or "").strip() or None
+    if "advocate_client_id" in payload:
+        ref.advocate_client_id = payload["advocate_client_id"]
+    if "active" in payload:
+        ref.active = 1 if payload["active"] else 0
+    db.commit()
+    db.refresh(ref)
+    resp = ClientReferralResponse.model_validate(ref)
+    if ref.advocate_client_id:
+        advocate = db.query(Client).filter(Client.id == ref.advocate_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+    return resp
+
+
+@app.delete("/api/client-referrals/{referral_id}", response_model=dict)
+def delete_client_referral(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Delete an advocate/referral entry."""
+    ref = db.query(ClientReferral).filter(ClientReferral.id == referral_id).first()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Referral not found")
+    db.delete(ref)
+    db.commit()
+    return {"ok": True}
 
 
 @app.delete("/api/clients/{client_id}", response_model=dict)
@@ -4424,7 +4541,15 @@ def delete_client(
         synchronize_session=False
     )
 
-    # 4) Finally, delete the client itself
+    # 4) Client referrals (advocate links)
+    db.query(ClientReferral).filter(ClientReferral.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    db.query(ClientReferral).filter(ClientReferral.advocate_client_id == client_id).update(
+        {ClientReferral.advocate_client_id: None}, synchronize_session=False
+    )
+
+    # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
 

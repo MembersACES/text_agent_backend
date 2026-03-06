@@ -158,6 +158,9 @@ class ClientUpdate(BaseModel):
     gdrive_folder_url: Optional[str] = None
     stage: Optional[ClientStage] = None
     owner_email: Optional[str] = None
+    referred_by_client_id: Optional[int] = None
+    referred_by_business_name: Optional[str] = None
+    referred_by_active: Optional[bool] = None
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -190,12 +193,28 @@ class ClientResponse(BaseModel):
     owner_email: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    # Advocate / referral: who referred this member (link to another member or free-text if lead not yet in CRM)
+    referred_by_client_id: Optional[int] = None
+    referred_by_business_name: Optional[str] = None
+    referred_by_active: Optional[bool] = True
+    referred_by_advocate_name: Optional[str] = None  # display name when referred_by_client_id is set
 
     @field_serializer("created_at", "updated_at", "stage_changed_at")
     def serialize_datetime(self, dt: Optional[datetime], _info):
         if dt is None:
             return None
         return to_melbourne_iso(dt)
+
+    @field_validator("referred_by_active", mode="before")
+    @classmethod
+    def _referred_by_active_bool(cls, v: Optional[object]) -> Optional[bool]:
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return True
 
     class Config:
         from_attributes = True
@@ -223,6 +242,49 @@ class ClientResponse(BaseModel):
         except ValueError:
             # Fallback for truly unexpected historic values.
             return ClientStage.LEAD
+
+
+class ClientReferralCreate(BaseModel):
+    advocate_client_id: Optional[int] = None
+    advocate_business_name: Optional[str] = None
+    active: Optional[bool] = True
+
+
+class ClientReferralUpdate(BaseModel):
+    advocate_client_id: Optional[int] = None
+    advocate_business_name: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class ClientReferralResponse(BaseModel):
+    id: int
+    client_id: int
+    advocate_client_id: Optional[int] = None
+    advocate_business_name: Optional[str] = None
+    active: bool = True
+    advocate_display_name: Optional[str] = None  # advocate member's business_name when advocate_client_id set
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    @field_validator("active", mode="before")
+    @classmethod
+    def _active_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return True
+
+    class Config:
+        from_attributes = True
 
 
 class OfferCreate(BaseModel):
