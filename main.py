@@ -146,7 +146,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime
+from datetime import datetime, date
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -4372,6 +4372,19 @@ def update_client(
         db_client.referred_by_business_name = client_update.referred_by_business_name
     if "referred_by_active" in update_payload:
         db_client.referred_by_active = 1 if client_update.referred_by_active else 0
+    if "advocacy_meeting_date" in update_payload:
+        val = client_update.advocacy_meeting_date
+        if val and str(val).strip():
+            try:
+                db_client.advocacy_meeting_date = date.fromisoformat(str(val).strip()[:10])
+            except ValueError:
+                db_client.advocacy_meeting_date = None
+        else:
+            db_client.advocacy_meeting_date = None
+    if "advocacy_meeting_time" in update_payload:
+        db_client.advocacy_meeting_time = (client_update.advocacy_meeting_time or "").strip() or None
+    if "advocacy_meeting_completed" in update_payload:
+        db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()

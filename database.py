@@ -156,3 +156,26 @@ def init_db():
                 logging.info("✅ Added clients.referred_by_active column")
     except Exception as e:
         logging.warning("Could not ensure clients advocate columns: %s", e)
+
+    # Clients: advocacy meeting details (stored on dashboard)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "advocacy_meeting_date" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_date column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_date DATE"))
+                logging.info("✅ Added clients.advocacy_meeting_date column")
+            if "advocacy_meeting_time" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_time column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_time VARCHAR(20)"))
+                logging.info("✅ Added clients.advocacy_meeting_time column")
+            if "advocacy_meeting_completed" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_completed column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_completed INTEGER NOT NULL DEFAULT 0"))
+                logging.info("✅ Added clients.advocacy_meeting_completed column")
+    except Exception as e:
+        logging.warning("Could not ensure clients advocacy meeting columns: %s", e)

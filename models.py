@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Float
 from sqlalchemy.sql import func
 from datetime import datetime
 from database import Base
@@ -28,6 +28,11 @@ class Client(Base):
     referred_by_client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)
     referred_by_business_name = Column(String(255), nullable=True)  # when lead hasn't eventuated
     referred_by_active = Column(Integer, nullable=False, default=1)  # 1=active, 0=inactive
+
+    # Advocacy meeting details (stored on dashboard, no n8n)
+    advocacy_meeting_date = Column(Date, nullable=True)
+    advocacy_meeting_time = Column(String(20), nullable=True)  # e.g. "11:03 AM"
+    advocacy_meeting_completed = Column(Integer, nullable=False, default=0)  # 0=no, 1=yes
 
 
 class ClientReferral(Base):

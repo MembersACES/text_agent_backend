@@ -161,6 +161,9 @@ class ClientUpdate(BaseModel):
     referred_by_client_id: Optional[int] = None
     referred_by_business_name: Optional[str] = None
     referred_by_active: Optional[bool] = None
+    advocacy_meeting_date: Optional[str] = None
+    advocacy_meeting_time: Optional[str] = None
+    advocacy_meeting_completed: Optional[bool] = None
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -198,6 +201,10 @@ class ClientResponse(BaseModel):
     referred_by_business_name: Optional[str] = None
     referred_by_active: Optional[bool] = True
     referred_by_advocate_name: Optional[str] = None  # display name when referred_by_client_id is set
+    # Advocacy meeting details (stored on dashboard)
+    advocacy_meeting_date: Optional[str] = None  # ISO date YYYY-MM-DD
+    advocacy_meeting_time: Optional[str] = None  # e.g. "11:03 AM"
+    advocacy_meeting_completed: Optional[bool] = False
 
     @field_serializer("created_at", "updated_at", "stage_changed_at")
     def serialize_datetime(self, dt: Optional[datetime], _info):
@@ -215,6 +222,28 @@ class ClientResponse(BaseModel):
         if isinstance(v, int):
             return bool(v)
         return True
+
+    @field_validator("advocacy_meeting_date", mode="before")
+    @classmethod
+    def _advocacy_meeting_date_str(cls, v: Optional[object]) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return v
+        if hasattr(v, "isoformat"):
+            return v.isoformat()[:10]
+        return str(v)[:10]
+
+    @field_validator("advocacy_meeting_completed", mode="before")
+    @classmethod
+    def _advocacy_meeting_completed_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return False
 
     class Config:
         from_attributes = True
