@@ -73,3 +73,109 @@ def init_db():
     except Exception as e:
         # Don't block startup if this fails; log and continue.
         logging.warning("Could not ensure offers.pipeline_stage column: %s", e)
+
+    # Offers: optional Base 2 / comparison fields (annual_savings, current_cost, new_cost)
+    try:
+        insp = inspect(engine)
+        if "offers" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("offers")]
+            for col_name, col_type in [("annual_savings", "REAL"), ("current_cost", "REAL"), ("new_cost", "REAL")]:
+                if col_name not in cols:
+                    logging.info("Adding missing offers.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE offers ADD COLUMN {col_name} {col_type}"))
+                    logging.info("✅ Added offers.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure offers savings columns: %s", e)
+
+    # Strategy & WIP: ensure strategy_items has offer_id and activity_type if table exists.
+    try:
+        insp = inspect(engine)
+        if "strategy_items" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("strategy_items")]
+            if "offer_id" not in cols:
+                logging.info("Adding missing strategy_items.offer_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE strategy_items ADD COLUMN offer_id INTEGER"))
+                logging.info("✅ Added strategy_items.offer_id column")
+            if "activity_type" not in cols:
+                logging.info("Adding missing strategy_items.activity_type column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE strategy_items ADD COLUMN activity_type VARCHAR(50)"))
+                logging.info("✅ Added strategy_items.activity_type column")
+            if "offer_activity_id" not in cols:
+                logging.info("Adding missing strategy_items.offer_activity_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE strategy_items ADD COLUMN offer_activity_id INTEGER"))
+                logging.info("✅ Added strategy_items.offer_activity_id column")
+            if "excluded_from_wip" not in cols:
+                logging.info("Adding missing strategy_items.excluded_from_wip column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE strategy_items ADD COLUMN excluded_from_wip INTEGER DEFAULT 0"))
+                logging.info("✅ Added strategy_items.excluded_from_wip column")
+    except Exception as e:
+        logging.warning("Could not ensure strategy_items columns: %s", e)
+
+    # Testimonials: ensure testimonial_type, testimonial_solution_type_id, testimonial_savings exist (added after initial table).
+    try:
+        insp = inspect(engine)
+        if "testimonials" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("testimonials")]
+            for col_name, col_type in [
+                ("testimonial_type", "VARCHAR(255)"),
+                ("testimonial_solution_type_id", "VARCHAR(100)"),
+                ("testimonial_savings", "VARCHAR(255)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing testimonials.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE testimonials ADD COLUMN {col_name} {col_type}"))
+                    logging.info("✅ Added testimonials.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure testimonials columns: %s", e)
+
+    # Clients: advocate / referral fields (referred by another member or business name + active flag)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "referred_by_client_id" not in cols:
+                logging.info("Adding missing clients.referred_by_client_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_client_id INTEGER"))
+                logging.info("✅ Added clients.referred_by_client_id column")
+            if "referred_by_business_name" not in cols:
+                logging.info("Adding missing clients.referred_by_business_name column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_business_name VARCHAR(255)"))
+                logging.info("✅ Added clients.referred_by_business_name column")
+            if "referred_by_active" not in cols:
+                logging.info("Adding missing clients.referred_by_active column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN referred_by_active INTEGER NOT NULL DEFAULT 1"))
+                logging.info("✅ Added clients.referred_by_active column")
+    except Exception as e:
+        logging.warning("Could not ensure clients advocate columns: %s", e)
+
+    # Clients: advocacy meeting details (stored on dashboard)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "advocacy_meeting_date" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_date column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_date DATE"))
+                logging.info("✅ Added clients.advocacy_meeting_date column")
+            if "advocacy_meeting_time" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_time column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_time VARCHAR(20)"))
+                logging.info("✅ Added clients.advocacy_meeting_time column")
+            if "advocacy_meeting_completed" not in cols:
+                logging.info("Adding missing clients.advocacy_meeting_completed column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN advocacy_meeting_completed INTEGER NOT NULL DEFAULT 0"))
+                logging.info("✅ Added clients.advocacy_meeting_completed column")
+    except Exception as e:
+        logging.warning("Could not ensure clients advocacy meeting columns: %s", e)

@@ -12,7 +12,7 @@ from crm_enums import (
     OfferPipelineStage,
     POST_WIN_STAGES,
 )
-from models import Client, Offer, ClientStatusNote, OfferActivity
+from models import Client, Offer, ClientStatusNote, OfferActivity, StrategyItem
 
 
 def upsert_client_from_business_info(
@@ -153,6 +153,9 @@ def update_offer_status_and_propagate_client_stage(
                 client.stage = ClientStage.LOST.value
                 client.stage_changed_at = datetime.utcnow()
 
+    # Keep Strategy & WIP status in sync with offer status.
+    sync_strategy_status_from_offer(db, offer)
+
     db.commit()
     db.refresh(offer)
     return offer
@@ -192,6 +195,25 @@ def create_offer_activity(
     )
     activity.metadata_ = meta_str
     db.add(activity)
+
+    # Optional: Base 2 / DMA / comparison metadata may include annual_savings, current_cost, new_cost.
+    # Update the offer so CRM and Strategy WIP show them; other webhooks don't need to send these.
+    if metadata:
+        try:
+            if "annual_savings" in metadata:
+                v = metadata["annual_savings"]
+                if v is not None and v != "":
+                    offer.annual_savings = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "current_cost" in metadata:
+                v = metadata["current_cost"]
+                if v is not None and v != "":
+                    offer.current_cost = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "new_cost" in metadata:
+                v = metadata["new_cost"]
+                if v is not None and v != "":
+                    offer.new_cost = float(v) if not isinstance(v, (int, float)) else float(v)
+        except (TypeError, ValueError):
+            pass
 
     # Advance offer.pipeline_stage based on key structured activity events.
     # We only move forwards along the defined order; we never move backwards.
@@ -292,6 +314,15 @@ def create_offer_activity(
             # Refresh the in-memory offer so callers see the latest values.
             db.refresh(offer)
 
+    # Auto-add a Strategy & WIP row for this activity (same commit as activity).
+    upsert_strategy_item_for_activity(
+        db,
+        offer=offer,
+        activity=activity,
+        client=client,
+        metadata=metadata,
+    )
+
     db.commit()
     db.refresh(activity)
     return activity
@@ -336,4 +367,295 @@ def get_or_create_offer_for_activity(
     db.commit()
     db.refresh(offer)
     return offer
+
+
+# --- Strategy & WIP auto-sync from CRM events ---
+
+# Activity types that get a row in Strategy & WIP when they are created.
+ACTIVITY_TYPES_FOR_STRATEGY = {
+    OfferActivityType.ENGAGEMENT_FORM,
+    OfferActivityType.COMPARISON,
+    OfferActivityType.DMA_REVIEW_GENERATED,
+    OfferActivityType.DMA_EMAIL_SENT,
+    OfferActivityType.BASE2_REVIEW,
+    OfferActivityType.GHG_OFFER,
+    OfferActivityType.ONE_MONTH_SAVINGS_INVOICE,
+    OfferActivityType.SOLUTION_PRESENTATION,
+    OfferActivityType.ENGAGEMENT_FORM_SIGNED,
+    OfferActivityType.CONTRACT_SIGNED_LODGED,
+    OfferActivityType.CONTRACT_REQUESTED,
+    OfferActivityType.CONTRACT_RECEIVED,
+    OfferActivityType.CONTRACT_SENT_FOR_SIGNING,
+    OfferActivityType.DISCREPANCY_EMAIL_SENT,
+    OfferActivityType.EOI,
+    OfferActivityType.LOA,
+    OfferActivityType.SERVICE_AGREEMENT,
+}
+
+# Human-readable label for each activity type (for key_results / member display).
+ACTIVITY_TYPE_LABELS = {
+    OfferActivityType.ENGAGEMENT_FORM: "Engagement form generated",
+    OfferActivityType.COMPARISON: "Comparison sent",
+    OfferActivityType.DMA_REVIEW_GENERATED: "DMA review generated",
+    OfferActivityType.DMA_EMAIL_SENT: "DMA email sent",
+    OfferActivityType.BASE2_REVIEW: "Base 2 review",
+    OfferActivityType.GHG_OFFER: "GHG offer",
+    OfferActivityType.ONE_MONTH_SAVINGS_INVOICE: "1st Month Savings invoice",
+    OfferActivityType.SOLUTION_PRESENTATION: "Solution presentation",
+    OfferActivityType.ENGAGEMENT_FORM_SIGNED: "Engagement form signed",
+    OfferActivityType.CONTRACT_SIGNED_LODGED: "Contract signed & lodged",
+    OfferActivityType.CONTRACT_REQUESTED: "Contract requested",
+    OfferActivityType.CONTRACT_RECEIVED: "Contract received",
+    OfferActivityType.CONTRACT_SENT_FOR_SIGNING: "Contract sent for signing",
+    OfferActivityType.DISCREPANCY_EMAIL_SENT: "Discrepancy email sent",
+    OfferActivityType.EOI: "EOI generated",
+    OfferActivityType.LOA: "LOA generated",
+    OfferActivityType.SERVICE_AGREEMENT: "Service agreement",
+}
+
+# Map offer status to Strategy & WIP status text.
+OFFER_STATUS_TO_STRATEGY_STATUS = {
+    OfferStatus.REQUESTED: "Requested",
+    OfferStatus.AWAITING_RESPONSE: "Awaiting response",
+    OfferStatus.RESPONSE_RECEIVED: "Response received",
+    OfferStatus.ACCEPTED: "Accepted",
+    OfferStatus.LOST: "Lost",
+}
+
+
+def _strategy_offer_label(offer: Offer, activity_type: OfferActivityType, metadata: Optional[dict]) -> str:
+    """Build a short 'Member level / solution' label from offer + activity + metadata."""
+    parts = []
+    if offer.utility_type_identifier or offer.utility_type:
+        parts.append((offer.utility_type_identifier or offer.utility_type or "").strip())
+    if offer.identifier:
+        parts.append(str(offer.identifier).strip())
+    if metadata:
+        comp = (metadata.get("comparison_type") or metadata.get("utility_type") or "").strip()
+        if comp and (not parts or comp not in " ".join(parts)):
+            parts.append(comp)
+    label = " ".join(p for p in parts if p).strip()
+    if not label:
+        label = ACTIVITY_TYPE_LABELS.get(activity_type, activity_type.value)
+    return label[:255] if label else "Offer activity"
+
+
+def upsert_strategy_item_for_activity(
+    db: Session,
+    *,
+    offer: Offer,
+    activity: OfferActivity,
+    client: Optional[Client] = None,
+    metadata: Optional[dict] = None,
+) -> Optional[StrategyItem]:
+    """
+    When a key activity is created for an offer, add a row in Strategy & WIP
+    so the member's Strategy tab reflects it. Does not commit; caller must commit.
+    """
+    activity_type_val = getattr(activity, "activity_type", None) or ""
+    try:
+        at_enum = OfferActivityType(activity_type_val)
+    except ValueError:
+        at_enum = None
+    if at_enum not in ACTIVITY_TYPES_FOR_STRATEGY:
+        return None
+
+    client_id = offer.client_id or (client.id if client else None)
+    if not client_id:
+        return None
+
+    year = datetime.utcnow().year
+    section = "in_progress"
+    key_results = ACTIVITY_TYPE_LABELS.get(at_enum, activity_type_val.replace("_", " ").title())
+    member_label = _strategy_offer_label(offer, at_enum, metadata or {})
+
+    status_label = OFFER_STATUS_TO_STRATEGY_STATUS.get(
+        OfferStatus(offer.status) if offer.status else OfferStatus.REQUESTED
+    ) or (offer.status or "Requested")
+
+    row_index = (
+        db.query(StrategyItem)
+        .filter(
+            StrategyItem.client_id == client_id,
+            StrategyItem.year == year,
+            StrategyItem.section == section,
+        )
+        .count()
+    )
+
+    # Prefer annual_savings from metadata (e.g. DMA) or offer; fall back to estimated_value
+    est_saving = None
+    if metadata and "annual_savings" in metadata:
+        try:
+            v = metadata["annual_savings"]
+            if v is not None and v != "":
+                est_saving = float(v) if not isinstance(v, (int, float)) else float(v)
+        except (TypeError, ValueError):
+            pass
+    if est_saving is None and getattr(offer, "annual_savings", None) is not None:
+        try:
+            est_saving = float(offer.annual_savings)
+        except (TypeError, ValueError):
+            pass
+    if est_saving is None and offer.estimated_value is not None:
+        try:
+            est_saving = float(offer.estimated_value)
+        except (TypeError, ValueError):
+            pass
+
+    item = StrategyItem(
+        client_id=client_id,
+        year=year,
+        section=section,
+        row_index=row_index,
+        member_level_solutions=member_label,
+        details="",
+        key_results=key_results,
+        offer_id=offer.id,
+        offer_activity_id=activity.id,
+        activity_type=activity_type_val,
+        status=status_label,
+        priority="High",
+        est_saving_pa=est_saving,
+        est_revenue_pa=None,
+    )
+    db.add(item)
+    return item
+
+
+def sync_strategy_status_from_offer(db: Session, offer: Offer) -> None:
+    """
+    When an offer's status (or savings) changes, update the status and est_saving_pa
+    of all Strategy & WIP rows linked to that offer. Does not commit; caller must commit.
+    """
+    if not offer.id:
+        return
+    status_label = OFFER_STATUS_TO_STRATEGY_STATUS.get(
+        OfferStatus(offer.status) if offer.status else OfferStatus.REQUESTED
+    ) or (offer.status or "Requested")
+    items = db.query(StrategyItem).filter(StrategyItem.offer_id == offer.id).all()
+    est_saving = None
+    if getattr(offer, "annual_savings", None) is not None:
+        try:
+            est_saving = float(offer.annual_savings)
+        except (TypeError, ValueError):
+            pass
+    if est_saving is None and offer.estimated_value is not None:
+        try:
+            est_saving = float(offer.estimated_value)
+        except (TypeError, ValueError):
+            pass
+    for item in items:
+        item.status = status_label
+        if est_saving is not None:
+            item.est_saving_pa = est_saving
+
+
+def _parse_activity_metadata(metadata_raw) -> Optional[dict]:
+    """Parse activity metadata from DB (JSON string or dict)."""
+    if metadata_raw is None:
+        return None
+    if isinstance(metadata_raw, dict):
+        return metadata_raw
+    if isinstance(metadata_raw, str):
+        try:
+            return json.loads(metadata_raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def sync_strategy_items_from_crm(
+    db: Session,
+    client_id: int,
+    year: Optional[int] = None,
+) -> int:
+    """
+    Backfill Strategy & WIP from existing offers and activities for this client.
+    Creates a strategy row for each relevant activity that does not already have one.
+    Returns the number of new rows created. Caller should commit.
+    """
+    if year is None:
+        year = datetime.utcnow().year
+
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        return 0
+
+    offers = db.query(Offer).filter(Offer.client_id == client_id).all()
+    activity_type_values = {t.value for t in ACTIVITY_TYPES_FOR_STRATEGY}
+    created = 0
+
+    for offer in offers:
+        activities = (
+            db.query(OfferActivity)
+            .filter(
+                OfferActivity.offer_id == offer.id,
+                OfferActivity.activity_type.in_(activity_type_values),
+            )
+            .order_by(OfferActivity.created_at.asc())
+            .all()
+        )
+        for activity in activities:
+            existing = (
+                db.query(StrategyItem)
+                .filter(StrategyItem.offer_activity_id == activity.id)
+                .first()
+            )
+            if existing:
+                continue
+            meta = _parse_activity_metadata(getattr(activity, "metadata_", None))
+            try:
+                at_enum = OfferActivityType(activity.activity_type)
+            except ValueError:
+                at_enum = None
+            if at_enum not in ACTIVITY_TYPES_FOR_STRATEGY:
+                continue
+            key_results = ACTIVITY_TYPE_LABELS.get(
+                at_enum, (activity.activity_type or "").replace("_", " ").title()
+            )
+            member_label = _strategy_offer_label(offer, at_enum, meta)
+            status_label = OFFER_STATUS_TO_STRATEGY_STATUS.get(
+                OfferStatus(offer.status) if offer.status else OfferStatus.REQUESTED
+            ) or (offer.status or "Requested")
+            row_index = (
+                db.query(StrategyItem)
+                .filter(
+                    StrategyItem.client_id == client_id,
+                    StrategyItem.year == year,
+                    StrategyItem.section == "in_progress",
+                )
+                .count()
+            )
+            est_saving = None
+            if getattr(offer, "annual_savings", None) is not None:
+                try:
+                    est_saving = float(offer.annual_savings)
+                except (TypeError, ValueError):
+                    pass
+            if est_saving is None and offer.estimated_value is not None:
+                try:
+                    est_saving = float(offer.estimated_value)
+                except (TypeError, ValueError):
+                    pass
+            item = StrategyItem(
+                client_id=client_id,
+                year=year,
+                section="in_progress",
+                row_index=row_index,
+                member_level_solutions=member_label,
+                details="",
+                key_results=key_results,
+                offer_id=offer.id,
+                offer_activity_id=activity.id,
+                activity_type=activity.activity_type,
+                status=status_label,
+                priority="High",
+                est_saving_pa=est_saving,
+                est_revenue_pa=None,
+            )
+            db.add(item)
+            created += 1
+
+    return created
 

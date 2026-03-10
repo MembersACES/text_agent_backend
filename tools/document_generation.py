@@ -365,6 +365,11 @@ class EngagementFormType(Enum):
         "Referral Distribution Program",
         "1Brif45hiE650wdy-JWYd2oZ3Elfcwqiw4tapnUeFx0A",
     )
+    ERA_ROBOTIC_REFERRAL_PROGRAM = (
+        "ERA Robotic Referral Program",
+        "1Brif45hiE650wdy-JWYd2oZ3Elfcwqiw4tapnUeFx0A"
+    )
+
 
 def engagement_form_generation(
     business_name: str,
@@ -413,3 +418,122 @@ def engagement_form_generation(
 def get_available_engagement_form_types():
     """Get all available Engagement Form types."""
     return [e.value[0] for e in EngagementFormType]
+
+
+def generate_testimonial_document(
+    business_name: str,
+    trading_as: str,
+    contact_name: str,
+    position: str,
+    email: str,
+    telephone: str,
+    client_folder_url: str,
+    solution_type_id: str,
+    savings_amount: float,
+    abn: str = "",
+    postal_address: str = "",
+    site_address: str = "",
+) -> Dict[str, Any]:
+    """
+    Generate a testimonial document using the testimonial Google Doc template.
+    Merges business info, calculated savings, and solution-type content (from testimonial_solution_content),
+    then calls the n8n testimonial-generation webhook.
+    """
+    from tools.testimonial_solution_content import get_merged_content, TESTIMONIAL_TEMPLATE_DOC_ID
+
+    current_date = datetime.datetime.now()
+    current_year = current_date.year
+
+    content = get_merged_content(solution_type_id)
+    if not content:
+        return {
+            "status": "error",
+            "message": f"Unknown solution type: {solution_type_id}",
+            "document_link": None,
+        }
+
+    monthly_savings = round(float(savings_amount), 2)
+    annual_savings = round(monthly_savings * 12, 2)
+    net_outcome = annual_savings  # Template may show optional cost later
+
+    # Build data dict for n8n: keys match template placeholders {{key}}
+    data = {
+        "business_name": business_name or "",
+        "trading_as": trading_as or "",
+        "abn": abn or "",
+        "postal_address": postal_address or "",
+        "site_address": site_address or "",
+        "telephone": telephone or "",
+        "email": email or "",
+        "contact_name": contact_name or "",
+        "position": position or "",
+        "contact_position": position or "",
+        "contact_email": email or "",
+        "contact_number": telephone or "",
+        "client_folder_url": client_folder_url or "",
+        "current_year": str(current_year),
+        "solution_type": content.get("solution_type_label", solution_type_id),
+        "key_outcome_metrics": content.get("key_outcome_metrics", ""),
+        "key_challenge_of_solution": content.get("key_challenge_of_solution", ""),
+        "key_approach_of_solution": content.get("key_approach_of_solution", ""),
+        "key_outcome_of_solution": content.get("key_outcome_of_solution", ""),
+        "key_outcome_dotpoints_1": content.get("key_outcome_dotpoints_1", ""),
+        "key_outcome_dotpoints_2": content.get("key_outcome_dotpoints_2", ""),
+        "key_outcome_dotpoints_3": content.get("key_outcome_dotpoints_3", ""),
+        "key_outcome_dotpoints_4": content.get("key_outcome_dotpoints_4", ""),
+        "key_outcome_dotpoints_5": content.get("key_outcome_dotpoints_5", ""),
+        "conclusion": content.get("conclusion", ""),
+        "esg_scope_for_solution": content.get("esg_scope_for_solution", ""),
+        "sdg_impact_for_solution": content.get("sdg_impact_for_solution", ""),
+        "monthly_savings": f"{monthly_savings:.2f}",
+        "annual_savings": f"{annual_savings:.2f}",
+        "net_outcome": f"{net_outcome:.2f}",
+    }
+
+    payload = {
+        "data": data,
+        "template_id": TESTIMONIAL_TEMPLATE_DOC_ID,
+        "file_name": f"Testimonial - {business_name or 'Member'}",
+    }
+
+    try:
+        response = requests.post(
+            "https://membersaces.app.n8n.cloud/webhook/testimonial-generation",
+            json=payload,
+            timeout=30,
+        )
+        if response.status_code != 200:
+            return {
+                "status": "error",
+                "message": f"Document generation failed with status {response.status_code}",
+                "document_link": None,
+            }
+        result = response.json()
+        document_link = result.get("document_link")
+        if not document_link:
+            return {
+                "status": "error",
+                "message": "Document generated but no link returned",
+                "document_link": None,
+            }
+        logger.info(f"Testimonial document generated for {business_name}")
+        return {
+            "status": "success",
+            "message": f'Testimonial for "{business_name}" has been generated.',
+            "document_link": document_link,
+            "client_folder_url": client_folder_url,
+        }
+    except requests.exceptions.Timeout:
+        logger.error("Testimonial document generation timed out")
+        return {
+            "status": "error",
+            "message": "Document generation timed out. Please try again.",
+            "document_link": None,
+        }
+    except Exception as e:
+        logger.exception("Testimonial document generation failed")
+        return {
+            "status": "error",
+            "message": str(e),
+            "document_link": None,
+        }

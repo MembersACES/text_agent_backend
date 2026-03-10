@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 load_dotenv()
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status
 from typing import List
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +51,8 @@ from tools.document_generation import (
     ghg_offer_generation,
     get_available_eoi_types,
     engagement_form_generation,
-    get_available_engagement_form_types
+    get_available_engagement_form_types,
+    generate_testimonial_document,
 )
 from tools.supplier_quote_request import send_supplier_quote_request
 from tools.loa_generation import loa_generation_new
@@ -60,16 +61,32 @@ from tools.send_supplier_signed_agreement import send_supplier_signed_agreement_
 from tools.one_month_savings import (
     log_invoice_to_sheets,
     get_invoice_history,
+    update_invoice_status,
     get_next_sequential_invoice_number,
     get_or_create_subfolder,
     upload_pdf_to_drive,
+    upload_file_to_drive,
     extract_folder_id_from_url,
-    get_drive_service
+    get_drive_service,
 )
+from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.testimonial_solution_content import get_merged_content, save_override
+from tools.testimonial_examples import get_testimonials_for_solution_type
 
 # Database imports
 from database import get_db, init_db
-from models import Task, User, TaskHistory, ClientStatusNote, Client, Offer, OfferActivity
+from models import (
+    Task,
+    User,
+    TaskHistory,
+    ClientStatusNote,
+    Client,
+    ClientReferral,
+    Offer,
+    OfferActivity,
+    StrategyItem,
+    Testimonial,
+)
 from schemas import (
     TaskCreate,
     TaskUpdate,
@@ -82,6 +99,9 @@ from schemas import (
     ClientCreate,
     ClientUpdate,
     ClientResponse,
+    ClientReferralCreate,
+    ClientReferralUpdate,
+    ClientReferralResponse,
     OfferCreate,
     OfferUpdate,
     OfferResponse,
@@ -89,6 +109,14 @@ from schemas import (
     OfferActivityResponse,
     ActivityReportItem,
     OfferPipelineStage as OfferPipelineStageSchema,
+    StrategyItemCreate,
+    StrategyItemUpdate,
+    StrategyItemResponse,
+    TestimonialResponse,
+    TestimonialUpdate,
+    TestimonialCheckApprovedResponse,
+    TestimonialSolutionContentItem,
+    TestimonialSolutionContentUpdate,
 )
 from crm_enums import (
     ClientStage,
@@ -103,6 +131,8 @@ from services.crm import (
     update_offer_status_and_propagate_client_stage,
     create_offer_activity,
     get_or_create_offer_for_activity,
+    sync_strategy_status_from_offer,
+    sync_strategy_items_from_crm,
 )
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
@@ -116,7 +146,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime
+from datetime import datetime, date
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -383,27 +413,30 @@ def get_business_info(
     result = get_business_information(request.business_name)
     if isinstance(result, dict):
         result["user_email"] = user_info.get("email")
-        try:
-            business_details = result.get("business_details", {}) or {}
-            contact_info = result.get("contact_information", {}) or {}
-            gdrive_info = result.get("gdrive", {}) or {}
+        # Only create/update CRM member when get-business-info actually returned business data
+        # (e.g. from n8n). Avoid creating stub profiles when the search finds nothing.
+        business_details = result.get("business_details", {}) or {}
+        if business_details.get("name"):
+            try:
+                contact_info = result.get("contact_information", {}) or {}
+                gdrive_info = result.get("gdrive", {}) or {}
 
-            business_name = business_details.get("name") or request.business_name
-            external_business_id = result.get("record_ID")
-            primary_contact_email = contact_info.get("email")
-            gdrive_folder_url = gdrive_info.get("folder_url")
+                business_name = business_details.get("name") or request.business_name
+                external_business_id = result.get("record_ID")
+                primary_contact_email = contact_info.get("email")
+                gdrive_folder_url = gdrive_info.get("folder_url")
 
-            client = upsert_client_from_business_info(
-                db=db,
-                business_name=business_name,
-                external_business_id=external_business_id,
-                primary_contact_email=primary_contact_email,
-                gdrive_folder_url=gdrive_folder_url,
-            )
-            if client:
-                result["client_id"] = client.id
-        except Exception as e:
-            logging.error(f"Error upserting Client from business info: {str(e)}")
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name=business_name,
+                    external_business_id=external_business_id,
+                    primary_contact_email=primary_contact_email,
+                    gdrive_folder_url=gdrive_folder_url,
+                )
+                if client:
+                    result["client_id"] = client.id
+            except Exception as e:
+                logging.error(f"Error upserting Client from business info: {str(e)}")
 
     logging.info(f"Returning response to frontend: {result}")
     return result
@@ -1224,7 +1257,8 @@ def get_base1_leads_endpoint(
 @app.post("/api/generate-loa")
 def generate_loa_endpoint(
     request: DocumentGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Letter of Authority document"""
     logging.info(f"Received LOA generation request for: {request.business_name}")
@@ -1245,6 +1279,33 @@ def generate_loa_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"LOA generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=result.get("document_link"),
+                        metadata={"source": "document_generation_page"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create LOA activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1254,7 +1315,8 @@ def generate_loa_endpoint(
 @app.post("/api/generate-service-agreement")
 def generate_service_agreement_endpoint(
     request: DocumentGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Service Fee Agreement document"""
     logging.info(f"Received Service Agreement generation request for: {request.business_name}")
@@ -1275,6 +1337,33 @@ def generate_service_agreement_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"Service Agreement generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=result.get("document_link"),
+                        metadata={"source": "document_generation_page"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create service_agreement activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1284,7 +1373,8 @@ def generate_service_agreement_endpoint(
 @app.post("/api/generate-eoi")
 def generate_eoi_endpoint(
     request: EOIGenerationRequest,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Expression of Interest document"""
     logging.info(f"Received EOI generation request for: {request.business_name}, type: {request.expression_type}")
@@ -1306,6 +1396,36 @@ def generate_eoi_endpoint(
         
         result["user_email"] = user_info.get("email")
         logging.info(f"EOI generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if isinstance(result, dict) and result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=request.client_folder_url or None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "eoi",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Expression of Interest",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.EOI,
+                        document_link=result.get("document_link"),
+                        metadata={
+                            "expression_type": request.expression_type,
+                            "source": "document_generation_page",
+                        },
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create EOI activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1786,7 +1906,8 @@ def get_engagement_form_types_endpoint(user_info: dict = Depends(verify_google_t
 @app.post("/api/generate-loa-new")
 def generate_loa_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Letter of Authority document for new clients (without client folder URL)"""
     logging.info(f"Received new LOA generation request for: {request.business_name}")
@@ -1822,6 +1943,33 @@ def generate_loa_new_endpoint(
         }
         
         logging.info(f"New LOA generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=document_link,
+                        metadata={"source": "document_generation_page", "variant": "new"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create LOA activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1836,7 +1984,8 @@ def generate_loa_new_endpoint(
 @app.post("/api/generate-service-agreement-new")
 def generate_service_agreement_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate Service Fee Agreement document for new clients (without client folder URL)"""
     logging.info(f"Received new Service Agreement generation request for: {request.business_name}")
@@ -1872,6 +2021,33 @@ def generate_service_agreement_new_endpoint(
         }
         
         logging.info(f"New Service Agreement generation completed for: {request.business_name}")
+        # Record CRM activity when generation succeeds
+        if result.get("status") == "success":
+            try:
+                client = upsert_client_from_business_info(
+                    db,
+                    business_name=request.business_name,
+                    external_business_id=None,
+                    primary_contact_email=request.email or None,
+                    gdrive_folder_url=None,
+                )
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=document_link,
+                        metadata={"source": "document_generation_page", "variant": "new"},
+                        created_by=user_info.get("email"),
+                    )
+            except Exception as act_e:
+                logging.warning(f"Failed to create service_agreement activity: {act_e}")
         return result
         
     except Exception as e:
@@ -1886,7 +2062,8 @@ def generate_service_agreement_new_endpoint(
 @app.post("/api/generate-loa-sfa-new")
 def generate_loa_sfa_new_endpoint(
     request: NewLOAGeneration,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """Generate both LOA and Service Fee Agreement documents for new clients (without client folder URL)"""
     logging.info(f"Received LOA and SFA generation request for: {request.business_name}")
@@ -1971,6 +2148,50 @@ def generate_loa_sfa_new_endpoint(
         "user_email": user_info.get("email")
     }
     
+    # Record CRM activity for each document generated
+    if status in ("success", "partial_success") and (loa_document_link or sfa_document_link):
+        try:
+            client = upsert_client_from_business_info(
+                db,
+                business_name=request.business_name,
+                external_business_id=None,
+                primary_contact_email=request.email or None,
+                gdrive_folder_url=None,
+            )
+            if client:
+                if loa_document_link:
+                    offer_loa = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "loa",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Letter of Authority",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer_loa,
+                        client=client,
+                        activity_type=OfferActivityType.LOA,
+                        document_link=loa_document_link,
+                        metadata={"source": "document_generation_page", "variant": "loa_sfa_new"},
+                        created_by=user_info.get("email"),
+                    )
+                if sfa_document_link:
+                    offer_sfa = get_or_create_offer_for_activity(
+                        db, client.id, request.business_name, "service_agreement",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="Service Fee Agreement",
+                    )
+                    create_offer_activity(
+                        db,
+                        offer=offer_sfa,
+                        client=client,
+                        activity_type=OfferActivityType.SERVICE_AGREEMENT,
+                        document_link=sfa_document_link,
+                        metadata={"source": "document_generation_page", "variant": "loa_sfa_new"},
+                        created_by=user_info.get("email"),
+                    )
+        except Exception as act_e:
+            logging.warning(f"Failed to create LOA/SFA activity: {act_e}")
+    
     logging.info(f"LOA and SFA generation completed for: {request.business_name} - LOA: {bool(loa_document_link)}, SFA: {bool(sfa_document_link)}")
     return result
 
@@ -1994,7 +2215,8 @@ def extract_google_drive_id(url: str) -> str:
 def generate_strategy_presentation_real_endpoint(
     request: StrategyPresentationRequest,
     authorization: str = Header(...),
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     try:
         # Your Apps Script Web App URL
@@ -2018,6 +2240,42 @@ def generate_strategy_presentation_real_endpoint(
         
         if response.status_code == 200:
             result = response.json()
+            # Record CRM activity when strategy presentation is generated
+            business_name = (request.businessInfo.get("businessName") or
+                            request.businessInfo.get("business_name") or "").strip()
+            if business_name and (result.get("success") is True or result.get("document_link") or result.get("documentLink")):
+                try:
+                    ext_id = request.businessInfo.get("record_ID")
+                    if ext_id is not None:
+                        ext_id = str(ext_id)
+                    client = upsert_client_from_business_info(
+                        db,
+                        business_name=business_name,
+                        external_business_id=ext_id,
+                        primary_contact_email=request.businessInfo.get("email"),
+                        gdrive_folder_url=client_folder_url or None,
+                    )
+                    if client:
+                        doc_link = result.get("document_link") or result.get("documentLink")
+                        offer = get_or_create_offer_for_activity(
+                            db, client.id, business_name, "solution_presentation",
+                            created_by=user_info.get("email"),
+                            utility_type_identifier="Solution presentation",
+                        )
+                        create_offer_activity(
+                            db,
+                            offer=offer,
+                            client=client,
+                            activity_type=OfferActivityType.SOLUTION_PRESENTATION,
+                            document_link=doc_link,
+                            metadata={
+                                "selected_strategies": request.selectedStrategies,
+                                "source": "document_generation_page",
+                            },
+                            created_by=user_info.get("email"),
+                        )
+                except Exception as act_e:
+                    logging.warning(f"Failed to create solution_presentation activity: {act_e}")
             return result
         else:
             return {
@@ -2097,7 +2355,8 @@ class NextInvoiceNumberRequest(BaseModel):
 async def log_invoice_endpoint(
     request: Request,
     authorization: str = Header(...),
-    user_info: dict = None
+    user_info: dict = None,
+    db: Session = Depends(get_db),
 ):
     """Log an invoice to Google Sheets directly or via n8n webhook"""
     logging.info("=== One Month Savings Invoice Log Endpoint Called ===")
@@ -2166,6 +2425,56 @@ async def log_invoice_endpoint(
         
         result = log_invoice_to_sheets(invoice_data)
         result["user_email"] = user_info.get("email")
+
+        # Best-effort: also create a CRM activity so the invoice appears on the member timeline.
+        try:
+            business_name = invoice_data.get("business_name") or ""
+            contact_email = invoice_data.get("contact_email") or None
+
+            if business_name:
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name=business_name,
+                    external_business_id=None,
+                    primary_contact_email=contact_email,
+                    gdrive_folder_url=None,
+                )
+
+                if client:
+                    offer = get_or_create_offer_for_activity(
+                        db=db,
+                        client_id=client.id,
+                        business_name=client.business_name,
+                        utility_type="one_month_savings",
+                        created_by=user_info.get("email"),
+                        utility_type_identifier="1st Month Savings Invoice",
+                        identifier=invoice_data.get("invoice_number"),
+                    )
+
+                    metadata = {
+                        "source": "one_month_savings",
+                        "invoice_number": invoice_data.get("invoice_number"),
+                        "total_amount": invoice_data.get("total_amount"),
+                        "due_date": invoice_data.get("due_date"),
+                        "line_items": invoice_data.get("line_items", []),
+                        "invoice_file_id": invoice_data.get("invoice_file_id"),
+                    }
+
+                    create_offer_activity(
+                        db=db,
+                        offer=offer,
+                        client=client,
+                        activity_type=OfferActivityType.ONE_MONTH_SAVINGS_INVOICE,
+                        document_link=None,
+                        external_id=None,
+                        metadata=metadata,
+                        created_by=user_info.get("email"),
+                    )
+        except Exception as e:
+            logging.error(
+                f"Failed to create CRM activity for 1st Month Savings invoice "
+                f"{invoice_data.get('invoice_number')}: {e}"
+            )
         
         logging.info(f"Invoice logging completed: {result.get('success')}")
         return result
@@ -2222,6 +2531,86 @@ async def get_invoice_history_endpoint(
     except Exception as e:
         logging.error(f"Error fetching invoice history: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching invoice history: {str(e)}")
+
+
+@app.post("/api/one-month-savings/calculate")
+async def calculate_one_month_savings_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Calculate 1-month savings from Member ACES Data sheet by identifier and utility type."""
+    logging.info("=== One Month Savings Calculate Endpoint Called ===")
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token != os.getenv("BACKEND_API_KEY", "test-key"):
+            try:
+                verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+
+    identifier = request_data.get("identifier")
+    utility_type = request_data.get("utility_type")
+    agreement_start_month = request_data.get("agreement_start_month")
+    business_name = request_data.get("business_name")
+    if not identifier or not utility_type or not agreement_start_month:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing required fields: identifier, utility_type, agreement_start_month",
+        )
+    try:
+        result = calculate_one_month_savings(
+            identifier=identifier,
+            utility_type=utility_type,
+            agreement_start_month=agreement_start_month,
+            business_name=business_name,
+        )
+        return result
+    except Exception as e:
+        logging.exception("Error calculating one month savings")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/one-month-savings/status")
+async def update_invoice_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    user_info: dict = None
+):
+    """Update the status of a 1st Month Savings invoice (Generated / Sent / Paid)."""
+    logging.info("=== One Month Savings Update Status Endpoint Called ===")
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(
+            status_code=400,
+            detail="business_name, invoice_number and status are required"
+        )
+    result = update_invoice_status(business_name, invoice_number, status)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400 if "No matching" in str(result.get("error", "")) else 500,
+            detail=result.get("error", "Failed to update status")
+        )
+    return result
+
 
 @app.post("/api/one-month-savings/next-invoice-number")
 async def get_next_invoice_number_endpoint(
@@ -2462,6 +2851,346 @@ async def upload_invoice_pdf_endpoint(
         logging.error(f"Error uploading PDF: {str(e)}")
         logging.exception(e)
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+# --- Testimonials API (member testimonials, optional link to 1st Month Savings) ---
+
+TESTIMONIAL_STORAGE_FOLDER_ID = os.getenv("TESTIMONIAL_STORAGE_FOLDER_ID", "")
+
+
+@app.get("/api/testimonials", response_model=List[TestimonialResponse])
+async def list_testimonials(
+    business_name: str = Query(..., description="Business name to list testimonials for"),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """List testimonials for a business (by business_name)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    items = db.query(Testimonial).filter(
+        func.lower(Testimonial.business_name) == business_name.strip().lower()
+    ).order_by(Testimonial.created_at.desc()).all()
+    return [TestimonialResponse.model_validate(t) for t in items]
+
+
+@app.get("/api/testimonials/check-approved", response_model=TestimonialCheckApprovedResponse)
+async def check_testimonial_approved(
+    business_name: str = Query(..., description="Business name to check"),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Check if the business has at least one Approved testimonial (for soft guard before 1st Month Savings invoice)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    approved = db.query(Testimonial).filter(
+        func.lower(Testimonial.business_name) == business_name.strip().lower(),
+        Testimonial.status == "Approved",
+    ).count()
+    return TestimonialCheckApprovedResponse(has_approved=approved > 0, count=approved)
+
+
+@app.post("/api/testimonials/upload", response_model=TestimonialResponse)
+async def upload_testimonial(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    business_name: str = Form(...),
+    invoice_number: Optional[str] = Form(None),
+    status: Optional[str] = Form("Draft"),
+    gdrive_folder_url: Optional[str] = Form(None),
+    testimonial_type: Optional[str] = Form(None),
+    testimonial_solution_type_id: Optional[str] = Form(None),
+    testimonial_savings: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload a testimonial document via n8n.
+
+    Instead of uploading directly with the service account (which has no storage quota),
+    this endpoint forwards the file + metadata to an n8n webhook, which handles the
+    actual Drive upload and returns the created file ID. We then log that file as a
+    Testimonial row in the CRM.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    filename = (file.filename or "document").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    allowed = (".pdf", ".docx", ".doc")
+    if not any(filename.lower().endswith(ext) for ext in allowed):
+        raise HTTPException(status_code=400, detail="File must be PDF or Word (.pdf, .docx, .doc)")
+    status_val = (status or "Draft").strip()
+    if status_val not in ("Draft", "Sent for approval", "Approved"):
+        status_val = "Draft"
+
+    # Prefer the explicit client folder URL; fall back to TESTIMONIAL_STORAGE_FOLDER_ID if set.
+    drive_folder = (gdrive_folder_url or "").strip() or TESTIMONIAL_STORAGE_FOLDER_ID
+
+    # Forward to n8n webhook which handles the actual Drive upload.
+    try:
+        contents = await file.read()
+        files = {
+            "file": (filename, contents, file.content_type or "application/octet-stream"),
+        }
+        norm_testimonial_type = (testimonial_type or "").strip()
+        norm_solution_type_id = (testimonial_solution_type_id or "").strip()
+        norm_savings = (testimonial_savings or "").strip()
+        data = {
+            "business_name": business_name.strip(),
+            "drive_folder": drive_folder,
+            "upload_type": "testimonial",
+            # Always include these keys so they are visible in n8n even if blank
+            "testimonial_type": norm_testimonial_type,
+            "testimonial_solution_type_id": norm_solution_type_id,
+            "testimonial_savings": norm_savings,
+        }
+        if invoice_number and invoice_number.strip():
+            data["invoice_number"] = invoice_number.strip()
+
+        logging.info(f"Calling testimonial-upload webhook with data: {data}")
+
+        resp = requests.post(
+            "https://membersaces.app.n8n.cloud/webhook/testimonial-upload",
+            data=data,
+            files=files,
+            timeout=60,
+        )
+    except Exception as e:
+        logging.error(f"Error calling testimonial-upload webhook: {e}")
+        raise HTTPException(status_code=500, detail="Failed to call testimonial upload workflow.")
+
+    if resp.status_code != 200:
+        logging.error(f"testimonial-upload webhook failed: {resp.status_code} - {resp.text}")
+        raise HTTPException(
+            status_code=500,
+            detail="Testimonial upload workflow failed.",
+        )
+
+    try:
+        result_json = resp.json()
+    except Exception:
+        logging.error("testimonial-upload webhook did not return JSON.")
+        raise HTTPException(status_code=500, detail="Testimonial upload workflow returned invalid response.")
+
+    file_id = result_json.get("file_id")
+    if not file_id:
+        logging.error(f"testimonial-upload webhook missing file_id in response: {result_json}")
+        raise HTTPException(status_code=500, detail="Testimonial upload workflow did not return file_id.")
+
+    testimonial = Testimonial(
+        business_name=business_name.strip(),
+        file_name=filename,
+        file_id=file_id,
+        invoice_number=invoice_number.strip() if invoice_number and invoice_number.strip() else None,
+        status=status_val,
+        testimonial_type=norm_testimonial_type or None,
+        testimonial_solution_type_id=norm_solution_type_id or None,
+        testimonial_savings=norm_savings or None,
+    )
+    db.add(testimonial)
+    db.commit()
+    db.refresh(testimonial)
+    return TestimonialResponse.model_validate(testimonial)
+
+
+@app.patch("/api/testimonials/{testimonial_id}", response_model=TestimonialResponse)
+async def update_testimonial(
+    testimonial_id: int,
+    body: TestimonialUpdate,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Update testimonial status and/or linked invoice number."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    if body.status is not None:
+        if body.status.strip() in ("Draft", "Sent for approval", "Approved"):
+            testimonial.status = body.status.strip()
+    if body.invoice_number is not None:
+        testimonial.invoice_number = body.invoice_number.strip() or None
+    db.commit()
+    db.refresh(testimonial)
+    return TestimonialResponse.model_validate(testimonial)
+
+
+# --- Testimonial solution content (defaults in code, overridable via API) ---
+
+
+@app.get("/api/testimonials/solution-content", response_model=List[TestimonialSolutionContentItem])
+async def list_testimonial_solution_content(
+    solution_type: Optional[str] = Query(None, description="Filter to one solution type"),
+    authorization: str = Header(...),
+):
+    """List merged testimonial content for all solution types, or one if solution_type is provided."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    if solution_type:
+        merged = get_merged_content(solution_type)
+        if not merged:
+            raise HTTPException(status_code=404, detail=f"Unknown solution_type: {solution_type}")
+        return [TestimonialSolutionContentItem(**merged)]
+    items = get_merged_content(None)
+    return [TestimonialSolutionContentItem(**item) for item in items]
+
+
+@app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
+async def update_testimonial_solution_content(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Save overrides for one solution type. Body: solution_type (required) + any content fields."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    st = body.get("solution_type")
+    if not st or not isinstance(st, str):
+        raise HTTPException(status_code=400, detail="solution_type is required")
+    payload = {k: v for k, v in body.items() if k != "solution_type"}
+    try:
+        merged = save_override(st.strip(), payload)
+        return TestimonialSolutionContentItem(**merged)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/testimonials/examples", response_model=List[TestimonialResponse])
+async def get_testimonial_examples_for_solution_type(
+    solution_type: str = Query(..., description="testimonial_solution_type_id to filter by"),
+    limit: int = Query(5, ge=1, le=20),
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Return recent testimonials for a given testimonial solution type (for content page examples)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    items = get_testimonials_for_solution_type(db, solution_type_id=solution_type, limit=limit)
+    return [TestimonialResponse.model_validate(t) for t in items]
+
+@app.post("/api/testimonials/generate-document")
+async def generate_testimonial_document_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Generate a testimonial document from the template via n8n. Body: business info + solution_type + savings_amount."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    business_name = (body.get("business_name") or "").strip()
+    solution_type_id = (body.get("solution_type") or "").strip()
+    savings_amount = body.get("savings_amount")
+    if not business_name or not solution_type_id:
+        raise HTTPException(status_code=400, detail="business_name and solution_type are required")
+    try:
+        savings_val = float(savings_amount) if savings_amount is not None else 0.0
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="savings_amount must be a number")
+    result = generate_testimonial_document(
+        business_name=business_name,
+        trading_as=(body.get("trading_as") or "").strip(),
+        contact_name=(body.get("contact_name") or "").strip(),
+        position=(body.get("position") or "").strip(),
+        email=(body.get("email") or "").strip(),
+        telephone=(body.get("telephone") or "").strip(),
+        client_folder_url=(body.get("client_folder_url") or "").strip(),
+        solution_type_id=solution_type_id,
+        savings_amount=savings_val,
+        abn=(body.get("abn") or "").strip(),
+        postal_address=(body.get("postal_address") or "").strip(),
+        site_address=(body.get("site_address") or "").strip(),
+    )
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=500 if "timeout" in (result.get("message") or "").lower() else 400,
+            detail=result.get("message", "Generation failed"),
+        )
+    # If n8n returned a document link, try to log this as a Testimonial row in the CRM.
+    document_link = result.get("document_link")
+    if document_link:
+        try:
+            # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
+            file_id = extract_folder_id_from_url(document_link)
+            if file_id:
+                file_name = f"Testimonial - {business_name}" if business_name else "Testimonial"
+                testimonial = Testimonial(
+                    business_name=business_name.strip(),
+                    file_name=file_name,
+                    file_id=file_id,
+                    invoice_number=None,
+                    status="Draft",
+                    testimonial_type=result.get("testimonial_type") or None,
+                    testimonial_solution_type_id=solution_type_id or None,
+                    testimonial_savings=str(savings_val) if savings_val is not None else None,
+                )
+                db.add(testimonial)
+                db.commit()
+                db.refresh(testimonial)
+                result["testimonial_id"] = testimonial.id
+        except Exception as e:
+            logging.error(f"Failed to create Testimonial record from generated document: {e}")
+    return result
+
 
 # Task API Routes
 @app.post("/api/tasks", response_model=TaskResponse)
@@ -3005,6 +3734,406 @@ def delete_client_status_note(
     logging.info(f"Client status note {note_id} deleted")
     return {"status": "success", "message": "Note deleted"}
 
+
+# ---------------------------------------------------------------------------
+# Strategy & WIP – per-client strategy items
+# ---------------------------------------------------------------------------
+
+
+def _format_date_for_csv(value):
+    """Format datetime or date string for CSV (YYYY-MM-DD)."""
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    s = str(value).strip()
+    if len(s) >= 10:
+        return s[:10]
+    return s
+
+
+def _float_for_csv(value):
+    """Format float for CSV; empty if None."""
+    if value is None:
+        return ""
+    try:
+        return str(float(value))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _str_for_csv(value):
+    """String for CSV; empty if None."""
+    return "" if value is None else str(value).strip()
+
+
+def _build_strategy_wip_csv(items: List, client, year: int) -> str:
+    """
+    Build Strategy & WIP CSV in the same format as the boss's template.
+    items: list of StrategyItem for this client/year, ordered by section, row_index.
+    client: Client model (for business_name).
+    """
+    from datetime import datetime
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    # Empty rows 1–4
+    for _ in range(4):
+        writer.writerow([""] * 13)
+    # Header
+    business_name = (client.business_name or "Business Member Detail").strip()
+    writer.writerow([business_name] + [""] * 12)
+    now = datetime.utcnow()
+    writer.writerow([f"Strategy {year} Update {now.strftime('%m')}.{year}"] + [""] * 12)
+    writer.writerow([""] * 13)
+
+    section_order = [
+        "past_achievements_annual",
+        "in_progress",
+        "objective",
+        "advocate",
+        "summary",
+    ]
+    section_titles = {
+        "past_achievements_annual": "▶  Past Achievements Annual",
+        "in_progress": "▶  In Progress",
+        "objective": "▶  Objective",
+        "advocate": "▶  Advocate",
+        "summary": "▶  Summary",
+    }
+    past_achievements_header = [
+        "Member Level / Solutions",
+        "Details",
+        "SDG",
+        "Key results",
+        "Solutions Details",
+        "Solutions Details",
+        "Solutions Details",
+        " Saving Achieved",
+        " New Revenue Achieved",
+        "Saving Start Date",
+        " New Revenue  Start Date",
+        "Priority",
+        "Status",
+    ]
+    in_progress_header = [
+        "Member Level / Solutions",
+        "Solution type",
+        "SDG",
+        "Key results",
+        "Engagement Form ",
+        "Contract Signed",
+        "Est. saving achieved p.a.",
+        "Est. revenue achieved p.a.",
+        "Est. sav/rev over duration",
+        "Est. start date",
+        "Est. sav. KPI achieved",
+        "Priority",
+        "Status",
+    ]
+
+    by_section = {}
+    for item in items:
+        key = (item.section or "").strip() or "in_progress"
+        if key not in by_section:
+            by_section[key] = []
+        by_section[key].append(item)
+
+    for section_key in section_order:
+        writer.writerow([section_titles.get(section_key, f"▶  {section_key}")] + [""] * 12)
+        rows = by_section.get(section_key, [])
+        rows = sorted(rows, key=lambda r: (r.row_index, r.id))
+
+        if section_key == "past_achievements_annual":
+            writer.writerow(past_achievements_header)
+            total_saving = 0.0
+            total_revenue = 0.0
+            for r in rows:
+                s_ach = r.saving_achieved if r.saving_achieved is not None else 0
+                r_ach = r.new_revenue_achieved if r.new_revenue_achieved is not None else 0
+                total_saving += float(s_ach)
+                total_revenue += float(r_ach)
+                writer.writerow([
+                    _str_for_csv(r.member_level_solutions),
+                    _str_for_csv(r.details),
+                    _str_for_csv(r.sdg),
+                    _str_for_csv(r.key_results),
+                    _str_for_csv(r.solution_details_1),
+                    _str_for_csv(r.solution_details_2),
+                    _str_for_csv(r.solution_details_3),
+                    _float_for_csv(r.saving_achieved),
+                    _float_for_csv(r.new_revenue_achieved),
+                    _format_date_for_csv(r.saving_start_date),
+                    _format_date_for_csv(r.new_revenue_start_date),
+                    _str_for_csv(r.priority),
+                    _str_for_csv(r.status),
+                ])
+            writer.writerow(["", "", "", "Net Total", "", "", "", _float_for_csv(total_saving), _float_for_csv(total_revenue), "", "", "", ""])
+        else:
+            writer.writerow(in_progress_header)
+            total_sav = 0.0
+            total_rev = 0.0
+            total_dur = 0.0
+            for r in rows:
+                s = r.est_saving_pa if r.est_saving_pa is not None else 0
+                rev = r.est_revenue_pa if r.est_revenue_pa is not None else 0
+                d = r.est_sav_rev_over_duration if r.est_sav_rev_over_duration is not None else 0
+                total_sav += float(s)
+                total_rev += float(rev)
+                total_dur += float(d)
+                writer.writerow([
+                    _str_for_csv(r.member_level_solutions),
+                    _str_for_csv(r.solution_type),
+                    _str_for_csv(r.sdg),
+                    _str_for_csv(r.key_results),
+                    _str_for_csv(r.engagement_form),
+                    _str_for_csv(r.contract_signed),
+                    _float_for_csv(r.est_saving_pa),
+                    _float_for_csv(r.est_revenue_pa),
+                    _float_for_csv(r.est_sav_rev_over_duration),
+                    _format_date_for_csv(r.est_start_date),
+                    _str_for_csv(r.est_sav_kpi_achieved),
+                    _str_for_csv(r.priority),
+                    _str_for_csv(r.status),
+                ])
+            writer.writerow(["", "", "", "Net Total", "", "", _float_for_csv(total_sav), _float_for_csv(total_rev), _float_for_csv(total_dur), "", "", "", ""])
+
+    return buf.getvalue()
+
+
+@app.get(
+    "/api/clients/{client_id}/strategy-items/export-csv",
+    response_class=Response,
+)
+def export_strategy_items_csv(
+    client_id: int,
+    year: int = Query(..., description="Strategy year to export"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Download Strategy & WIP for the client and year as CSV in the boss's template format.
+    """
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    query = db.query(StrategyItem).filter(StrategyItem.client_id == client_id, StrategyItem.year == year)
+    # Exclude items hidden from WIP for CSV export
+    query = query.filter(
+        (StrategyItem.excluded_from_wip == 0) | (StrategyItem.excluded_from_wip.is_(None))
+    )
+    items = (
+        query.order_by(
+            StrategyItem.section.asc(),
+            StrategyItem.row_index.asc(),
+            StrategyItem.id.asc(),
+        )
+        .all()
+    )
+    csv_content = _build_strategy_wip_csv(items, client, year)
+    filename = f"Strategy-WIP-{client_id}-{year}.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get(
+    "/api/clients/{client_id}/strategy-items",
+    response_model=List[StrategyItemResponse],
+)
+def list_strategy_items_for_client(
+    client_id: int,
+    year: Optional[int] = Query(None, description="Filter by strategy year"),
+    excluded: Optional[int] = Query(0, description="0 = only included in WIP (default), 1 = only excluded (removed from WIP)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    List Strategy & WIP items for a client (optionally filtered by year).
+    By default returns only items included in WIP (excluded_from_wip=0).
+    Use excluded=1 to list items that were "removed from WIP" (so UI can show "Include in WIP").
+    """
+    logging.info(f"Listing strategy items for client_id={client_id}, year={year}, excluded={excluded}")
+
+    query = db.query(StrategyItem).filter(StrategyItem.client_id == client_id)
+    if year is not None:
+        query = query.filter(StrategyItem.year == year)
+    if excluded == 1:
+        query = query.filter(StrategyItem.excluded_from_wip == 1)
+    else:
+        query = query.filter(
+            (StrategyItem.excluded_from_wip == 0) | (StrategyItem.excluded_from_wip.is_(None))
+        )
+
+    items = (
+        query.order_by(
+            StrategyItem.section.asc(),
+            StrategyItem.row_index.asc(),
+            StrategyItem.id.asc(),
+        )
+        .all()
+    )
+    return items
+
+
+@app.post(
+    "/api/clients/{client_id}/strategy-items/sync-from-crm",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+)
+def sync_strategy_items_from_crm_endpoint(
+    client_id: int,
+    year: Optional[int] = Query(None, description="Strategy year to backfill (default: current year)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Backfill Strategy & WIP from this client's existing offers and activities.
+    Creates a strategy row for each relevant activity (engagement form, comparison,
+    DMA review, etc.) that does not already have one. Idempotent for existing rows.
+    """
+    logging.info("Syncing strategy items from CRM for client_id=%s, year=%s", client_id, year)
+    created = sync_strategy_items_from_crm(db, client_id=client_id, year=year)
+    db.commit()
+    logging.info("Sync from CRM created %s strategy items for client_id=%s", created, client_id)
+    return {"created": created, "message": f"Added {created} row(s) from existing offers and activities."}
+
+
+@app.post(
+    "/api/clients/{client_id}/strategy-items",
+    response_model=StrategyItemResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_strategy_item_for_client(
+    client_id: int,
+    item: StrategyItemCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Create a new Strategy & WIP item for a client.
+
+    The client_id is taken from the path; the body describes the row contents.
+    """
+    logging.info(
+        "Creating strategy item for client_id=%s, section=%s, year=%s",
+        client_id,
+        item.section,
+        item.year,
+    )
+
+    db_item = StrategyItem(
+        client_id=client_id,
+        year=item.year,
+        section=item.section,
+        row_index=item.row_index,
+        member_level_solutions=item.member_level_solutions,
+        details=item.details,
+        solution_type=item.solution_type,
+        sdg=item.sdg,
+        key_results=item.key_results,
+        solution_details_1=item.solution_details_1,
+        solution_details_2=item.solution_details_2,
+        solution_details_3=item.solution_details_3,
+        engagement_form=item.engagement_form,
+        contract_signed=item.contract_signed,
+        saving_achieved=item.saving_achieved,
+        new_revenue_achieved=item.new_revenue_achieved,
+        est_saving_pa=item.est_saving_pa,
+        est_revenue_pa=item.est_revenue_pa,
+        est_sav_rev_over_duration=item.est_sav_rev_over_duration,
+        saving_start_date=item.saving_start_date,
+        new_revenue_start_date=item.new_revenue_start_date,
+        est_start_date=item.est_start_date,
+        est_sav_kpi_achieved=item.est_sav_kpi_achieved,
+        priority=item.priority,
+        status=item.status,
+    )
+
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+
+    logging.info("Created strategy item id=%s for client_id=%s", db_item.id, client_id)
+    return db_item
+
+
+@app.patch(
+    "/api/strategy-items/{item_id}",
+    response_model=StrategyItemResponse,
+)
+def update_strategy_item(
+    item_id: int,
+    update: StrategyItemUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Update an existing Strategy & WIP item.
+    When est_saving_pa or saving_achieved is updated and the item is linked to an offer,
+    the offer's annual_savings is updated so offer CRM and WIP stay in sync.
+    """
+    logging.info("Updating strategy item id=%s", item_id)
+
+    db_item = db.query(StrategyItem).filter(StrategyItem.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    update_data = update.model_dump(exclude_unset=True)
+    # Coerce excluded_from_wip bool to 0/1 for SQLite
+    if "excluded_from_wip" in update_data:
+        update_data["excluded_from_wip"] = 1 if update_data["excluded_from_wip"] else 0
+
+    for field, value in update_data.items():
+        setattr(db_item, field, value)
+
+    # Cross-sync: if this item is linked to an offer and we updated savings, push to offer
+    if db_item.offer_id and ("est_saving_pa" in update_data or "saving_achieved" in update_data):
+        offer = db.query(Offer).filter(Offer.id == db_item.offer_id).first()
+        if offer:
+            # Prefer est_saving_pa (in-progress) else saving_achieved (past)
+            val = db_item.est_saving_pa if "est_saving_pa" in update_data else db_item.saving_achieved
+            if val is not None:
+                try:
+                    offer.annual_savings = float(val)
+                except (TypeError, ValueError):
+                    pass
+            elif "est_saving_pa" in update_data or "saving_achieved" in update_data:
+                offer.annual_savings = None
+
+    db.commit()
+    db.refresh(db_item)
+
+    logging.info("Updated strategy item id=%s", item_id)
+    return db_item
+
+
+@app.delete(
+    "/api/strategy-items/{item_id}",
+    response_model=dict,
+    status_code=status.HTTP_200_OK,
+)
+def delete_strategy_item(
+    item_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a Strategy & WIP item.
+    """
+    logging.info("Deleting strategy item id=%s", item_id)
+
+    db_item = db.query(StrategyItem).filter(StrategyItem.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Item not found")
+
+    db.delete(db_item)
+    db.commit()
+
+    logging.info("Deleted strategy item id=%s", item_id)
+    return {"status": "success", "message": "Strategy item deleted"}
+
 @app.get("/api/client-status/debug/all")
 def debug_all_notes(db: Session = Depends(get_db)):
     """Debug endpoint to see all notes"""
@@ -3205,7 +4334,12 @@ def get_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    return client
+    resp = ClientResponse.model_validate(client)
+    if getattr(client, "referred_by_client_id", None):
+        advocate = db.query(Client).filter(Client.id == client.referred_by_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
+    return resp
 
 
 @app.patch("/api/clients/{client_id}", response_model=ClientResponse)
@@ -3231,6 +4365,26 @@ def update_client(
         db_client.gdrive_folder_url = client_update.gdrive_folder_url
     if client_update.owner_email is not None:
         db_client.owner_email = client_update.owner_email
+    update_payload = client_update.model_dump(exclude_unset=True)
+    if "referred_by_client_id" in update_payload:
+        db_client.referred_by_client_id = client_update.referred_by_client_id
+    if "referred_by_business_name" in update_payload:
+        db_client.referred_by_business_name = client_update.referred_by_business_name
+    if "referred_by_active" in update_payload:
+        db_client.referred_by_active = 1 if client_update.referred_by_active else 0
+    if "advocacy_meeting_date" in update_payload:
+        val = client_update.advocacy_meeting_date
+        if val and str(val).strip():
+            try:
+                db_client.advocacy_meeting_date = date.fromisoformat(str(val).strip()[:10])
+            except ValueError:
+                db_client.advocacy_meeting_date = None
+        else:
+            db_client.advocacy_meeting_date = None
+    if "advocacy_meeting_time" in update_payload:
+        db_client.advocacy_meeting_time = (client_update.advocacy_meeting_time or "").strip() or None
+    if "advocacy_meeting_completed" in update_payload:
+        db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
@@ -3238,7 +4392,105 @@ def update_client(
     db.commit()
     db.refresh(db_client)
     logging.info(f"Client {client_id} updated")
-    return db_client
+    resp = ClientResponse.model_validate(db_client)
+    if getattr(db_client, "referred_by_client_id", None):
+        advocate = db.query(Client).filter(Client.id == db_client.referred_by_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
+    return resp
+
+
+@app.get("/api/clients/{client_id}/referrals", response_model=List[ClientReferralResponse])
+def list_client_referrals(
+    client_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List all advocate/referral entries for this client (the lead)."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    refs = db.query(ClientReferral).filter(ClientReferral.client_id == client_id).order_by(ClientReferral.id).all()
+    out = []
+    for r in refs:
+        resp = ClientReferralResponse.model_validate(r)
+        if r.advocate_client_id:
+            advocate = db.query(Client).filter(Client.id == r.advocate_client_id).first()
+            if advocate:
+                resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+        out.append(resp)
+    return out
+
+
+@app.post("/api/clients/{client_id}/referrals", response_model=ClientReferralResponse)
+def create_client_referral(
+    client_id: int,
+    body: ClientReferralCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Add an advocate/referral entry for this client."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    ref = ClientReferral(
+        client_id=client_id,
+        advocate_client_id=body.advocate_client_id,
+        advocate_business_name=(body.advocate_business_name or "").strip() or None,
+        active=1 if (body.active if body.active is not None else True) else 0,
+    )
+    db.add(ref)
+    db.commit()
+    db.refresh(ref)
+    resp = ClientReferralResponse.model_validate(ref)
+    if ref.advocate_client_id:
+        advocate = db.query(Client).filter(Client.id == ref.advocate_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+    return resp
+
+
+@app.patch("/api/client-referrals/{referral_id}", response_model=ClientReferralResponse)
+def update_client_referral(
+    referral_id: int,
+    body: ClientReferralUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update an advocate/referral entry."""
+    ref = db.query(ClientReferral).filter(ClientReferral.id == referral_id).first()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Referral not found")
+    payload = body.model_dump(exclude_unset=True)
+    if "advocate_business_name" in payload:
+        ref.advocate_business_name = (payload["advocate_business_name"] or "").strip() or None
+    if "advocate_client_id" in payload:
+        ref.advocate_client_id = payload["advocate_client_id"]
+    if "active" in payload:
+        ref.active = 1 if payload["active"] else 0
+    db.commit()
+    db.refresh(ref)
+    resp = ClientReferralResponse.model_validate(ref)
+    if ref.advocate_client_id:
+        advocate = db.query(Client).filter(Client.id == ref.advocate_client_id).first()
+        if advocate:
+            resp = resp.model_copy(update={"advocate_display_name": advocate.business_name})
+    return resp
+
+
+@app.delete("/api/client-referrals/{referral_id}", response_model=dict)
+def delete_client_referral(
+    referral_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Delete an advocate/referral entry."""
+    ref = db.query(ClientReferral).filter(ClientReferral.id == referral_id).first()
+    if not ref:
+        raise HTTPException(status_code=404, detail="Referral not found")
+    db.delete(ref)
+    db.commit()
+    return {"ok": True}
 
 
 @app.delete("/api/clients/{client_id}", response_model=dict)
@@ -3302,7 +4554,15 @@ def delete_client(
         synchronize_session=False
     )
 
-    # 4) Finally, delete the client itself
+    # 4) Client referrals (advocate links)
+    db.query(ClientReferral).filter(ClientReferral.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    db.query(ClientReferral).filter(ClientReferral.advocate_client_id == client_id).update(
+        {ClientReferral.advocate_client_id: None}, synchronize_session=False
+    )
+
+    # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
 
@@ -3948,6 +5208,12 @@ def update_offer(
         )
     if offer_update.estimated_value is not None:
         db_offer.estimated_value = offer_update.estimated_value
+    if offer_update.annual_savings is not None:
+        db_offer.annual_savings = offer_update.annual_savings
+    if offer_update.current_cost is not None:
+        db_offer.current_cost = offer_update.current_cost
+    if offer_update.new_cost is not None:
+        db_offer.new_cost = offer_update.new_cost
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
@@ -3958,6 +5224,11 @@ def update_offer(
             if isinstance(offer_update.pipeline_stage, OfferPipelineStageSchema)
             else str(offer_update.pipeline_stage)
         )
+
+    if offer_update.status is not None:
+        sync_strategy_status_from_offer(db, db_offer)
+    if offer_update.annual_savings is not None or offer_update.estimated_value is not None:
+        sync_strategy_status_from_offer(db, db_offer)
 
     db.commit()
     db.refresh(db_offer)
