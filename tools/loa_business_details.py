@@ -45,7 +45,7 @@ def get_loa_business_details():
             if "Date" in details:
                 formatted_response += f"**Date:** {details['Date']}\n"
             
-            formatted_response += "\nPlease confirm if these details are correct for the client folder creation."
+            formatted_response += "\nPlease confirm if these details are correct for the member folder creation."
             
             logger.info(f"Formatted response: {formatted_response}")
             return formatted_response

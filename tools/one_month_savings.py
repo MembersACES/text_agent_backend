@@ -103,6 +103,10 @@ def get_sheets_service():
             logger.error("Failed to create credentials object")
             return None
         
+        service_account_email = getattr(creds, "service_account_email", None) or "unknown"
+        logger.info(f"Sheets API will use service account: {service_account_email}")
+        logger.info("Share your Google Sheet with this email (Editor or Viewer) to allow access.")
+        
         logger.info("Building Google Sheets API service...")
         service = build('sheets', 'v4', credentials=creds)
         logger.info("Google Sheets service created successfully")
@@ -281,6 +285,69 @@ def get_or_create_subfolder(drive_service, parent_folder_id: str, subfolder_name
     except Exception as e:
         logger.error(f"Error getting/creating subfolder: {str(e)}")
         logger.exception(e)
+        return None
+
+
+def upload_file_to_drive(
+    file_bytes: bytes,
+    filename: str,
+    folder_id: str,
+    mimetype: Optional[str] = None,
+    drive_service=None,
+) -> Optional[str]:
+    """
+    Upload any file to Google Drive folder (PDF, Word, etc.).
+    Uses same logic as upload_pdf_to_drive but with configurable mimetype.
+    """
+    if mimetype is None:
+        mimetype = "application/octet-stream"
+        if filename.lower().endswith(".pdf"):
+            mimetype = "application/pdf"
+        elif filename.lower().endswith(".docx"):
+            mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        elif filename.lower().endswith(".doc"):
+            mimetype = "application/msword"
+    try:
+        logger.info(f"Uploading file '{filename}' (mimetype={mimetype}) to folder {folder_id}")
+        if not drive_service:
+            drive_service = get_drive_service()
+            if not drive_service:
+                logger.error("Could not create Google Drive service")
+                return None
+        from io import BytesIO
+        from googleapiclient.http import MediaIoBaseUpload
+        drive_id = None
+        try:
+            folder_info = drive_service.files().get(
+                fileId=folder_id,
+                fields="id, name, driveId, parents",
+                supportsAllDrives=True,
+            ).execute()
+            drive_id = folder_info.get("driveId")
+        except HttpError as e:
+            if e.status_code != 404:
+                logger.info(f"Could not get folder info (will proceed): {e.status_code} - {e.reason}")
+            drive_id = None
+        file_metadata = {"name": filename, "parents": [folder_id]}
+        media = MediaIoBaseUpload(BytesIO(file_bytes), mimetype=mimetype, resumable=True)
+        create_params = {
+            "body": file_metadata,
+            "media_body": media,
+            "fields": "id, webViewLink",
+            "supportsAllDrives": True,
+            "supportsTeamDrives": True,
+        }
+        if drive_id:
+            create_params["driveId"] = drive_id
+        file = drive_service.files().create(**create_params).execute()
+        file_id = file.get("id")
+        logger.info(f"Uploaded file. File ID: {file_id}")
+        return file_id
+    except HttpError as e:
+        logger.error(f"Google Drive API error: {e.status_code} - {e.reason}")
+        return None
+    except Exception as e:
+        logger.error(f"Error uploading file: {str(e)}")
         return None
 
 
