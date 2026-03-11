@@ -71,6 +71,7 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -923,6 +924,131 @@ def update_utility_record_endpoint(
             detail="Utility record not found or update failed. Check business name, utility type, and identifier. See server logs for Airtable response.",
         )
     return {"status": "success", "message": "Utility record updated"}
+
+
+@app.get("/api/resources/contract-ending")
+def get_contract_ending(
+    sync: bool = Query(False, description="If true, run sheet->Airtable sync for missing end dates before returning"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Filter contracts ending in this month"),
+    year: Optional[int] = Query(None, ge=2000, le=2100, description="Filter contracts ending in this year"),
+    utility_type: Optional[str] = Query(None, description="Filter by utility type: C&I Electricity or C&I Gas"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Return C&I Electricity and C&I Gas utility records split into contracts with end date
+    and end dates undefined. Optionally run sync from Google Sheet to Airtable first.
+    """
+    # Always visible in terminal (uvicorn stdout)
+    print(f"[contract-ending] GET sync={sync} month={month} year={year} utility_type={utility_type or 'all'}", flush=True)
+    logging.info("[contract-ending] GET sync=%s", sync)
+
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    sync_result = {}
+    if sync:
+        try:
+            print("[contract-ending] Running sync: sheet -> Airtable (missing end dates only)", flush=True)
+            logging.info("[contract-ending] Sync requested: pulling contract end dates from Member ACES Data sheet -> Airtable")
+            sync_result = sync_contract_end_dates_to_airtable()
+            u_e, u_g = sync_result.get("updated_electricity", 0), sync_result.get("updated_gas", 0)
+            errs = sync_result.get("errors", [])
+            updates = sync_result.get("updates", [])
+            print(f"[contract-ending] Sync done: C&I E={u_e} updated, C&I G={u_g} updated, errors={len(errs)}", flush=True)
+            for u in updates:
+                print(f"  -> {u.get('utility_type')} {u.get('identifier_label')} {u.get('identifier')} -> {u.get('contract_end_date')} (from {u.get('source_sheet')})", flush=True)
+            if errs:
+                for e in errs:
+                    print(f"  ERROR: {e}", flush=True)
+            logging.info(
+                "[contract-ending] Sync complete: C&I Electricity=%s updated, C&I Gas=%s updated, errors=%s. Updates: %s",
+                u_e, u_g, len(errs),
+                [f"{u.get('utility_type')} {u.get('identifier_label', '')} {u.get('identifier')} -> {u.get('contract_end_date')}" for u in updates],
+            )
+        except Exception as e:
+            print(f"[contract-ending] Sync FAILED: {e}", flush=True)
+            logging.exception("[contract-ending] Sync failed: %s", e)
+            sync_result = {"errors": [str(e)], "updates": [], "updated_electricity": 0, "updated_gas": 0}
+    contracts_with_end_date: List[dict] = []
+    end_dates_undefined: List[dict] = []
+    for ut in ("C&I Electricity", "C&I Gas"):
+        if utility_type and ut != utility_type:
+            continue
+        try:
+            print(f"[contract-ending] Fetching Airtable records: {ut}", flush=True)
+            records = airtable_client.list_all_utility_records(ut)
+            n_with_date = sum(1 for r in records if r.get("contract_end_date"))
+            n_undefined = len(records) - n_with_date
+            print(f"[contract-ending] {ut}: {len(records)} total, {n_with_date} with end date, {n_undefined} undefined", flush=True)
+            logging.info("[contract-ending] %s: %s records (%s with end date, %s undefined)", ut, len(records), n_with_date, n_undefined)
+            for rec in records:
+                item = {
+                    "identifier": rec.get("identifier", ""),
+                    "utility_type": ut,
+                    "contract_end_date": rec.get("contract_end_date"),
+                    "retailer": rec.get("retailer", ""),
+                    "record_id": rec.get("record_id", ""),
+                }
+                if rec.get("contract_end_date"):
+                    # Optional server-side filter by month/year
+                    if month is not None or year is not None:
+                        try:
+                            parts = rec["contract_end_date"].split("-")
+                            if len(parts) >= 2:
+                                y, m = int(parts[0]), int(parts[1])
+                                if month is not None and m != month:
+                                    continue
+                                if year is not None and y != year:
+                                    continue
+                        except (ValueError, IndexError):
+                            pass
+                    contracts_with_end_date.append(item)
+                else:
+                    end_dates_undefined.append(item)
+        except Exception as e:
+            logging.warning("[contract-ending] list_all_utility_records %s failed: %s", ut, e)
+            print(f"[contract-ending] Airtable failed for {ut}: {e}", flush=True)
+    print(f"[contract-ending] Response: {len(contracts_with_end_date)} with end date, {len(end_dates_undefined)} undefined", flush=True)
+    return {
+        "contracts_with_end_date": contracts_with_end_date,
+        "end_dates_undefined": end_dates_undefined,
+        "sync": sync_result if sync else None,
+    }
+
+
+class ContractEndingUpdateRequest(BaseModel):
+    """Update contract end date for a utility record (by identifier, no business_name required)."""
+    utility_type: str  # "C&I Electricity" or "C&I Gas"
+    identifier: str
+    contract_end_date: str  # YYYY-MM-DD
+
+
+@app.patch("/api/resources/contract-ending/update")
+def update_contract_ending_record(
+    request: ContractEndingUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update Contract End Date in Airtable for a single utility record (identifier + utility_type)."""
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    if request.utility_type not in ("C&I Electricity", "C&I Gas"):
+        raise HTTPException(status_code=400, detail="utility_type must be C&I Electricity or C&I Gas")
+    date_str = (request.contract_end_date or "").strip()
+    if len(date_str) < 10:
+        raise HTTPException(status_code=400, detail="contract_end_date must be YYYY-MM-DD")
+    date_str = date_str[:10]
+    try:
+        ok = airtable_client.update_utility_record(
+            request.utility_type,
+            request.identifier.strip(),
+            contract_end_date=date_str,
+        )
+    except Exception as e:
+        logging.exception("[contract-ending update] %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Record not found or update failed")
+    return {"status": "success", "message": "Contract end date updated"}
+
 
 class SignedAgreementRequest(BaseModel):
     business_name: str

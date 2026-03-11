@@ -4,6 +4,7 @@ Used for get-business-info (LOA + linked utilities) and updating Data Requested 
 """
 import logging
 import os
+from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -295,6 +296,119 @@ def build_business_info_from_loa(loa_record: dict) -> dict:
         "representative_details": representative_details,
         "gdrive": gdrive,
     }
+
+
+# Possible Airtable field names for contract end date (C&I Electricity may differ from C&I Gas)
+CONTRACT_END_DATE_KEYS = ("Contract End Date", "Contract end date", "ContractEndDate", "Contract End date")
+
+
+def _get_contract_end_date_from_fields(fields: dict) -> Any:
+    """Get contract end date from record fields, trying multiple possible field names."""
+    for key in CONTRACT_END_DATE_KEYS:
+        if key in fields and fields[key] is not None:
+            return fields[key]
+    # Fallback: find any field whose name looks like "contract end date"
+    for k, v in fields.items():
+        if v is None:
+            continue
+        normalized = (k or "").strip().lower().replace(" ", "").replace("_", "")
+        if "contract" in normalized and "end" in normalized and "date" in normalized:
+            return v
+    return None
+
+
+def _normalize_contract_end_date(value: Any) -> Optional[str]:
+    """Normalize contract end date to YYYY-MM-DD or None if missing/invalid."""
+    if value is None or value == "":
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    # Already YYYY-MM-DD
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    # US format MM/DD/YYYY or M/D/YYYY
+    if "/" in s and len(s) >= 8:
+        parts = s.split("/")
+        if len(parts) == 3:
+            try:
+                m, d, y = int(parts[0]), int(parts[1]), int(parts[2])
+                if y < 100:
+                    y += 2000
+                dt = datetime(y, m, d)
+                return dt.strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                pass
+    if len(s) >= 10:
+        return s[:10]
+    return None
+
+
+def list_all_utility_records(utility_type: str) -> list[dict]:
+    """
+    List all records from the Airtable table for the given utility type.
+    utility_type must be "C&I Electricity" or "C&I Gas".
+    Returns a list of dicts: { "identifier", "contract_end_date", "retailer", "record_id" }.
+    Uses pagination (offset) to fetch all records. contract_end_date is YYYY-MM-DD or None.
+    """
+    if utility_type not in ("C&I Electricity", "C&I Gas"):
+        logger.warning("[list_all_utility_records] unsupported utility_type=%r", utility_type)
+        return []
+    if not AIRTABLE_API_KEY:
+        return []
+    cfg = None
+    for c in UTILITY_CONFIG:
+        if c["app_key"] == utility_type:
+            cfg = c
+            break
+    if not cfg:
+        return []
+    table_name = cfg["table_name"]
+    id_field = cfg["identifier_field"]
+    retailer_field = cfg.get("retailer_field") or "Retailer"
+    # Don't pass fields[] - Airtable can return 422 for field names (e.g. lookup names). Fetch all and use what we need.
+    out: list[dict] = []
+    try:
+        print(f"[airtable] list_all_utility_records: {utility_type} (fetching...)", flush=True)
+        offset = None
+        while True:
+            params: list[tuple[str, Any]] = [("maxRecords", 100)]
+            if offset is not None:
+                params.append(("offset", offset))
+            r = requests.get(
+                _url(table_name),
+                headers=_headers(),
+                params=params,
+                timeout=30,
+            )
+            r.raise_for_status()
+            data = r.json()
+            records = data.get("records", [])
+            for rec in records:
+                rid = rec.get("id", "")
+                f = rec.get("fields") or {}
+                ident = f.get(id_field)
+                identifier = str(ident).strip() if ident is not None else ""
+                contract_end_raw = _get_contract_end_date_from_fields(f)
+                contract_end = _normalize_contract_end_date(contract_end_raw)
+                ret = f.get(retailer_field)
+                if isinstance(ret, list):
+                    ret = ret[0] if ret else ""
+                retailer = str(ret).strip() if ret else ""
+                out.append({
+                    "identifier": identifier,
+                    "contract_end_date": contract_end,
+                    "retailer": retailer,
+                    "record_id": rid,
+                })
+            offset = data.get("offset")
+            if not offset:
+                break
+        logger.info("[list_all_utility_records] %s: fetched %s records", utility_type, len(out))
+    except requests.RequestException as e:
+        logger.warning("[list_all_utility_records] Airtable request failed: %s", e)
+    print(f"[airtable] list_all_utility_records: {utility_type} -> {len(out)} records", flush=True)
+    return out
 
 
 def find_utility_record_by_identifier(
