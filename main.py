@@ -72,6 +72,7 @@ from tools.one_month_savings import (
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
+from tools.discrepancy_check_sheet import get_discrepancy_rows
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -1013,6 +1014,24 @@ def get_contract_ending(
         "end_dates_undefined": end_dates_undefined,
         "sync": sync_result if sync else None,
     }
+
+
+@app.get("/api/resources/discrepancy-check")
+def get_discrepancy_check(
+    business_name: Optional[str] = Query(None, description="Filter by Linked Business Name (for CRM member page)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Return C&I Gas discrepancy check rows from the Google Sheet.
+    Optional business_name filter matches sheet column Linked Business Name (trim/case-normalized).
+    """
+    logging.info("[discrepancy-check] GET business_name=%s", business_name or "all")
+    try:
+        rows = get_discrepancy_rows(business_name=business_name)
+        return {"rows": rows, "utility_type": "C&I Gas"}
+    except Exception as e:
+        logging.exception("[discrepancy-check] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 class ContractEndingUpdateRequest(BaseModel):
