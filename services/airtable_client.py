@@ -77,6 +77,34 @@ UTILITY_CONFIG = [
 UTILITY_EXTRA_FIELDS = ["Data Requested", "Data Recieved", "Contract End Date"]
 
 
+def _normalize_identifier_raw(ident: Any) -> str:
+    """
+    Normalize NMI/MRIN from Airtable (number, string, or list) to a canonical string
+    so contract-ending matching works. Handles: 41036565463, 41036565463.0, "41036565463.0", list.
+    """
+    if ident is None:
+        return ""
+    if isinstance(ident, list):
+        ident = ident[0] if ident else None
+        if ident is None:
+            return ""
+    s = str(ident).strip()
+    if not s:
+        return ""
+    s = s.replace(",", "")
+    if not s:
+        return ""
+    if s.endswith(".0") and len(s) >= 3 and s[:-2].replace("-", "").replace("+", "").isdigit():
+        s = s[:-2]
+    try:
+        n = float(s)
+        if n == int(n):
+            return str(int(n))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
+
 def _headers() -> dict:
     if not AIRTABLE_API_KEY:
         return {}
@@ -370,11 +398,15 @@ def list_all_utility_records(utility_type: str) -> list[dict]:
     out: list[dict] = []
     try:
         print(f"[airtable] list_all_utility_records: {utility_type} (fetching...)", flush=True)
-        offset = None
-        while True:
-            params: list[tuple[str, Any]] = [("maxRecords", 100)]
-            if offset is not None:
-                params.append(("offset", offset))
+        offset: Optional[str] = None
+        page = 0
+        max_pages = 50
+        while page < max_pages:
+            page += 1
+            # Use pageSize (per-page), not maxRecords (total cap). maxRecords=100 can prevent offset.
+            params = {"pageSize": 100}
+            if offset:
+                params["offset"] = offset
             r = requests.get(
                 _url(table_name),
                 headers=_headers(),
@@ -388,7 +420,7 @@ def list_all_utility_records(utility_type: str) -> list[dict]:
                 rid = rec.get("id", "")
                 f = rec.get("fields") or {}
                 ident = f.get(id_field)
-                identifier = str(ident).strip() if ident is not None else ""
+                identifier = _normalize_identifier_raw(ident)
                 contract_end_raw = _get_contract_end_date_from_fields(f)
                 contract_end = _normalize_contract_end_date(contract_end_raw)
                 ret = f.get(retailer_field)
@@ -401,10 +433,18 @@ def list_all_utility_records(utility_type: str) -> list[dict]:
                     "retailer": retailer,
                     "record_id": rid,
                 })
-            offset = data.get("offset")
-            if not offset:
+            next_offset = data.get("offset")
+            print(f"[airtable] list_all_utility_records: {utility_type} page {page} -> {len(records)} records (total so far: {len(out)}), next_offset={bool(next_offset)}", flush=True)
+            if not next_offset:
+                if len(records) == 100:
+                    logger.warning(
+                        "[list_all_utility_records] %s: got exactly 100 records with no offset; table may have more records (Airtable caps at 100/page). Check if offset is in response: %s",
+                        utility_type, list(data.keys()),
+                    )
+                    print(f"[airtable] list_all_utility_records: WARNING got 100 records but no offset - response keys: {list(data.keys())}", flush=True)
                 break
-        logger.info("[list_all_utility_records] %s: fetched %s records", utility_type, len(out))
+            offset = next_offset
+        logger.info("[list_all_utility_records] %s: fetched %s records in %s page(s)", utility_type, len(out), page)
     except requests.RequestException as e:
         logger.warning("[list_all_utility_records] Airtable request failed: %s", e)
     print(f"[airtable] list_all_utility_records: {utility_type} -> {len(out)} records", flush=True)

@@ -109,6 +109,64 @@ def _find_column_index(headers: list, names: list) -> int:
     return -1
 
 
+def _normalize_identifier(value) -> str:
+    """
+    Normalize NMI/MRIN for comparison. Google Sheets often returns numbers as float (e.g. 20023230869.0)
+    while Airtable may return "20023230869" or "4,311,324,676". Ensure both sides match.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    # Strip thousands separators so "4,311,324,676" matches "4311324676"
+    s = s.replace(",", "")
+    if not s:
+        return ""
+    # Strip trailing .0 from numeric strings so "20023230869.0" matches "20023230869"
+    if s.endswith(".0") and s[:-2].replace("-", "").replace("+", "").isdigit():
+        return s[:-2]
+    # If value came in as number (int/float), normalize to integer string
+    try:
+        n = float(s)
+        if n == int(n):
+            return str(int(n))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
+
+def _identifier_matches_airtable(identifier: str, airtable_ids: set) -> bool:
+    """True if this NMI/MRIN (from contract sheet) has a matching record in Airtable.
+    Matches exact, or with one trailing digit added/removed (checksum)."""
+    if identifier in airtable_ids:
+        return True
+    # Contract sheet has extra checksum digit: e.g. sheet 43113246768, Airtable 4311324676
+    if len(identifier) >= 2 and identifier[:-1] in airtable_ids:
+        return True
+    # Airtable has extra checksum digit
+    for c in "0123456789":
+        if (identifier + c) in airtable_ids:
+            return True
+    return False
+
+
+def _get_sheet_date_for_airtable_id(id_to_date: dict, airtable_ident: str) -> Optional[str]:
+    """Look up contract end date: exact match, then sheet id = airtable_ident + one digit, then airtable_ident - one digit."""
+    date = id_to_date.get(airtable_ident)
+    if date:
+        return date
+    # Sheet may have extra checksum: sheet 40012455699, Airtable 4001245569
+    for c in "0123456789":
+        key = airtable_ident + c
+        if key in id_to_date:
+            return id_to_date[key]
+    # Sheet may be without checksum: sheet 4311324676, Airtable 43113246768
+    if len(airtable_ident) >= 2 and airtable_ident[:-1] in id_to_date:
+        return id_to_date[airtable_ident[:-1]]
+    return None
+
+
 def _read_sheet_contract_end_dates(
     service,
     spreadsheet_id: str,
@@ -152,7 +210,7 @@ def _read_sheet_contract_end_dates(
     for row in rows[1:]:
         if id_col >= len(row) or date_col >= len(row):
             continue
-        ident = str(row[id_col]).strip() if row[id_col] is not None else ""
+        ident = _normalize_identifier(row[id_col])
         if not ident:
             continue
         date_str = _parse_date_cell(row[date_col])
@@ -217,8 +275,10 @@ def sync_contract_end_dates_to_airtable() -> dict:
     """
     For each C&I Electricity and C&I Gas record in Airtable that has no contract end date,
     if the sheet has an end date for that NMI/MRIN, update Airtable.
-    Returns {"updated_electricity": int, "updated_gas": int, "errors": list, "updates": list}.
+    Returns {"updated_electricity": int, "updated_gas": int, "errors": list, "updates": list,
+            "identifiers_not_in_airtable": {"electricity": list, "gas": list}}.
     Each item in updates: {"utility_type", "identifier", "contract_end_date", "source_sheet"}.
+    identifiers_not_in_airtable: NMIs/MRINs that appear in the sheet but have no matching Airtable account.
     """
     from services import airtable_client
     result = {
@@ -226,6 +286,7 @@ def sync_contract_end_dates_to_airtable() -> dict:
         "updated_gas": 0,
         "errors": [],
         "updates": [],
+        "identifiers_not_in_airtable": {"electricity": [], "gas": []},
     }
     if not getattr(airtable_client, "AIRTABLE_API_KEY", None):
         result["errors"].append("Airtable not configured")
@@ -246,16 +307,46 @@ def sync_contract_end_dates_to_airtable() -> dict:
         source_sheet = sheet_sources.get(utility_type, "Google Sheet")
         try:
             records = airtable_client.list_all_utility_records(utility_type)
+            airtable_ids = set()
+            for rec in records:
+                raw = rec.get("identifier")
+                if raw is None:
+                    continue
+                # Single value or comma-separated (e.g. "4311324676" or "4103711676, 4103711676, 4103711676")
+                for part in str(raw).split(","):
+                    norm = _normalize_identifier(part.strip())
+                    if norm:
+                        airtable_ids.add(norm)
+                        # So sheet id with extra checksum digit matches: if Airtable has "4311324676",
+                        # we have it; if Airtable has "43113246768", also add "4311324676" so sheet "43113246768" matches
+                        if len(norm) >= 2 and norm.isdigit():
+                            airtable_ids.add(norm[:-1])
+            not_in_airtable = [
+                ident for ident in id_to_date
+                if not _identifier_matches_airtable(ident, airtable_ids)
+            ]
+            if utility_type == "C&I Electricity":
+                result["identifiers_not_in_airtable"]["electricity"] = sorted(not_in_airtable)
+            else:
+                result["identifiers_not_in_airtable"]["gas"] = sorted(not_in_airtable)
+            if not_in_airtable:
+                logger.info("[contract_ending_sheet] %s: %s %ss in sheet have no Airtable account: %s",
+                            utility_type, len(not_in_airtable), id_label, not_in_airtable[:10])
+                print(f"[contract-ending-sync] {utility_type}: {len(not_in_airtable)} {id_label}s in sheet with no Airtable account", flush=True)
             logger.info("[contract_ending_sheet] %s: %s Airtable records, %s identifiers with end date in sheet %r",
                         utility_type, len(records), len(id_to_date), source_sheet)
             print(f"[contract-ending-sync] {utility_type}: {len(records)} Airtable records, {len(id_to_date)} IDs with end date in sheet", flush=True)
             for rec in records:
                 if rec.get("contract_end_date"):
                     continue
-                ident = (rec.get("identifier") or "").strip()
+                raw_ident = rec.get("identifier")
+                ident = _normalize_identifier(raw_ident)
                 if not ident:
                     continue
-                date_str = id_to_date.get(ident)
+                # If Airtable stored comma-separated NMIs, use first for lookup and update
+                if "," in ident:
+                    ident = _normalize_identifier(ident.split(",")[0].strip()) or ident
+                date_str = _get_sheet_date_for_airtable_id(id_to_date, ident)
                 if not date_str:
                     continue
                 ok = airtable_client.update_utility_record(
