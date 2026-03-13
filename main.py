@@ -72,7 +72,11 @@ from tools.one_month_savings import (
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
-from tools.discrepancy_check_sheet import get_discrepancy_rows
+from tools.discrepancy_check_sheet import (
+    get_discrepancy_rows,
+    get_electricity_contract_discrepancy_rows,
+    get_dma_discrepancy_rows,
+)
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -1022,13 +1026,22 @@ def get_discrepancy_check(
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Return C&I Gas discrepancy check rows from the Google Sheet.
+    Return discrepancy check rows from the Google Sheet: C&I Gas, C&I Electricity (Contract), and DMA.
     Optional business_name filter matches sheet column Linked Business Name (trim/case-normalized).
+    For backward compatibility, "rows" is the gas rows; use gas, electricity_contract, electricity_dma for per-type data.
     """
     logging.info("[discrepancy-check] GET business_name=%s", business_name or "all")
     try:
-        rows = get_discrepancy_rows(business_name=business_name)
-        return {"rows": rows, "utility_type": "C&I Gas"}
+        gas = get_discrepancy_rows(business_name=business_name)
+        electricity_contract = get_electricity_contract_discrepancy_rows(business_name=business_name)
+        electricity_dma = get_dma_discrepancy_rows(business_name=business_name)
+        return {
+            "rows": gas,
+            "utility_type": "C&I Gas",
+            "gas": gas,
+            "electricity_contract": electricity_contract,
+            "electricity_dma": electricity_dma,
+        }
     except Exception as e:
         logging.exception("[discrepancy-check] failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
