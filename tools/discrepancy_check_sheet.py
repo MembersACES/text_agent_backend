@@ -12,7 +12,7 @@ from tools.business_info import FILE_IDS_SHEET_ID, get_sheets_service
 logger = logging.getLogger(__name__)
 
 # --- C&I Gas ---
-GAS_TAB_NAME = "C&I Gas Descrepancy Check"
+GAS_TAB_NAME = "Descrepancy Check"
 
 HEADER_TO_KEY_GAS = {
     "descrpancy type": "discrepancy_type",
@@ -221,7 +221,7 @@ def _read_tab(
 
 def get_discrepancy_rows(business_name: str | None = None) -> list[dict[str, str]]:
     """
-    Read the C&I Gas Discrepancy Check tab and return a list of row objects
+    Read the Discrepancy Check tab and return a list of row objects
     with normalized keys. If business_name is provided, filter to rows where
     Linked Business Name matches (trim/case-normalized).
     """
