@@ -794,23 +794,30 @@ def data_request(
         identifier_type = "account_number"
         utility_type = "waste"
         utility_type_identifier = "Waste"
+    elif service_type == "Other":
+        identifier_type = "other"
+        utility_type = "other"
+        utility_type_identifier = "Other"
     else:
         # Fallback to electricity/NMI if an unknown type sneaks through
         identifier_type = "NMI"
         utility_type = "electricity"
         utility_type_identifier = "Electricity"
 
-    raw_result = supplier_data_request(
-        supplier_name=request.supplier_name,
-        business_name=request.business_name,
-        service_type=service_type,
-        account_identifier=account_identifier,
-        identifier_type=identifier_type,
-    )
-
-    # Determine success based on the human-readable message
-    message = str(raw_result or "").strip()
-    is_success = message.startswith("✅") or "Data request successfully sent" in message
+    # "Other" request type: record in CRM only, no automated email
+    if service_type == "Other":
+        message = "✅ Data request recorded (Other). No automated email sent."
+        is_success = True
+    else:
+        raw_result = supplier_data_request(
+            supplier_name=request.supplier_name,
+            business_name=request.business_name,
+            service_type=service_type,
+            account_identifier=account_identifier,
+            identifier_type=identifier_type,
+        )
+        message = str(raw_result or "").strip()
+        is_success = message.startswith("✅") or "Data request successfully sent" in message
 
     # On success, upsert client, ensure offer, and record an offer activity
     if is_success and request.business_name:

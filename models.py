@@ -84,7 +84,7 @@ class TaskHistory(Base):
     __tablename__ = "task_history"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True)
     user_email = Column(String, nullable=True)
     action = Column(String, nullable=False)  # e.g., "task_created", "status_changed", "field_updated"
     field = Column(String, nullable=True)  # which field changed
