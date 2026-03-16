@@ -12,7 +12,7 @@ from tools.business_info import FILE_IDS_SHEET_ID, get_sheets_service
 logger = logging.getLogger(__name__)
 
 # --- C&I Gas ---
-GAS_TAB_NAME = "Descrepancy Check"
+GAS_TAB_NAME = "C&I Gas Descrepancy Check"
 
 HEADER_TO_KEY_GAS = {
     "descrpancy type": "discrepancy_type",
