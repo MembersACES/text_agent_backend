@@ -85,103 +85,23 @@ def get_sheets_service():
 
 def get_file_ids(business_name: str) -> dict:
     """
-    Get file IDs directly from Google Sheets instead of n8n webhook.
-    Reads from the 'Data from Airtable' sheet and filters by business name.
-    
-    Args:
-        business_name: Name of the business to look up
-        
-    Returns:
-        Dictionary with file IDs and status fields, or empty dict if not found/error
+    Get file IDs from n8n webhook (return_fileIDs). Used by get_business_information.
     """
     if not business_name:
-        logger.warning("get_file_ids called with empty business_name")
         return {}
-    
-    logger.info(f"Fetching file IDs from Google Sheets for: {business_name}")
-    logger.info(f"Sheet ID: {FILE_IDS_SHEET_ID}, Sheet Name: {FILE_IDS_SHEET_NAME}")
-    
-    # Get Google Sheets service
-    service = get_sheets_service()
-    if not service:
-        logger.error("Could not create Google Sheets service")
-        logger.warning("Falling back to empty dict - file IDs will not be available")
-        return {}
-    
     try:
-        # Read all data from the sheet (including header row)
-        result = service.spreadsheets().values().get(
-            spreadsheetId=FILE_IDS_SHEET_ID,
-            range=f"{FILE_IDS_SHEET_NAME}!A:ZZ",  # Read all columns
-        ).execute()
-        
-        values = result.get('values', [])
-        
-        if not values or len(values) < 2:  # Need at least header + 1 data row
-            logger.info(f"No data found in sheet for {business_name}")
-            return {}
-        
-        # First row is the header - find the "Business Name" column index
-        header_row = values[0]
-        business_name_col_idx = None
-        
-        for idx, header in enumerate(header_row):
-            if header and str(header).strip().lower() == "business name":
-                business_name_col_idx = idx
-                break
-        
-        if business_name_col_idx is None:
-            logger.error("Could not find 'Business Name' column in sheet")
-            return {}
-        
-        logger.info(f"Found 'Business Name' column at index {business_name_col_idx}")
-        
-        # Search for the matching business name in data rows
-        matching_row = None
-        search_business_name = business_name.strip()
-        
-        for row_idx, row in enumerate(values[1:], start=2):  # Start from row 2 (skip header)
-            # Ensure row has enough columns
-            while len(row) <= business_name_col_idx:
-                row.append("")
-            
-            row_business_name = str(row[business_name_col_idx]).strip() if row[business_name_col_idx] else ""
-            
-            # Case-insensitive match
-            if row_business_name.lower() == search_business_name.lower():
-                matching_row = row
-                logger.info(f"Found matching row at index {row_idx} for business: {row_business_name}")
-                break
-        
-        if not matching_row:
-            logger.info(f"No matching row found for business: {business_name}")
-            return {}
-        
-        # Convert row to dictionary using header row as keys
-        # Pad matching_row to match header length
-        while len(matching_row) < len(header_row):
-            matching_row.append("")
-        
-        file_ids_dict = {}
-        for idx, header in enumerate(header_row):
-            if idx < len(matching_row):
-                value = matching_row[idx]
-                # Only include non-empty values
-                if value and str(value).strip():
-                    file_ids_dict[str(header).strip()] = str(value).strip()
-        
-        logger.info(f"Successfully retrieved file IDs from Google Sheets. Found {len(file_ids_dict)} fields")
-        return file_ids_dict
-        
-    except HttpError as e:
-        logger.error(f"Google Sheets API HttpError: {e.status_code} - {e.reason}")
-        if e.status_code == 404:
-            logger.error(f"Sheet not found. Check that FILE_IDS_SHEET_ID and FILE_IDS_SHEET_NAME are correct")
-            logger.error(f"Also ensure the service account has access to the sheet")
-        return {}
+        response = requests.post(
+            "https://membersaces.app.n8n.cloud/webhook/return_fileIDs",
+            json={"business_name": business_name.strip()},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, list) and data:
+            return data[0] if isinstance(data[0], dict) else {}
+        return data if isinstance(data, dict) else {}
     except Exception as e:
-        logger.error(f"Unexpected error reading from Google Sheets: {str(e)}")
-        logger.exception(e)
+        logger.warning("Failed to get file IDs from n8n webhook: %s", e)
         return {}
 
 
@@ -249,13 +169,13 @@ def get_business_information(business_name: str) -> dict:
     logger = logging.getLogger(__name__)
 
     processed_file_ids = {}
-    # Send API request
+    # Send API request to n8n
     payload = {"business_name": business_name}
     logger.info(f"Making API call to n8n with payload: {payload}")
     
     try:
         response = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook/search-business-info", json=payload
+            "https://membersaces.app.n8n.cloud/webhook/search-business-info-test", json=payload
         )
         logger.info(f"API response status code: {response.status_code}")
         logger.info(f"API response content: {response.text}")
@@ -278,11 +198,11 @@ def get_business_information(business_name: str) -> dict:
 
         # Get the official business name to use for file ID lookup
         official_business_name = data.get('business_details', {}).get('name', business_name)
-        
-        # Call the new tool to get file IDs
+
+        # Get file IDs from n8n webhook (return_fileIDs)
         file_ids_data = get_file_ids(official_business_name)
 
-        # The webhook returns a list with one dictionary, so we extract it.
+        # Webhook may return a list with one dictionary or a single dict
         file_ids_dict = {}
         if isinstance(file_ids_data, list) and file_ids_data:
             file_ids_dict = file_ids_data[0]
@@ -290,12 +210,13 @@ def get_business_information(business_name: str) -> dict:
             file_ids_dict = file_ids_data
 
         # Process file IDs for easy access by other functions
-        # Map N8N keys to expected keys
+        # Map N8N keys to expected keys (support both "Site Profling" and "Site Profiling" from n8n)
         file_mapping = {
             'LOA File ID': 'business_LOA',
             'WIP': 'business_WIP',
             'Floor Plan': 'business_Floor Plan (Exit Map)',
-            'Site Profiling': 'business_Site Profling',
+            'Site Profling': 'business_Site Profiling',
+            'Site Profiling': 'business_Site Profiling',
             'Service Fee Agreement': 'business_Service Fee Agreement',
             'Initial Strategy': 'business_Initial Strategy',
             'Cleaning Invoice': 'invoice_Cleaning',
@@ -373,16 +294,16 @@ def get_business_information(business_name: str) -> dict:
         # Create business documents dict from available files
         business_documents = {}
         
-        # Check each document type based on N8N data
+        # Check each document type based on N8N data (use correct "Site Profiling" as key)
         doc_checks = [
             ('Initial Strategy', 'Initial Strategy'),
-            ('Site Profling', 'Site Profiling'),  # Note the typo handling
+            ('Site Profiling', 'Site Profiling'),  # try both spellings for file_id below
             ('Service Fee Agreement', 'Service Fee Agreement'),
             ('Floor Plan (Exit Map)', 'Floor Plan'),
         ]
-        
+
         for doc_name, n8n_key in doc_checks:
-            file_id = file_ids_dict.get(n8n_key)
+            file_id = file_ids_dict.get(n8n_key) or (file_ids_dict.get('Site Profling') if n8n_key == 'Site Profiling' else None)
             business_documents[doc_name] = bool(file_id and file_id.strip())
         
         # Always show Initial Strategy as available (as per original logic)
@@ -431,7 +352,7 @@ def get_business_information(business_name: str) -> dict:
         if wip_file_id and wip_file_id.strip():
             wip_file_link = f"https://drive.google.com/file/d/{wip_file_id}/view"
             processed_file_ids["business_WIP"] = wip_file_link
-        
+
         formatted_response += "\n### Linked Utilities and Retailers:"
 
         # Add linked utilities and their details

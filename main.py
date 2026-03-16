@@ -20,7 +20,7 @@ import logging
 import tempfile
 import os
 import httpx
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 import json
 from fastapi import HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
@@ -34,6 +34,7 @@ import io
 
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
+from services import airtable_client
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -70,6 +71,12 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
+from tools.discrepancy_check_sheet import (
+    get_discrepancy_rows,
+    get_electricity_contract_discrepancy_rows,
+    get_dma_discrepancy_rows,
+)
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -413,8 +420,8 @@ def get_business_info(
     result = get_business_information(request.business_name)
     if isinstance(result, dict):
         result["user_email"] = user_info.get("email")
-        # Only create/update CRM member when get-business-info actually returned business data
-        # (e.g. from n8n). Avoid creating stub profiles when the search finds nothing.
+        # Airtable utility data (Contract End Date, Data Requested, Data Recieved) is loaded
+        # lazily via GET /api/utility-extra to keep this endpoint fast.
         business_details = result.get("business_details", {}) or {}
         if business_details.get("name"):
             try:
@@ -440,6 +447,48 @@ def get_business_info(
 
     logging.info(f"Returning response to frontend: {result}")
     return result
+
+
+@app.get("/api/utility-extra")
+def get_utility_extra(
+    business_name: str = Query(..., description="Business name to fetch Airtable utility details for"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Lazy-load Airtable utility data (Contract End Date, Data Requested, Data Recieved)
+    and optionally merged linked_utilities/utility_retailers. Does not block get-business-info.
+    Returns empty dicts if Airtable is not configured or business not found.
+    """
+    out = {"linked_utilities": {}, "utility_retailers": {}, "linked_utility_extra": {}}
+    logging.info("[utility-extra] request business_name=%r", business_name)
+    if not getattr(airtable_client, "USE_AIRTABLE_DIRECT", False) or not airtable_client.AIRTABLE_API_KEY:
+        logging.info("[utility-extra] skipped: USE_AIRTABLE_DIRECT or AIRTABLE_API_KEY not set")
+        return out
+    name = (business_name or "").strip()
+    if not name:
+        return out
+    try:
+        loa_record = airtable_client.get_loa_record_by_business_name(name)
+        if not loa_record:
+            logging.info("[utility-extra] no LOA record found for business_name=%r", name)
+            return out
+        logging.info("[utility-extra] LOA record id=%s", (loa_record.get("id") or "")[:12])
+        linked_utilities, utility_retailers, linked_utility_extra = airtable_client.get_linked_utility_records(loa_record)
+        out["linked_utilities"] = linked_utilities
+        out["utility_retailers"] = utility_retailers
+        out["linked_utility_extra"] = linked_utility_extra
+        # Log response shape so you can see what the frontend receives
+        logging.info(
+            "[utility-extra] response: linked_utilities keys=%s, linked_utility_extra keys=%s",
+            list(out["linked_utilities"].keys()),
+            list(out["linked_utility_extra"].keys()),
+        )
+        for uk, extra_list in out["linked_utility_extra"].items():
+            logging.info("[utility-extra] linked_utility_extra[%r] count=%s, first=%s", uk, len(extra_list or []), (extra_list or [])[:1])
+    except Exception as e:
+        logging.warning("Airtable utility-extra failed: %s", e)
+    return out
+
 
 class ElectricityInvoiceRequest(BaseModel):
     business_name: Optional[str] = None
@@ -467,6 +516,15 @@ class DataRequest(BaseModel):
 
 class RobotDataRequest(BaseModel):
     robot_number: str
+
+class UtilityRecordUpdateRequest(BaseModel):
+    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
+    business_name: str
+    utility_type: str  # e.g. "C&I Electricity", "SME Gas", "Waste"
+    identifier: str    # NMI, MRIN, account number, etc.
+    data_requested: Optional[str] = None   # YYYY-MM-DD
+    data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
+    contract_end_date: Optional[str] = None  # YYYY-MM-DD
 # Add these Pydantic models with your other BaseModel classes
 class BusinessSolution(BaseModel):
     id: str
@@ -736,23 +794,30 @@ def data_request(
         identifier_type = "account_number"
         utility_type = "waste"
         utility_type_identifier = "Waste"
+    elif service_type == "Other":
+        identifier_type = "other"
+        utility_type = "other"
+        utility_type_identifier = "Other"
     else:
         # Fallback to electricity/NMI if an unknown type sneaks through
         identifier_type = "NMI"
         utility_type = "electricity"
         utility_type_identifier = "Electricity"
 
-    raw_result = supplier_data_request(
-        supplier_name=request.supplier_name,
-        business_name=request.business_name,
-        service_type=service_type,
-        account_identifier=account_identifier,
-        identifier_type=identifier_type,
-    )
-
-    # Determine success based on the human-readable message
-    message = str(raw_result or "").strip()
-    is_success = message.startswith("✅") or "Data request successfully sent" in message
+    # "Other" request type: record in CRM only, no automated email
+    if service_type == "Other":
+        message = "✅ Data request recorded (Other). No automated email sent."
+        is_success = True
+    else:
+        raw_result = supplier_data_request(
+            supplier_name=request.supplier_name,
+            business_name=request.business_name,
+            service_type=service_type,
+            account_identifier=account_identifier,
+            identifier_type=identifier_type,
+        )
+        message = str(raw_result or "").strip()
+        is_success = message.startswith("✅") or "Data request successfully sent" in message
 
     # On success, upsert client, ensure offer, and record an offer activity
     if is_success and request.business_name:
@@ -802,6 +867,30 @@ def data_request(
                     logging.warning(
                         "Failed to create DATA_REQUEST offer activity: %s", act_e
                     )
+
+            # Update Airtable "Data Requested" (and clear "Data Received" for C&I E/G) when direct link is enabled
+            try:
+                from services.airtable_client import (
+                    USE_AIRTABLE_DIRECT,
+                    update_utility_record_data_requested,
+                )
+                if USE_AIRTABLE_DIRECT and account_identifier:
+                    from datetime import date
+                    today = date.today().isoformat()
+                    # For C&I Electricity and C&I Gas, also deselect Data Received (request just sent)
+                    set_received_false = utility_type_identifier in ("C&I Electricity", "C&I Gas")
+                    if update_utility_record_data_requested(
+                        utility_type_identifier, account_identifier, today,
+                        data_recieved=False if set_received_false else None,
+                    ):
+                        logging.info(
+                            "Updated Airtable Data Requested for %s %s%s",
+                            utility_type_identifier,
+                            account_identifier,
+                            " (Data Received unchecked)" if set_received_false else "",
+                        )
+            except Exception as air_e:
+                logging.warning("Airtable Data Requested update failed: %s", air_e)
         except Exception as crm_e:
             logging.error("Failed to record CRM data for data request: %s", crm_e)
 
@@ -812,6 +901,193 @@ def data_request(
     }
     logging.info(f"Returning data request response to frontend: {response_payload}")
     return response_payload
+
+
+@app.patch("/api/utility-record")
+def update_utility_record_endpoint(
+    request: UtilityRecordUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on a member's utility record in Airtable."""
+    logging.info(
+        "[utility-record PATCH] request: business_name=%r, utility_type=%r, identifier=%r, data_requested=%r, data_recieved=%r, contract_end_date=%r",
+        request.business_name, request.utility_type, request.identifier,
+        request.data_requested, request.data_recieved, request.contract_end_date,
+    )
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    if not getattr(airtable_client, "USE_AIRTABLE_DIRECT", False):
+        raise HTTPException(status_code=503, detail="Airtable direct mode is not enabled")
+    try:
+        ok = airtable_client.update_utility_record(
+            request.utility_type,
+            request.identifier,
+            data_requested=request.data_requested,
+            data_recieved=request.data_recieved,
+            contract_end_date=request.contract_end_date,
+        )
+    except Exception as e:
+        logging.exception("[utility-record PATCH] Airtable update raised: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ok:
+        logging.warning("[utility-record PATCH] update_utility_record returned False (record not found or Airtable error)")
+        raise HTTPException(
+            status_code=404,
+            detail="Utility record not found or update failed. Check business name, utility type, and identifier. See server logs for Airtable response.",
+        )
+    return {"status": "success", "message": "Utility record updated"}
+
+
+@app.get("/api/resources/contract-ending")
+def get_contract_ending(
+    sync: bool = Query(False, description="If true, run sheet->Airtable sync for missing end dates before returning"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Filter contracts ending in this month"),
+    year: Optional[int] = Query(None, ge=2000, le=2100, description="Filter contracts ending in this year"),
+    utility_type: Optional[str] = Query(None, description="Filter by utility type: C&I Electricity or C&I Gas"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Return C&I Electricity and C&I Gas utility records split into contracts with end date
+    and end dates undefined. Optionally run sync from Google Sheet to Airtable first.
+    """
+    # Always visible in terminal (uvicorn stdout)
+    print(f"[contract-ending] GET sync={sync} month={month} year={year} utility_type={utility_type or 'all'}", flush=True)
+    logging.info("[contract-ending] GET sync=%s", sync)
+
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    sync_result = {}
+    if sync:
+        try:
+            print("[contract-ending] Running sync: sheet -> Airtable (missing end dates only)", flush=True)
+            logging.info("[contract-ending] Sync requested: pulling contract end dates from Member ACES Data sheet -> Airtable")
+            sync_result = sync_contract_end_dates_to_airtable()
+            u_e, u_g = sync_result.get("updated_electricity", 0), sync_result.get("updated_gas", 0)
+            errs = sync_result.get("errors", [])
+            updates = sync_result.get("updates", [])
+            print(f"[contract-ending] Sync done: C&I E={u_e} updated, C&I G={u_g} updated, errors={len(errs)}", flush=True)
+            for u in updates:
+                print(f"  -> {u.get('utility_type')} {u.get('identifier_label')} {u.get('identifier')} -> {u.get('contract_end_date')} (from {u.get('source_sheet')})", flush=True)
+            if errs:
+                for e in errs:
+                    print(f"  ERROR: {e}", flush=True)
+            logging.info(
+                "[contract-ending] Sync complete: C&I Electricity=%s updated, C&I Gas=%s updated, errors=%s. Updates: %s",
+                u_e, u_g, len(errs),
+                [f"{u.get('utility_type')} {u.get('identifier_label', '')} {u.get('identifier')} -> {u.get('contract_end_date')}" for u in updates],
+            )
+        except Exception as e:
+            print(f"[contract-ending] Sync FAILED: {e}", flush=True)
+            logging.exception("[contract-ending] Sync failed: %s", e)
+            sync_result = {"errors": [str(e)], "updates": [], "updated_electricity": 0, "updated_gas": 0}
+    contracts_with_end_date: List[dict] = []
+    end_dates_undefined: List[dict] = []
+    for ut in ("C&I Electricity", "C&I Gas"):
+        if utility_type and ut != utility_type:
+            continue
+        try:
+            print(f"[contract-ending] Fetching Airtable records: {ut}", flush=True)
+            records = airtable_client.list_all_utility_records(ut)
+            n_with_date = sum(1 for r in records if r.get("contract_end_date"))
+            n_undefined = len(records) - n_with_date
+            print(f"[contract-ending] {ut}: {len(records)} total, {n_with_date} with end date, {n_undefined} undefined", flush=True)
+            logging.info("[contract-ending] %s: %s records (%s with end date, %s undefined)", ut, len(records), n_with_date, n_undefined)
+            for rec in records:
+                item = {
+                    "identifier": rec.get("identifier", ""),
+                    "utility_type": ut,
+                    "contract_end_date": rec.get("contract_end_date"),
+                    "retailer": rec.get("retailer", ""),
+                    "record_id": rec.get("record_id", ""),
+                }
+                if rec.get("contract_end_date"):
+                    # Optional server-side filter by month/year
+                    if month is not None or year is not None:
+                        try:
+                            parts = rec["contract_end_date"].split("-")
+                            if len(parts) >= 2:
+                                y, m = int(parts[0]), int(parts[1])
+                                if month is not None and m != month:
+                                    continue
+                                if year is not None and y != year:
+                                    continue
+                        except (ValueError, IndexError):
+                            pass
+                    contracts_with_end_date.append(item)
+                else:
+                    end_dates_undefined.append(item)
+        except Exception as e:
+            logging.warning("[contract-ending] list_all_utility_records %s failed: %s", ut, e)
+            print(f"[contract-ending] Airtable failed for {ut}: {e}", flush=True)
+    print(f"[contract-ending] Response: {len(contracts_with_end_date)} with end date, {len(end_dates_undefined)} undefined", flush=True)
+    return {
+        "contracts_with_end_date": contracts_with_end_date,
+        "end_dates_undefined": end_dates_undefined,
+        "sync": sync_result if sync else None,
+    }
+
+
+@app.get("/api/resources/discrepancy-check")
+def get_discrepancy_check(
+    business_name: Optional[str] = Query(None, description="Filter by Linked Business Name (for CRM member page)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Return discrepancy check rows from the Google Sheet: C&I Gas, C&I Electricity (Contract), and DMA.
+    Optional business_name filter matches sheet column Linked Business Name (trim/case-normalized).
+    For backward compatibility, "rows" is the gas rows; use gas, electricity_contract, electricity_dma for per-type data.
+    """
+    logging.info("[discrepancy-check] GET business_name=%s", business_name or "all")
+    try:
+        gas = get_discrepancy_rows(business_name=business_name)
+        electricity_contract = get_electricity_contract_discrepancy_rows(business_name=business_name)
+        electricity_dma = get_dma_discrepancy_rows(business_name=business_name)
+        return {
+            "rows": gas,
+            "utility_type": "C&I Gas",
+            "gas": gas,
+            "electricity_contract": electricity_contract,
+            "electricity_dma": electricity_dma,
+        }
+    except Exception as e:
+        logging.exception("[discrepancy-check] failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ContractEndingUpdateRequest(BaseModel):
+    """Update contract end date for a utility record (by identifier, no business_name required)."""
+    utility_type: str  # "C&I Electricity" or "C&I Gas"
+    identifier: str
+    contract_end_date: str  # YYYY-MM-DD
+
+
+@app.patch("/api/resources/contract-ending/update")
+def update_contract_ending_record(
+    request: ContractEndingUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update Contract End Date in Airtable for a single utility record (identifier + utility_type)."""
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    if request.utility_type not in ("C&I Electricity", "C&I Gas"):
+        raise HTTPException(status_code=400, detail="utility_type must be C&I Electricity or C&I Gas")
+    date_str = (request.contract_end_date or "").strip()
+    if len(date_str) < 10:
+        raise HTTPException(status_code=400, detail="contract_end_date must be YYYY-MM-DD")
+    date_str = date_str[:10]
+    try:
+        ok = airtable_client.update_utility_record(
+            request.utility_type,
+            request.identifier.strip(),
+            contract_end_date=date_str,
+        )
+    except Exception as e:
+        logging.exception("[contract-ending update] %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Record not found or update failed")
+    return {"status": "success", "message": "Contract end date updated"}
+
 
 class SignedAgreementRequest(BaseModel):
     business_name: str
