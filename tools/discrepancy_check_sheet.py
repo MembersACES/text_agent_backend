@@ -1,6 +1,6 @@
 """
 Discrepancy checks – read from Google Sheet (FILE_IDS spreadsheet).
-Tabs: C&I Gas, C&I Electricity (Contract), DMA.
+Tabs: C&I Gas, C&I Electricity (Contract), DMA, Demand Check.
 Uses the same Sheets service and sheet ID as business_info (FILE_IDS_SHEET_ID).
 """
 
@@ -147,6 +147,50 @@ DMA_KEYS = [
     "status",
 ]
 
+# --- Demand Check (Maximum demand review, interval data vs invoice) ---
+# This lives on a separate tab called "Demand Check". It is used to flag sites
+# where interval data has been received and a maximum demand review has been run.
+DEMAND_TAB_NAME = "Demand Check"
+
+HEADER_TO_KEY_DEMAND = {
+    # Core identifying columns
+    "review type": "review_type",
+    "risk / opportunity": "risk_or_opportunity",
+    "risk/opportunity": "risk_or_opportunity",
+    "utility identifier (nmi)": "utility_identifier",
+    "utility identifier": "utility_identifier",
+    "linked business name": "linked_business_name",
+    "site address": "site_address",
+    "network provider": "network_provider",
+    "demand type": "demand_type",
+    # Demand numbers
+    "highest invoice demand": "highest_invoice_demand",
+    "actual interval demand": "actual_interval_demand",
+    "demand difference": "demand_difference",
+    # Charges
+    "actual invoice charge": "actual_invoice_charge",
+    "expected charge": "expected_charge",
+    "difference": "difference",
+    "status": "status",
+}
+
+DEMAND_KEYS = [
+    "review_type",
+    "risk_or_opportunity",
+    "utility_identifier",
+    "linked_business_name",
+    "site_address",
+    "network_provider",
+    "demand_type",
+    "highest_invoice_demand",
+    "actual_interval_demand",
+    "demand_difference",
+    "actual_invoice_charge",
+    "expected_charge",
+    "difference",
+    "status",
+]
+
 
 def _normalize_header(h: Any) -> str:
     if h is None:
@@ -256,5 +300,18 @@ def get_dma_discrepancy_rows(business_name: str | None = None) -> list[dict[str,
         DMA_TAB_NAME,
         HEADER_TO_KEY_DMA,
         DMA_KEYS,
+        business_name,
+    )
+
+
+def get_demand_check_rows(business_name: str | None = None) -> list[dict[str, str]]:
+    """
+    Read the Demand Check tab (maximum demand review invoice vs data).
+    Filter by linked_business_name if provided.
+    """
+    return _read_tab(
+        DEMAND_TAB_NAME,
+        HEADER_TO_KEY_DEMAND,
+        DEMAND_KEYS,
         business_name,
     )
