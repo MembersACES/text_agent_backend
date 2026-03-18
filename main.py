@@ -76,6 +76,7 @@ from tools.discrepancy_check_sheet import (
     get_discrepancy_rows,
     get_electricity_contract_discrepancy_rows,
     get_dma_discrepancy_rows,
+    get_demand_check_rows,
 )
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
@@ -1042,12 +1043,26 @@ def get_discrepancy_check(
         gas = get_discrepancy_rows(business_name=business_name)
         electricity_contract = get_electricity_contract_discrepancy_rows(business_name=business_name)
         electricity_dma = get_dma_discrepancy_rows(business_name=business_name)
+        demand_check_rows = get_demand_check_rows(business_name=business_name)
+
+        # Build per-identifier flag for interval demand review from Demand Check tab
+        demand_review_flags: dict[str, bool] = {}
+        for row in demand_check_rows:
+            review_type = (row.get("review_type") or "").strip().lower()
+            identifier = (row.get("utility_identifier") or "").strip()
+            if not identifier:
+                continue
+            if "maximum demand review invoice vs data" == review_type:
+                demand_review_flags[identifier] = True
+
         return {
             "rows": gas,
             "utility_type": "C&I Gas",
             "gas": gas,
             "electricity_contract": electricity_contract,
             "electricity_dma": electricity_dma,
+            "electricity_demand_check": demand_check_rows,
+            "electricity_demand_review_flags": demand_review_flags,
         }
     except Exception as e:
         logging.exception("[discrepancy-check] failed: %s", e)

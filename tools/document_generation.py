@@ -349,6 +349,13 @@ def get_available_eoi_types():
     return [e.value[0] for e in ExpressionOfInterestType]
 
 class EngagementFormType(Enum):
+    # Enum member names must match the normalized `engagement_form_type` string:
+    # engagement_form_type.upper().replace(" ", "_").replace("-", "_")
+    # For "Solar Panel Cleaning" this becomes "SOLAR_PANEL_CLEANING"
+    SOLAR_PANEL_CLEANING = (
+        "Solar Panel Cleaning",
+        "1-udcqTyew1Gavaoa2rF_kRKracMnQ0wbIxEYGNAGvQo",
+    )
     TELECOMMUNICATION = (
         "Telecommunication",
         "1vrZFrCUyS_6qlcpsSdJqNabIRrEuqd4VfDOLjbN3QiU",
