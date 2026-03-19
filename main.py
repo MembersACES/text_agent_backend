@@ -5455,6 +5455,37 @@ def post_offer_activity(
         metadata["utility_type"] = offer.utility_type
     if "utility_type_identifier" not in metadata and getattr(offer, "utility_type_identifier", None):
         metadata["utility_type_identifier"] = offer.utility_type_identifier
+
+    # Debug logs to trace missing activity rows in activity reports.
+    # Keep payload small: log key fields + metadata keys only.
+    try:
+        meta_debug = {
+            k: metadata.get(k)
+            for k in (
+                "comparison_type",
+                "utility_type",
+                "utility_type_identifier",
+                "nmi",
+                "mrin",
+                "identifier",
+                "account_number",
+                "account_name",
+                "annual_savings",
+                "current_cost",
+                "new_cost",
+            )
+            if k in metadata
+        }
+    except Exception:
+        meta_debug = {}
+    logging.info(
+        "[post_offer_activity] offer_id=%s activity_type=%s created_by=%s doc_present=%s meta=%s",
+        offer_id,
+        body.activity_type,
+        created_by,
+        bool(body.document_link),
+        meta_debug,
+    )
     activity = create_offer_activity(
         db,
         offer=offer,
