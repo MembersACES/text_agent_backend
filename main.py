@@ -94,6 +94,8 @@ from models import (
     OfferActivity,
     StrategyItem,
     Testimonial,
+    AutonomousSequenceRun,
+    AutonomousSequenceStep,
 )
 from schemas import (
     TaskCreate,
@@ -125,6 +127,12 @@ from schemas import (
     TestimonialCheckApprovedResponse,
     TestimonialSolutionContentItem,
     TestimonialSolutionContentUpdate,
+    AutonomousSequenceStartRequest,
+    AutonomousSequenceRunResponse,
+    AutonomousSequenceRunListItem,
+    AutonomousSequenceStepResponse,
+    AutonomousSequenceInboundRequest,
+    AutonomousSequenceRunPatchRequest,
 )
 from crm_enums import (
     ClientStage,
@@ -142,7 +150,7 @@ from services.crm import (
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
 )
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_
 from utils.task_history import (
     log_task_created,
@@ -163,6 +171,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 app = FastAPI()
 
+_autonomous_scheduler: Optional[AsyncIOScheduler] = None
+
 
 @app.on_event("startup")
 def on_startup() -> None:
@@ -170,7 +180,38 @@ def on_startup() -> None:
     Ensure all SQLAlchemy models (including new CRM tables like 'clients' and 'offers')
     are created in the configured database on application startup.
     """
+    global _autonomous_scheduler
     init_db()
+
+    if os.getenv("AUTONOMOUS_SCHEDULER_ENABLED", "").lower() in ("1", "true", "yes"):
+        from database import SessionLocal
+        from services.autonomous_sequence import execute_due_steps_sync
+
+        _autonomous_scheduler = AsyncIOScheduler()
+
+        async def _autonomous_tick():
+            db = SessionLocal()
+            try:
+                n = execute_due_steps_sync(db)
+                if n:
+                    logging.info("Autonomous sequences: executed %s step(s)", n)
+            except Exception:
+                logging.exception("Autonomous scheduler tick failed")
+            finally:
+                db.close()
+
+        interval = int(os.getenv("AUTONOMOUS_SCHEDULER_INTERVAL_SECONDS", "60"))
+        _autonomous_scheduler.add_job(_autonomous_tick, "interval", seconds=max(15, interval))
+        _autonomous_scheduler.start()
+        logging.info("Autonomous sequence scheduler enabled (interval=%ss)", interval)
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    global _autonomous_scheduler
+    if _autonomous_scheduler is not None:
+        _autonomous_scheduler.shutdown(wait=False)
+        _autonomous_scheduler = None
 
 # CORS: allow these origins so error responses (e.g. 500) can include CORS headers
 CORS_ORIGINS = [
@@ -5497,6 +5538,242 @@ def post_offer_activity(
         created_by=created_by,
     )
     return OfferActivityResponse.model_validate(activity)
+
+
+def verify_autonomous_inbound_secret(
+    x_autonomous_inbound_secret: Optional[str] = Header(None, alias="X-Autonomous-Inbound-Secret"),
+):
+    """n8n / Twilio / Retell callbacks: require shared secret when AUTONOMOUS_INBOUND_SECRET is set."""
+    secret = os.getenv("AUTONOMOUS_INBOUND_SECRET", "").strip()
+    if not secret:
+        return
+    if (x_autonomous_inbound_secret or "").strip() != secret:
+        raise HTTPException(status_code=401, detail="Invalid X-Autonomous-Inbound-Secret")
+
+
+def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunListItem:
+    steps = sorted(run.steps, key=lambda s: s.step_index)
+    offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
+    business_name = offer.business_name if offer else None
+    pending = [s for s in steps if s.step_status in ("ready", "to_start") and s.scheduled_at]
+    next_ch, next_at = None, None
+    if pending:
+        p = min(pending, key=lambda x: x.scheduled_at)
+        next_ch, next_at = p.channel, p.scheduled_at
+    done = len([s for s in steps if s.step_status in ("completed", "failed", "skipped")])
+    return AutonomousSequenceRunListItem(
+        id=run.id,
+        offer_id=run.offer_id,
+        business_name=business_name,
+        sequence_type=run.sequence_type,
+        run_status=run.run_status,
+        stop_reason=run.stop_reason,
+        anchor_at=run.anchor_at,
+        next_step_channel=next_ch,
+        next_step_at=next_at,
+        steps_done=done,
+        steps_total=len(steps),
+    )
+
+
+def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunResponse:
+    from services.autonomous_sequence import _parse_context
+
+    steps = sorted(run.steps, key=lambda s: s.step_index)
+    offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
+    return AutonomousSequenceRunResponse(
+        id=run.id,
+        sequence_type=run.sequence_type,
+        offer_id=run.offer_id,
+        client_id=run.client_id,
+        run_status=run.run_status,
+        stop_reason=run.stop_reason,
+        anchor_at=run.anchor_at,
+        timezone=run.timezone,
+        created_at=run.created_at,
+        updated_at=run.updated_at,
+        business_name=offer.business_name if offer else None,
+        context=_parse_context(run),
+        steps=[AutonomousSequenceStepResponse.model_validate(s) for s in steps],
+    )
+
+
+@app.post("/api/autonomous/sequences/start")
+def autonomous_sequence_start(
+    body: AutonomousSequenceStartRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import start_gas_base2_sequence
+
+    allowed_base2_types = frozenset(
+        {
+            "gas_base2_followup_v1",  # C&I (and SME) gas — same schedule; use context.utility_lane in n8n
+            "ci_electricity_base2_followup_v1",
+        }
+    )
+    if body.sequence_type not in allowed_base2_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported sequence_type; allowed: {sorted(allowed_base2_types)}",
+        )
+    offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    run = start_gas_base2_sequence(
+        db,
+        sequence_type=body.sequence_type,
+        offer_id=body.offer_id,
+        client_id=body.client_id if body.client_id is not None else offer.client_id,
+        crm_activity_id=body.crm_activity_id,
+        anchor_at=body.anchor_at,
+        tz=body.timezone,
+        context=body.context or {},
+    )
+    steps_planned = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run.id).count()
+    return {
+        "run_id": run.id,
+        "sequence_type": run.sequence_type,
+        "offer_id": run.offer_id,
+        "run_status": run.run_status,
+        "steps_planned": steps_planned,
+    }
+
+
+@app.get("/api/autonomous/sequences/runs")
+def autonomous_sequence_list_runs(
+    run_status: Optional[str] = Query(None, description="running | stopped | completed | cancelled"),
+    run_status_group: Optional[str] = Query(
+        None,
+        description="running = only active runs; finished = stopped, completed, or cancelled",
+    ),
+    limit: int = Query(50, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    q = db.query(AutonomousSequenceRun)
+    if run_status_group == "running":
+        q = q.filter(AutonomousSequenceRun.run_status == "running")
+    elif run_status_group == "finished":
+        q = q.filter(
+            AutonomousSequenceRun.run_status.in_(("stopped", "completed", "cancelled"))
+        )
+    elif run_status:
+        q = q.filter(AutonomousSequenceRun.run_status == run_status.strip())
+    total = q.count()
+    runs = (
+        q.options(joinedload(AutonomousSequenceRun.steps))
+        .order_by(AutonomousSequenceRun.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    items = [_autonomous_list_item(db, r).model_dump(mode="json") for r in runs]
+    return JSONResponse(content={"items": items, "total": total})
+
+
+@app.get("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
+def autonomous_sequence_get_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _autonomous_run_detail(db, run)
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/stop", response_model=AutonomousSequenceRunResponse)
+def autonomous_sequence_stop_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import manual_stop_run
+
+    updated = manual_stop_run(db, run_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Run not found")
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    return _autonomous_run_detail(db, run)
+
+
+@app.patch("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
+def autonomous_sequence_patch_run(
+    run_id: int,
+    body: AutonomousSequenceRunPatchRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import update_run_context
+
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    update_run_context(db, run, body.context)
+    db.commit()
+    db.refresh(run)
+    return _autonomous_run_detail(db, run)
+
+
+@app.post(
+    "/api/autonomous/sequences/inbound",
+    dependencies=[Depends(verify_autonomous_inbound_secret)],
+)
+def autonomous_sequence_inbound(
+    body: AutonomousSequenceInboundRequest,
+    db: Session = Depends(get_db),
+):
+    from services.autonomous_sequence import apply_inbound
+
+    run = None
+    if body.run_id:
+        run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == body.run_id).first()
+    if not run:
+        run = (
+            db.query(AutonomousSequenceRun)
+            .filter(
+                AutonomousSequenceRun.offer_id == body.offer_id,
+                AutonomousSequenceRun.run_status == "running",
+            )
+            .order_by(AutonomousSequenceRun.created_at.desc())
+            .first()
+        )
+    if not run:
+        raise HTTPException(status_code=404, detail="No matching autonomous run")
+
+    payload = body.model_dump()
+    apply_inbound(db, run, payload)
+    return {"ok": True, "run_id": run.id, "run_status": run.run_status, "stop_reason": run.stop_reason}
+
+
+@app.post("/api/autonomous/internal/tick")
+def autonomous_manual_tick(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import execute_due_steps_sync
+
+    n = execute_due_steps_sync(db)
+    return {"ok": True, "steps_executed": n}
 
 
 @app.patch("/api/offers/{offer_id}", response_model=OfferResponse)

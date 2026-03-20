@@ -2,7 +2,7 @@
 Pydantic schemas for API requests and responses
 """
 from pydantic import BaseModel, field_serializer, field_validator
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from datetime import datetime
 import json
 from utils.timezone import to_melbourne_iso
@@ -637,3 +637,95 @@ class TestimonialSolutionContentItem(BaseModel):
     conclusion: str = ""
     esg_scope_for_solution: str = ""
     sdg_impact_for_solution: str = ""
+
+
+# --- Autonomous follow-up sequences ---
+
+
+class AutonomousSequenceStartRequest(BaseModel):
+    sequence_type: str = "gas_base2_followup_v1"  # or ci_electricity_base2_followup_v1 (same cadence)
+    offer_id: int
+    client_id: Optional[int] = None
+    crm_activity_id: Optional[int] = None
+    anchor_at: datetime
+    timezone: str = "Australia/Melbourne"
+    context: Dict[str, Any] = {}
+
+
+class AutonomousSequenceStepResponse(BaseModel):
+    id: int
+    step_index: int
+    day_number: int
+    channel: str
+    step_status: str
+    scheduled_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    retell_agent_id: Optional[str] = None
+    last_outcome_summary: Optional[str] = None
+
+    @field_serializer("scheduled_at", "started_at", "completed_at")
+    def serialize_dt(self, dt: Optional[datetime], _info):
+        return to_melbourne_iso(dt) if dt else None
+
+    class Config:
+        from_attributes = True
+
+
+class AutonomousSequenceRunResponse(BaseModel):
+    id: int
+    sequence_type: str
+    offer_id: int
+    client_id: Optional[int] = None
+    run_status: str
+    stop_reason: Optional[str] = None
+    anchor_at: datetime
+    timezone: str
+    created_at: datetime
+    updated_at: datetime
+    business_name: Optional[str] = None
+    context: Dict[str, Any] = {}
+    steps: List[AutonomousSequenceStepResponse] = []
+
+    @field_serializer("anchor_at", "created_at", "updated_at")
+    def serialize_run_dt(self, dt: datetime, _info):
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class AutonomousSequenceRunPatchRequest(BaseModel):
+    """Replace stored n8n/Retell context (contact details, lane, etc.)."""
+
+    context: Dict[str, Any]
+
+
+class AutonomousSequenceRunListItem(BaseModel):
+    id: int
+    offer_id: int
+    business_name: Optional[str] = None
+    sequence_type: str
+    run_status: str
+    stop_reason: Optional[str] = None
+    anchor_at: datetime
+    next_step_channel: Optional[str] = None
+    next_step_at: Optional[datetime] = None
+    steps_done: int = 0
+    steps_total: int = 0
+
+    @field_serializer("anchor_at", "next_step_at")
+    def serialize_item_dt(self, dt: Optional[datetime], _info):
+        return to_melbourne_iso(dt) if dt else None
+
+
+class AutonomousSequenceInboundRequest(BaseModel):
+    offer_id: int
+    run_id: Optional[int] = None
+    channel: str = "email"
+    raw_text: Optional[str] = None
+    transcript: Optional[str] = None
+    external_id: Optional[str] = None
+    intent: Optional[str] = None
+    sentiment_negative: bool = False
+    agreement_signed: bool = False

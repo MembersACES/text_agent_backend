@@ -418,6 +418,8 @@ OFFER_STATUS_TO_STRATEGY_STATUS = {
     OfferStatus.REQUESTED: "Requested",
     OfferStatus.AWAITING_RESPONSE: "Awaiting response",
     OfferStatus.RESPONSE_RECEIVED: "Response received",
+    OfferStatus.AUTONOMOUS_AGENT_TRIGGER: "Autonomous agent trigger",
+    OfferStatus.AUTONOMOUS_AGENT_STOPPED: "Autonomous agent stopped",
     OfferStatus.ACCEPTED: "Accepted",
     OfferStatus.LOST: "Lost",
 }
