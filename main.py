@@ -5514,6 +5514,10 @@ def post_offer_activity(
                 "annual_savings",
                 "current_cost",
                 "new_cost",
+                "annual_usage_gj",
+                "energy_charge_pct",
+                "contracted_rate",
+                "offer_rate",
             )
             if k in metadata
         }
@@ -5813,6 +5817,14 @@ def update_offer(
         db_offer.current_cost = offer_update.current_cost
     if offer_update.new_cost is not None:
         db_offer.new_cost = offer_update.new_cost
+    if offer_update.annual_usage_gj is not None:
+        db_offer.annual_usage_gj = offer_update.annual_usage_gj
+    if offer_update.energy_charge_pct is not None:
+        db_offer.energy_charge_pct = offer_update.energy_charge_pct
+    if offer_update.contracted_rate is not None:
+        db_offer.contracted_rate = offer_update.contracted_rate
+    if offer_update.offer_rate is not None:
+        db_offer.offer_rate = offer_update.offer_rate
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:

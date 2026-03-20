@@ -342,6 +342,10 @@ class OfferUpdate(BaseModel):
     annual_savings: Optional[float] = None
     current_cost: Optional[float] = None
     new_cost: Optional[float] = None
+    annual_usage_gj: Optional[float] = None
+    energy_charge_pct: Optional[float] = None
+    contracted_rate: Optional[float] = None
+    offer_rate: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -361,6 +365,10 @@ class OfferResponse(BaseModel):
     annual_savings: Optional[float] = None
     current_cost: Optional[float] = None
     new_cost: Optional[float] = None
+    annual_usage_gj: Optional[float] = None
+    energy_charge_pct: Optional[float] = None
+    contracted_rate: Optional[float] = None
+    offer_rate: Optional[float] = None
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None

@@ -196,7 +196,8 @@ def create_offer_activity(
     activity.metadata_ = meta_str
     db.add(activity)
 
-    # Optional: Base 2 / DMA / comparison metadata may include annual_savings, current_cost, new_cost.
+    # Optional: Base 2 / DMA / comparison metadata may include offer pricing/savings fields.
+    # We store a small subset directly on the offer for quick CRM display.
     # Update the offer so CRM and Strategy WIP show them; other webhooks don't need to send these.
     if metadata:
         try:
@@ -212,6 +213,22 @@ def create_offer_activity(
                 v = metadata["new_cost"]
                 if v is not None and v != "":
                     offer.new_cost = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "annual_usage_gj" in metadata:
+                v = metadata["annual_usage_gj"]
+                if v is not None and v != "":
+                    offer.annual_usage_gj = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "energy_charge_pct" in metadata:
+                v = metadata["energy_charge_pct"]
+                if v is not None and v != "":
+                    offer.energy_charge_pct = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "contracted_rate" in metadata:
+                v = metadata["contracted_rate"]
+                if v is not None and v != "":
+                    offer.contracted_rate = float(v) if not isinstance(v, (int, float)) else float(v)
+            if "offer_rate" in metadata:
+                v = metadata["offer_rate"]
+                if v is not None and v != "":
+                    offer.offer_rate = float(v) if not isinstance(v, (int, float)) else float(v)
         except (TypeError, ValueError):
             pass
 
