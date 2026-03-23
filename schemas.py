@@ -709,6 +709,17 @@ class AutonomousSequenceRunPatchRequest(BaseModel):
     context: Dict[str, Any]
 
 
+class AutonomousSequenceStepScheduleItem(BaseModel):
+    step_id: int
+    scheduled_at: datetime
+
+
+class AutonomousSequenceStepsSchedulePatchRequest(BaseModel):
+    """Reschedule pending steps (ready / to_start only). Times are interpreted as ISO-8601 instants (UTC or offset)."""
+
+    updates: List[AutonomousSequenceStepScheduleItem]
+
+
 class AutonomousSequenceRunListItem(BaseModel):
     id: int
     offer_id: int

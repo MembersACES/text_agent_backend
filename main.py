@@ -133,6 +133,7 @@ from schemas import (
     AutonomousSequenceStepResponse,
     AutonomousSequenceInboundRequest,
     AutonomousSequenceRunPatchRequest,
+    AutonomousSequenceStepsSchedulePatchRequest,
 )
 from crm_enums import (
     ClientStage,
@@ -5735,6 +5736,45 @@ def autonomous_sequence_patch_run(
     update_run_context(db, run, body.context)
     db.commit()
     db.refresh(run)
+    return _autonomous_run_detail(db, run)
+
+
+@app.patch(
+    "/api/autonomous/sequences/runs/{run_id}/steps/schedule",
+    response_model=AutonomousSequenceRunResponse,
+)
+def autonomous_sequence_patch_step_schedules(
+    run_id: int,
+    body: AutonomousSequenceStepsSchedulePatchRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import update_step_schedules
+
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        update_step_schedules(
+            db,
+            run,
+            [(u.step_id, u.scheduled_at) for u in body.updates],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    db.commit()
+    db.refresh(run)
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
     return _autonomous_run_detail(db, run)
 
 

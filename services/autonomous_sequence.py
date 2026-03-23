@@ -139,6 +139,48 @@ def update_run_context(db: Session, run: AutonomousSequenceRun, context: dict[st
     run.context_json = json.dumps(context) if context else None
 
 
+_SCHEDULE_EDITABLE_STATUSES = frozenset(("ready", "to_start"))
+
+
+def update_step_schedules(
+    db: Session,
+    run: AutonomousSequenceRun,
+    updates: list[tuple[int, datetime]],
+) -> None:
+    """Set scheduled_at for steps on this run. Raises ValueError if a step is missing or not reschedulable."""
+    if not updates:
+        return
+    step_ids = [u[0] for u in updates]
+    if len(step_ids) != len(set(step_ids)):
+        raise ValueError("Duplicate step_id in updates")
+    rows = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == run.id,
+            AutonomousSequenceStep.id.in_(step_ids),
+        )
+        .all()
+    )
+    by_id = {s.id: s for s in rows}
+    missing = [sid for sid in step_ids if sid not in by_id]
+    if missing:
+        raise ValueError(f"Step(s) not on this run: {missing}")
+    for sid, at in updates:
+        step = by_id[sid]
+        if step.step_status not in _SCHEDULE_EDITABLE_STATUSES:
+            raise ValueError(
+                f"Step {sid} is {step.step_status!r}; only ready or to_start can be rescheduled"
+            )
+        step.scheduled_at = _to_utc_naive(at)
+    run.updated_at = _utc_now_naive()
+    _log_event(
+        db,
+        run.id,
+        "steps_rescheduled",
+        payload={"updates": [{"step_id": sid, "scheduled_at": at.isoformat()} for sid, at in updates]},
+    )
+
+
 def _should_stop_run(db: Session, run: AutonomousSequenceRun) -> tuple[bool, Optional[str]]:
     ev = (
         db.query(AutonomousSequenceEvent)
