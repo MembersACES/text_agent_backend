@@ -6009,6 +6009,7 @@ def delete_offer(
     Delete a single offer and its dependent records.
 
     This removes:
+    - StrategyItem rows linked to this offer or its activities
     - OfferActivity rows for this offer
     - ClientStatusNote rows linked via related_offer_id for this offer
     Finally, deletes the Offer row.
@@ -6018,6 +6019,11 @@ def delete_offer(
     offer = db.query(Offer).filter(Offer.id == offer_id).first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
+
+    # Delete strategy rows linked directly to this offer.
+    db.query(StrategyItem).filter(StrategyItem.offer_id == offer_id).delete(
+        synchronize_session=False
+    )
 
     # Delete activities for this offer
     db.query(OfferActivity).filter(OfferActivity.offer_id == offer_id).delete(
@@ -6035,6 +6041,34 @@ def delete_offer(
 
     logging.info(f"Offer {offer_id} and dependent records deleted")
     return {"status": "success", "message": "Offer and related data deleted"}
+
+
+@app.delete("/api/reports/activities/{activity_id}", response_model=dict)
+def delete_activity_report_item(
+    activity_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete a single offer activity row from the activity report.
+
+    This removes:
+    - StrategyItem rows linked via offer_activity_id
+    - The OfferActivity row itself
+    """
+    logging.info(f"Deleting activity report item {activity_id}")
+
+    activity = db.query(OfferActivity).filter(OfferActivity.id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    db.query(StrategyItem).filter(
+        StrategyItem.offer_activity_id == activity_id
+    ).delete(synchronize_session=False)
+    db.delete(activity)
+    db.commit()
+
+    return {"status": "success", "message": "Activity deleted"}
 
 
 @app.get("/api/reports/clients/offer-counts")
