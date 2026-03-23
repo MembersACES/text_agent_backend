@@ -16,6 +16,22 @@ from sqlalchemy.orm import Session, joinedload
 
 from models import AutonomousSequenceEvent, AutonomousSequenceRun, AutonomousSequenceStep
 
+
+def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
+    """Remove a run and all steps/events. Events reference steps, so delete events first."""
+    run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
+    if not run:
+        return False
+    db.query(AutonomousSequenceEvent).filter(AutonomousSequenceEvent.run_id == run_id).delete(
+        synchronize_session=False
+    )
+    db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run_id).delete(
+        synchronize_session=False
+    )
+    db.delete(run)
+    db.commit()
+    return True
+
 logger = logging.getLogger(__name__)
 
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()

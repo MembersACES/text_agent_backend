@@ -659,6 +659,43 @@ def get_gas_sme_info(
     logging.info(f"Returning SME gas info to frontend: {data}")
     return data
 
+
+@app.get("/api/base2/ci-gas-energy-reference")
+def get_base2_ci_gas_energy_reference(
+    postcode: str = Query(..., min_length=3, max_length=32, description="Postcode or address fragment (4-digit AU postcode extracted server-side)"),
+    relax_postcode: bool = Query(
+        False,
+        description="If true and few exact postcode matches, include same first-3-digit postcode area",
+    ),
+    debug: bool = Query(
+        False,
+        description="If true, include diagnostics in JSON and log summary (field keys, match counts, samples)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Median (energy charges ÷ invoice total) from C&I Gas Clients in Airtable for Base 2 SME→C&I comparison.
+    Field names are configurable via AIRTABLE_CI_GAS_REF_* env vars.
+    """
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    result = airtable_client.fetch_ci_gas_energy_share_reference(
+        postcode, relax_postcode=relax_postcode, debug=debug
+    )
+    logging.info(
+        "[base2/ci-gas-energy-reference] user=%s postcode=%r relax=%s debug=%s -> strategy=%s used_fallback=%s sample_count=%s median=%s message=%r",
+        email,
+        postcode,
+        relax_postcode,
+        debug,
+        result.get("match_strategy"),
+        result.get("used_fallback"),
+        result.get("sample_count"),
+        result.get("median_energy_share"),
+        result.get("message"),
+    )
+    return result
+
+
 @app.post("/api/get-waste-info")
 def get_waste_info(
     request: WasteInvoiceRequest,
@@ -5714,6 +5751,19 @@ def autonomous_sequence_stop_run(
         .first()
     )
     return _autonomous_run_detail(db, run)
+
+
+@app.delete("/api/autonomous/sequences/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
+def autonomous_sequence_delete_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_autonomous_sequence_run
+
+    if not delete_autonomous_sequence_run(db, run_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.patch("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
