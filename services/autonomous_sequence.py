@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from sqlalchemy.orm import Session, joinedload
 
-from models import AutonomousSequenceEvent, AutonomousSequenceRun, AutonomousSequenceStep
+from models import AutonomousSequenceEvent, AutonomousSequenceRun, AutonomousSequenceStep, Offer
 
 
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
@@ -38,6 +38,10 @@ N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
 N8N_SMS_URL = os.getenv("N8N_AUTONOMOUS_SMS_WEBHOOK_URL", "").strip()
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
+
+# All autonomous step times are computed in fixed Australian Eastern Standard Time (UTC+10, no DST).
+# IANA zone Australia/Brisbane matches AEST year-round (unlike Sydney/Melbourne).
+AUTONOMOUS_SCHEDULE_TZ = "Australia/Brisbane"
 
 
 def _utc_now_naive() -> datetime:
@@ -64,15 +68,15 @@ def ensure_weekday(d: date) -> date:
     return n
 
 
-def plan_gas_base2_followup_times(anchor: datetime, tz_name: str) -> list[tuple[int, str, datetime]]:
-    """Returns (day_number, channel, scheduled_at UTC naive)."""
-    tz = ZoneInfo(tz_name)
+def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
+    """Returns (day_number, channel, scheduled_at UTC naive). Always uses AEST (Australia/Brisbane)."""
+    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
     local = a.astimezone(tz)
     base_date = local.date()
 
     d1 = next_business_day(base_date)
-    email1_local = datetime.combine(d1, time(16, 0), tzinfo=tz)
+    email1_local = datetime.combine(d1, time(9, 0), tzinfo=tz)
     call1_local = email1_local + timedelta(minutes=30)
 
     d2_raw = d1 + timedelta(days=1)
@@ -133,6 +137,80 @@ def skip_remaining_steps(db: Session, run_id: int) -> None:
         if s.step_status in ("to_start", "ready", "in_progress"):
             s.step_status = "skipped"
             s.completed_at = _utc_now_naive()
+
+
+_RESTARTABLE_SEQUENCE_TYPES = frozenset(
+    {
+        "gas_base2_followup_v1",
+        "ci_electricity_base2_followup_v1",
+    }
+)
+
+
+def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dict[str, Any]]:
+    """
+    Start a new Base-2 follow-up run for the same offer/type as a finished run, reusing stored
+    context and client/activity IDs. Anchor is current time in AEST (Australia/Brisbane).
+    If an active run already exists for that offer+type, returns that run with reused_existing=True.
+    """
+    run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
+    if not run:
+        return None
+    if run.run_status not in ("stopped", "completed", "cancelled"):
+        raise ValueError("Only stopped, completed, or cancelled runs can be restarted")
+    if run.sequence_type not in _RESTARTABLE_SEQUENCE_TYPES:
+        raise ValueError(
+            f"Unsupported sequence_type for restart; allowed: {sorted(_RESTARTABLE_SEQUENCE_TYPES)}",
+        )
+
+    offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
+    if not offer:
+        raise ValueError("Offer not found for this sequence")
+
+    existing = (
+        db.query(AutonomousSequenceRun)
+        .filter(
+            AutonomousSequenceRun.offer_id == run.offer_id,
+            AutonomousSequenceRun.sequence_type == run.sequence_type,
+            AutonomousSequenceRun.run_status == "running",
+        )
+        .first()
+    )
+    reused_existing = existing is not None
+
+    anchor_at = datetime.now(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    ctx = _parse_context(run)
+    client_id = run.client_id if run.client_id is not None else offer.client_id
+
+    out = start_gas_base2_sequence(
+        db,
+        sequence_type=run.sequence_type,
+        offer_id=run.offer_id,
+        client_id=client_id,
+        crm_activity_id=run.crm_activity_id,
+        anchor_at=anchor_at,
+        tz=AUTONOMOUS_SCHEDULE_TZ,
+        context=ctx,
+    )
+
+    steps_planned = (
+        db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == out.id).count()
+    )
+
+    if not reused_existing:
+        _log_event(db, out.id, "run_restarted_from", payload={"prior_run_id": run_id})
+        db.commit()
+        db.refresh(out)
+
+    return {
+        "run_id": out.id,
+        "prior_run_id": run_id,
+        "reused_existing": reused_existing,
+        "sequence_type": out.sequence_type,
+        "offer_id": out.offer_id,
+        "run_status": out.run_status,
+        "steps_planned": steps_planned,
+    }
 
 
 def manual_stop_run(db: Session, run_id: int) -> Optional[AutonomousSequenceRun]:
@@ -224,6 +302,7 @@ def start_gas_base2_sequence(
     tz: str,
     context: dict[str, Any],
 ) -> AutonomousSequenceRun:
+    """tz is accepted for API compatibility but ignored; schedules always use AUTONOMOUS_SCHEDULE_TZ (AEST)."""
     existing = (
         db.query(AutonomousSequenceRun)
         .filter(
@@ -238,6 +317,7 @@ def start_gas_base2_sequence(
         return existing
 
     anchor_utc = _to_utc_naive(anchor_at)
+    _ = tz  # caller may pass client timezone; scheduling is always AEST
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
         offer_id=offer_id,
@@ -245,13 +325,13 @@ def start_gas_base2_sequence(
         crm_activity_id=crm_activity_id,
         run_status="running",
         anchor_at=anchor_utc,
-        timezone=tz,
+        timezone=AUTONOMOUS_SCHEDULE_TZ,
         context_json=json.dumps(context) if context else None,
     )
     db.add(run)
     db.flush()
 
-    plan = plan_gas_base2_followup_times(anchor_at, tz)
+    plan = plan_gas_base2_followup_times(anchor_at)
     retell_agent_id = context.get("retell_agent_id")
 
     for idx, (day_num, channel, scheduled_utc_naive) in enumerate(plan):

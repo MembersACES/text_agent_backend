@@ -5753,6 +5753,23 @@ def autonomous_sequence_stop_run(
     return _autonomous_run_detail(db, run)
 
 
+@app.post("/api/autonomous/sequences/runs/{run_id}/restart")
+def autonomous_sequence_restart_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import restart_sequence_from_finished_run
+
+    try:
+        result = restart_sequence_from_finished_run(db, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not result:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return JSONResponse(content=result)
+
+
 @app.delete("/api/autonomous/sequences/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
 def autonomous_sequence_delete_run(
     run_id: int,
