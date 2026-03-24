@@ -43,6 +43,8 @@ class OfferStatus(str, Enum):
     REQUESTED = "requested"
     AWAITING_RESPONSE = "awaiting_response"
     RESPONSE_RECEIVED = "response_received"
+    AUTONOMOUS_AGENT_TRIGGER = "autonomous_agent_trigger"
+    AUTONOMOUS_AGENT_STOPPED = "autonomous_agent_stopped"
     ACCEPTED = "accepted"
     LOST = "lost"
 

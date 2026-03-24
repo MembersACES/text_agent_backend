@@ -2,6 +2,7 @@
 Database models
 """
 from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Float
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
 from database import Base
@@ -126,6 +127,11 @@ class Offer(Base):
     annual_savings = Column(Float, nullable=True)
     current_cost = Column(Float, nullable=True)
     new_cost = Column(Float, nullable=True)
+    # Additional Base 2 / comparison offer metrics (e.g. C&I gas/electricity)
+    annual_usage_gj = Column(Float, nullable=True)
+    energy_charge_pct = Column(Float, nullable=True)
+    contracted_rate = Column(Float, nullable=True)
+    offer_rate = Column(Float, nullable=True)
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
     document_link = Column(Text, nullable=True)
@@ -235,3 +241,73 @@ class Testimonial(Base):
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+# --- Autonomous follow-up sequences (Base 2 / gas follow-up; n8n + Retell) ---
+
+
+class AutonomousSequenceRun(Base):
+    """One automation run per offer (scheduled email / SMS / voice steps)."""
+
+    __tablename__ = "autonomous_sequence_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sequence_type = Column(String(80), nullable=False, index=True)
+    offer_id = Column(Integer, ForeignKey("offers.id"), nullable=False, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)
+    crm_activity_id = Column(Integer, nullable=True)
+
+    run_status = Column(String(32), nullable=False, default="running")
+    stop_reason = Column(String(120), nullable=True)
+
+    anchor_at = Column(DateTime, nullable=False)
+    timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
+    context_json = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    steps = relationship(
+        "AutonomousSequenceStep",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="AutonomousSequenceStep.step_index",
+    )
+    events = relationship(
+        "AutonomousSequenceEvent",
+        back_populates="run",
+        cascade="all, delete-orphan",
+    )
+
+
+class AutonomousSequenceStep(Base):
+    __tablename__ = "autonomous_sequence_steps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("autonomous_sequence_runs.id"), nullable=False, index=True)
+    step_index = Column(Integer, nullable=False)
+    day_number = Column(Integer, nullable=False)
+    channel = Column(String(32), nullable=False)
+    offset_minutes_from_day_start = Column(Integer, nullable=False, default=0)
+
+    step_status = Column(String(32), nullable=False, default="to_start")
+    scheduled_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    retell_agent_id = Column(String(120), nullable=True)
+    last_outcome_summary = Column(Text, nullable=True)
+
+    run = relationship("AutonomousSequenceRun", back_populates="steps")
+
+
+class AutonomousSequenceEvent(Base):
+    __tablename__ = "autonomous_sequence_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("autonomous_sequence_runs.id"), nullable=False, index=True)
+    step_id = Column(Integer, ForeignKey("autonomous_sequence_steps.id"), nullable=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    run = relationship("AutonomousSequenceRun", back_populates="events")
