@@ -74,12 +74,21 @@ def init_db():
         # Don't block startup if this fails; log and continue.
         logging.warning("Could not ensure offers.pipeline_stage column: %s", e)
 
-    # Offers: optional Base 2 / comparison fields (annual_savings, current_cost, new_cost)
+    # Offers: optional Base 2 / comparison fields
+    # (annual_savings, current_cost, new_cost, and comparison offer metrics)
     try:
         insp = inspect(engine)
         if "offers" in (insp.get_table_names() or []):
             cols = [c["name"] for c in insp.get_columns("offers")]
-            for col_name, col_type in [("annual_savings", "REAL"), ("current_cost", "REAL"), ("new_cost", "REAL")]:
+            for col_name, col_type in [
+                ("annual_savings", "REAL"),
+                ("current_cost", "REAL"),
+                ("new_cost", "REAL"),
+                ("annual_usage_gj", "REAL"),
+                ("energy_charge_pct", "REAL"),
+                ("contracted_rate", "REAL"),
+                ("offer_rate", "REAL"),
+            ]:
                 if col_name not in cols:
                     logging.info("Adding missing offers.%s column", col_name)
                     with engine.begin() as conn:
