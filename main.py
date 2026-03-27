@@ -696,6 +696,43 @@ def get_base2_ci_gas_energy_reference(
     return result
 
 
+@app.get("/api/base2/sme-gas-airtable-annual-usage")
+def get_base2_sme_gas_airtable_annual_usage(
+    mrin: str = Query(
+        ...,
+        min_length=4,
+        max_length=40,
+        description="MRIN; all matching SME Gas invoice rows in Airtable are aggregated",
+    ),
+    usage_unit: str = Query(
+        "auto",
+        description="How to interpret usage numbers: auto (heuristic), mj, or gj",
+    ),
+    debug: bool = Query(False, description="Include diagnostics (field keys, per-bill breakdown sample)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Aggregate SME gas invoice history from Airtable by MRIN for annual consumption (GJ) and
+    whether usage likely meets the ~1000 GJ C&I-style threshold (configurable via env).
+    """
+    mode = (usage_unit or "auto").strip().lower()
+    if mode not in ("auto", "mj", "gj"):
+        raise HTTPException(status_code=400, detail="usage_unit must be auto, mj, or gj")
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    result = airtable_client.fetch_sme_gas_airtable_annual_usage(mrin, usage_unit=mode, debug=debug)
+    logging.info(
+        "[base2/sme-gas-airtable-annual-usage] user=%s mrin=%r unit=%s -> bills=%s days=%s annual=%s meets=%s",
+        email,
+        mrin,
+        mode,
+        result.get("bill_count"),
+        result.get("total_days"),
+        result.get("annual_usage_gj"),
+        result.get("meets_ci_threshold_1000gj"),
+    )
+    return result
+
+
 @app.post("/api/get-waste-info")
 def get_waste_info(
     request: WasteInvoiceRequest,
