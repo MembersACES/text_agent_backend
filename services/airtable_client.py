@@ -621,6 +621,14 @@ _CI_GAS_REF_TOTAL_FIELDS = [
     ).split(",")
     if s.strip()
 ]
+_CI_GAS_REF_BUSINESS_NAME_FIELDS = [
+    s.strip()
+    for s in os.environ.get(
+        "AIRTABLE_CI_GAS_REF_BUSINESS_NAME_FIELDS",
+        "Bus Name Copy (from Link to LOA),Trading As,Client Name",
+    ).split(",")
+    if s.strip()
+]
 _CI_GAS_REF_MIN_EXACT = int(os.environ.get("AIRTABLE_CI_GAS_REF_MIN_EXACT_SAMPLES", "1"))
 _CI_GAS_REF_DEFAULT_SHARE = float(os.environ.get("AIRTABLE_CI_GAS_REF_DEFAULT_ENERGY_SHARE", "0.72"))
 
@@ -732,6 +740,25 @@ def _address_text_from_fields(fields: dict) -> str:
         if isinstance(v, (int, float)):
             return str(v)
     return ""
+
+
+def _ci_gas_ref_business_display_name(fields: dict) -> Optional[str]:
+    """First non-empty business label from C&I Gas client row (configurable field list)."""
+    for name in _CI_GAS_REF_BUSINESS_NAME_FIELDS:
+        v = fields.get(name)
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            s = str(v).strip()
+            if s:
+                return s
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str) and item.strip():
+                    return item.strip()
+    return None
 
 
 def _record_energy_share_ratio(fields: dict) -> Optional[float]:
@@ -910,6 +937,7 @@ def fetch_ci_gas_energy_share_reference(
             "message": "Invalid postcode",
             "match_strategy": "invalid_postcode",
             "matched_postcodes": [],
+            "matched_postcode_reference": [],
             "confidence": "low",
             "fallback_reason": "invalid_postcode",
         }
@@ -925,6 +953,7 @@ def fetch_ci_gas_energy_share_reference(
             "message": "Airtable not configured",
             "match_strategy": "default_share",
             "matched_postcodes": [],
+            "matched_postcode_reference": [],
             "confidence": "low",
             "fallback_reason": "airtable_not_configured",
         }
@@ -941,6 +970,7 @@ def fetch_ci_gas_energy_share_reference(
             "message": "C&I Gas table not configured",
             "match_strategy": "default_share",
             "matched_postcodes": [],
+            "matched_postcode_reference": [],
             "confidence": "low",
             "fallback_reason": "ci_gas_table_not_configured",
         }
@@ -948,7 +978,7 @@ def fetch_ci_gas_energy_share_reference(
     table_name = cfg["table_name"]
     invoice_table_candidates = get_ci_gas_invoices_table_candidates()
     _ci_gas_ref_log(
-        "start postcode_raw=%r postcode_norm=%r relax=%s table=%r invoice_table_candidates=%s address_fields=%s energy_fields=%s total_fields=%s min_exact=%s default_share=%s",
+        "start postcode_raw=%r postcode_norm=%r relax=%s table=%r invoice_table_candidates=%s address_fields=%s energy_fields=%s total_fields=%s business_name_fields=%s min_exact=%s default_share=%s",
         postcode,
         norm,
         relax_postcode,
@@ -957,6 +987,7 @@ def fetch_ci_gas_energy_share_reference(
         _CI_GAS_REF_ADDRESS_FIELDS,
         _CI_GAS_REF_ENERGY_FIELDS,
         _CI_GAS_REF_TOTAL_FIELDS,
+        _CI_GAS_REF_BUSINESS_NAME_FIELDS,
         _CI_GAS_REF_MIN_EXACT,
         _CI_GAS_REF_DEFAULT_SHARE,
     )
@@ -983,11 +1014,13 @@ def fetch_ci_gas_energy_share_reference(
     address_hits = [k for k in _CI_GAS_REF_ADDRESS_FIELDS if k in key_union]
     energy_hits = [k for k in _CI_GAS_REF_ENERGY_FIELDS if k in key_union]
     total_hits = [k for k in _CI_GAS_REF_TOTAL_FIELDS if k in key_union]
+    business_hits = [k for k in _CI_GAS_REF_BUSINESS_NAME_FIELDS if k in key_union]
     _ci_gas_ref_log(
-        "config_vs_airtable: address_candidates_found=%s energy_candidates_found=%s total_candidates_found=%s",
+        "config_vs_airtable: address_candidates_found=%s energy_candidates_found=%s total_candidates_found=%s business_name_candidates_found=%s",
         address_hits or "(none — check AIRTABLE_CI_GAS_REF_ADDRESS_FIELDS)",
         energy_hits or "(none — check AIRTABLE_CI_GAS_REF_ENERGY_FIELDS)",
         total_hits or "(none — check AIRTABLE_CI_GAS_REF_TOTAL_FIELDS)",
+        business_hits or "(none — check AIRTABLE_CI_GAS_REF_BUSINESS_NAME_FIELDS)",
     )
     link_hits = [k for k in _CI_GAS_REF_CLIENT_INVOICE_LINK_FIELDS if k in key_union]
     _ci_gas_ref_log(
@@ -1006,7 +1039,7 @@ def fetch_ci_gas_energy_share_reference(
         addr = _address_text_from_fields(f)
         return _extract_postcode_from_address_text(addr)
 
-    entries: list[tuple[float, str]] = []
+    entries: list[tuple[float, str, Optional[str]]] = []
     rows_with_address = 0
     rows_with_pc = 0
     exact_pc_rows = 0
@@ -1034,7 +1067,7 @@ def fetch_ci_gas_energy_share_reference(
             invoice_table_cache=resolved_invoice_table_cache,
         )
         if ratio is not None:
-            entries.append((ratio, norm))
+            entries.append((ratio, norm, _ci_gas_ref_business_display_name(f)))
             exact_pc_with_ratio += 1
         elif len(no_ratio_samples) < 8:
             eng = _first_numeric_from_fields(f, _CI_GAS_REF_ENERGY_FIELDS)
@@ -1098,7 +1131,7 @@ def fetch_ci_gas_energy_share_reference(
                 invoice_table_cache=resolved_invoice_table_cache,
             )
             if ratio is not None:
-                entries.append((ratio, pc))
+                entries.append((ratio, pc, _ci_gas_ref_business_display_name(f)))
                 relax_added += 1
         _ci_gas_ref_log(
             "relax_postcode: prefix=%s ratios_added_beyond_exact=%s total_ratios=%s",
@@ -1140,7 +1173,7 @@ def fetch_ci_gas_energy_share_reference(
                     invoice_table_cache=resolved_invoice_table_cache,
                 )
                 if ratio is not None:
-                    entries.append((ratio, pc_pick))
+                    entries.append((ratio, pc_pick, _ci_gas_ref_business_display_name(f)))
         if entries:
             tier3_filled = True
         _ci_gas_ref_log(
@@ -1171,7 +1204,7 @@ def fetch_ci_gas_energy_share_reference(
                 invoice_table_cache=resolved_invoice_table_cache,
             )
             if ratio is not None:
-                entries.append((ratio, pc if pc else "unknown"))
+                entries.append((ratio, pc if pc else "unknown", _ci_gas_ref_business_display_name(f)))
         if entries:
             tier5_filled = True
         _ci_gas_ref_log(
@@ -1213,12 +1246,27 @@ def fetch_ci_gas_energy_share_reference(
         ratios_only = [e[0] for e in entries]
         med = float(statistics.median(ratios_only))
         med = max(0.01, min(1.0, med))
-        matched_postcodes = sorted({pc for _, pc in entries if pc and pc != "unknown"})
+        matched_postcodes = sorted({pc for _, pc, _ in entries if pc and pc != "unknown"})
+        pc_to_names: dict[str, list[str]] = {}
+        for _, pc, biz in entries:
+            if not pc or pc == "unknown":
+                continue
+            if not biz:
+                continue
+            name = str(biz).strip()
+            if not name:
+                continue
+            lst = pc_to_names.setdefault(pc, [])
+            if name not in lst:
+                lst.append(name)
+        matched_postcode_reference = [
+            {"postcode": pc, "business_names": pc_to_names.get(pc, [])} for pc in matched_postcodes
+        ]
         if tier5_filled:
             match_strategy = "global_dataset_median"
         elif tier3_filled:
             match_strategy = "nearest_numeric_postcode"
-        elif relax_used and any(pc != norm for _, pc in entries):
+        elif relax_used and any(pc != norm for _, pc, _ in entries):
             match_strategy = "prefix_3digit"
         else:
             match_strategy = "exact_postcode"
@@ -1226,7 +1274,14 @@ def fetch_ci_gas_energy_share_reference(
         confidence = _CI_GAS_REF_CONFIDENCE_BY_STRATEGY.get(match_strategy, "low")
         msg: Optional[str] = None
         if match_strategy == "nearest_numeric_postcode":
-            pcs_disp = ", ".join(matched_postcodes) if matched_postcodes else "(see data)"
+            pcs_disp_parts: list[str] = []
+            for pc in matched_postcodes:
+                names = pc_to_names.get(pc, [])
+                if names:
+                    pcs_disp_parts.append(f"{pc} ({', '.join(names)})")
+                else:
+                    pcs_disp_parts.append(pc)
+            pcs_disp = ", ".join(pcs_disp_parts) if pcs_disp_parts else "(see data)"
             msg = (
                 f"No exact or same-prefix C&I gas match for {norm}; energy share uses "
                 f"nearest_numeric_postcode_fallback (numeric distance, not map geography). "
@@ -1254,6 +1309,7 @@ def fetch_ci_gas_energy_share_reference(
             "message": msg,
             "match_strategy": match_strategy,
             "matched_postcodes": matched_postcodes,
+            "matched_postcode_reference": matched_postcode_reference,
             "confidence": confidence,
             "fallback_reason": None,
         }
@@ -1283,6 +1339,7 @@ def fetch_ci_gas_energy_share_reference(
                 "address_config_hits": address_hits,
                 "energy_config_hits": energy_hits,
                 "total_config_hits": total_hits,
+                "business_name_config_hits": business_hits,
                 "invoice_linked_probe_failures_sample": invoice_probe_failures[:8],
             }
             out["diagnostics"] = diagnostics
@@ -1305,6 +1362,7 @@ def fetch_ci_gas_energy_share_reference(
         "message": "No matching C&I gas rows with energy and total fields; using default share",
         "match_strategy": "default_share",
         "matched_postcodes": [],
+        "matched_postcode_reference": [],
         "confidence": "low",
         "fallback_reason": "no_ratios_after_exact_prefix_nearest_global",
     }
@@ -1332,9 +1390,304 @@ def fetch_ci_gas_energy_share_reference(
             "address_config_hits": address_hits,
             "energy_config_hits": energy_hits,
             "total_config_hits": total_hits,
+            "business_name_config_hits": business_hits,
             "no_ratio_samples": no_ratio_samples,
             "postcode_histogram_top": sorted(postcode_histogram.items(), key=lambda x: -x[1])[:15],
             "invoice_linked_probe_failures": invoice_probe_failures,
         }
         out["diagnostics"] = diagnostics
+    return out
+
+
+# --- Base 2 SME Gas: aggregate invoice history from Airtable by MRIN (annual GJ, 1000 GJ threshold) ---
+def _sme_gas_hist_table_name() -> str:
+    raw = os.environ.get("AIRTABLE_SME_GAS_USAGE_TABLE", "").strip()
+    if raw:
+        return raw
+    cfg = next((c for c in UTILITY_CONFIG if c["app_key"] == "SME Gas"), None)
+    return cfg["table_name"] if cfg else "SME Gas Accounts"
+
+
+_SME_GAS_HIST_DAYS_FIELDS = [
+    s.strip()
+    for s in os.environ.get(
+        "AIRTABLE_SME_GAS_HIST_DAYS_FIELDS",
+        "Invoice Review Number of Days,Invoice Period Days,Bill Days,Days in Period,Number of Days,Days",
+    ).split(",")
+    if s.strip()
+]
+_SME_GAS_HIST_PERIOD_FIELDS = [
+    s.strip()
+    for s in os.environ.get(
+        "AIRTABLE_SME_GAS_HIST_PERIOD_FIELDS",
+        "Invoice Review Period,Billing Period,Period,Invoice Period,Bill Period",
+    ).split(",")
+    if s.strip()
+]
+_SME_GAS_HIST_USAGE_FIELDS = [
+    s.strip()
+    for s in os.environ.get(
+        "AIRTABLE_SME_GAS_HIST_USAGE_FIELDS",
+        "Total Consumption MJ,Total MJ,Total Usage MJ,Consumption (MJ),Consumption MJ,"
+        "General Usage MJ,Energy Quantity (MJ),Invoice Consumption MJ,Total Consumption (MJ),"
+        "Total usage (MJ),Annual consumption MJ",
+    ).split(",")
+    if s.strip()
+]
+
+_SME_GAS_THRESHOLD_GJ = float(os.environ.get("AIRTABLE_SME_GAS_CI_THRESHOLD_GJ", "1000"))
+
+
+def _paginate_with_filter_formula(table_name: str, formula: str) -> list[dict[str, Any]]:
+    """Return raw Airtable records {id, fields} matching formula (paginated)."""
+    out: list[dict[str, Any]] = []
+    if not AIRTABLE_API_KEY or not formula:
+        return out
+    offset: Optional[str] = None
+    page = 0
+    max_pages = 120
+    while page < max_pages:
+        page += 1
+        params: dict[str, Any] = {"pageSize": 100, "filterByFormula": formula}
+        if offset:
+            params["offset"] = offset
+        try:
+            r = requests.get(_url(table_name), headers=_headers(), params=params, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            logger.warning("[sme-gas-hist] paginate %s failed: %s", table_name, e)
+            break
+        for rec in data.get("records", []):
+            out.append({"id": rec.get("id", ""), "fields": rec.get("fields") or {}})
+        offset = data.get("offset")
+        if not offset:
+            break
+    return out
+
+
+def _first_non_empty_string_from_fields(fields: dict, candidates: list[str]) -> str:
+    for name in candidates:
+        v = fields.get(name)
+        if v is None:
+            continue
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _parse_sme_gas_period_to_days(period_text: str) -> Optional[int]:
+    """
+    Parse SME bill period strings into inclusive day count.
+    Supports: dd/mm/yyyy-dd/mm/yyyy, '01 Nov 2023 to 03 Jan 2024'.
+    """
+
+    def _parse_one_date(chunk: str) -> Optional[datetime]:
+        chunk = chunk.strip()
+        if not chunk:
+            return None
+        for fmt in (
+            "%d/%m/%Y",
+            "%d/%m/%y",
+            "%d %b %Y",
+            "%d %B %Y",
+            "%d %b %y",
+            "%d %B %y",
+        ):
+            try:
+                return datetime.strptime(chunk, fmt)
+            except ValueError:
+                continue
+        return None
+
+    if not period_text or not str(period_text).strip():
+        return None
+    s = str(period_text).strip()
+    for sep in ("–", "—"):
+        s = s.replace(sep, "-")
+
+    parts: Optional[list[str]] = None
+    if re.search(r"\s+to\s+", s, flags=re.I):
+        parts = re.split(r"\s+to\s+", s, maxsplit=1, flags=re.I)
+    elif "-" in s:
+        dash_parts = s.split("-", 1)
+        if len(dash_parts) == 2:
+            left, right = dash_parts[0].strip(), dash_parts[1].strip()
+            if re.search(r"\d", left) and re.search(r"\d", right):
+                parts = [left, right]
+
+    if parts and len(parts) == 2:
+        d0 = _parse_one_date(parts[0])
+        d1 = _parse_one_date(parts[1])
+        if d0 and d1:
+            return max(1, (d1 - d0).days + 1)
+    d = _parse_one_date(s)
+    if d:
+        return 1
+    return None
+
+
+def _row_usage_to_gj(raw: float, days: int, mode: str) -> tuple[float, str]:
+    if raw is None or raw <= 0 or raw != raw:
+        return 0.0, "none"
+    if mode == "gj":
+        return float(raw), "gj"
+    if mode == "mj":
+        return float(raw) / 1000.0, "mj"
+    # auto
+    if days > 0:
+        daily_if_mj = (float(raw) / 1000.0) / days
+        daily_if_gj = float(raw) / days
+        if daily_if_mj > 120:
+            return float(raw), "gj_auto_high_daily_if_mj"
+        if daily_if_gj <= 0.05 and raw >= 500:
+            return float(raw) / 1000.0, "mj_auto_low_daily_if_gj"
+        if raw <= 450 and days >= 18 and daily_if_gj <= 35:
+            return float(raw), "gj_auto_small_total"
+    return float(raw) / 1000.0, "mj_auto_default"
+
+
+def _sme_gas_mrin_match_formula(id_field: str, mrin_norm: str) -> str:
+    esc = _escape_formula_value(mrin_norm)
+    parts = [f"{{{id_field}}}='{esc}'"]
+    if mrin_norm.isdigit():
+        parts.append(f"{{{id_field}}}={mrin_norm}")
+    return "OR(" + ",".join(parts) + ")"
+
+
+def fetch_sme_gas_airtable_annual_usage(
+    mrin: str,
+    *,
+    usage_unit: str = "auto",
+    debug: bool = False,
+) -> dict[str, Any]:
+    """
+    Load all SME Gas invoice rows from Airtable for MRIN; sum bill-period usage, annualise by total days.
+    usage_unit: mj | gj | auto (auto applies heuristics; SME data is often MJ).
+    """
+    mrin_raw = (mrin or "").strip()
+    mrin_norm = _normalize_identifier_raw(mrin_raw)
+    if not mrin_norm:
+        return {
+            "error": "mrin_required",
+            "mrin_normalized": None,
+            "bill_count": 0,
+            "total_days": 0,
+            "annual_usage_gj": None,
+            "meets_ci_threshold_1000gj": None,
+            "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+            "confidence": "low",
+        }
+
+    mode = (usage_unit or "auto").strip().lower()
+    if mode not in ("auto", "mj", "gj"):
+        mode = "auto"
+
+    if not AIRTABLE_API_KEY:
+        return {
+            "error": "airtable_not_configured",
+            "mrin_normalized": mrin_norm,
+            "bill_count": 0,
+            "total_days": 0,
+            "annual_usage_gj": None,
+            "meets_ci_threshold_1000gj": None,
+            "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+            "confidence": "low",
+        }
+
+    table = _sme_gas_hist_table_name()
+    cfg = next((c for c in UTILITY_CONFIG if c["app_key"] == "SME Gas"), None)
+    id_field = cfg["identifier_field"] if cfg else "MRIN"
+    formula = _sme_gas_mrin_match_formula(id_field, mrin_norm)
+
+    rows = _paginate_with_filter_formula(table, formula)
+    matched = []
+    for rec in rows:
+        f = rec.get("fields") or {}
+        row_id = _normalize_identifier_raw(f.get(id_field))
+        if row_id != mrin_norm:
+            continue
+        matched.append(rec)
+
+    bills: list[dict[str, Any]] = []
+    total_gj = 0.0
+    total_days_acc = 0
+
+    for rec in matched:
+        f = rec.get("fields") or {}
+        days_val = _first_numeric_from_fields(f, _SME_GAS_HIST_DAYS_FIELDS)
+        days_i = int(days_val) if days_val is not None and days_val > 0 else 0
+        if days_i <= 0:
+            period_s = _first_non_empty_string_from_fields(f, _SME_GAS_HIST_PERIOD_FIELDS)
+            parsed_days = _parse_sme_gas_period_to_days(period_s)
+            if parsed_days:
+                days_i = parsed_days
+        raw_usage = _first_numeric_from_fields(f, _SME_GAS_HIST_USAGE_FIELDS)
+        gj, unit_note = _row_usage_to_gj(float(raw_usage or 0), days_i, mode)
+        if gj <= 0 or days_i <= 0:
+            continue
+        period_lbl = _first_non_empty_string_from_fields(f, _SME_GAS_HIST_PERIOD_FIELDS)
+        bills.append(
+            {
+                "record_id": (rec.get("id") or "")[:14],
+                "days": days_i,
+                "usage_gj": round(gj, 6),
+                "usage_unit_note": unit_note,
+                "period": period_lbl or None,
+            }
+        )
+        total_gj += gj
+        total_days_acc += days_i
+
+    annual: Optional[float] = None
+    if total_days_acc > 0 and total_gj > 0:
+        annual = (total_gj / total_days_acc) * 365.0
+
+    confidence = "low"
+    if total_days_acc >= 320 and len(bills) >= 4:
+        confidence = "high"
+    elif total_days_acc >= 180 and len(bills) >= 2:
+        confidence = "medium"
+
+    meets: Optional[bool]
+    if annual is None:
+        meets = None
+    else:
+        meets = annual >= _SME_GAS_THRESHOLD_GJ
+
+    out: dict[str, Any] = {
+        "mrin_normalized": mrin_norm,
+        "table_name": table,
+        "bill_count": len(bills),
+        "total_days": total_days_acc,
+        "total_usage_gj_sum": round(total_gj, 4) if total_gj else 0.0,
+        "annual_usage_gj": round(annual, 2) if annual is not None else None,
+        "meets_ci_threshold_1000gj": meets,
+        "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+        "confidence": confidence,
+        "usage_unit_mode": mode,
+    }
+    if annual is None and len(matched) == 0:
+        out["error"] = "no_matching_rows"
+        out["message"] = f"No SME gas invoice rows in Airtable for MRIN {mrin_norm} (check table {table!r} and field mapping)."
+    elif annual is None:
+        out["error"] = "no_usable_usage_rows"
+        out["message"] = (
+            f"Found {len(matched)} row(s) for MRIN {mrin_norm} but none had positive usage and bill days "
+            f"(set AIRTABLE_SME_GAS_HIST_USAGE_FIELDS / _DAYS_FIELDS / _PERIOD_FIELDS to match your base)."
+        )
+
+    if debug:
+        key_union: set[str] = set()
+        for rec in matched[:25]:
+            key_union.update((rec.get("fields") or {}).keys())
+        out["diagnostics"] = {
+            "filter_formula": formula,
+            "rows_matched_mrin": len(matched),
+            "bills_used": bills[:40],
+            "field_keys_sample": sorted(key_union)[:80],
+            "days_fields_config": _SME_GAS_HIST_DAYS_FIELDS,
+            "usage_fields_config": _SME_GAS_HIST_USAGE_FIELDS,
+            "period_fields_config": _SME_GAS_HIST_PERIOD_FIELDS,
+        }
     return out

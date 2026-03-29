@@ -656,7 +656,7 @@ class AutonomousSequenceStartRequest(BaseModel):
     client_id: Optional[int] = None
     crm_activity_id: Optional[int] = None
     anchor_at: datetime
-    timezone: str = "Australia/Melbourne"
+    timezone: str = "Australia/Brisbane"  # Ignored for scheduling; sequences always use fixed AEST (Brisbane)
     context: Dict[str, Any] = {}
 
 

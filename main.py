@@ -696,6 +696,43 @@ def get_base2_ci_gas_energy_reference(
     return result
 
 
+@app.get("/api/base2/sme-gas-airtable-annual-usage")
+def get_base2_sme_gas_airtable_annual_usage(
+    mrin: str = Query(
+        ...,
+        min_length=4,
+        max_length=40,
+        description="MRIN; all matching SME Gas invoice rows in Airtable are aggregated",
+    ),
+    usage_unit: str = Query(
+        "auto",
+        description="How to interpret usage numbers: auto (heuristic), mj, or gj",
+    ),
+    debug: bool = Query(False, description="Include diagnostics (field keys, per-bill breakdown sample)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Aggregate SME gas invoice history from Airtable by MRIN for annual consumption (GJ) and
+    whether usage likely meets the ~1000 GJ C&I-style threshold (configurable via env).
+    """
+    mode = (usage_unit or "auto").strip().lower()
+    if mode not in ("auto", "mj", "gj"):
+        raise HTTPException(status_code=400, detail="usage_unit must be auto, mj, or gj")
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    result = airtable_client.fetch_sme_gas_airtable_annual_usage(mrin, usage_unit=mode, debug=debug)
+    logging.info(
+        "[base2/sme-gas-airtable-annual-usage] user=%s mrin=%r unit=%s -> bills=%s days=%s annual=%s meets=%s",
+        email,
+        mrin,
+        mode,
+        result.get("bill_count"),
+        result.get("total_days"),
+        result.get("annual_usage_gj"),
+        result.get("meets_ci_threshold_1000gj"),
+    )
+    return result
+
+
 @app.post("/api/get-waste-info")
 def get_waste_info(
     request: WasteInvoiceRequest,
@@ -5751,6 +5788,23 @@ def autonomous_sequence_stop_run(
         .first()
     )
     return _autonomous_run_detail(db, run)
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/restart")
+def autonomous_sequence_restart_run(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import restart_sequence_from_finished_run
+
+    try:
+        result = restart_sequence_from_finished_run(db, run_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not result:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return JSONResponse(content=result)
 
 
 @app.delete("/api/autonomous/sequences/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
