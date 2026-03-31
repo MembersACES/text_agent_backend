@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import statistics
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -19,7 +19,9 @@ _backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _env_path = os.path.join(_backend_root, ".env")
 if os.path.exists(_env_path):
     from dotenv import load_dotenv
-    load_dotenv(dotenv_path=_env_path)
+
+    # override=True: same as main.py — beat empty placeholders from shell/OS or earlier load_dotenv(cwd).
+    load_dotenv(dotenv_path=_env_path, override=True)
 
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID", "appG1WoHcJt10iO5K")
@@ -1400,6 +1402,14 @@ def fetch_ci_gas_energy_share_reference(
 
 
 # --- Base 2 SME Gas: aggregate invoice history from Airtable by MRIN (annual GJ, 1000 GJ threshold) ---
+def _reload_backend_dotenv_for_sme_gas() -> None:
+    """Re-read backend/.env from disk so vars are picked up after save (editor buffer != on-disk file)."""
+    from dotenv import load_dotenv
+
+    if os.path.isfile(_env_path):
+        load_dotenv(dotenv_path=_env_path, override=True)
+
+
 def _sme_gas_hist_table_name() -> str:
     raw = os.environ.get("AIRTABLE_SME_GAS_USAGE_TABLE", "").strip()
     if raw:
@@ -1408,34 +1418,53 @@ def _sme_gas_hist_table_name() -> str:
     return cfg["table_name"] if cfg else "SME Gas Accounts"
 
 
-_SME_GAS_HIST_DAYS_FIELDS = [
-    s.strip()
-    for s in os.environ.get(
-        "AIRTABLE_SME_GAS_HIST_DAYS_FIELDS",
-        "Invoice Review Number of Days,Invoice Period Days,Bill Days,Days in Period,Number of Days,Days",
-    ).split(",")
-    if s.strip()
-]
-_SME_GAS_HIST_PERIOD_FIELDS = [
-    s.strip()
-    for s in os.environ.get(
-        "AIRTABLE_SME_GAS_HIST_PERIOD_FIELDS",
-        "Invoice Review Period,Billing Period,Period,Invoice Period,Bill Period",
-    ).split(",")
-    if s.strip()
-]
-_SME_GAS_HIST_USAGE_FIELDS = [
-    s.strip()
-    for s in os.environ.get(
-        "AIRTABLE_SME_GAS_HIST_USAGE_FIELDS",
+def _sme_gas_hist_threshold_gj() -> float:
+    return float(os.environ.get("AIRTABLE_SME_GAS_CI_THRESHOLD_GJ", "1000"))
+
+
+def _sme_gas_hist_near_screen_low_gj() -> float:
+    """Lower bound of the 'near 1000 GJ' review band on bill-day annual (inclusive)."""
+    return float(os.environ.get("AIRTABLE_SME_GAS_NEAR_SCREEN_GJ", "850"))
+
+
+def _sme_gas_hist_days_fields() -> list[str]:
+    default = (
+        "Invoice Review Number of Days,Invoice Period Days,Bill Days,Days in Period,Number of Days,Days"
+    )
+    return [
+        s.strip()
+        for s in os.environ.get("AIRTABLE_SME_GAS_HIST_DAYS_FIELDS", default).split(",")
+        if s.strip()
+    ]
+
+
+def _sme_gas_hist_period_fields() -> list[str]:
+    default = "Invoice Review Period,Billing Period,Period,Invoice Period,Bill Period"
+    return [
+        s.strip()
+        for s in os.environ.get("AIRTABLE_SME_GAS_HIST_PERIOD_FIELDS", default).split(",")
+        if s.strip()
+    ]
+
+
+def _sme_gas_hist_usage_fields() -> list[str]:
+    default = (
         "Total Consumption MJ,Total MJ,Total Usage MJ,Consumption (MJ),Consumption MJ,"
         "General Usage MJ,Energy Quantity (MJ),Invoice Consumption MJ,Total Consumption (MJ),"
-        "Total usage (MJ),Annual consumption MJ",
-    ).split(",")
-    if s.strip()
-]
+        "Total usage (MJ),Annual consumption MJ"
+    )
+    return [
+        s.strip()
+        for s in os.environ.get("AIRTABLE_SME_GAS_HIST_USAGE_FIELDS", default).split(",")
+        if s.strip()
+    ]
 
-_SME_GAS_THRESHOLD_GJ = float(os.environ.get("AIRTABLE_SME_GAS_CI_THRESHOLD_GJ", "1000"))
+
+def _sme_gas_hist_log(msg: str, *args: Any) -> None:
+    """Terminal + logger so uvicorn PowerShell shows SME gas Airtable history diagnostics."""
+    line = msg % args if args else msg
+    logger.info("[sme-gas-hist] %s", line)
+    print(f"[sme-gas-hist] {line}", flush=True)
 
 
 def _paginate_with_filter_formula(table_name: str, formula: str) -> list[dict[str, Any]]:
@@ -1527,6 +1556,76 @@ def _parse_sme_gas_period_to_days(period_text: str) -> Optional[int]:
     return None
 
 
+def _parse_sme_gas_period_date_bounds(period_text: str) -> Optional[tuple[datetime, datetime]]:
+    """Return (start_date, end_date) inclusive when period text is a range; else None."""
+
+    def _parse_one_date(chunk: str) -> Optional[datetime]:
+        chunk = chunk.strip()
+        if not chunk:
+            return None
+        for fmt in (
+            "%d/%m/%Y",
+            "%d/%m/%y",
+            "%d %b %Y",
+            "%d %B %Y",
+            "%d %b %y",
+            "%d %B %y",
+        ):
+            try:
+                return datetime.strptime(chunk, fmt)
+            except ValueError:
+                continue
+        return None
+
+    if not period_text or not str(period_text).strip():
+        return None
+    s = str(period_text).strip()
+    for sep in ("–", "—"):
+        s = s.replace(sep, "-")
+
+    parts: Optional[list[str]] = None
+    if re.search(r"\s+to\s+", s, flags=re.I):
+        parts = re.split(r"\s+to\s+", s, maxsplit=1, flags=re.I)
+    elif "-" in s:
+        dash_parts = s.split("-", 1)
+        if len(dash_parts) == 2:
+            left, right = dash_parts[0].strip(), dash_parts[1].strip()
+            if re.search(r"\d", left) and re.search(r"\d", right):
+                parts = [left, right]
+
+    if parts and len(parts) == 2:
+        d0 = _parse_one_date(parts[0])
+        d1 = _parse_one_date(parts[1])
+        if d0 and d1:
+            if d1 < d0:
+                d0, d1 = d1, d0
+            return (d0, d1)
+    return None
+
+
+def _sme_gas_hist_preview_field_value(val: Any) -> str:
+    """Short, log-safe description of an Airtable field value (type + sample)."""
+    if val is None:
+        return "None"
+    if isinstance(val, bool):
+        return f"bool({val})"
+    if isinstance(val, (int, float)):
+        return f"number({val})"
+    if isinstance(val, str):
+        s = val.strip()
+        if len(s) > 80:
+            return f"str(len={len(s)}, head={s[:40]!r}…)"
+        return f"str({s!r})"
+    if isinstance(val, list):
+        if len(val) == 0:
+            return "list(empty)"
+        first = val[0]
+        return f"list(n={len(val)}, first={_sme_gas_hist_preview_field_value(first)})"
+    if isinstance(val, dict):
+        return f"dict(keys={list(val.keys())[:8]!r}…)" if len(val) > 8 else f"dict(keys={list(val.keys())!r})"
+    return f"{type(val).__name__}(…)"
+
+
 def _row_usage_to_gj(raw: float, days: int, mode: str) -> tuple[float, str]:
     if raw is None or raw <= 0 or raw != raw:
         return 0.0, "none"
@@ -1567,6 +1666,8 @@ def fetch_sme_gas_airtable_annual_usage(
     """
     mrin_raw = (mrin or "").strip()
     mrin_norm = _normalize_identifier_raw(mrin_raw)
+    threshold_gj = _sme_gas_hist_threshold_gj()
+    near_low_gj = _sme_gas_hist_near_screen_low_gj()
     if not mrin_norm:
         return {
             "error": "mrin_required",
@@ -1575,7 +1676,9 @@ def fetch_sme_gas_airtable_annual_usage(
             "total_days": 0,
             "annual_usage_gj": None,
             "meets_ci_threshold_1000gj": None,
-            "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+            "meets_1000gj_screen": None,
+            "near_1000gj_screen": None,
+            "threshold_gj": threshold_gj,
             "confidence": "low",
         }
 
@@ -1591,57 +1694,254 @@ def fetch_sme_gas_airtable_annual_usage(
             "total_days": 0,
             "annual_usage_gj": None,
             "meets_ci_threshold_1000gj": None,
-            "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+            "meets_1000gj_screen": None,
+            "near_1000gj_screen": None,
+            "threshold_gj": threshold_gj,
             "confidence": "low",
         }
 
+    _reload_backend_dotenv_for_sme_gas()
+
+    days_fields = _sme_gas_hist_days_fields()
+    usage_fields = _sme_gas_hist_usage_fields()
+    period_fields = _sme_gas_hist_period_fields()
     table = _sme_gas_hist_table_name()
     cfg = next((c for c in UTILITY_CONFIG if c["app_key"] == "SME Gas"), None)
     id_field = cfg["identifier_field"] if cfg else "MRIN"
     formula = _sme_gas_mrin_match_formula(id_field, mrin_norm)
 
+    usage_table_env_raw = os.environ.get("AIRTABLE_SME_GAS_USAGE_TABLE", "")
+    _sme_gas_hist_log(
+        "env AIRTABLE_SME_GAS_USAGE_TABLE=%r (empty uses SME Gas Accounts / UTILITY_CONFIG)",
+        usage_table_env_raw,
+    )
+    _sme_gas_hist_log(
+        "start mrin_raw=%r mrin_norm=%r table=%r id_field=%r usage_unit=%r",
+        mrin_raw,
+        mrin_norm,
+        table,
+        id_field,
+        mode,
+    )
+    _sme_gas_hist_log(
+        "resolved field lists: days_n=%s usage_n=%s period_n=%s | days[0]=%r usage[0]=%r period[0]=%r",
+        len(days_fields),
+        len(usage_fields),
+        len(period_fields),
+        days_fields[0] if days_fields else None,
+        usage_fields[0] if usage_fields else None,
+        period_fields[0] if period_fields else None,
+    )
+
     rows = _paginate_with_filter_formula(table, formula)
+    _sme_gas_hist_log("airtable filter returned records=%s formula=%s", len(rows), formula)
+
     matched = []
+    dropped_normalize = 0
     for rec in rows:
         f = rec.get("fields") or {}
         row_id = _normalize_identifier_raw(f.get(id_field))
         if row_id != mrin_norm:
+            dropped_normalize += 1
             continue
         matched.append(rec)
+
+    if dropped_normalize:
+        _sme_gas_hist_log(
+            "after Python MRIN filter: matched=%s dropped_wrong_mrin=%s (id_field=%r)",
+            len(matched),
+            dropped_normalize,
+            id_field,
+        )
+    else:
+        _sme_gas_hist_log("after Python MRIN filter: matched=%s", len(matched))
+
+    if matched:
+        sample_fields = matched[0].get("fields") or {}
+        keys_sorted = sorted(sample_fields.keys())
+        _sme_gas_hist_log(
+            "first_matched_record keys_sample (up to 40)=%s",
+            keys_sorted[:40],
+        )
+        overlap_days = [n for n in days_fields if n in sample_fields]
+        overlap_usage = [n for n in usage_fields if n in sample_fields]
+        overlap_period = [n for n in period_fields if n in sample_fields]
+        _sme_gas_hist_log(
+            "config_vs_airtable on first row: days_hits=%s usage_hits=%s period_hits=%s",
+            overlap_days or "(none — field name mismatch or empty table row)",
+            overlap_usage or "(none — field name mismatch or empty table row)",
+            overlap_period or "(none)",
+        )
+        for fn in usage_fields[:5]:
+            if fn in sample_fields:
+                _sme_gas_hist_log(
+                    "sample usage candidate %r -> %s",
+                    fn,
+                    _sme_gas_hist_preview_field_value(sample_fields.get(fn)),
+                )
+        for fn in days_fields[:5]:
+            if fn in sample_fields:
+                _sme_gas_hist_log(
+                    "sample days candidate %r -> %s",
+                    fn,
+                    _sme_gas_hist_preview_field_value(sample_fields.get(fn)),
+                )
 
     bills: list[dict[str, Any]] = []
     total_gj = 0.0
     total_days_acc = 0
+    skipped_rows = 0
 
     for rec in matched:
         f = rec.get("fields") or {}
-        days_val = _first_numeric_from_fields(f, _SME_GAS_HIST_DAYS_FIELDS)
+        rid = (rec.get("id") or "")[:14]
+        days_val = _first_numeric_from_fields(f, days_fields)
         days_i = int(days_val) if days_val is not None and days_val > 0 else 0
+        period_s = ""
         if days_i <= 0:
-            period_s = _first_non_empty_string_from_fields(f, _SME_GAS_HIST_PERIOD_FIELDS)
+            period_s = _first_non_empty_string_from_fields(f, period_fields)
             parsed_days = _parse_sme_gas_period_to_days(period_s)
             if parsed_days:
                 days_i = parsed_days
-        raw_usage = _first_numeric_from_fields(f, _SME_GAS_HIST_USAGE_FIELDS)
+        raw_usage = _first_numeric_from_fields(f, usage_fields)
         gj, unit_note = _row_usage_to_gj(float(raw_usage or 0), days_i, mode)
         if gj <= 0 or days_i <= 0:
+            skipped_rows += 1
+            # Log first few skips in detail so PowerShell shows the real blocker
+            if skipped_rows <= 12:
+                usage_raw_by_name = {name: f.get(name) for name in usage_fields if name in f}
+                days_raw_by_name = {name: f.get(name) for name in days_fields if name in f}
+                _sme_gas_hist_log(
+                    "skip record=%s days_i=%s days_val_coerced=%s period=%r raw_usage_coerced=%s -> gj=%.6f note=%s | raw_usage_fields=%s | raw_days_fields=%s",
+                    rid,
+                    days_i,
+                    days_val,
+                    (period_s[:60] + "…") if len(period_s) > 60 else period_s,
+                    raw_usage,
+                    gj,
+                    unit_note,
+                    {k: _sme_gas_hist_preview_field_value(v) for k, v in usage_raw_by_name.items()},
+                    {k: _sme_gas_hist_preview_field_value(v) for k, v in days_raw_by_name.items()},
+                )
             continue
-        period_lbl = _first_non_empty_string_from_fields(f, _SME_GAS_HIST_PERIOD_FIELDS)
-        bills.append(
-            {
-                "record_id": (rec.get("id") or "")[:14],
-                "days": days_i,
-                "usage_gj": round(gj, 6),
-                "usage_unit_note": unit_note,
-                "period": period_lbl or None,
-            }
-        )
+        period_lbl = _first_non_empty_string_from_fields(f, period_fields)
+        bounds = _parse_sme_gas_period_date_bounds(period_lbl) if period_lbl else None
+        bill_row: dict[str, Any] = {
+            "record_id": (rec.get("id") or "")[:14],
+            "days": days_i,
+            "usage_gj": round(gj, 6),
+            "usage_unit_note": unit_note,
+            "period": period_lbl or None,
+        }
+        if bounds:
+            bill_row["period_start"] = bounds[0].date().isoformat()
+            bill_row["period_end"] = bounds[1].date().isoformat()
+        bills.append(bill_row)
         total_gj += gj
         total_days_acc += days_i
 
-    annual: Optional[float] = None
+    annual_bill_days: Optional[float] = None
     if total_days_acc > 0 and total_gj > 0:
-        annual = (total_gj / total_days_acc) * 365.0
+        annual_bill_days = (total_gj / total_days_acc) * 365.0
+
+    period_coverage: dict[str, Any] = {}
+    bills_with_dates = [b for b in bills if b.get("period_start") and b.get("period_end")]
+    n_parsed = len(bills_with_dates)
+    bc = len(bills)
+    calendar_span: Optional[int] = None
+    annual_calendar: Optional[float] = None
+    use_calendar_primary = False
+    min_calendar_days_for_primary = int(os.environ.get("AIRTABLE_SME_GAS_MIN_CALENDAR_DAYS_PRIMARY", "365"))
+
+    if bills:
+        period_coverage["bills_with_parsed_period_dates"] = n_parsed
+        period_coverage["bill_count"] = bc
+        period_coverage["sum_of_bill_period_days"] = total_days_acc
+        if n_parsed > 0:
+            starts = [date.fromisoformat(str(b["period_start"])) for b in bills_with_dates]
+            ends = [date.fromisoformat(str(b["period_end"])) for b in bills_with_dates]
+            c_start = min(starts)
+            c_end = max(ends)
+            period_coverage["calendar_start"] = c_start.isoformat()
+            period_coverage["calendar_end"] = c_end.isoformat()
+            calendar_span = (c_end - c_start).days + 1
+            period_coverage["calendar_span_inclusive_days"] = calendar_span
+            period_coverage["period_range_label_au"] = (
+                f"{c_start.strftime('%d/%m/%Y')} – {c_end.strftime('%d/%m/%Y')}"
+            )
+        cb = n_parsed
+        use_calendar_primary = (
+            total_gj > 0
+            and calendar_span is not None
+            and calendar_span >= min_calendar_days_for_primary
+            and n_parsed == bc
+            and bc > 0
+        )
+        if total_gj > 0 and calendar_span and calendar_span > 0:
+            annual_calendar = (total_gj / float(calendar_span)) * 365.0
+            period_coverage["annual_usage_gj_calendar_window"] = round(annual_calendar, 2)
+
+        if annual_bill_days is not None:
+            period_coverage["annual_usage_gj_bill_period_days"] = round(annual_bill_days, 2)
+
+        lines: list[str] = []
+        if n_parsed > 0 and period_coverage.get("period_range_label_au"):
+            cspan = period_coverage.get("calendar_span_inclusive_days")
+            lines.append(
+                f"Bill dates in Airtable span {period_coverage['period_range_label_au']}"
+                + (f" ({cspan} calendar days from earliest start to latest end)." if cspan else ".")
+            )
+
+        if use_calendar_primary and annual_calendar is not None:
+            period_coverage["annual_usage_gj_primary_method"] = "calendar_window"
+            lines.append(
+                "Estimated annual usage uses the calendar window between earliest bill start and latest bill end: "
+                f"(total {round(total_gj, 2)} GJ) ÷ ({calendar_span} calendar days) × 365, because every bill had parseable "
+                f"period dates and the span is at least {min_calendar_days_for_primary} days."
+            )
+            if annual_bill_days is not None and abs(annual_calendar - annual_bill_days) > 0.05:
+                lines.append(
+                    f"Bill-period alternative (sum of each bill’s day lengths = {total_days_acc} days): "
+                    f"{round(annual_bill_days, 1)} GJ/yr — use when calendar coverage may be incomplete."
+                )
+        else:
+            period_coverage["annual_usage_gj_primary_method"] = "bill_period_days"
+            lines.append(
+                "Estimated annual usage uses bill-period lengths: (total usage GJ) ÷ (sum of each bill’s day count) × 365."
+            )
+            if annual_calendar is not None:
+                reason = []
+                if n_parsed < bc:
+                    reason.append(
+                        f"only {n_parsed} of {bc} bills had parseable period text for calendar bounds"
+                    )
+                if calendar_span is not None and calendar_span < min_calendar_days_for_primary:
+                    reason.append(
+                        f"calendar span ({calendar_span} days) is under {min_calendar_days_for_primary} days"
+                    )
+                lines.append(
+                    f"Calendar-window figure ({round(annual_calendar, 1)} GJ/yr) is shown for reference only"
+                    + (f" ({'; '.join(reason)})." if reason else ".")
+                )
+
+        if cb < bc:
+            lines.append(
+                f"Explicit date ranges were parsed from the period field on {cb} of {bc} bills; "
+                f"the rest contributed only day counts (no parseable period text)."
+            )
+        if n_parsed > 0 and total_days_acc > 0 and calendar_span:
+            if total_days_acc != calendar_span:
+                lines.append(
+                    f"Sum of bill lengths is {total_days_acc} days vs {calendar_span} calendar days in that window—"
+                    "normal if periods overlap or have small gaps."
+                )
+        period_coverage["explanation"] = " ".join(lines)
+
+    annual: Optional[float] = None
+    if use_calendar_primary and annual_calendar is not None:
+        annual = annual_calendar
+    elif annual_bill_days is not None:
+        annual = annual_bill_days
 
     confidence = "low"
     if total_days_acc >= 320 and len(bills) >= 4:
@@ -1649,11 +1949,15 @@ def fetch_sme_gas_airtable_annual_usage(
     elif total_days_acc >= 180 and len(bills) >= 2:
         confidence = "medium"
 
-    meets: Optional[bool]
-    if annual is None:
-        meets = None
+    # Eligibility / screening: bill-day annualisation only (calendar is contextual).
+    meets_bill_days: Optional[bool]
+    near_bill_days: Optional[bool]
+    if annual_bill_days is None:
+        meets_bill_days = None
+        near_bill_days = None
     else:
-        meets = annual >= _SME_GAS_THRESHOLD_GJ
+        meets_bill_days = annual_bill_days >= threshold_gj
+        near_bill_days = near_low_gj <= annual_bill_days < threshold_gj
 
     out: dict[str, Any] = {
         "mrin_normalized": mrin_norm,
@@ -1662,20 +1966,59 @@ def fetch_sme_gas_airtable_annual_usage(
         "total_days": total_days_acc,
         "total_usage_gj_sum": round(total_gj, 4) if total_gj else 0.0,
         "annual_usage_gj": round(annual, 2) if annual is not None else None,
-        "meets_ci_threshold_1000gj": meets,
-        "threshold_gj": _SME_GAS_THRESHOLD_GJ,
+        "annual_usage_gj_bill_period_days": round(annual_bill_days, 2) if annual_bill_days is not None else None,
+        "annual_usage_gj_calendar_window": round(annual_calendar, 2) if annual_calendar is not None else None,
+        "annual_usage_gj_primary_method": (
+            "calendar_window"
+            if use_calendar_primary and annual_calendar is not None
+            else ("bill_period_days" if annual is not None else None)
+        ),
+        # Back-compat: same as meets_1000gj_screen (bill-day threshold), not calendar-primary annual.
+        "meets_ci_threshold_1000gj": meets_bill_days,
+        "meets_1000gj_screen": meets_bill_days,
+        "near_1000gj_screen": near_bill_days,
+        "threshold_gj": threshold_gj,
         "confidence": confidence,
         "usage_unit_mode": mode,
     }
+    if period_coverage:
+        out["period_coverage"] = period_coverage
     if annual is None and len(matched) == 0:
         out["error"] = "no_matching_rows"
         out["message"] = f"No SME gas invoice rows in Airtable for MRIN {mrin_norm} (check table {table!r} and field mapping)."
     elif annual is None:
         out["error"] = "no_usable_usage_rows"
+        hint = ""
+        if matched:
+            sf = (matched[0].get("fields") or {})
+            sk = set(sf.keys())
+            row_has_link_fields = any(
+                "invoice" in k.lower() or k.startswith("Link to") for k in sk
+            )
+            no_usage_cols = not any(n in sk for n in usage_fields) and not any(
+                n in sk for n in days_fields
+            )
+            if row_has_link_fields and no_usage_cols:
+                hint = (
+                    " This row looks like an account header (links only, no usage columns). "
+                    "Set AIRTABLE_SME_GAS_USAGE_TABLE to your SME gas invoice-lines table id (tbl…), "
+                    "where each record has MRIN + usage + bill days."
+                )
         out["message"] = (
             f"Found {len(matched)} row(s) for MRIN {mrin_norm} but none had positive usage and bill days "
             f"(set AIRTABLE_SME_GAS_HIST_USAGE_FIELDS / _DAYS_FIELDS / _PERIOD_FIELDS to match your base)."
+            f"{hint}"
         )
+
+    _sme_gas_hist_log(
+        "done mrin_norm=%r bills=%s total_days=%s annual_gj=%s error=%r skipped_unusable_rows=%s",
+        mrin_norm,
+        len(bills),
+        total_days_acc,
+        out.get("annual_usage_gj"),
+        out.get("error"),
+        skipped_rows,
+    )
 
     if debug:
         key_union: set[str] = set()
@@ -1686,8 +2029,9 @@ def fetch_sme_gas_airtable_annual_usage(
             "rows_matched_mrin": len(matched),
             "bills_used": bills[:40],
             "field_keys_sample": sorted(key_union)[:80],
-            "days_fields_config": _SME_GAS_HIST_DAYS_FIELDS,
-            "usage_fields_config": _SME_GAS_HIST_USAGE_FIELDS,
-            "period_fields_config": _SME_GAS_HIST_PERIOD_FIELDS,
+            "airtable_sme_gas_usage_table_env": usage_table_env_raw or None,
+            "days_fields_config": days_fields,
+            "usage_fields_config": usage_fields,
+            "period_fields_config": period_fields,
         }
     return out
