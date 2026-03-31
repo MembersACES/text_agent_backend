@@ -1,5 +1,13 @@
+from pathlib import Path
+
 from dotenv import load_dotenv
-load_dotenv()
+
+# Always load this app's .env from the backend folder (not process cwd), and let it override
+# stale/empty vars so keys like AIRTABLE_SME_GAS_USAGE_TABLE are not lost when uvicorn cwd differs.
+_backend_env = Path(__file__).resolve().parent / ".env"
+if _backend_env.is_file():
+    load_dotenv(_backend_env, override=True)
+
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status
 from typing import List
 from fastapi import Header
@@ -712,24 +720,34 @@ def get_base2_sme_gas_airtable_annual_usage(
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Aggregate SME gas invoice history from Airtable by MRIN for annual consumption (GJ) and
-    whether usage likely meets the ~1000 GJ C&I-style threshold (configurable via env).
+    Aggregate SME gas invoice history from Airtable by MRIN for annual consumption (GJ).
+    `meets_1000gj_screen` / `meets_ci_threshold_1000gj` use bill-period-days annualisation only.
+    `near_1000gj_screen` is true when bill-day annual is in the review band below threshold
+    (default 850–1000 GJ via `AIRTABLE_SME_GAS_NEAR_SCREEN_GJ`). Calendar-window figures are diagnostic.
     """
     mode = (usage_unit or "auto").strip().lower()
     if mode not in ("auto", "mj", "gj"):
         raise HTTPException(status_code=400, detail="usage_unit must be auto, mj, or gj")
     email = user_info.get("email") if isinstance(user_info, dict) else None
     result = airtable_client.fetch_sme_gas_airtable_annual_usage(mrin, usage_unit=mode, debug=debug)
-    logging.info(
-        "[base2/sme-gas-airtable-annual-usage] user=%s mrin=%r unit=%s -> bills=%s days=%s annual=%s meets=%s",
-        email,
-        mrin,
-        mode,
-        result.get("bill_count"),
-        result.get("total_days"),
-        result.get("annual_usage_gj"),
-        result.get("meets_ci_threshold_1000gj"),
+    _sme_line = (
+        "[base2/sme-gas-airtable-annual-usage] user=%s mrin=%r unit=%s debug=%s table=%r -> bills=%s total_days=%s annual_gj=%s meets=%s error=%r message=%r"
+        % (
+            email,
+            mrin,
+            mode,
+            debug,
+            result.get("table_name"),
+            result.get("bill_count"),
+            result.get("total_days"),
+            result.get("annual_usage_gj"),
+            result.get("meets_ci_threshold_1000gj"),
+            result.get("error"),
+            result.get("message"),
+        )
     )
+    logging.info(_sme_line)
+    print(_sme_line, flush=True)
     return result
 
 

@@ -18,6 +18,12 @@ QUOTE_RETAILER_EMAILS = {
         "email": "data.quote@fornrg.com",
         "variants": ["Test"]
     },
+    # Alias used by the quote-request UI (same inbox as Test)
+    "Data Quote": {
+        "name": "Data Quote",
+        "email": "data.quote@fornrg.com",
+        "variants": ["Data Quote"]
+    },
     "Origin C&I": {
         "name": "Origin C&I",
         "email": "Tenders@originenergy.com.au",
