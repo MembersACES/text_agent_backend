@@ -128,7 +128,22 @@ def _parse_context(run: AutonomousSequenceRun) -> dict[str, Any]:
 def _merge_context(db: Session, run: AutonomousSequenceRun, extra: dict[str, Any]) -> None:
     base = _parse_context(run)
     base.update(extra)
-    run.context_json = json.dumps(base)
+    update_run_context(db, run, base)
+
+
+def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]:
+    def _norm(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    return {
+        "email_ID": _norm(context.get("email_ID")),
+        "contact_phone": _norm(context.get("contact_phone")),
+        "contact_name": _norm(context.get("contact_name")),
+        "contact_email": _norm(context.get("contact_email")),
+    }
 
 
 def skip_remaining_steps(db: Session, run_id: int) -> None:
@@ -231,6 +246,11 @@ def manual_stop_run(db: Session, run_id: int) -> Optional[AutonomousSequenceRun]
 
 def update_run_context(db: Session, run: AutonomousSequenceRun, context: dict[str, Any]) -> None:
     run.context_json = json.dumps(context) if context else None
+    contact_fields = _context_contact_fields(context or {})
+    run.email_ID = contact_fields["email_ID"]
+    run.contact_phone = contact_fields["contact_phone"]
+    run.contact_name = contact_fields["contact_name"]
+    run.contact_email = contact_fields["contact_email"]
 
 
 _SCHEDULE_EDITABLE_STATUSES = frozenset(("ready", "to_start"))
@@ -318,6 +338,7 @@ def start_gas_base2_sequence(
 
     anchor_utc = _to_utc_naive(anchor_at)
     _ = tz  # caller may pass client timezone; scheduling is always AEST
+    contact_fields = _context_contact_fields(context)
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
         offer_id=offer_id,
@@ -327,6 +348,10 @@ def start_gas_base2_sequence(
         anchor_at=anchor_utc,
         timezone=AUTONOMOUS_SCHEDULE_TZ,
         context_json=json.dumps(context) if context else None,
+        email_ID=contact_fields["email_ID"],
+        contact_phone=contact_fields["contact_phone"],
+        contact_name=contact_fields["contact_name"],
+        contact_email=contact_fields["contact_email"],
     )
     db.add(run)
     db.flush()
