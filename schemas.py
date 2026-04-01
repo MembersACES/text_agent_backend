@@ -692,6 +692,10 @@ class AutonomousSequenceRunResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     business_name: Optional[str] = None
+    email_ID: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
     context: Dict[str, Any] = {}
     steps: List[AutonomousSequenceStepResponse] = []
 

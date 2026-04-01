@@ -5690,6 +5690,10 @@ def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> Autonomou
         created_at=run.created_at,
         updated_at=run.updated_at,
         business_name=offer.business_name if offer else None,
+        email_ID=run.email_ID,
+        contact_phone=run.contact_phone,
+        contact_name=run.contact_name,
+        contact_email=run.contact_email,
         context=_parse_context(run),
         steps=[AutonomousSequenceStepResponse.model_validate(s) for s in steps],
     )

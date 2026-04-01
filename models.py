@@ -263,6 +263,10 @@ class AutonomousSequenceRun(Base):
     anchor_at = Column(DateTime, nullable=False)
     timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
     context_json = Column(Text, nullable=True)
+    email_ID = Column(String(255), nullable=True)
+    contact_phone = Column(String(64), nullable=True)
+    contact_name = Column(String(255), nullable=True)
+    contact_email = Column(String(255), nullable=True)
 
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
