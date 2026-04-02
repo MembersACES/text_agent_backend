@@ -79,6 +79,7 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.solar_cleaning_quote import generate_solar_cleaning_quote, preview_solar_quote_extract
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
 from tools.discrepancy_check_sheet import (
     get_discrepancy_rows,
@@ -3276,6 +3277,75 @@ async def upload_invoice_pdf_endpoint(
         logging.error(f"Error uploading PDF: {str(e)}")
         logging.exception(e)
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+class SolarCleaningQuoteGenerateRequest(BaseModel):
+    """When manual_entry is false, quote fields are read from source_pdf_base64 (vendor PDF)."""
+
+    manual_entry: bool = False
+    quote_number: Optional[str] = None
+    client_name: Optional[str] = None
+    street_address: Optional[str] = None
+    suburb_state_postcode: Optional[str] = None
+    quote_date: Optional[str] = None
+    panel_qty: Optional[str] = None
+    system_kw: Optional[str] = None
+    site_name: Optional[str] = None
+    contact_name: Optional[str] = None
+    amount_cleaning_ex_gst: Optional[float] = None
+    amount_discount: Optional[float] = None
+    amount_subtotal_ex_gst: Optional[float] = None
+    amount_gst: Optional[float] = None
+    amount_total_inc_gst: Optional[float] = None
+    business_name: Optional[str] = None
+    client_folder_url: Optional[str] = None
+    pv_cleaning_note: Optional[str] = None
+    source_pdf_base64: Optional[str] = None
+    source_pdf_filename: Optional[str] = None
+
+
+class SolarCleaningQuoteExtractRequest(BaseModel):
+    """Vendor PDF + optional CRM prefill; returns parsed fields for the UI only."""
+
+    source_pdf_base64: str
+    source_pdf_filename: Optional[str] = None
+    business_name: Optional[str] = None
+    client_name: Optional[str] = None
+    street_address: Optional[str] = None
+    suburb_state_postcode: Optional[str] = None
+    contact_name: Optional[str] = None
+    site_name: Optional[str] = None
+    client_folder_url: Optional[str] = None
+
+
+@app.post("/api/solar-cleaning-quote/extract")
+async def solar_cleaning_quote_extract(
+    body: SolarCleaningQuoteExtractRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Parse vendor quote PDF and return merged field preview (no Doc generation)."""
+    _ = user_info
+    return preview_solar_quote_extract(body.model_dump())
+
+
+@app.post("/api/solar-cleaning-quote/generate")
+async def solar_cleaning_quote_generate(
+    body: SolarCleaningQuoteGenerateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Copy Google Docs quote template, merge fields, export PDF (service account)."""
+    _ = user_info
+    try:
+        result = generate_solar_cleaning_quote(body.model_dump())
+    except Exception as e:
+        logging.exception("solar_cleaning_quote_generate failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not result.get("success"):
+        detail = result.get("error") or "Generation failed"
+        status = 400 if "no drive folder" in detail.lower() else 502
+        raise HTTPException(status_code=status, detail=detail)
+    return result
 
 
 # --- Testimonials API (member testimonials, optional link to 1st Month Savings) ---
