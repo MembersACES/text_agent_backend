@@ -8,7 +8,7 @@ Solar cleaning quote generation via Google Docs API (service account).
 The Google Doc master must use UNIQUE amount tokens per row, e.g. $[AMT_CLEAN] (or $$[AMT_CLEAN]),
   -$[AMT_DISC] or −$$[AMT_DISC] (Unicode minus OK), $[AMT_SUB], $[AMT_GST], $[AMT_TOT].
 
-Other placeholders match the EasyNRG template (square brackets), including a single [STREET ADDRESS]
+Other placeholders match the ACES quote Google Doc template (square brackets), including a single [STREET ADDRESS]
 line for the full site address (no separate suburb line).
 
 Master Google Doc IDs are constants below (SOLAR_QUOTE_TEMPLATE_DOC_ID,
@@ -75,9 +75,9 @@ DRIVE_DOCS_SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
-# EasyNRG_Quote_TEMPLATE
+# Master Google Doc: ACES solar panel cleaning quote template
 SOLAR_QUOTE_TEMPLATE_DOC_ID = "1-gX0UUAZW1PnQPahffVsRDqYWWGNpoZa"
-# EasyNRG_Solar_Cleaning_TCs (master for n8n / send flow)
+# Terms & conditions master (n8n / send flow)
 SOLAR_QUOTE_TCS_MASTER_DOC_ID = "1yAVB8xyd1IvgC2uCFqtZi9tEOjmxX9Eb"
 
 
@@ -183,7 +183,7 @@ def _money_after_label_last(text: str, label_regex: str) -> Optional[float]:
 
 def extract_vendor_quote_from_pdf(pdf_bytes: bytes) -> Dict[str, Any]:
     """
-    Heuristic extraction from supplier quote PDF (e.g. EasyNRG layout).
+    Heuristic extraction from supplier quote PDF (common solar-cleaning vendor layouts).
     Returns merge keys plus extraction_warnings when guesses were used.
     """
     warnings: list[str] = []
@@ -615,9 +615,19 @@ def build_replacements(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
     pairs: List[Tuple[str, str]] = [
         ("CUSTOMER QUOTATION No. XXXX", f"CUSTOMER QUOTATION No. {qn}"),
         ("SOLAR CLEANING QUOTATION No. XXXX", f"SOLAR CLEANING QUOTATION No. {qn}"),
+        # New ACES-branded heading (if present as placeholder in the Doc template)
+        (
+            "ACES Quote No: XXXX [CLIENT NAME]",
+            f"ACES Quote No. {qn} {client_name}",
+        ),
+        (
+            "ACES Quote No.: XXXX [CLIENT NAME]",
+            f"ACES Quote No. {qn} {client_name}",
+        ),
+        # Legacy template line (harmless if the Doc no longer contains it)
         (
             "EasyNRG Quote No: XXXX [CLIENT NAME]",
-            f"EasyNRG Quote No. {qn} {client_name}",
+            f"ACES Quote No. {qn} {client_name}",
         ),
         ("Quote No. XXXX", f"Quote No. {qn}"),
         ("[CLIENT NAME]", client_name),
@@ -628,7 +638,7 @@ def build_replacements(payload: Dict[str, Any]) -> List[Tuple[str, str]]:
         ("[kW]", kw),
         ("[SITE NAME]", site_name),
         ("[CLIENT CONTACT NAME]", contact_name),
-        # Amount tokens: support $$[…] (legacy) and $[…] (current EasyNRG template).
+        # Amount tokens: support $$[…] (legacy) and $[…] (current template).
         ("$$[AMT_CLEAN]", _format_aud(amt_clean)),
         ("$[AMT_CLEAN]", _format_aud(amt_clean)),
         ("−$$[AMT_DISC]", disc_display),
@@ -683,7 +693,7 @@ def generate_solar_cleaning_quote(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     business = str(payload.get("business_name") or payload.get("client_name") or "Client").strip()
     qn = str(payload.get("quote_number", "")).strip()
-    copy_title = f"EasyNRG_Quote_{qn}_{_slug(business)}"
+    copy_title = f"ACES_Solar_Cleaning_Quote_{qn}_{_slug(business)}"
 
     try:
         copied = (
@@ -753,7 +763,7 @@ def generate_solar_cleaning_quote(payload: Dict[str, Any]) -> Dict[str, Any]:
             "quote_doc_url": f"https://docs.google.com/document/d/{new_doc_id}/edit",
         }
 
-    pdf_name = f"EasyNRG_Quote_{qn}_{_slug(business)}.pdf"
+    pdf_name = f"ACES_Solar_Cleaning_Quote_{qn}_{_slug(business)}.pdf"
     pdf_file_id = upload_file_to_drive(
         pdf_bytes, pdf_name, work_folder_id, "application/pdf", drive_service=drive
     )
