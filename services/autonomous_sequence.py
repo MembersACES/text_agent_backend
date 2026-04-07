@@ -279,6 +279,85 @@ def ensure_default_sequence_templates(db: Session) -> None:
     if changed:
         db.commit()
 
+    # Bootstrap templates from existing run data where needed.
+    # This migrates pre-existing sequence types into template-driven scheduling.
+    run_types = [
+        r[0]
+        for r in db.query(AutonomousSequenceRun.sequence_type)
+        .distinct()
+        .all()
+        if isinstance(r[0], str) and r[0].strip()
+    ]
+    for seq_type in run_types:
+        existing_template = (
+            db.query(AutonomousSequenceTemplate)
+            .filter(AutonomousSequenceTemplate.sequence_type == seq_type)
+            .first()
+        )
+        if existing_template:
+            continue
+        latest_run = (
+            db.query(AutonomousSequenceRun)
+            .filter(AutonomousSequenceRun.sequence_type == seq_type)
+            .order_by(AutonomousSequenceRun.created_at.desc())
+            .first()
+        )
+        if not latest_run:
+            continue
+        run_steps = (
+            db.query(AutonomousSequenceStep)
+            .filter(AutonomousSequenceStep.run_id == latest_run.id)
+            .order_by(AutonomousSequenceStep.step_index.asc())
+            .all()
+        )
+        # Even if there are no existing steps, still create a template so staff can edit it.
+        template = AutonomousSequenceTemplate(
+            sequence_type=seq_type,
+            display_name=seq_type.replace("_", " ").replace(" v", " V").title(),
+            description="Bootstrapped from existing run data.",
+            timezone=AUTONOMOUS_SCHEDULE_TZ,
+            is_active=1,
+            is_restartable=1,
+        )
+        db.add(template)
+        db.flush()
+        tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+        if run_steps:
+            for st in run_steps:
+                hhmm = "09:00"
+                if st.scheduled_at:
+                    hhmm = (
+                        st.scheduled_at.replace(tzinfo=timezone.utc)
+                        .astimezone(tz)
+                        .strftime("%H:%M")
+                    )
+                db.add(
+                    AutonomousSequenceTemplateStep(
+                        template_id=template.id,
+                        step_index=int(st.step_index),
+                        day_number=max(1, int(st.day_number)),
+                        channel=str(st.channel),
+                        send_time_local=hhmm,
+                        prompt_text=None,
+                        retell_agent_id=st.retell_agent_id,
+                        is_active=1,
+                    )
+                )
+        else:
+            db.add(
+                AutonomousSequenceTemplateStep(
+                    template_id=template.id,
+                    step_index=0,
+                    day_number=1,
+                    channel="email",
+                    send_time_local="09:00",
+                    prompt_text=None,
+                    retell_agent_id=None,
+                    is_active=1,
+                )
+            )
+        db.commit()
+
 
 def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[AutonomousSequenceTemplate]:
     return (
