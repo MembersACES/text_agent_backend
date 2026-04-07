@@ -5309,7 +5309,7 @@ def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
     if at == "comparison":
         return "Comparison"
     if at in ("solar_cleaning_quote_generated", "solar_cleaning_quote_sent"):
-        return "EasyNRG"
+        return "Solar cleaning"
     return None
 
 
