@@ -315,3 +315,50 @@ class AutonomousSequenceEvent(Base):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
     run = relationship("AutonomousSequenceRun", back_populates="events")
+
+
+class AutonomousSequenceTemplate(Base):
+    """Editable sequence definition (type, label, prompt defaults, cadence metadata)."""
+
+    __tablename__ = "autonomous_sequence_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sequence_type = Column(String(80), nullable=False, unique=True, index=True)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    timezone = Column(String(64), nullable=False, default="Australia/Brisbane")
+    is_active = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
+    is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    steps = relationship(
+        "AutonomousSequenceTemplateStep",
+        back_populates="template",
+        cascade="all, delete-orphan",
+        order_by="AutonomousSequenceTemplateStep.step_index",
+    )
+
+
+class AutonomousSequenceTemplateStep(Base):
+    __tablename__ = "autonomous_sequence_template_steps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_id = Column(
+        Integer,
+        ForeignKey("autonomous_sequence_templates.id"),
+        nullable=False,
+        index=True,
+    )
+    step_index = Column(Integer, nullable=False)
+    day_number = Column(Integer, nullable=False)
+    channel = Column(String(32), nullable=False)
+    send_time_local = Column(String(5), nullable=False, default="09:00")  # HH:MM
+    prompt_text = Column(Text, nullable=True)
+    retell_agent_id = Column(String(120), nullable=True)
+    is_active = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
+
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    template = relationship("AutonomousSequenceTemplate", back_populates="steps")
