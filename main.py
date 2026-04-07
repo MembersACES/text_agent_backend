@@ -169,7 +169,7 @@ from services.crm import (
     sync_strategy_items_from_crm,
 )
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
     log_task_created,
     log_field_change,
@@ -5865,6 +5865,94 @@ def _autonomous_template_response(
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
         }
     )
+
+
+def _autonomous_sequence_type_columns(db: Session) -> List[str]:
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_type" not in tables:
+        return []
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
+    if not cols:
+        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    return [str(c) for c in cols if c]
+
+
+@app.get("/api/autonomous/sequences/type-prompts")
+def autonomous_sequence_get_type_prompts(
+    sequence_type: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    cols = _autonomous_sequence_type_columns(db)
+    if not cols:
+        raise HTTPException(
+            status_code=404,
+            detail="autonomous_sequence_type table not found in this environment",
+        )
+    wanted = [
+        "id",
+        "sequence_type",
+        "system_prompt",
+        "email_example",
+        "sms_example",
+        "voice_example",
+        "retell_agent_id",
+    ]
+    select_cols = [c for c in wanted if c in cols]
+    if "sequence_type" not in select_cols:
+        raise HTTPException(status_code=500, detail="autonomous_sequence_type.sequence_type missing")
+    sql = text(
+        f"SELECT {', '.join(select_cols)} "
+        "FROM public.autonomous_sequence_type "
+        "WHERE sequence_type = :sequence_type "
+        "LIMIT 1"
+    )
+    row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
+    return dict(row)
+
+
+@app.patch("/api/autonomous/sequences/type-prompts")
+def autonomous_sequence_patch_type_prompts(
+    body: Dict[str, Union[str, None]],
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    sequence_type = str((body or {}).get("sequence_type") or "").strip()
+    if not sequence_type:
+        raise HTTPException(status_code=400, detail="sequence_type is required")
+    cols = _autonomous_sequence_type_columns(db)
+    if not cols:
+        raise HTTPException(
+            status_code=404,
+            detail="autonomous_sequence_type table not found in this environment",
+        )
+    allowed = ["system_prompt", "email_example", "sms_example", "voice_example", "retell_agent_id"]
+    patchable = [k for k in allowed if k in cols and k in body]
+    if not patchable:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    exists_sql = text(
+        "SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"
+    )
+    exists = db.execute(exists_sql, {"sequence_type": sequence_type}).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
+
+    assignments = ", ".join([f"{k} = :{k}" for k in patchable])
+    params: Dict[str, Union[str, None]] = {"sequence_type": sequence_type}
+    for k in patchable:
+        v = body.get(k)
+        params[k] = None if v is None else str(v)
+    update_sql = text(
+        f"UPDATE public.autonomous_sequence_type SET {assignments} "
+        "WHERE sequence_type = :sequence_type"
+    )
+    db.execute(update_sql, params)
+    db.commit()
+    return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
 
 
 @app.get(
