@@ -105,6 +105,8 @@ from models import (
     Testimonial,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
+    AutonomousSequenceTemplate,
+    AutonomousSequenceTemplateStep,
 )
 from schemas import (
     TaskCreate,
@@ -143,6 +145,12 @@ from schemas import (
     AutonomousSequenceInboundRequest,
     AutonomousSequenceRunPatchRequest,
     AutonomousSequenceStepsSchedulePatchRequest,
+    AutonomousSequenceTemplateCreate,
+    AutonomousSequenceTemplateResponse,
+    AutonomousSequenceTemplateStepCreate,
+    AutonomousSequenceTemplateStepResponse,
+    AutonomousSequenceTemplateStepUpdate,
+    AutonomousSequenceTemplateUpdate,
 )
 from crm_enums import (
     ClientStage,
@@ -161,7 +169,7 @@ from services.crm import (
     sync_strategy_items_from_crm,
 )
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
     log_task_created,
     log_field_change,
@@ -192,6 +200,17 @@ def on_startup() -> None:
     """
     global _autonomous_scheduler
     init_db()
+    try:
+        from database import SessionLocal
+        from services.autonomous_sequence import ensure_default_sequence_templates
+
+        db = SessionLocal()
+        try:
+            ensure_default_sequence_templates(db)
+        finally:
+            db.close()
+    except Exception:
+        logging.exception("Failed to ensure default autonomous sequence templates")
 
     if os.getenv("AUTONOMOUS_SCHEDULER_ENABLED", "").lower() in ("1", "true", "yes"):
         from database import SessionLocal
@@ -5777,19 +5796,13 @@ def autonomous_sequence_start(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    from services.autonomous_sequence import start_gas_base2_sequence
+    from services.autonomous_sequence import get_sequence_template_by_type, start_gas_base2_sequence
 
-    allowed_base2_types = frozenset(
-        {
-            "gas_base2_followup_v1",  # C&I (and SME) gas — same schedule; use context.utility_lane in n8n
-            "ci_electricity_base2_followup_v1",
-        }
-    )
-    if body.sequence_type not in allowed_base2_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported sequence_type; allowed: {sorted(allowed_base2_types)}",
-        )
+    template = get_sequence_template_by_type(db, body.sequence_type)
+    if not template:
+        raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")
+    if not bool(template.is_active):
+        raise HTTPException(status_code=400, detail="Sequence template is inactive")
     offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
@@ -5812,6 +5825,313 @@ def autonomous_sequence_start(
         "run_status": run.run_status,
         "steps_planned": steps_planned,
     }
+
+
+def _autonomous_template_step_response(
+    step: AutonomousSequenceTemplateStep,
+) -> AutonomousSequenceTemplateStepResponse:
+    return AutonomousSequenceTemplateStepResponse.model_validate(
+        {
+            "id": step.id,
+            "template_id": step.template_id,
+            "step_index": step.step_index,
+            "day_number": step.day_number,
+            "channel": step.channel,
+            "send_time_local": step.send_time_local,
+            "prompt_text": step.prompt_text,
+            "retell_agent_id": step.retell_agent_id,
+            "is_active": bool(step.is_active),
+            "created_at": step.created_at,
+            "updated_at": step.updated_at,
+        }
+    )
+
+
+def _autonomous_template_response(
+    template: AutonomousSequenceTemplate,
+) -> AutonomousSequenceTemplateResponse:
+    steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
+    return AutonomousSequenceTemplateResponse.model_validate(
+        {
+            "id": template.id,
+            "sequence_type": template.sequence_type,
+            "display_name": template.display_name,
+            "description": template.description,
+            "timezone": template.timezone,
+            "is_active": bool(template.is_active),
+            "is_restartable": bool(template.is_restartable),
+            "created_at": template.created_at,
+            "updated_at": template.updated_at,
+            "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
+        }
+    )
+
+
+def _autonomous_sequence_type_columns(db: Session) -> List[str]:
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_type" not in tables:
+        return []
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
+    if not cols:
+        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    return [str(c) for c in cols if c]
+
+
+@app.get("/api/autonomous/sequences/type-prompts")
+def autonomous_sequence_get_type_prompts(
+    sequence_type: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    cols = _autonomous_sequence_type_columns(db)
+    if not cols:
+        raise HTTPException(
+            status_code=404,
+            detail="autonomous_sequence_type table not found in this environment",
+        )
+    wanted = [
+        "id",
+        "sequence_type",
+        "system_prompt",
+        "email_example",
+        "sms_example",
+        "voice_example",
+        "retell_agent_id",
+    ]
+    select_cols = [c for c in wanted if c in cols]
+    if "sequence_type" not in select_cols:
+        raise HTTPException(status_code=500, detail="autonomous_sequence_type.sequence_type missing")
+    sql = text(
+        f"SELECT {', '.join(select_cols)} "
+        "FROM public.autonomous_sequence_type "
+        "WHERE sequence_type = :sequence_type "
+        "LIMIT 1"
+    )
+    row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
+    return dict(row)
+
+
+@app.patch("/api/autonomous/sequences/type-prompts")
+def autonomous_sequence_patch_type_prompts(
+    body: Dict[str, Union[str, None]],
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    sequence_type = str((body or {}).get("sequence_type") or "").strip()
+    if not sequence_type:
+        raise HTTPException(status_code=400, detail="sequence_type is required")
+    cols = _autonomous_sequence_type_columns(db)
+    if not cols:
+        raise HTTPException(
+            status_code=404,
+            detail="autonomous_sequence_type table not found in this environment",
+        )
+    allowed = ["system_prompt", "email_example", "sms_example", "voice_example", "retell_agent_id"]
+    patchable = [k for k in allowed if k in cols and k in body]
+    if not patchable:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    exists_sql = text(
+        "SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"
+    )
+    exists = db.execute(exists_sql, {"sequence_type": sequence_type}).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
+
+    assignments = ", ".join([f"{k} = :{k}" for k in patchable])
+    params: Dict[str, Union[str, None]] = {"sequence_type": sequence_type}
+    for k in patchable:
+        v = body.get(k)
+        params[k] = None if v is None else str(v)
+    update_sql = text(
+        f"UPDATE public.autonomous_sequence_type SET {assignments} "
+        "WHERE sequence_type = :sequence_type"
+    )
+    db.execute(update_sql, params)
+    db.commit()
+    return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get(
+    "/api/autonomous/sequences/templates",
+    response_model=List[AutonomousSequenceTemplateResponse],
+)
+def autonomous_sequence_list_templates(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    rows = (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .order_by(AutonomousSequenceTemplate.sequence_type.asc())
+        .all()
+    )
+    return [_autonomous_template_response(r) for r in rows]
+
+
+@app.post(
+    "/api/autonomous/sequences/templates",
+    response_model=AutonomousSequenceTemplateResponse,
+)
+def autonomous_sequence_create_template(
+    body: AutonomousSequenceTemplateCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    seq_type = body.sequence_type.strip()
+    if not seq_type:
+        raise HTTPException(status_code=400, detail="sequence_type is required")
+    existing = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.sequence_type == seq_type)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="sequence_type already exists")
+    template = AutonomousSequenceTemplate(
+        sequence_type=seq_type,
+        display_name=body.display_name.strip() or seq_type,
+        description=(body.description or "").strip() or None,
+        timezone=(body.timezone or "Australia/Brisbane").strip() or "Australia/Brisbane",
+        is_active=1 if body.is_active else 0,
+        is_restartable=1 if body.is_restartable else 0,
+    )
+    db.add(template)
+    db.flush()
+    for s in body.steps:
+        db.add(
+            AutonomousSequenceTemplateStep(
+                template_id=template.id,
+                step_index=s.step_index,
+                day_number=s.day_number,
+                channel=s.channel.strip(),
+                send_time_local=s.send_time_local.strip(),
+                prompt_text=(s.prompt_text or "").strip() or None,
+                retell_agent_id=(s.retell_agent_id or "").strip() or None,
+                is_active=1 if s.is_active else 0,
+            )
+        )
+    from services.autonomous_sequence import ensure_autonomous_sequence_type_row
+
+    ensure_autonomous_sequence_type_row(db, seq_type)
+    db.commit()
+    db.refresh(template)
+    template = (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .filter(AutonomousSequenceTemplate.id == template.id)
+        .first()
+    )
+    return _autonomous_template_response(template)
+
+
+@app.patch(
+    "/api/autonomous/sequences/templates/{template_id}",
+    response_model=AutonomousSequenceTemplateResponse,
+)
+def autonomous_sequence_update_template(
+    template_id: int,
+    body: AutonomousSequenceTemplateUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    template = (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .filter(AutonomousSequenceTemplate.id == template_id)
+        .first()
+    )
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    if body.display_name is not None:
+        template.display_name = body.display_name.strip() or template.display_name
+    if body.description is not None:
+        template.description = body.description.strip() or None
+    if body.timezone is not None:
+        template.timezone = body.timezone.strip() or template.timezone
+    if body.is_active is not None:
+        template.is_active = 1 if body.is_active else 0
+    if body.is_restartable is not None:
+        template.is_restartable = 1 if body.is_restartable else 0
+    db.commit()
+    db.refresh(template)
+    return _autonomous_template_response(template)
+
+
+@app.post(
+    "/api/autonomous/sequences/templates/{template_id}/steps",
+    response_model=AutonomousSequenceTemplateStepResponse,
+)
+def autonomous_sequence_add_template_step(
+    template_id: int,
+    body: AutonomousSequenceTemplateStepCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    template = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.id == template_id)
+        .first()
+    )
+    if not template:
+        raise HTTPException(status_code=404, detail="Template not found")
+    step = AutonomousSequenceTemplateStep(
+        template_id=template_id,
+        step_index=body.step_index,
+        day_number=body.day_number,
+        channel=body.channel.strip(),
+        send_time_local=body.send_time_local.strip(),
+        prompt_text=(body.prompt_text or "").strip() or None,
+        retell_agent_id=(body.retell_agent_id or "").strip() or None,
+        is_active=1 if body.is_active else 0,
+    )
+    db.add(step)
+    db.commit()
+    db.refresh(step)
+    return _autonomous_template_step_response(step)
+
+
+@app.patch(
+    "/api/autonomous/sequences/templates/{template_id}/steps/{step_id}",
+    response_model=AutonomousSequenceTemplateStepResponse,
+)
+def autonomous_sequence_update_template_step(
+    template_id: int,
+    step_id: int,
+    body: AutonomousSequenceTemplateStepUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    step = (
+        db.query(AutonomousSequenceTemplateStep)
+        .filter(
+            AutonomousSequenceTemplateStep.id == step_id,
+            AutonomousSequenceTemplateStep.template_id == template_id,
+        )
+        .first()
+    )
+    if not step:
+        raise HTTPException(status_code=404, detail="Template step not found")
+    if body.step_index is not None:
+        step.step_index = body.step_index
+    if body.day_number is not None:
+        step.day_number = body.day_number
+    if body.channel is not None:
+        step.channel = body.channel.strip() or step.channel
+    if body.send_time_local is not None:
+        step.send_time_local = body.send_time_local.strip() or step.send_time_local
+    if body.prompt_text is not None:
+        step.prompt_text = body.prompt_text.strip() or None
+    if body.retell_agent_id is not None:
+        step.retell_agent_id = body.retell_agent_id.strip() or None
+    if body.is_active is not None:
+        step.is_active = 1 if body.is_active else 0
+    db.commit()
+    db.refresh(step)
+    return _autonomous_template_step_response(step)
 
 
 @app.get("/api/autonomous/sequences/runs")
