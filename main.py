@@ -6014,6 +6014,9 @@ def autonomous_sequence_create_template(
                 is_active=1 if s.is_active else 0,
             )
         )
+    from services.autonomous_sequence import ensure_autonomous_sequence_type_row
+
+    ensure_autonomous_sequence_type_row(db, seq_type)
     db.commit()
     db.refresh(template)
     template = (

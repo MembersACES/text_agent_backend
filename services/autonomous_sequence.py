@@ -12,6 +12,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session, joinedload
 
 from models import (
@@ -219,6 +220,71 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
 )
 
 
+def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool:
+    """
+    Insert a minimal public.autonomous_sequence_type row when missing so
+    autonomous_sequence_runs.sequence_type FK can resolve. Idempotent.
+    Returns True if a row was inserted.
+    """
+    st = (sequence_type or "").strip()
+    if not st:
+        return False
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_type" not in tables:
+        return False
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
+    if not cols:
+        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    colset = {str(c) for c in cols if c}
+    if "sequence_type" not in colset:
+        return False
+    exists = db.execute(
+        text("SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"),
+        {"sequence_type": st},
+    ).first()
+    if exists:
+        return False
+
+    default_agent = ""
+    if "retell_agent_id" in colset:
+        for ref_type in ("gas_base2_followup_v1", "ci_electricity_base2_followup_v1"):
+            row = db.execute(
+                text(
+                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    "WHERE sequence_type = :sequence_type AND COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
+                ),
+                {"sequence_type": ref_type},
+            ).first()
+            if row and row[0]:
+                default_agent = str(row[0]).strip()
+                break
+        if not default_agent:
+            any_row = db.execute(
+                text(
+                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    "WHERE COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
+                ),
+            ).first()
+            if any_row and any_row[0]:
+                default_agent = str(any_row[0]).strip()
+
+    if "retell_agent_id" in colset:
+        db.execute(
+            text(
+                "INSERT INTO public.autonomous_sequence_type (sequence_type, retell_agent_id) "
+                "VALUES (:sequence_type, :retell_agent_id)"
+            ),
+            {"sequence_type": st, "retell_agent_id": default_agent},
+        )
+    else:
+        db.execute(
+            text("INSERT INTO public.autonomous_sequence_type (sequence_type) VALUES (:sequence_type)"),
+            {"sequence_type": st},
+        )
+    return True
+
+
 def ensure_default_sequence_templates(db: Session) -> None:
     """Seed default templates if missing (idempotent)."""
     defaults = [
@@ -251,6 +317,8 @@ def ensure_default_sequence_templates(db: Session) -> None:
             .first()
         )
         if existing:
+            if ensure_autonomous_sequence_type_row(db, d["sequence_type"]):
+                changed = True
             continue
         t = AutonomousSequenceTemplate(
             sequence_type=d["sequence_type"],
@@ -275,6 +343,7 @@ def ensure_default_sequence_templates(db: Session) -> None:
                     is_active=1,
                 )
             )
+        ensure_autonomous_sequence_type_row(db, d["sequence_type"])
         changed = True
     if changed:
         db.commit()
@@ -356,6 +425,7 @@ def ensure_default_sequence_templates(db: Session) -> None:
                     is_active=1,
                 )
             )
+        ensure_autonomous_sequence_type_row(db, seq_type)
         db.commit()
 
 
