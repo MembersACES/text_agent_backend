@@ -26,7 +26,7 @@ from models import (
 
 
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
-    """Remove a run and all steps/events. Events reference steps, so delete events first."""
+    """Remove a run and all dependent rows (events, steps, context extension table)."""
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
     if not run:
         return False
@@ -36,6 +36,14 @@ def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run_id).delete(
         synchronize_session=False
     )
+    # Postgres FK autonomous_sequence_context_run_id_fkey — table may exist only in some envs
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_context" in tables:
+        db.execute(
+            text("DELETE FROM public.autonomous_sequence_context WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        )
     db.delete(run)
     db.commit()
     return True
