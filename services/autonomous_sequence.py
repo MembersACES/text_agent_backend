@@ -12,13 +12,21 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import httpx
+from sqlalchemy import inspect, text
 from sqlalchemy.orm import Session, joinedload
 
-from models import AutonomousSequenceEvent, AutonomousSequenceRun, AutonomousSequenceStep, Offer
+from models import (
+    AutonomousSequenceEvent,
+    AutonomousSequenceRun,
+    AutonomousSequenceStep,
+    AutonomousSequenceTemplate,
+    AutonomousSequenceTemplateStep,
+    Offer,
+)
 
 
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
-    """Remove a run and all steps/events. Events reference steps, so delete events first."""
+    """Remove a run and all dependent rows (events, steps, context extension table)."""
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
     if not run:
         return False
@@ -28,6 +36,14 @@ def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run_id).delete(
         synchronize_session=False
     )
+    # Postgres FK autonomous_sequence_context_run_id_fkey — table may exist only in some envs
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_context" in tables:
+        db.execute(
+            text("DELETE FROM public.autonomous_sequence_context WHERE run_id = :run_id"),
+            {"run_id": run_id},
+        )
     db.delete(run)
     db.commit()
     return True
@@ -66,6 +82,56 @@ def ensure_weekday(d: date) -> date:
     while n.weekday() >= 5:
         n += timedelta(days=1)
     return n
+
+
+def _parse_local_time_hhmm(value: str) -> tuple[int, int]:
+    raw = (value or "").strip()
+    parts = raw.split(":")
+    if len(parts) != 2:
+        raise ValueError(f"Invalid send_time_local {value!r}; expected HH:MM")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise ValueError(f"Invalid send_time_local {value!r}; hour/minute out of range")
+    return hour, minute
+
+
+def _plan_template_times(
+    anchor: datetime,
+    template_steps: list[AutonomousSequenceTemplateStep],
+    *,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime, Optional[str], Optional[str]]]:
+    """
+    Returns tuples:
+      (day_number, channel, scheduled_at_utc_naive, prompt_text, retell_agent_id)
+    """
+    tz = ZoneInfo(timezone_name)
+    a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
+    local = a.astimezone(tz)
+    base_date = local.date()
+    day1 = next_business_day(base_date)
+
+    plan: list[tuple[int, str, datetime, Optional[str], Optional[str]]] = []
+    ordered_steps = sorted(
+        [s for s in template_steps if bool(s.is_active)],
+        key=lambda s: s.step_index,
+    )
+    for s in ordered_steps:
+        target_date = day1 + timedelta(days=max(0, int(s.day_number) - 1))
+        target_date = ensure_weekday(target_date)
+        hh, mm = _parse_local_time_hhmm(s.send_time_local)
+        local_dt = datetime.combine(target_date, time(hh, mm), tzinfo=tz)
+        plan.append(
+            (
+                int(s.day_number),
+                str(s.channel),
+                local_dt.astimezone(timezone.utc).replace(tzinfo=None),
+                s.prompt_text,
+                s.retell_agent_id,
+            )
+        )
+    return plan
 
 
 def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
@@ -162,6 +228,224 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
 )
 
 
+def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool:
+    """
+    Insert a minimal public.autonomous_sequence_type row when missing so
+    autonomous_sequence_runs.sequence_type FK can resolve. Idempotent.
+    Returns True if a row was inserted.
+    """
+    st = (sequence_type or "").strip()
+    if not st:
+        return False
+    insp = inspect(db.bind)
+    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    if "autonomous_sequence_type" not in tables:
+        return False
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
+    if not cols:
+        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    colset = {str(c) for c in cols if c}
+    if "sequence_type" not in colset:
+        return False
+    exists = db.execute(
+        text("SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"),
+        {"sequence_type": st},
+    ).first()
+    if exists:
+        return False
+
+    default_agent = ""
+    if "retell_agent_id" in colset:
+        for ref_type in ("gas_base2_followup_v1", "ci_electricity_base2_followup_v1"):
+            row = db.execute(
+                text(
+                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    "WHERE sequence_type = :sequence_type AND COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
+                ),
+                {"sequence_type": ref_type},
+            ).first()
+            if row and row[0]:
+                default_agent = str(row[0]).strip()
+                break
+        if not default_agent:
+            any_row = db.execute(
+                text(
+                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    "WHERE COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
+                ),
+            ).first()
+            if any_row and any_row[0]:
+                default_agent = str(any_row[0]).strip()
+
+    if "retell_agent_id" in colset:
+        db.execute(
+            text(
+                "INSERT INTO public.autonomous_sequence_type (sequence_type, retell_agent_id) "
+                "VALUES (:sequence_type, :retell_agent_id)"
+            ),
+            {"sequence_type": st, "retell_agent_id": default_agent},
+        )
+    else:
+        db.execute(
+            text("INSERT INTO public.autonomous_sequence_type (sequence_type) VALUES (:sequence_type)"),
+            {"sequence_type": st},
+        )
+    return True
+
+
+def ensure_default_sequence_templates(db: Session) -> None:
+    """Seed default templates if missing (idempotent)."""
+    defaults = [
+        {
+            "sequence_type": "gas_base2_followup_v1",
+            "display_name": "Gas Base 2 Follow-up v1",
+            "description": "Default Base 2 cadence for gas offers.",
+            "is_restartable": 1,
+        },
+        {
+            "sequence_type": "ci_electricity_base2_followup_v1",
+            "display_name": "C&I Electricity Base 2 Follow-up v1",
+            "description": "Default Base 2 cadence for C&I electricity offers.",
+            "is_restartable": 1,
+        },
+    ]
+    step_defaults = [
+        # step_index, day_number, channel, send_time_local
+        (0, 1, "email", "09:00"),
+        (1, 1, "voice_call", "09:30"),
+        (2, 2, "sms", "10:00"),
+        (3, 3, "voice_call", "11:00"),
+        (4, 3, "email", "11:30"),
+    ]
+    changed = False
+    for d in defaults:
+        existing = (
+            db.query(AutonomousSequenceTemplate)
+            .filter(AutonomousSequenceTemplate.sequence_type == d["sequence_type"])
+            .first()
+        )
+        if existing:
+            if ensure_autonomous_sequence_type_row(db, d["sequence_type"]):
+                changed = True
+            continue
+        t = AutonomousSequenceTemplate(
+            sequence_type=d["sequence_type"],
+            display_name=d["display_name"],
+            description=d["description"],
+            timezone=AUTONOMOUS_SCHEDULE_TZ,
+            is_active=1,
+            is_restartable=d["is_restartable"],
+        )
+        db.add(t)
+        db.flush()
+        for idx, day_num, channel, hhmm in step_defaults:
+            db.add(
+                AutonomousSequenceTemplateStep(
+                    template_id=t.id,
+                    step_index=idx,
+                    day_number=day_num,
+                    channel=channel,
+                    send_time_local=hhmm,
+                    prompt_text=None,
+                    retell_agent_id=None,
+                    is_active=1,
+                )
+            )
+        ensure_autonomous_sequence_type_row(db, d["sequence_type"])
+        changed = True
+    if changed:
+        db.commit()
+
+    # Bootstrap templates from existing run data where needed.
+    # This migrates pre-existing sequence types into template-driven scheduling.
+    run_types = [
+        r[0]
+        for r in db.query(AutonomousSequenceRun.sequence_type)
+        .distinct()
+        .all()
+        if isinstance(r[0], str) and r[0].strip()
+    ]
+    for seq_type in run_types:
+        existing_template = (
+            db.query(AutonomousSequenceTemplate)
+            .filter(AutonomousSequenceTemplate.sequence_type == seq_type)
+            .first()
+        )
+        if existing_template:
+            continue
+        latest_run = (
+            db.query(AutonomousSequenceRun)
+            .filter(AutonomousSequenceRun.sequence_type == seq_type)
+            .order_by(AutonomousSequenceRun.created_at.desc())
+            .first()
+        )
+        if not latest_run:
+            continue
+        run_steps = (
+            db.query(AutonomousSequenceStep)
+            .filter(AutonomousSequenceStep.run_id == latest_run.id)
+            .order_by(AutonomousSequenceStep.step_index.asc())
+            .all()
+        )
+        # Even if there are no existing steps, still create a template so staff can edit it.
+        template = AutonomousSequenceTemplate(
+            sequence_type=seq_type,
+            display_name=seq_type.replace("_", " ").replace(" v", " V").title(),
+            description="Bootstrapped from existing run data.",
+            timezone=AUTONOMOUS_SCHEDULE_TZ,
+            is_active=1,
+            is_restartable=1,
+        )
+        db.add(template)
+        db.flush()
+        tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+        if run_steps:
+            for st in run_steps:
+                hhmm = "09:00"
+                if st.scheduled_at:
+                    hhmm = (
+                        st.scheduled_at.replace(tzinfo=timezone.utc)
+                        .astimezone(tz)
+                        .strftime("%H:%M")
+                    )
+                db.add(
+                    AutonomousSequenceTemplateStep(
+                        template_id=template.id,
+                        step_index=int(st.step_index),
+                        day_number=max(1, int(st.day_number)),
+                        channel=str(st.channel),
+                        send_time_local=hhmm,
+                        prompt_text=None,
+                        retell_agent_id=st.retell_agent_id,
+                        is_active=1,
+                    )
+                )
+        else:
+            db.add(
+                AutonomousSequenceTemplateStep(
+                    template_id=template.id,
+                    step_index=0,
+                    day_number=1,
+                    channel="email",
+                    send_time_local="09:00",
+                    prompt_text=None,
+                    retell_agent_id=None,
+                    is_active=1,
+                )
+            )
+        ensure_autonomous_sequence_type_row(db, seq_type)
+        db.commit()
+
+
+def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[AutonomousSequenceTemplate]:
+    return (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .filter(AutonomousSequenceTemplate.sequence_type == sequence_type)
+        .first()
+    )
+
+
 def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dict[str, Any]]:
     """
     Start a new Base-2 follow-up run for the same offer/type as a finished run, reusing stored
@@ -173,7 +457,10 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
         return None
     if run.run_status not in ("stopped", "completed", "cancelled"):
         raise ValueError("Only stopped, completed, or cancelled runs can be restarted")
-    if run.sequence_type not in _RESTARTABLE_SEQUENCE_TYPES:
+    tpl = get_sequence_template_by_type(db, run.sequence_type)
+    if tpl and not bool(tpl.is_restartable):
+        raise ValueError("This sequence type is not restartable")
+    if not tpl and run.sequence_type not in _RESTARTABLE_SEQUENCE_TYPES:
         raise ValueError(
             f"Unsupported sequence_type for restart; allowed: {sorted(_RESTARTABLE_SEQUENCE_TYPES)}",
         )
@@ -356,10 +643,23 @@ def start_gas_base2_sequence(
     db.add(run)
     db.flush()
 
-    plan = plan_gas_base2_followup_times(anchor_at)
-    retell_agent_id = context.get("retell_agent_id")
+    template = get_sequence_template_by_type(db, sequence_type)
+    if template and bool(template.is_active):
+        plan = _plan_template_times(
+            anchor_at,
+            template.steps,
+            timezone_name=template.timezone or AUTONOMOUS_SCHEDULE_TZ,
+        )
+    else:
+        fallback_plan = plan_gas_base2_followup_times(anchor_at)
+        plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
 
-    for idx, (day_num, channel, scheduled_utc_naive) in enumerate(plan):
+    ctx_retell_agent_id = context.get("retell_agent_id")
+
+    for idx, (day_num, channel, scheduled_utc_naive, prompt_text, step_retell_agent_id) in enumerate(plan):
+        resolved_retell_agent_id = step_retell_agent_id or (
+            str(ctx_retell_agent_id) if ctx_retell_agent_id else None
+        )
         step = AutonomousSequenceStep(
             run_id=run.id,
             step_index=idx,
@@ -368,11 +668,22 @@ def start_gas_base2_sequence(
             offset_minutes_from_day_start=0,
             step_status="ready",
             scheduled_at=scheduled_utc_naive,
-            retell_agent_id=str(retell_agent_id) if retell_agent_id and channel == "voice_call" else None,
+            retell_agent_id=resolved_retell_agent_id if channel == "voice_call" else None,
         )
         db.add(step)
 
-    _log_event(db, run.id, "run_started", payload={"offer_id": offer_id, "steps": len(plan)})
+    _log_event(
+        db,
+        run.id,
+        "run_started",
+        payload={
+            "offer_id": offer_id,
+            "steps": len(plan),
+            "sequence_type": sequence_type,
+            "template_found": bool(template),
+            "template_id": template.id if template else None,
+        },
+    )
     db.commit()
     db.refresh(run)
     return run
@@ -524,6 +835,12 @@ def execute_due_steps_sync(db: Session) -> int:
             ctx = _parse_context(run)
             ctx["offer_id"] = run.offer_id
             ctx["run_id"] = run.id
+            template = get_sequence_template_by_type(db, run.sequence_type)
+            if template:
+                by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
+                t_step = by_idx.get(int(step.step_index))
+                if t_step and t_step.prompt_text:
+                    ctx["step_prompt"] = t_step.prompt_text
 
             try:
                 if step.channel == "email":

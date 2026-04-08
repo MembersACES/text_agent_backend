@@ -660,6 +660,114 @@ class AutonomousSequenceStartRequest(BaseModel):
     context: Dict[str, Any] = {}
 
 
+class AutonomousSequenceTemplateStepBase(BaseModel):
+    step_index: int
+    day_number: int
+    channel: str
+    send_time_local: str
+    prompt_text: Optional[str] = None
+    retell_agent_id: Optional[str] = None
+    is_active: bool = True
+
+
+class AutonomousSequenceTemplateStepCreate(AutonomousSequenceTemplateStepBase):
+    pass
+
+
+class AutonomousSequenceTemplateStepUpdate(BaseModel):
+    step_index: Optional[int] = None
+    day_number: Optional[int] = None
+    channel: Optional[str] = None
+    send_time_local: Optional[str] = None
+    prompt_text: Optional[str] = None
+    retell_agent_id: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class AutonomousSequenceTemplateBase(BaseModel):
+    sequence_type: str
+    display_name: str
+    description: Optional[str] = None
+    timezone: str = "Australia/Brisbane"
+    is_active: bool = True
+    is_restartable: bool = True
+
+
+class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
+    steps: List[AutonomousSequenceTemplateStepCreate] = []
+
+
+class AutonomousSequenceTemplateUpdate(BaseModel):
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    timezone: Optional[str] = None
+    is_active: Optional[bool] = None
+    is_restartable: Optional[bool] = None
+
+
+class AutonomousSequenceTemplateStepResponse(BaseModel):
+    id: int
+    template_id: int
+    step_index: int
+    day_number: int
+    channel: str
+    send_time_local: str
+    prompt_text: Optional[str] = None
+    retell_agent_id: Optional[str] = None
+    is_active: bool = True
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_template_step_dt(self, dt: datetime, _info):
+        return to_melbourne_iso(dt)
+
+    @field_validator("is_active", mode="before")
+    @classmethod
+    def _is_active_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return True
+
+    class Config:
+        from_attributes = True
+
+
+class AutonomousSequenceTemplateResponse(BaseModel):
+    id: int
+    sequence_type: str
+    display_name: str
+    description: Optional[str] = None
+    timezone: str
+    is_active: bool = True
+    is_restartable: bool = True
+    created_at: datetime
+    updated_at: datetime
+    steps: List[AutonomousSequenceTemplateStepResponse] = []
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_template_dt(self, dt: datetime, _info):
+        return to_melbourne_iso(dt)
+
+    @field_validator("is_active", "is_restartable", mode="before")
+    @classmethod
+    def _template_flags_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return True
+
+    class Config:
+        from_attributes = True
+
+
 class AutonomousSequenceStepResponse(BaseModel):
     id: int
     step_index: int

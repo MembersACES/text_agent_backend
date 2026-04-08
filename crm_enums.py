@@ -74,7 +74,7 @@ class OfferActivityType(str, Enum):
     MANUAL_DOCUMENT = "manual_document"
     MANUAL_ACTIVITY = "manual_activity"
     ONE_MONTH_SAVINGS_INVOICE = "one_month_savings_invoice"
-    # EasyNRG solar panel cleaning quote (Docs/PDF + email via n8n)
+    # ACES solar panel cleaning quote (Docs/PDF + email via n8n)
     SOLAR_CLEANING_QUOTE_GENERATED = "solar_cleaning_quote_generated"
     SOLAR_CLEANING_QUOTE_SENT = "solar_cleaning_quote_sent"
 
