@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -255,6 +255,7 @@ def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool
         return False
 
     default_agent = ""
+    agent_was_copied = False
     if "retell_agent_id" in colset:
         for ref_type in ("gas_base2_followup_v1", "ci_electricity_base2_followup_v1"):
             row = db.execute(
@@ -266,6 +267,7 @@ def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool
             ).first()
             if row and row[0]:
                 default_agent = str(row[0]).strip()
+                agent_was_copied = True
                 break
         if not default_agent:
             any_row = db.execute(
@@ -276,14 +278,22 @@ def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool
             ).first()
             if any_row and any_row[0]:
                 default_agent = str(any_row[0]).strip()
+                agent_was_copied = True
 
     if "retell_agent_id" in colset:
+        insert_cols = ["sequence_type", "retell_agent_id"]
+        insert_params: dict[str, Union[str, int]] = {
+            "sequence_type": st,
+            "retell_agent_id": default_agent,
+        }
+        if "retell_agent_copied" in colset:
+            insert_cols.append("retell_agent_copied")
+            insert_params["retell_agent_copied"] = 1 if agent_was_copied else 0
+        cols_sql = ", ".join(insert_cols)
+        vals_sql = ", ".join(f":{c}" for c in insert_cols)
         db.execute(
-            text(
-                "INSERT INTO public.autonomous_sequence_type (sequence_type, retell_agent_id) "
-                "VALUES (:sequence_type, :retell_agent_id)"
-            ),
-            {"sequence_type": st, "retell_agent_id": default_agent},
+            text(f"INSERT INTO public.autonomous_sequence_type ({cols_sql}) VALUES ({vals_sql})"),
+            insert_params,
         )
     else:
         db.execute(
