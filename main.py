@@ -87,6 +87,10 @@ from tools.discrepancy_check_sheet import (
     get_dma_discrepancy_rows,
     get_demand_check_rows,
 )
+from tools.resources_drive_videos import (
+    get_resources_videos_folder_id,
+    list_resources_folder_videos,
+)
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -1221,6 +1225,26 @@ def get_discrepancy_check(
     except Exception as e:
         logging.exception("[discrepancy-check] failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/resources/drive-videos")
+def get_resources_drive_videos(
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List video files in the configured Google Drive folder (service account).
+    Embed previews work in-browser when the signed-in user can view the file in Drive.
+    """
+    _ = user_info  # require authenticated ACES session
+    folder_id = get_resources_videos_folder_id()
+    videos, err = list_resources_folder_videos()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return {
+        "folder_id": folder_id,
+        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
+        "videos": videos,
+    }
 
 
 class ContractEndingUpdateRequest(BaseModel):
@@ -3999,6 +4023,15 @@ def delete_task(
     
     # Log deletion in history before deleting
     log_task_deleted(db, task_id, current_user_email)
+
+    # Detach references from notes before deleting the task to avoid FK violations
+    # in databases where related_task_id does not auto-null on delete.
+    db.query(ClientStatusNote).filter(
+        ClientStatusNote.related_task_id == task_id
+    ).update(
+        {ClientStatusNote.related_task_id: None},
+        synchronize_session=False
+    )
     
     # Delete the task (history will be kept due to foreign key, or cascade if configured)
     db.delete(db_task)
