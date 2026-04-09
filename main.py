@@ -178,7 +178,6 @@ from utils.task_history import (
     log_task_created,
     log_field_change,
     log_status_change,
-    log_task_deleted,
 )
 
 # Email and scheduler imports
@@ -3810,11 +3809,7 @@ async def update_task_status(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can update
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
-    
+
     old_status = db_task.status
     db_task.status = status_update.status
     db.commit()
@@ -3861,11 +3856,7 @@ async def update_task(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can update
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
-    
+
     # If task is completed and being edited, reset to in_progress
     if db_task.status.lower() == "completed":
         log_field_change(
@@ -4016,13 +4007,6 @@ def delete_task(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can delete
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only delete tasks assigned to you or created by you.")
-    
-    # Log deletion in history before deleting
-    log_task_deleted(db, task_id, current_user_email)
 
     # Detach references from notes before deleting the task to avoid FK violations
     # in databases where related_task_id does not auto-null on delete.
@@ -4032,12 +4016,21 @@ def delete_task(
         {ClientStatusNote.related_task_id: None},
         synchronize_session=False
     )
-    
-    # Delete the task (history will be kept due to foreign key, or cascade if configured)
+
+    # PostgreSQL enforces task_history -> tasks FK; delete history rows first (prod DB may
+    # not have ON DELETE SET NULL/CASCADE from SQLAlchemy model metadata).
+    db.query(TaskHistory).filter(TaskHistory.task_id == task_id).delete(
+        synchronize_session=False
+    )
+
     db.delete(db_task)
     db.commit()
-    
-    logging.info(f"Task {task_id} deleted successfully by {current_user_email}")
+
+    logging.info(
+        "Task %s deleted by %s (task_history cleared for this task; no per-task delete row logged)",
+        task_id,
+        current_user_email,
+    )
     return {"status": "success", "message": f"Task {task_id} deleted successfully"}
 
 
