@@ -5898,6 +5898,7 @@ def autonomous_sequence_get_type_prompts(
         "sms_example",
         "voice_example",
         "retell_agent_id",
+        "retell_agent_copied",
     ]
     select_cols = [c for c in wanted if c in cols]
     if "sequence_type" not in select_cols:
@@ -5931,7 +5932,12 @@ def autonomous_sequence_patch_type_prompts(
         )
     allowed = ["system_prompt", "email_example", "sms_example", "voice_example", "retell_agent_id"]
     patchable = [k for k in allowed if k in cols and k in body]
-    if not patchable:
+    reviewed = str((body or {}).get("retell_agent_reviewed") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not patchable and not (reviewed and "retell_agent_copied" in cols):
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     exists_sql = text(
@@ -5941,11 +5947,30 @@ def autonomous_sequence_patch_type_prompts(
     if not exists:
         raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
 
-    assignments = ", ".join([f"{k} = :{k}" for k in patchable])
+    assignment_parts = [f"{k} = :{k}" for k in patchable]
     params: Dict[str, Union[str, None]] = {"sequence_type": sequence_type}
     for k in patchable:
         v = body.get(k)
         params[k] = None if v is None else str(v)
+    if "retell_agent_id" in patchable and "retell_agent_copied" in cols:
+        row_cur = db.execute(
+            text(
+                "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                "WHERE sequence_type = :sequence_type LIMIT 1"
+            ),
+            {"sequence_type": sequence_type},
+        ).mappings().first()
+        old_r = str(row_cur["retell_agent_id"] or "").strip() if row_cur else ""
+        new_r = str(params.get("retell_agent_id") or "").strip()
+        if new_r != old_r:
+            assignment_parts.append("retell_agent_copied = 0")
+    if reviewed and "retell_agent_copied" in cols and "retell_agent_copied = 0" not in " ".join(
+        assignment_parts
+    ):
+        assignment_parts.append("retell_agent_copied = 0")
+    if not assignment_parts:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    assignments = ", ".join(assignment_parts)
     update_sql = text(
         f"UPDATE public.autonomous_sequence_type SET {assignments} "
         "WHERE sequence_type = :sequence_type"
