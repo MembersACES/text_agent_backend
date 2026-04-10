@@ -226,7 +226,8 @@ def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]
         return text or None
 
     return {
-        "email_ID": _norm(context.get("email_ID")),
+        # Accept both historical `email_ID` and snake_case `email_id`.
+        "email_ID": _norm(context.get("email_ID") or context.get("email_id")),
         "contact_phone": _norm(context.get("contact_phone")),
         "contact_name": _norm(context.get("contact_name")),
         "contact_email": _norm(context.get("contact_email")),

@@ -657,6 +657,9 @@ class AutonomousSequenceStartRequest(BaseModel):
     crm_activity_id: Optional[int] = None
     anchor_at: datetime
     timezone: str = "Australia/Brisbane"  # Ignored for scheduling; sequences always use fixed AEST (Brisbane)
+    # Accept either naming from webhook payloads.
+    email_id: Optional[str] = None
+    email_ID: Optional[str] = None
     context: Dict[str, Any] = {}
 
 

@@ -5824,6 +5824,13 @@ def autonomous_sequence_start(
 ):
     from services.autonomous_sequence import get_sequence_template_by_type, start_gas_base2_sequence
 
+    sequence_context = dict(body.context or {})
+    incoming_email_id = (body.email_id or body.email_ID or "").strip()
+    if incoming_email_id and not str(sequence_context.get("email_ID") or "").strip():
+        # Keep canonical key used internally, while also preserving snake_case for compatibility.
+        sequence_context["email_ID"] = incoming_email_id
+        sequence_context.setdefault("email_id", incoming_email_id)
+
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:
         raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")
@@ -5841,7 +5848,7 @@ def autonomous_sequence_start(
         crm_activity_id=body.crm_activity_id,
         anchor_at=body.anchor_at,
         tz=body.timezone,
-        context=body.context or {},
+        context=sequence_context,
     )
     steps_planned = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run.id).count()
     return {
