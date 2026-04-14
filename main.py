@@ -43,6 +43,15 @@ import io
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
 from services import airtable_client
+from services.pudu_dashboard import (
+    build_dashboard_payload,
+    fetch_clean_task_detail,
+    fetch_cleanbot_task_definitions,
+    fetch_pudu_robots_list,
+    fetch_pudu_shops_list,
+)
+from services.pudu_directory import fetch_pudu_weekly_directory
+from services.pudu_open_tasks import fetch_open_task_list as pudu_fetch_open_task_list
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -183,7 +192,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -856,6 +865,170 @@ def get_robot_data(
     except Exception as e:
         logging.error(f"Robot data fetch failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error retrieving robot data: {str(e)}")
+
+
+@app.get("/api/pudu/dashboard")
+def pudu_dashboard_endpoint(
+    sn: str = Query(..., min_length=2, description="Robot serial number"),
+    start_time: Optional[int] = Query(
+        None, description="Unix period start (seconds); default end_time − 24h"
+    ),
+    end_time: Optional[int] = Query(
+        None, description="Unix period end (seconds); default now (UTC)"
+    ),
+    shop_id: Optional[str] = Query(None, description="Optional Pudu shop id (scopes mode + executions)"),
+    execution_offset: int = Query(0, ge=0, description="Offset for execution log pagination (advance by used_lim)"),
+    only_executions: bool = Query(
+        False,
+        description="If true, only refetch execution list (faster for Load more)",
+    ),
+    refresh: bool = Query(False, description="Bypass short-lived server cache (about 45s)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Aggregated Pudu cleaning dashboard for a robot: period summary (clean/mode),
+    robot-scoped paging series (clean/paging, sn-only branch), first page of execution rows
+    (log/clean_task/query_list with resilient limits). Authenticated CRM users only; secrets stay server-side.
+    """
+    now = int(datetime.now(timezone.utc).timestamp())
+    et = end_time if end_time is not None else now
+    st = start_time if start_time is not None else et - 86400
+    if st >= et:
+        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+    try:
+        payload = build_dashboard_payload(
+            sn.strip(),
+            st,
+            et,
+            shop_id.strip() if shop_id else None,
+            execution_offset,
+            only_executions=only_executions,
+            skip_cache=refresh,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logging.exception("Pudu dashboard failed")
+        raise HTTPException(status_code=500, detail="Pudu dashboard failed")
+    payload["user_email"] = user_info.get("email")
+    return payload
+
+
+@app.get("/api/pudu/clean-task-detail")
+def pudu_clean_task_detail_endpoint(
+    sn: str = Query(..., min_length=2),
+    report_id: str = Query(..., min_length=1),
+    start_time: int = Query(..., description="Same window as dashboard list (Unix seconds)"),
+    end_time: int = Query(...),
+    shop_id: Optional[str] = Query(None),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Single execution row detail from log/clean_task/query."""
+    try:
+        data, err = fetch_clean_task_detail(
+            sn.strip(),
+            report_id.strip(),
+            start_time,
+            end_time,
+            shop_id.strip() if shop_id else None,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    if data is None:
+        raise HTTPException(status_code=404, detail="No detail payload from Pudu")
+    return {"data": data, "user_email": user_info.get("email")}
+
+
+@app.get("/api/pudu/directory")
+def pudu_directory_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Sites / robots the org can access (n8n weekly map). Used to populate Base 1 Robot Data pickers.
+    """
+    try:
+        items = fetch_pudu_weekly_directory()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Directory service HTTP {e.response.status_code}",
+        ) from e
+    except Exception as e:
+        logging.exception("Pudu directory fetch failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"items": items, "user_email": user_info.get("email")}
+
+
+@app.get("/api/pudu/open-tasks")
+def pudu_open_tasks_endpoint(
+    shop_id: str = Query(..., min_length=1, description="Pudu shop_id"),
+    sn: str = Query(..., min_length=2, description="Robot serial"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Task definitions on a bot (cleanbot open task list), not execution history."""
+    try:
+        data, err = pudu_fetch_open_task_list(shop_id, sn)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {"data": data, "user_email": user_info.get("email")}
+
+
+@app.get("/api/pudu/shops")
+def pudu_shops_list_endpoint(user_info: dict = Depends(verify_google_token)):
+    """List Pudu shops from open platform (paginated server-side)."""
+    try:
+        shops, err = fetch_pudu_shops_list()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logging.exception("Pudu shops list failed")
+        raise HTTPException(status_code=500, detail="Pudu shops list failed")
+    return {
+        "shops": shops,
+        "warning": err,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/pudu/robots")
+def pudu_robots_list_endpoint(
+    shop_id: Optional[str] = Query(None, description="Filter robots for one shop; omit for tenant-wide list"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """List Pudu robots / machines (optional shop_id filter)."""
+    try:
+        robots, err = fetch_pudu_robots_list(shop_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logging.exception("Pudu robots list failed")
+        raise HTTPException(status_code=500, detail="Pudu robots list failed")
+    return {
+        "robots": robots,
+        "warning": err,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/pudu/task-definitions")
+def pudu_task_definitions_endpoint(
+    shop_id: str = Query(..., min_length=1, description="Pudu shop id (required for task catalog)"),
+    sn: str = Query(..., min_length=2, description="Robot serial number"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Cleanbot task definitions (scheduled jobs), not execution log rows."""
+    try:
+        data, err = fetch_cleanbot_task_definitions(shop_id, sn, offset, limit)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {"data": data, "user_email": user_info.get("email")}
+
 
 @app.post("/api/get-utility-information")
 def get_utility_information(
