@@ -8,7 +8,7 @@ import json
 import logging
 import os
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -25,6 +25,26 @@ from models import (
 )
 
 
+def _is_postgresql(bind) -> bool:
+    return bind.dialect.name == "postgresql"
+
+
+def _reflect_table_names(insp, bind) -> set[str]:
+    """Table names for introspection; avoid schema=public on SQLite (breaks sqlite_master)."""
+    names = set(insp.get_table_names())
+    if _is_postgresql(bind):
+        names |= set(insp.get_table_names(schema="public"))
+    return names
+
+
+def _inspector_schema_kw(bind) -> dict:
+    return {"schema": "public"} if _is_postgresql(bind) else {}
+
+
+def _qualified_table(bind, table: str) -> str:
+    return f"public.{table}" if _is_postgresql(bind) else table
+
+
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     """Remove a run and all dependent rows (events, steps, context extension table)."""
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
@@ -38,10 +58,11 @@ def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     )
     # Postgres FK autonomous_sequence_context_run_id_fkey — table may exist only in some envs
     insp = inspect(db.bind)
-    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    tables = _reflect_table_names(insp, db.bind)
     if "autonomous_sequence_context" in tables:
+        ctx_tbl = _qualified_table(db.bind, "autonomous_sequence_context")
         db.execute(
-            text("DELETE FROM public.autonomous_sequence_context WHERE run_id = :run_id"),
+            text(f"DELETE FROM {ctx_tbl} WHERE run_id = :run_id"),
             {"run_id": run_id},
         )
     db.delete(run)
@@ -205,7 +226,8 @@ def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]
         return text or None
 
     return {
-        "email_ID": _norm(context.get("email_ID")),
+        # Accept both historical `email_ID` and snake_case `email_id`.
+        "email_ID": _norm(context.get("email_ID") or context.get("email_id")),
         "contact_phone": _norm(context.get("contact_phone")),
         "contact_name": _norm(context.get("contact_name")),
         "contact_email": _norm(context.get("contact_email")),
@@ -230,64 +252,75 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
 
 def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool:
     """
-    Insert a minimal public.autonomous_sequence_type row when missing so
+    Insert a minimal autonomous_sequence_type row when missing so
     autonomous_sequence_runs.sequence_type FK can resolve. Idempotent.
     Returns True if a row was inserted.
     """
     st = (sequence_type or "").strip()
     if not st:
         return False
-    insp = inspect(db.bind)
-    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
     if "autonomous_sequence_type" not in tables:
         return False
-    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
-    if not cols:
-        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    skw = _inspector_schema_kw(bind)
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", **skw)]
     colset = {str(c) for c in cols if c}
     if "sequence_type" not in colset:
         return False
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
     exists = db.execute(
-        text("SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"),
+        text(f"SELECT 1 FROM {ast_tbl} WHERE sequence_type = :sequence_type LIMIT 1"),
         {"sequence_type": st},
     ).first()
     if exists:
         return False
 
     default_agent = ""
+    agent_was_copied = False
     if "retell_agent_id" in colset:
         for ref_type in ("gas_base2_followup_v1", "ci_electricity_base2_followup_v1"):
             row = db.execute(
                 text(
-                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    f"SELECT retell_agent_id FROM {ast_tbl} "
                     "WHERE sequence_type = :sequence_type AND COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
                 ),
                 {"sequence_type": ref_type},
             ).first()
             if row and row[0]:
                 default_agent = str(row[0]).strip()
+                agent_was_copied = True
                 break
         if not default_agent:
             any_row = db.execute(
                 text(
-                    "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                    f"SELECT retell_agent_id FROM {ast_tbl} "
                     "WHERE COALESCE(TRIM(retell_agent_id), '') <> '' LIMIT 1"
                 ),
             ).first()
             if any_row and any_row[0]:
                 default_agent = str(any_row[0]).strip()
+                agent_was_copied = True
 
     if "retell_agent_id" in colset:
+        insert_cols = ["sequence_type", "retell_agent_id"]
+        insert_params: dict[str, Union[str, int]] = {
+            "sequence_type": st,
+            "retell_agent_id": default_agent,
+        }
+        if "retell_agent_copied" in colset:
+            insert_cols.append("retell_agent_copied")
+            insert_params["retell_agent_copied"] = 1 if agent_was_copied else 0
+        cols_sql = ", ".join(insert_cols)
+        vals_sql = ", ".join(f":{c}" for c in insert_cols)
         db.execute(
-            text(
-                "INSERT INTO public.autonomous_sequence_type (sequence_type, retell_agent_id) "
-                "VALUES (:sequence_type, :retell_agent_id)"
-            ),
-            {"sequence_type": st, "retell_agent_id": default_agent},
+            text(f"INSERT INTO {ast_tbl} ({cols_sql}) VALUES ({vals_sql})"),
+            insert_params,
         )
     else:
         db.execute(
-            text("INSERT INTO public.autonomous_sequence_type (sequence_type) VALUES (:sequence_type)"),
+            text(f"INSERT INTO {ast_tbl} (sequence_type) VALUES (:sequence_type)"),
             {"sequence_type": st},
         )
     return True

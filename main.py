@@ -87,6 +87,10 @@ from tools.discrepancy_check_sheet import (
     get_dma_discrepancy_rows,
     get_demand_check_rows,
 )
+from tools.resources_drive_videos import (
+    get_resources_videos_folder_id,
+    list_resources_folder_videos,
+)
 from tools.testimonial_solution_content import get_merged_content, save_override
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -174,7 +178,6 @@ from utils.task_history import (
     log_task_created,
     log_field_change,
     log_status_change,
-    log_task_deleted,
 )
 
 # Email and scheduler imports
@@ -1221,6 +1224,26 @@ def get_discrepancy_check(
     except Exception as e:
         logging.exception("[discrepancy-check] failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/resources/drive-videos")
+def get_resources_drive_videos(
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List video files in the configured Google Drive folder (service account).
+    Embed previews work in-browser when the signed-in user can view the file in Drive.
+    """
+    _ = user_info  # require authenticated ACES session
+    folder_id = get_resources_videos_folder_id()
+    videos, err = list_resources_folder_videos()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return {
+        "folder_id": folder_id,
+        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
+        "videos": videos,
+    }
 
 
 class ContractEndingUpdateRequest(BaseModel):
@@ -3786,11 +3809,7 @@ async def update_task_status(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can update
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
-    
+
     old_status = db_task.status
     db_task.status = status_update.status
     db.commit()
@@ -3837,11 +3856,7 @@ async def update_task(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can update
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only edit tasks assigned to you or created by you.")
-    
+
     # If task is completed and being edited, reset to in_progress
     if db_task.status.lower() == "completed":
         log_field_change(
@@ -3992,19 +4007,30 @@ def delete_task(
     
     if not db_task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
-    # Permission check: only assigned user or creator can delete
-    if db_task.assigned_to != current_user_email and db_task.assigned_by != current_user_email:
-        raise HTTPException(status_code=403, detail="You may only delete tasks assigned to you or created by you.")
-    
-    # Log deletion in history before deleting
-    log_task_deleted(db, task_id, current_user_email)
-    
-    # Delete the task (history will be kept due to foreign key, or cascade if configured)
+
+    # Detach references from notes before deleting the task to avoid FK violations
+    # in databases where related_task_id does not auto-null on delete.
+    db.query(ClientStatusNote).filter(
+        ClientStatusNote.related_task_id == task_id
+    ).update(
+        {ClientStatusNote.related_task_id: None},
+        synchronize_session=False
+    )
+
+    # PostgreSQL enforces task_history -> tasks FK; delete history rows first (prod DB may
+    # not have ON DELETE SET NULL/CASCADE from SQLAlchemy model metadata).
+    db.query(TaskHistory).filter(TaskHistory.task_id == task_id).delete(
+        synchronize_session=False
+    )
+
     db.delete(db_task)
     db.commit()
-    
-    logging.info(f"Task {task_id} deleted successfully by {current_user_email}")
+
+    logging.info(
+        "Task %s deleted by %s (task_history cleared for this task; no per-task delete row logged)",
+        task_id,
+        current_user_email,
+    )
     return {"status": "success", "message": f"Task {task_id} deleted successfully"}
 
 
@@ -5798,6 +5824,13 @@ def autonomous_sequence_start(
 ):
     from services.autonomous_sequence import get_sequence_template_by_type, start_gas_base2_sequence
 
+    sequence_context = dict(body.context or {})
+    incoming_email_id = (body.email_id or body.email_ID or "").strip()
+    if incoming_email_id and not str(sequence_context.get("email_ID") or "").strip():
+        # Keep canonical key used internally, while also preserving snake_case for compatibility.
+        sequence_context["email_ID"] = incoming_email_id
+        sequence_context.setdefault("email_id", incoming_email_id)
+
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:
         raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")
@@ -5815,7 +5848,7 @@ def autonomous_sequence_start(
         crm_activity_id=body.crm_activity_id,
         anchor_at=body.anchor_at,
         tz=body.timezone,
-        context=body.context or {},
+        context=sequence_context,
     )
     steps_planned = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run.id).count()
     return {
@@ -5898,6 +5931,7 @@ def autonomous_sequence_get_type_prompts(
         "sms_example",
         "voice_example",
         "retell_agent_id",
+        "retell_agent_copied",
     ]
     select_cols = [c for c in wanted if c in cols]
     if "sequence_type" not in select_cols:
@@ -5931,7 +5965,12 @@ def autonomous_sequence_patch_type_prompts(
         )
     allowed = ["system_prompt", "email_example", "sms_example", "voice_example", "retell_agent_id"]
     patchable = [k for k in allowed if k in cols and k in body]
-    if not patchable:
+    reviewed = str((body or {}).get("retell_agent_reviewed") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not patchable and not (reviewed and "retell_agent_copied" in cols):
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     exists_sql = text(
@@ -5941,11 +5980,30 @@ def autonomous_sequence_patch_type_prompts(
     if not exists:
         raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
 
-    assignments = ", ".join([f"{k} = :{k}" for k in patchable])
+    assignment_parts = [f"{k} = :{k}" for k in patchable]
     params: Dict[str, Union[str, None]] = {"sequence_type": sequence_type}
     for k in patchable:
         v = body.get(k)
         params[k] = None if v is None else str(v)
+    if "retell_agent_id" in patchable and "retell_agent_copied" in cols:
+        row_cur = db.execute(
+            text(
+                "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                "WHERE sequence_type = :sequence_type LIMIT 1"
+            ),
+            {"sequence_type": sequence_type},
+        ).mappings().first()
+        old_r = str(row_cur["retell_agent_id"] or "").strip() if row_cur else ""
+        new_r = str(params.get("retell_agent_id") or "").strip()
+        if new_r != old_r:
+            assignment_parts.append("retell_agent_copied = 0")
+    if reviewed and "retell_agent_copied" in cols and "retell_agent_copied = 0" not in " ".join(
+        assignment_parts
+    ):
+        assignment_parts.append("retell_agent_copied = 0")
+    if not assignment_parts:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    assignments = ", ".join(assignment_parts)
     update_sql = text(
         f"UPDATE public.autonomous_sequence_type SET {assignments} "
         "WHERE sequence_type = :sequence_type"
