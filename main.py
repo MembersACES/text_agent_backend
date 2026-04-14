@@ -52,6 +52,8 @@ from services.pudu_dashboard import (
 )
 from services.pudu_directory import fetch_pudu_weekly_directory
 from services.pudu_open_tasks import fetch_open_task_list as pudu_fetch_open_task_list
+from services.trial_summary_dashboard import generate_dashboard_trial_report
+from services.trial_summary_report import DEFAULT_START_DATE
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -600,6 +602,17 @@ class DataRequest(BaseModel):
 class RobotDataRequest(BaseModel):
     robot_number: str
 
+class PuduTrialRobotInput(BaseModel):
+    sn: str
+    label: Optional[str] = None
+
+class PuduTrialSummaryReportRequest(BaseModel):
+    shop_id: str
+    shop_name: Optional[str] = None
+    start_date: Optional[str] = None  # YYYY-MM-DD
+    labor_rate: Optional[float] = None
+    robots: Optional[List[PuduTrialRobotInput]] = None
+
 class UtilityRecordUpdateRequest(BaseModel):
     """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
     business_name: str
@@ -1028,6 +1041,96 @@ def pudu_task_definitions_endpoint(
     if err:
         raise HTTPException(status_code=502, detail=err)
     return {"data": data, "user_email": user_info.get("email")}
+
+
+def _robot_sn_from_open_platform_row(row: Dict[str, object]) -> str:
+    for key in ("sn", "SN", "robot_sn", "serial_num", "serial_number", "device_sn"):
+        v = row.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _robot_label_from_open_platform_row(row: Dict[str, object], sn: str) -> str:
+    for key in ("robot_name", "name", "device_name", "nick_name", "nickname"):
+        v = row.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return sn
+
+
+@app.post("/api/pudu/trial-summary-report")
+def pudu_trial_summary_report_endpoint(
+    request: PuduTrialSummaryReportRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Generate a site-level trial summary PDF for the selected Pudu shop.
+    If robots are omitted, loads all robots for that shop from the open platform.
+    """
+    shop_id = (request.shop_id or "").strip()
+    if not shop_id:
+        raise HTTPException(status_code=400, detail="shop_id is required")
+
+    shop_name = (request.shop_name or "").strip() or f"Shop {shop_id}"
+    report_start = (request.start_date or "").strip() or DEFAULT_START_DATE
+
+    robots_payload = [
+        {"sn": r.sn.strip(), "label": (r.label or "").strip() or r.sn.strip()}
+        for r in (request.robots or [])
+        if (r.sn or "").strip()
+    ]
+
+    if not robots_payload:
+        try:
+            robots_raw, robots_warning = fetch_pudu_robots_list(shop_id)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except Exception:
+            logging.exception("Pudu robots list failed for trial summary report")
+            raise HTTPException(status_code=500, detail="Failed to load robots for selected site")
+
+        if robots_warning:
+            logging.warning("Pudu trial summary robots warning for shop_id=%s: %s", shop_id, robots_warning)
+
+        dedup: Dict[str, Dict[str, str]] = {}
+        for row in robots_raw:
+            if not isinstance(row, dict):
+                continue
+            sn = _robot_sn_from_open_platform_row(row)
+            if not sn:
+                continue
+            dedup[sn] = {"sn": sn, "label": _robot_label_from_open_platform_row(row, sn)}
+        robots_payload = list(dedup.values())
+
+    if not robots_payload:
+        raise HTTPException(status_code=400, detail="No robots available for this site")
+
+    result = generate_dashboard_trial_report(
+        shop_id=shop_id,
+        shop_name=shop_name,
+        robots=robots_payload,
+        start_date=report_start,
+        labour_rate=request.labor_rate,
+    )
+    if not result.ok:
+        raise HTTPException(status_code=400, detail=result.error or "Failed to generate report")
+    if not result.report_pdf_bytes:
+        raise HTTPException(status_code=500, detail="Report generated without PDF output")
+
+    safe_shop = "".join(c if c.isalnum() else "-" for c in shop_name).strip("-") or "site"
+    filename = f"trial-summary-{safe_shop}.pdf"
+    logging.info(
+        "Generated Pudu trial summary report shop_id=%s user=%s robots=%s",
+        shop_id,
+        user_info.get("email"),
+        len(robots_payload),
+    )
+    return Response(
+        content=result.report_pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/api/get-utility-information")
