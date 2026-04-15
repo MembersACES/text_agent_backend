@@ -73,6 +73,8 @@ class OfferActivityType(str, Enum):
     # User-added from offer page (no pipeline/status side effects)
     MANUAL_DOCUMENT = "manual_document"
     MANUAL_ACTIVITY = "manual_activity"
+    # Member CRM Documents tab / drive filing (no pipeline side effects; not on Strategy WIP)
+    MEMBER_DOCUMENT_UPLOAD = "member_document_upload"
     ONE_MONTH_SAVINGS_INVOICE = "one_month_savings_invoice"
     # ACES solar panel cleaning quote (Docs/PDF + email via n8n)
     SOLAR_CLEANING_QUOTE_GENERATED = "solar_cleaning_quote_generated"

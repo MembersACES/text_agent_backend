@@ -345,6 +345,94 @@ def create_offer_activity(
     return activity
 
 
+MEMBER_DOCS_UTILITY_TYPE = "member_documents"
+
+
+def _utility_context_from_contract_key(key: Optional[str]) -> Optional[tuple[str, str]]:
+    """Map CRM contract row key (e.g. C&I Electricity) to (utility_type, utility_type_identifier)."""
+    if not key or not str(key).strip():
+        return None
+    m = {
+        "C&I Electricity": ("electricity", "C&I Electricity"),
+        "SME Electricity": ("electricity", "SME Electricity"),
+        "C&I Gas": ("gas", "C&I Gas"),
+        "SME Gas": ("gas", "SME Gas"),
+        "Waste": ("waste", "Waste"),
+        "Oil": ("other", "Other"),
+        "DMA": ("electricity", "DMA"),
+        "Other": ("other", "Other"),
+    }
+    return m.get(str(key).strip())
+
+
+def _utility_context_from_drive_filing_type(filing_type: str) -> Optional[tuple[str, str]]:
+    """Signed contract filing types attach to the matching utility offer; other filings use a synthetic bucket."""
+    signed = {
+        "signed_CI_E": ("electricity", "C&I Electricity"),
+        "signed_SME_E": ("electricity", "SME Electricity"),
+        "signed_CI_G": ("gas", "C&I Gas"),
+        "signed_SME_G": ("gas", "SME Gas"),
+        "signed_WASTE": ("waste", "Waste"),
+        "signed_OIL": ("other", "Other"),
+        "signed_DMA": ("electricity", "DMA"),
+    }
+    if filing_type in signed:
+        return signed[filing_type]
+    ft = (filing_type or "")[:100]
+    if not ft:
+        return None
+    return (MEMBER_DOCS_UTILITY_TYPE, ft)
+
+
+def resolve_offer_for_member_upload(
+    db: Session,
+    *,
+    client: Client,
+    business_name: str,
+    created_by: Optional[str] = None,
+    offer_id: Optional[int] = None,
+    filing_type: Optional[str] = None,
+    utility_key: Optional[str] = None,
+) -> Offer:
+    """
+    Pick an offer to attach member upload activities to: explicit offer_id, utility-key
+    (contract type), signed-contract filing_type, else a per-filing synthetic member_documents offer.
+    """
+    if offer_id is not None:
+        offer = (
+            db.query(Offer)
+            .filter(Offer.id == offer_id, Offer.client_id == client.id)
+            .first()
+        )
+        if not offer:
+            raise HTTPException(status_code=404, detail="Offer not found for this client")
+        return offer
+
+    ctx = _utility_context_from_contract_key(utility_key)
+    if ctx is None and filing_type:
+        ctx = _utility_context_from_drive_filing_type(filing_type.strip())
+    if ctx:
+        ut, utid = ctx
+        return get_or_create_offer_for_activity(
+            db,
+            client.id,
+            business_name,
+            ut,
+            created_by,
+            utility_type_identifier=utid,
+            identifier=None,
+        )
+    return get_or_create_offer_for_activity(
+        db,
+        client.id,
+        business_name,
+        MEMBER_DOCS_UTILITY_TYPE,
+        created_by,
+        utility_type_identifier="General",
+        identifier=None,
+    )
+
+
 def get_or_create_offer_for_activity(
     db: Session,
     client_id: int,
@@ -433,6 +521,7 @@ ACTIVITY_TYPE_LABELS = {
     OfferActivityType.SERVICE_AGREEMENT: "Service agreement",
     OfferActivityType.SOLAR_CLEANING_QUOTE_GENERATED: "Solar panel cleaning quote generated",
     OfferActivityType.SOLAR_CLEANING_QUOTE_SENT: "Solar panel cleaning quote sent to client",
+    OfferActivityType.MEMBER_DOCUMENT_UPLOAD: "Member document uploaded",
 }
 
 # Map offer status to Strategy & WIP status text.

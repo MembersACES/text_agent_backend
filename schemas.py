@@ -396,6 +396,17 @@ class OfferActivityCreate(BaseModel):
     created_by: Optional[str] = None
 
 
+class MemberDocumentUploadActivityCreate(BaseModel):
+    """Log a member-area file upload on the activity report (offer resolved server-side)."""
+    upload_kind: str
+    filename: Optional[str] = None
+    document_link: Optional[str] = None
+    filing_type: Optional[str] = None
+    utility_key: Optional[str] = None
+    offer_id: Optional[int] = None
+    metadata: Optional[dict] = None
+
+
 def _parse_metadata(v: Any) -> Optional[dict]:
     """Parse metadata from DB: may be stored as JSON string."""
     if v is None:

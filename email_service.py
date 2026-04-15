@@ -1,6 +1,7 @@
 """
 Email service for task notifications via n8n webhook
 """
+from collections import defaultdict
 from sqlalchemy.orm import Session
 from models import Task, User
 from datetime import datetime, date as date_type
@@ -132,7 +133,7 @@ async def send_task_completed_email(assigned_by_email: str, assigned_to_email: s
 
 
 async def check_due_tasks(db: Session):
-    """Check for tasks due today or overdue and send notifications (batched n8n calls)."""
+    """Check for tasks due today or overdue; send one daily_task_digest per assignee via n8n."""
     today = date_type.today()
     today_start = datetime.combine(today, datetime.min.time())
 
@@ -165,45 +166,60 @@ async def check_due_tasks(db: Session):
             overdue_filtered.append(task)
 
     due_with_email = [t for t in due_today_filtered if t.assigned_to]
-    if due_with_email:
-        items = [_due_today_item(t, db) for t in due_with_email]
-        ok = await send_notification(
-            "due_today_batch",
-            {"items": items},
-            timeout=_BATCH_WEBHOOK_TIMEOUT,
-        )
-        if ok:
-            now = datetime.now()
-            for t in due_with_email:
-                t.last_notification_sent_at = now
-            try:
-                db.commit()
-            except Exception as e:
-                logging.error(f"Failed to commit due_today_batch notification timestamps: {e}")
-                db.rollback()
-        else:
-            logging.error("due_today_batch webhook failed; not updating last_notification_sent_at")
-
     overdue_with_email = [t for t in overdue_filtered if t.assigned_to]
-    if overdue_with_email:
-        items = [_overdue_item(t, db) for t in overdue_with_email]
+
+    # One digest entry per assignee (due today + overdue in a single n8n payload).
+    by_user: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(
+        lambda: {"due_today": [], "overdue": []}
+    )
+    for t in due_with_email:
+        email = t.assigned_to
+        if email:
+            by_user[email]["due_today"].append(_due_today_item(t, db))
+    for t in overdue_with_email:
+        email = t.assigned_to
+        if email:
+            by_user[email]["overdue"].append(_overdue_item(t, db))
+
+    digest: List[Dict[str, Any]] = []
+    for user_email, buckets in by_user.items():
+        if not buckets["due_today"] and not buckets["overdue"]:
+            continue
+        digest.append(
+            {
+                "user_email": user_email,
+                "user_name": _assignee_display_name(db, user_email),
+                "due_today": buckets["due_today"],
+                "overdue": buckets["overdue"],
+            }
+        )
+
+    all_digest_tasks = due_with_email + overdue_with_email
+    if digest:
         ok = await send_notification(
-            "overdue_batch",
-            {"items": items},
+            "daily_task_digest",
+            {"digest": digest},
             timeout=_BATCH_WEBHOOK_TIMEOUT,
         )
         if ok:
             now = datetime.now()
-            for t in overdue_with_email:
+            for t in all_digest_tasks:
                 t.last_notification_sent_at = now
             try:
                 db.commit()
             except Exception as e:
-                logging.error(f"Failed to commit overdue_batch notification timestamps: {e}")
+                logging.error(
+                    f"Failed to commit daily_task_digest notification timestamps: {e}"
+                )
                 db.rollback()
         else:
-            logging.error("overdue_batch webhook failed; not updating last_notification_sent_at")
+            logging.error(
+                "daily_task_digest webhook failed; not updating last_notification_sent_at"
+            )
 
     logging.info(
-        f"Daily task check completed: {len(due_today_filtered)} due today, {len(overdue_filtered)} overdue"
+        "Daily task check completed: %s due today, %s overdue, digest_recipients=%s",
+        len(due_today_filtered),
+        len(overdue_filtered),
+        len(digest),
     )
