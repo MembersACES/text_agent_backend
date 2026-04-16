@@ -24,6 +24,7 @@ import copy
 from google.auth.transport.requests import Request
 from urllib.parse import urlparse, parse_qs
 import os
+import sys
 import logging
 import tempfile
 import os
@@ -44,6 +45,7 @@ import io
 from tools.business_info import get_business_information, get_base1_landing_responses
 from services import airtable_client
 from services.pudu_dashboard import (
+    annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
     fetch_clean_task_detail,
     fetch_cleanbot_task_definitions,
@@ -143,6 +145,7 @@ from schemas import (
     OfferResponse,
     OfferActivityCreate,
     OfferActivityResponse,
+    MemberDocumentUploadActivityCreate,
     ActivityReportItem,
     OfferPipelineStage as OfferPipelineStageSchema,
     StrategyItemCreate,
@@ -180,6 +183,7 @@ from services.crm import (
     update_offer_status_and_propagate_client_stage,
     create_offer_activity,
     get_or_create_offer_for_activity,
+    resolve_offer_for_member_upload,
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
 )
@@ -198,8 +202,24 @@ from datetime import datetime, date, timezone
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+# Configure logging (uvicorn may configure the root logger first; keep app logs visible)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
+
+
+def _configure_aces_pudu_logging() -> None:
+    """Uvicorn often sets root to WARNING; route Pudu diagnostics through a dedicated logger."""
+    log = logging.getLogger("aces.pudu")
+    log.setLevel(logging.INFO)
+    if log.handlers:
+        return
+    h = logging.StreamHandler(sys.stderr)
+    h.setLevel(logging.INFO)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [aces.pudu] %(message)s"))
+    log.addHandler(h)
+    log.propagate = False
+
+
+_configure_aces_pudu_logging()
 
 app = FastAPI()
 
@@ -908,6 +928,17 @@ def pudu_dashboard_endpoint(
     st = start_time if start_time is not None else et - 86400
     if st >= et:
         raise HTTPException(status_code=400, detail="start_time must be before end_time")
+    logging.getLogger("aces.pudu").info(
+        "GET /api/pudu/dashboard user=%s sn=%s shop_id=%s start_time=%s end_time=%s execution_offset=%s only_executions=%s refresh=%s",
+        user_info.get("email"),
+        sn.strip(),
+        (shop_id.strip() if shop_id else None),
+        st,
+        et,
+        execution_offset,
+        only_executions,
+        refresh,
+    )
     try:
         payload = build_dashboard_payload(
             sn.strip(),
@@ -1018,6 +1049,26 @@ def pudu_robots_list_endpoint(
     except Exception:
         logging.exception("Pudu robots list failed")
         raise HTTPException(status_code=500, detail="Pudu robots list failed")
+    annotate_robot_list_with_canonical_sn(robots)
+    plog = logging.getLogger("aces.pudu")
+    plog.info(
+        "GET /api/pudu/robots user=%s shop_id=%s count=%s",
+        user_info.get("email"),
+        (shop_id or "").strip() or "(all)",
+        len(robots),
+    )
+    for i, row in enumerate(robots[:12]):
+        if not isinstance(row, dict):
+            continue
+        plog.info(
+            "  robot[%s] product=%r sn=%r sn_canonical=%r mac=%r keys_sample=%s",
+            i,
+            row.get("product_code") or row.get("productCode") or row.get("type"),
+            row.get("sn"),
+            row.get("sn_canonical"),
+            row.get("mac") or row.get("MAC"),
+            list(row.keys())[:18],
+        )
     return {
         "robots": robots,
         "warning": err,
@@ -1059,6 +1110,22 @@ def _robot_label_from_open_platform_row(row: Dict[str, object], sn: str) -> str:
     return sn
 
 
+def _robot_display_label_from_open_platform_row(row: Dict[str, object], sn: str) -> str:
+    """Product / model code first (matches dashboard robot tabs), then device name, then serial."""
+    pc = str(
+        row.get("product_code")
+        or row.get("productCode")
+        or row.get("model")
+        or row.get("robot_model")
+        or row.get("machine_model")
+        or row.get("type")
+        or ""
+    ).strip()
+    if pc:
+        return pc
+    return _robot_label_from_open_platform_row(row, sn)
+
+
 @app.post("/api/pudu/trial-summary-report")
 def pudu_trial_summary_report_endpoint(
     request: PuduTrialSummaryReportRequest,
@@ -1093,14 +1160,15 @@ def pudu_trial_summary_report_endpoint(
         if robots_warning:
             logging.warning("Pudu trial summary robots warning for shop_id=%s: %s", shop_id, robots_warning)
 
+        annotate_robot_list_with_canonical_sn(robots_raw)
         dedup: Dict[str, Dict[str, str]] = {}
         for row in robots_raw:
             if not isinstance(row, dict):
                 continue
-            sn = _robot_sn_from_open_platform_row(row)
+            sn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
             if not sn:
                 continue
-            dedup[sn] = {"sn": sn, "label": _robot_label_from_open_platform_row(row, sn)}
+            dedup[sn] = {"sn": sn, "label": _robot_display_label_from_open_platform_row(row, sn)}
         robots_payload = list(dedup.values())
 
     if not robots_payload:
@@ -5553,6 +5621,59 @@ def list_client_activities(
         .all()
     )
     return [OfferActivityResponse.model_validate(a) for a in activities]
+
+
+@app.post(
+    "/api/clients/{client_id}/member-upload-activity",
+    response_model=OfferActivityResponse,
+)
+def post_member_upload_activity(
+    client_id: int,
+    body: MemberDocumentUploadActivityCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Record a file upload from the member CRM Documents area on the global activity report.
+    Resolves or creates a suitable offer (utility-specific for signed contracts when possible).
+    """
+    user_info = user_data.get("idinfo") or {}
+    user_email = user_info.get("email")
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    business_name = (client.business_name or "").strip()
+    if not business_name:
+        raise HTTPException(status_code=400, detail="Client has no business_name")
+
+    offer = resolve_offer_for_member_upload(
+        db,
+        client=client,
+        business_name=business_name,
+        created_by=user_email,
+        offer_id=body.offer_id,
+        filing_type=body.filing_type,
+        utility_key=body.utility_key,
+    )
+    meta: dict = {}
+    if body.metadata:
+        meta.update(body.metadata)
+    meta["upload_kind"] = (body.upload_kind or "").strip() or "unknown"
+    if body.filename:
+        meta["filename"] = body.filename
+    if body.filing_type:
+        meta["filing_type"] = body.filing_type
+
+    activity = create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.MEMBER_DOCUMENT_UPLOAD,
+        document_link=(body.document_link or "").strip() or None,
+        metadata=meta or None,
+        created_by=user_email,
+    )
+    return OfferActivityResponse.model_validate(activity)
 
 
 @app.get("/api/clients/{client_id}/notes", response_model=List[ClientStatusNoteResponse])

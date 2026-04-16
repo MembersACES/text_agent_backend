@@ -19,9 +19,146 @@ from services.pudu_signed_request import pudu_message_ok, signed_pudu_get
 
 DM_SYSTEM_ERROR = "DM_SYSTEM_ERROR"
 
+PUDU_LOG = logging.getLogger("aces.pudu")
+
+_PRIO_ROBOT_SN_KEYS = (
+    "machine_sn",
+    "machineSn",
+    "machine_serial_number",
+    "machine_serial_no",
+    "machineNo",
+    "robot_sn",
+    "robotSn",
+    "robot_serial_number",
+    "device_sn",
+    "deviceSn",
+    "device_serial_number",
+    "serial_number",
+    "serialNumber",
+    "serial_no",
+    "equipment_sn",
+    "equipment_no",
+    "sn",
+    "SN",
+    "Sn",
+    "S/N",
+)
+
+
+def _norm_serial_str(v: Any) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() in ("null", "none", "undefined", "-"):
+        return ""
+    return s
+
+
+def _robot_serial_candidates(row: Dict[str, Any], *, depth: int = 0) -> List[str]:
+    """Ordered serial-like strings from an open-platform robot row (sn is sometimes wrong or shared)."""
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(s: str) -> None:
+        s = s.strip()
+        if len(s) < 4 or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    for k in _PRIO_ROBOT_SN_KEYS:
+        add(_norm_serial_str(row.get(k)))
+
+    if depth < 3:
+        for nest_key in ("robot", "device", "machine", "deviceInfo", "robotInfo", "robot_info"):
+            inner = row.get(nest_key)
+            if isinstance(inner, dict):
+                for c in _robot_serial_candidates(inner, depth=depth + 1):
+                    add(c)
+
+    for key, v in row.items():
+        if isinstance(v, (dict, list)):
+            continue
+        sv = _norm_serial_str(v)
+        if len(sv) < 6:
+            continue
+        kn = str(key).lower().replace("-", "_")
+        if kn in ("shop_id", "shopid", "id", "shop_name", "shopname"):
+            continue
+        if "serial" in kn or kn.endswith("_sn") or kn == "sn" or "machine_no" in kn:
+            add(sv)
+    return out
+
+
+def annotate_robot_list_with_canonical_sn(robots: List[Any]) -> None:
+    """
+    Mutates each robot dict in-place: sets ``sn_canonical`` to a best-effort unique serial per shop list.
+    Open-platform rows occasionally repeat ``sn`` across different machines; prefer machine-specific keys first.
+    """
+    used: set[str] = set()
+    for i, r in enumerate(robots):
+        if not isinstance(r, dict):
+            continue
+        cands = _robot_serial_candidates(r)
+        chosen = ""
+        for c in cands:
+            if c not in used:
+                chosen = c
+                break
+        if not chosen and cands:
+            chosen = cands[0]
+            PUDU_LOG.warning(
+                "robot list: could not pick unused sn_canonical row=%s raw_sn=%r candidates=%s",
+                i,
+                r.get("sn"),
+                cands[:8],
+            )
+        if chosen:
+            r["sn_canonical"] = chosen
+            used.add(chosen)
+        elif not cands:
+            PUDU_LOG.warning(
+                "robot list: no serial candidates row=%s keys=%s",
+                i,
+                list(r.keys())[:24],
+            )
+
+
+def _execution_row_sn(row: Any) -> str:
+    """Best-effort serial from a Pudu clean_task/query_list row (keys vary by tenant/version)."""
+    if not isinstance(row, dict):
+        return ""
+    for k in ("sn", "SN", "Sn", "S/N", "s/n", "serial_number", "robot_sn", "machine_sn"):
+        v = row.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    for key, v in row.items():
+        nk = str(key).lower().replace("-", "_").replace("/", "_")
+        if nk in ("sn", "s_n") or nk.endswith("_sn") or nk == "serial" or nk == "serial_number":
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    return ""
+
+
+def _execution_sn_histogram(rows: List[Any]) -> Dict[str, int]:
+    hist: Dict[str, int] = {}
+    for row in rows:
+        s = _execution_row_sn(row)
+        if s:
+            hist[s] = hist.get(s, 0) + 1
+    return hist
+
+
 _cache_lock = threading.Lock()
 _cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 CACHE_TTL_SEC = 45.0
+
+
+def _json_stable(obj: Any) -> str:
+    try:
+        return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return str(obj)
 
 
 def get_pudu_credentials() -> Tuple[Optional[str], Optional[str]]:
@@ -174,17 +311,17 @@ def fetch_clean_paging_sn_resilient(
     return None, last_err or "paging failed"
 
 
-def _fetch_mode(
-    app_key: str, app_secret: str, q: Dict[str, Any]
+def _fetch_mode_with_label(
+    layer: str, app_key: str, app_secret: str, q: Dict[str, Any]
 ) -> Tuple[str, Any, Optional[str]]:
     body, _, err = signed_pudu_get(
         app_key, app_secret, "/data-board/v1/analysis/clean/mode", q
     )
     if err:
-        return "mode", None, err
+        return layer, None, err
     if not pudu_message_ok(body):
-        return "mode", body, body.get("message") if isinstance(body, dict) else "bad message"
-    return "mode", body.get("data"), None
+        return layer, body, body.get("message") if isinstance(body, dict) else "bad message"
+    return layer, body.get("data"), None
 
 
 def _fetch_paging_sn_job(
@@ -229,7 +366,25 @@ def build_dashboard_payload(
                 if time.time() - ts < CACHE_TTL_SEC:
                     out = dict(payload)
                     out["cached"] = True
+                    PUDU_LOG.info(
+                        "Pudu dashboard cache hit shop_id=%s sn=%s range_unix=%s-%s age_sec=%.1f",
+                        (shop_id or "").strip() or "(none)",
+                        sn.strip(),
+                        start_time,
+                        end_time,
+                        time.time() - ts,
+                    )
                     return out
+
+    PUDU_LOG.info(
+        "Pudu dashboard build start shop_id=%s request_sn=%s range_unix=%s-%s execution_offset=%s only_executions=%s",
+        (shop_id or "").strip() or "(none)",
+        sn.strip(),
+        start_time,
+        end_time,
+        execution_offset,
+        only_executions,
+    )
 
     tz = melbourne_offset_hours(start_time, end_time)
     base_time: Dict[str, Any] = {
@@ -238,9 +393,10 @@ def build_dashboard_payload(
         "end_time": end_time,
     }
 
-    degraded = {"mode": False, "paging": False, "executions": False}
+    degraded = {"mode": False, "robot_mode": False, "paging": False, "executions": False}
     errors: List[Dict[str, Any]] = []
     mode_data: Any = None
+    robot_mode_data: Any = None
     paging_data: Any = None
     paging_list: List[Any] = []
 
@@ -253,6 +409,7 @@ def build_dashboard_payload(
         }
         if shop_id:
             mode_params["shop_id"] = str(shop_id).strip()
+        robot_mode_params = {**mode_params, "sn": sn.strip()}
 
         paging_base = {
             **base_time,
@@ -262,9 +419,10 @@ def build_dashboard_payload(
             "sn": sn.strip(),
         }
 
-        with ThreadPoolExecutor(max_workers=2) as ex:
+        with ThreadPoolExecutor(max_workers=3) as ex:
             futs = [
-                ex.submit(_fetch_mode, key, secret, mode_params),
+                ex.submit(_fetch_mode_with_label, "mode", key, secret, mode_params),
+                ex.submit(_fetch_mode_with_label, "robot_mode", key, secret, robot_mode_params),
                 ex.submit(_fetch_paging_sn_job, key, secret, paging_base),
             ]
             for fut in as_completed(futs):
@@ -274,8 +432,29 @@ def build_dashboard_payload(
                     errors.append({"layer": layer, "detail": err})
                 if layer == "mode":
                     mode_data = data
+                elif layer == "robot_mode":
+                    robot_mode_data = data
                 else:
                     paging_data = data
+
+            if shop_id and mode_data is not None and robot_mode_data is not None:
+                if _json_stable(mode_data) == _json_stable(robot_mode_data):
+                    PUDU_LOG.info(
+                        "Pudu clean/mode returned identical payload for shop-only vs shop+sn; treating robot_mode as absent sn=%s shop=%s",
+                        sn.strip()[:10],
+                        str(shop_id).strip(),
+                    )
+                    robot_mode_data = None
+
+        PUDU_LOG.info(
+            "Pudu dashboard vendor layers shop_id=%s request_sn=%s has_site_mode=%s has_robot_mode=%s has_paging=%s degraded_partial=%s",
+            (shop_id or "").strip() or "(none)",
+            sn.strip(),
+            mode_data is not None,
+            robot_mode_data is not None,
+            paging_data is not None,
+            degraded,
+        )
 
     exec_query: Dict[str, Any] = {
         **base_time,
@@ -292,6 +471,18 @@ def build_dashboard_payload(
         degraded["executions"] = True
         errors.append({"layer": "executions", "detail": ex_err})
 
+    exec_rows = rows or []
+    exec_hist = _execution_sn_histogram(exec_rows)
+    PUDU_LOG.info(
+        "Pudu dashboard query_list shop_id=%s request_sn=%s row_count=%s used_lim=%s sn_histogram=%s request_sn_in_page=%s",
+        (shop_id or "").strip() or "(none)",
+        sn.strip(),
+        len(exec_rows),
+        used_lim,
+        exec_hist,
+        sn.strip() in exec_hist,
+    )
+
     if isinstance(paging_data, dict):
         pl = paging_data.get("list")
         if isinstance(pl, list):
@@ -306,15 +497,16 @@ def build_dashboard_payload(
         "degraded": degraded,
         "errors": errors,
         "mode": mode_data,
+        "robot_mode": robot_mode_data,
         "paging": paging_data,
         "paging_list": paging_list,
         "executions": {
-            "list": rows or [],
+            "list": exec_rows,
             "offset": execution_offset,
             "used_lim": used_lim,
         },
         "execution_next_offset": execution_offset + used_lim if used_lim else execution_offset,
-        "execution_has_more": bool(rows) and used_lim > 0 and len(rows) >= used_lim,
+        "execution_has_more": bool(exec_rows) and used_lim > 0 and len(exec_rows) >= used_lim,
         "cached": False,
     }
 
@@ -326,13 +518,16 @@ def build_dashboard_payload(
                 for k in list(_cache.keys())[:50]:
                     _cache.pop(k, None)
 
-    logging.info(
-        "Pudu dashboard sn=%s range=%s-%s degraded=%s err_count=%s",
-        sn[:8],
+    PUDU_LOG.info(
+        "Pudu dashboard done shop_id=%s request_sn=%s range_unix=%s-%s execution_rows=%s sn_histogram=%s degraded=%s error_layers=%s",
+        (shop_id or "").strip() or "(none)",
+        sn.strip(),
         start_time,
         end_time,
+        len(exec_rows),
+        exec_hist,
         degraded,
-        len(errors),
+        [e.get("layer") for e in errors],
     )
     return result
 

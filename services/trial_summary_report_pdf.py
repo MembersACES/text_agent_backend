@@ -207,7 +207,7 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
         story.append(_P(f"- {n}", body))
         story.append(Spacer(1, 1.5 * mm))
 
-    story.append(_P("Typical recent week (analytics)", h2))
+        story.append(_P("Recent week — site totals (analytics)", h2))
     sw_s = sample_week.get("start_date", "")
     sw_e = sample_week.get("end_date", "")
     story.append(_P(f"Window: {sw_s} to {sw_e}", meta))
@@ -264,10 +264,11 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
             continue
         lab = robot_labels.get(sn, sn)
         story.append(Spacer(1, 4 * mm))
-        story.append(_P(f"What was cleaned - {lab} ({sn})", h3))
+        story.append(_P(f"Tasks by name — {lab} ({sn})", h3))
         story.append(
             _P(
-                f"Execution rows in window: {_i(details.get('rows'))}. Data source: Pudu log/clean_task/query_list.",
+                f"Execution rows in this 7-day window: {_i(details.get('rows'))}. "
+                "All distinct task names from Pudu log/clean_task/query_list (same source as the dashboard executions table).",
                 meta,
             )
         )
@@ -282,7 +283,7 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
         if top_area:
             zh = [_P("Task name", th), _P("Area (m^2)", th), _P("Runs", th)]
             zr = [zh]
-            for task_name, area in top_area[:12]:
+            for task_name, area in top_area:
                 tn = str(task_name)[:70]
                 zr.append(
                     [
@@ -352,8 +353,8 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
     story.append(Spacer(1, 8 * mm))
     story.append(
         _P(
-            "Data sources: Pudu Open Platform - analysis/clean/paging (totals and weekly trend) "
-            "and log/clean_task/query_list (task names and status mix for the sample week).",
+            "Data sources: Pudu Open Platform — analysis/clean/paging (cumulative and weekly site totals per robot) "
+            "and log/clean_task/query_list (full task-name breakdown and status mix for the recent 7-day window, per robot).",
             meta,
         )
     )

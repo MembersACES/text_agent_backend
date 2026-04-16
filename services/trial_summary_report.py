@@ -314,11 +314,18 @@ def summarize_week_tasks(tasks: List[dict]) -> dict:
         total_area += area
         total_runtime_h += runtime_h
 
+    # Every distinct task name in the window (not capped), sorted by cleaned area then runs.
+    names_union = set(top_area_by_task.keys()) | set(top_runs_by_task.keys())
+    top_tasks_by_area = sorted(
+        ((n, top_area_by_task[n]) for n in names_union),
+        key=lambda kv: (-kv[1], -top_runs_by_task[kv[0]], kv[0].lower()),
+    )
+
     return {
         "rows": len(tasks),
         "status_counts": dict(status_counter),
-        "top_tasks_by_area": sorted(top_area_by_task.items(), key=lambda kv: kv[1], reverse=True)[:8],
-        "top_tasks_by_runs": top_runs_by_task.most_common(8),
+        "top_tasks_by_area": top_tasks_by_area,
+        "top_tasks_by_runs": top_runs_by_task.most_common(),
         "total_area_from_logs": total_area,
         "total_runtime_h_from_logs": total_runtime_h,
     }
@@ -415,7 +422,7 @@ def build_markdown(
             statuses = ", ".join(f"{k}: {v}" for k, v in sorted(status_counts.items(), key=lambda kv: kv[0]))
             lines.append(f"- Status mix: {statuses}")
         lines.append("")
-        lines.append("Top task names by cleaned area:")
+        lines.append("Task names by cleaned area (all names in sample window):")
         lines.append("")
         lines.append("| Task name | Area (m2) | Runs |")
         lines.append("|---|---:|---:|")
