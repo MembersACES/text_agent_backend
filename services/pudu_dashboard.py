@@ -201,13 +201,20 @@ def fetch_clean_task_query_list_page(
     app_secret: str,
     query: Dict[str, Any],
     *,
-    initial_limit: int = 50,
+    initial_limit: int = 20,
 ) -> Tuple[Optional[List[Any]], int, Optional[str]]:
     """
-    Resilient first page of query_list: limit chain  initial_limit → 20 → 10 → 5, retries on 5xx/429.
+    Resilient first page of query_list: limit chain initial_limit → smaller, retries on 5xx/429.
+
+    Pudu often returns HTTP 500 for ``limit=50`` on this endpoint while ``limit=20`` succeeds;
+    default first attempt is therefore 20, not 50 (see clean/paging resilient helper for same pattern).
     Returns (rows, used_lim, error).
     """
-    limits = [initial_limit, 20, 10, 5]
+    raw_limits = [initial_limit, 15, 10, 5]
+    limits: List[int] = []
+    for lim in raw_limits:
+        if lim not in limits:
+            limits.append(lim)
     last_err: Optional[str] = None
     for lim in limits:
         q = {**query, "limit": lim}
@@ -275,7 +282,7 @@ def detect_robot_first_execution_ts(
     *,
     shop_id: str,
     robot_sn: str,
-    max_pages: int = 1200,
+    max_pages: int = 200,
 ) -> Tuple[Optional[int], Optional[str]]:
     """
     Best-effort first available execution timestamp for a robot by walking query_list pages.
@@ -300,7 +307,7 @@ def detect_robot_first_execution_ts(
                 "timezone_offset": tz_off,
                 "offset": offset,
             },
-            initial_limit=50,
+            initial_limit=20,
         )
         if rows is None:
             last_err = err
@@ -547,7 +554,7 @@ def build_dashboard_payload(
         exec_query["shop_id"] = str(shop_id).strip()
 
     rows, used_lim, ex_err = fetch_clean_task_query_list_page(
-        key, secret, exec_query, initial_limit=50
+        key, secret, exec_query, initial_limit=20
     )
     if ex_err:
         degraded["executions"] = True

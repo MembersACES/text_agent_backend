@@ -1155,6 +1155,7 @@ def _resolve_consumables_baseline_state(
     app_key: Optional[str],
     app_secret: Optional[str],
     force_redetect: bool = False,
+    max_pages: int = 200,
 ) -> Optional[PuduConsumableRobotState]:
     state = (
         db.query(PuduConsumableRobotState)
@@ -1174,6 +1175,7 @@ def _resolve_consumables_baseline_state(
         app_secret,
         shop_id=shop_id,
         robot_sn=robot_sn,
+        max_pages=max_pages,
     )
     if first_ts is None:
         if err:
@@ -1485,6 +1487,7 @@ def pudu_consumables_baseline_redetect_endpoint(
             app_key=app_key,
             app_secret=app_secret,
             force_redetect=True,
+            max_pages=600,
         )
         baseline_iso = state.baseline_start_date.isoformat() if state and state.baseline_start_date else None
         if baseline_iso:
@@ -1514,17 +1517,26 @@ def pudu_consumables_baseline_redetect_endpoint(
     }
 
 
-@app.post("/api/pudu/consumables/baseline-redetect-all-sites")
-def pudu_consumables_baseline_redetect_all_sites_endpoint(
-    user_info: dict = Depends(verify_google_token),
-    db: Session = Depends(get_db),
-):
+def _pudu_consumables_baseline_redetect_all_sites_impl(
+    db: Session,
+    *,
+    initiated_by: str,
+    force_redetect: bool,
+    max_pages: int,
+    user_email_for_response: str,
+) -> Dict[str, object]:
+    """
+    Shared all-sites baseline logic.
+
+    When force_redetect is False (daily cron), robots that already have a baseline are skipped
+    (no Pudu history walk), so the job stays fast after the first full baseline pass.
+    """
     app_key, app_secret = get_pudu_credentials()
     if not app_key or not app_secret:
         raise HTTPException(status_code=503, detail="Missing Pudu credentials for baseline detection.")
     run = PuduConsumableBaselineRun(
         run_scope="all_sites",
-        initiated_by=str(user_info.get("email") or ""),
+        initiated_by=initiated_by,
         status="running",
     )
     db.add(run)
@@ -1612,7 +1624,8 @@ def pudu_consumables_baseline_redetect_all_sites_endpoint(
                 robot_sn=rsn,
                 app_key=app_key,
                 app_secret=app_secret,
-                force_redetect=True,
+                force_redetect=force_redetect,
+                max_pages=max_pages,
             )
             if state and state.baseline_start_date:
                 site_updated += 1
@@ -1642,8 +1655,22 @@ def pudu_consumables_baseline_redetect_all_sites_endpoint(
         "total_count": total_robots,
         "sites": site_results,
         "run": _serialize_baseline_run(run),
-        "user_email": user_info.get("email"),
+        "user_email": user_email_for_response,
     }
+
+
+@app.post("/api/pudu/consumables/baseline-redetect-all-sites")
+def pudu_consumables_baseline_redetect_all_sites_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    return _pudu_consumables_baseline_redetect_all_sites_impl(
+        db,
+        initiated_by=str(user_info.get("email") or ""),
+        force_redetect=True,
+        max_pages=600,
+        user_email_for_response=str(user_info.get("email") or ""),
+    )
 
 
 @app.post("/api/pudu/consumables/baseline-redetect-all-sites-cron")
@@ -1652,14 +1679,20 @@ def pudu_consumables_baseline_redetect_all_sites_cron(
 ):
     """
     Cron endpoint mirroring /api/tasks/check-due-cron style (no auth dependency).
-    Intended for Cloud Scheduler daily refresh of consumables baselines.
+    Fills missing baselines only (does not re-walk Pudu history for robots that already have one),
+    so it stays within typical HTTP timeouts after the first full baseline pass.
     """
-    logging.info("Cron job triggered: consumables baseline re-detect (all sites)")
+    logging.info("Cron job triggered: consumables baseline re-detect (all sites, missing only)")
     try:
-        return pudu_consumables_baseline_redetect_all_sites_endpoint(
-            user_info={"email": "cron@system"},
-            db=db,
+        return _pudu_consumables_baseline_redetect_all_sites_impl(
+            db,
+            initiated_by="cron@system",
+            force_redetect=False,
+            max_pages=200,
+            user_email_for_response="cron@system",
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error("Error during consumables baseline all-sites cron: %s", str(e))
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

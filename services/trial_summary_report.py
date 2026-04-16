@@ -203,7 +203,7 @@ def fetch_query_list_for_robot(
     out: List[dict] = []
     offset = 0
     tz_off = melbourne_offset_for_period(start_ts, end_ts)
-    limits = [50, 20, 10, 5]
+    limits = [20, 15, 10, 5]
 
     for _ in range(250):
         page_rows: List[dict] = []
