@@ -9,7 +9,6 @@ if _backend_env.is_file():
     load_dotenv(_backend_env, override=True)
 
 from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status
-from typing import List
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
@@ -29,7 +28,7 @@ import logging
 import tempfile
 import os
 import httpx
-from typing import Optional, List, Dict, Union
+from typing import Any, Dict, List, Optional, Union
 import json
 from fastapi import HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
@@ -59,7 +58,7 @@ from services.pudu_directory import fetch_pudu_weekly_directory
 from services.pudu_open_tasks import fetch_open_task_list as pudu_fetch_open_task_list
 from services.trial_summary_dashboard import generate_dashboard_trial_report
 from services.trial_summary_report import DEFAULT_START_DATE, get_robot_period_totals
-from services.pudu_consumables import default_consumables_for_product
+from services.pudu_consumables import approx_replacement_interval_days, default_consumables_for_product
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -1125,7 +1124,19 @@ def pudu_task_definitions_endpoint(
     return {"data": data, "user_email": user_info.get("email")}
 
 
-def _serialize_consumable_row(row: PuduConsumable) -> Dict[str, object]:
+def _serialize_consumable_row(
+    row: PuduConsumable,
+    *,
+    baseline_fallback: Optional[date] = None,
+) -> Dict[str, object]:
+    last = row.last_replaced_at.isoformat() if row.last_replaced_at else None
+    if last is None and baseline_fallback is not None:
+        last = baseline_fallback.isoformat()
+    interval = row.replacement_interval_days
+    if interval is None:
+        parsed = approx_replacement_interval_days(row.lifespan_per_unit or "")
+        if parsed is not None:
+            interval = parsed
     return {
         "id": row.id,
         "mode_name": row.mode_name or "",
@@ -1136,12 +1147,72 @@ def _serialize_consumable_row(row: PuduConsumable) -> Dict[str, object]:
         "rrp": row.rrp or "",
         "lifespan_per_unit": row.lifespan_per_unit or "",
         "hours": row.hours,
-        "last_replaced_at": row.last_replaced_at.isoformat() if row.last_replaced_at else None,
-        "replacement_interval_days": row.replacement_interval_days,
+        "last_replaced_at": last,
+        "replacement_interval_days": interval,
         "item_type": row.item_type or "",
         "notes": row.notes or "",
         "sort_order": row.sort_order,
     }
+
+
+def _enrich_consumable_template_dicts(
+    rows: List[Dict[str, Any]],
+    *,
+    baseline_date: Optional[date],
+) -> None:
+    """Fill last_replaced_at / replacement_interval_days on template dicts when unset and data allows."""
+    if not rows:
+        return
+    biso = baseline_date.isoformat() if baseline_date else None
+    for row in rows:
+        lr = row.get("last_replaced_at")
+        if biso and (lr is None or (isinstance(lr, str) and not lr.strip())):
+            row["last_replaced_at"] = biso
+        iv = row.get("replacement_interval_days")
+        if iv is None or iv == "":
+            parsed = approx_replacement_interval_days(str(row.get("lifespan_per_unit") or ""))
+            if parsed is not None:
+                row["replacement_interval_days"] = parsed
+
+
+def _backfill_consumable_last_replaced_from_baseline(
+    db: Session,
+    *,
+    shop_id: str,
+    robot_sn: str,
+    baseline_date: date,
+) -> None:
+    """Set last_replaced_at to baseline for saved consumables that never had a date (NULL only)."""
+    db.query(PuduConsumable).filter(
+        PuduConsumable.shop_id == shop_id,
+        PuduConsumable.robot_sn == robot_sn,
+        PuduConsumable.last_replaced_at.is_(None),
+    ).update(
+        {PuduConsumable.last_replaced_at: baseline_date},
+        synchronize_session=False,
+    )
+
+
+def _backfill_consumable_intervals_from_lifespan(
+    db: Session,
+    *,
+    shop_id: str,
+    robot_sn: str,
+) -> None:
+    """Set replacement_interval_days from lifespan text where the column is still NULL."""
+    rows = (
+        db.query(PuduConsumable)
+        .filter(
+            PuduConsumable.shop_id == shop_id,
+            PuduConsumable.robot_sn == robot_sn,
+            PuduConsumable.replacement_interval_days.is_(None),
+        )
+        .all()
+    )
+    for r in rows:
+        parsed = approx_replacement_interval_days(r.lifespan_per_unit or "")
+        if parsed is not None:
+            r.replacement_interval_days = parsed
 
 
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
@@ -1194,6 +1265,13 @@ def _resolve_consumables_baseline_state(
     state.baseline_start_date = detected_date
     state.baseline_source = "auto_query_list_first_seen"
     state.baseline_detected_at = datetime.now(timezone.utc)
+    _backfill_consumable_last_replaced_from_baseline(
+        db,
+        shop_id=shop_id,
+        robot_sn=robot_sn,
+        baseline_date=detected_date,
+    )
+    _backfill_consumable_intervals_from_lifespan(db, shop_id=shop_id, robot_sn=robot_sn)
     db.commit()
     db.refresh(state)
     return state
@@ -1289,11 +1367,12 @@ def pudu_consumables_list_endpoint(
         .order_by(PuduConsumable.mode_name.asc(), PuduConsumable.sort_order.asc(), PuduConsumable.id.asc())
         .all()
     )
+    baseline_fb = state.baseline_start_date if state and state.baseline_start_date else None
     if rows:
         return {
             "shop_id": sid,
             "sn": serial,
-            "items": [_serialize_consumable_row(r) for r in rows],
+            "items": [_serialize_consumable_row(r, baseline_fallback=baseline_fb) for r in rows],
             "source": "database",
             "baseline_start_date": state.baseline_start_date.isoformat() if state and state.baseline_start_date else None,
             "baseline_source": state.baseline_source if state else None,
@@ -1303,6 +1382,7 @@ def pudu_consumables_list_endpoint(
     template_rows = default_consumables_for_product(product_code or "")
     for i, row in enumerate(template_rows):
         row["sort_order"] = i
+    _enrich_consumable_template_dicts(template_rows, baseline_date=baseline_fb)
     return {
         "shop_id": sid,
         "sn": serial,
@@ -1332,6 +1412,13 @@ def pudu_consumables_replace_endpoint(
         synchronize_session=False
     )
 
+    state_row = (
+        db.query(PuduConsumableRobotState)
+        .filter(PuduConsumableRobotState.shop_id == sid, PuduConsumableRobotState.robot_sn == serial)
+        .first()
+    )
+    baseline_fallback = state_row.baseline_start_date if state_row else None
+
     new_rows: List[PuduConsumable] = []
     for i, item in enumerate(request.items):
         name = (item.name or "").strip()
@@ -1348,7 +1435,11 @@ def pudu_consumables_replace_endpoint(
                     status_code=400,
                     detail=f"Invalid last_replaced_at for item '{name}'. Expected YYYY-MM-DD.",
                 )
+        if last_replaced_at is None and baseline_fallback is not None:
+            last_replaced_at = baseline_fallback
         interval_days = item.replacement_interval_days
+        if interval_days is None:
+            interval_days = approx_replacement_interval_days((item.lifespan_per_unit or "").strip())
         if interval_days is not None and interval_days < 0:
             raise HTTPException(
                 status_code=400,
@@ -1386,7 +1477,7 @@ def pudu_consumables_replace_endpoint(
     return {
         "shop_id": sid,
         "sn": serial,
-        "items": [_serialize_consumable_row(r) for r in saved],
+        "items": [_serialize_consumable_row(r, baseline_fallback=baseline_fallback) for r in saved],
         "saved_count": len(saved),
         "user_email": user_info.get("email"),
     }
@@ -1791,8 +1882,11 @@ def pudu_trial_summary_report_endpoint(
             .order_by(PuduConsumable.robot_sn.asc(), PuduConsumable.mode_name.asc(), PuduConsumable.sort_order.asc(), PuduConsumable.id.asc())
             .all()
         )
+        by_sn: Dict[str, List[PuduConsumable]] = {}
         for row in c_rows:
-            consumables_by_sn.setdefault(row.robot_sn, []).append(_serialize_consumable_row(row))
+            by_sn.setdefault(row.robot_sn, []).append(row)
+
+        baseline_by_sn: Dict[str, Optional[date]] = {}
         for robot_sn in robots_by_sn.keys():
             state = _resolve_consumables_baseline_state(
                 db,
@@ -1801,6 +1895,7 @@ def pudu_trial_summary_report_endpoint(
                 app_key=app_key,
                 app_secret=app_secret,
             )
+            baseline_by_sn[robot_sn] = state.baseline_start_date if state and state.baseline_start_date else None
             if state and state.baseline_start_date:
                 consumables_baseline_start_date_by_sn[robot_sn] = state.baseline_start_date.isoformat()
                 life_h = _compute_robot_lifetime_runtime_hours(
@@ -1812,6 +1907,11 @@ def pudu_trial_summary_report_endpoint(
                 )
                 if life_h is not None:
                     consumables_runtime_h_by_sn[robot_sn] = life_h
+
+        for robot_sn, prow in by_sn.items():
+            bf = baseline_by_sn.get(robot_sn)
+            for r in prow:
+                consumables_by_sn.setdefault(robot_sn, []).append(_serialize_consumable_row(r, baseline_fallback=bf))
 
     result = generate_dashboard_trial_report(
         shop_id=shop_id,

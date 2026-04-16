@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
+
+_INTERVAL_RE = re.compile(
+    r"^\s*(\d+(?:\.\d+)?)\s*(month|months|year|years|day|days)\s*$",
+    re.IGNORECASE,
+)
 
 
 ConsumableRow = Dict[str, Any]
@@ -93,3 +99,22 @@ def default_consumables_for_product(product_hint: str) -> List[ConsumableRow]:
         return []
     rows = DEFAULT_CONSUMABLE_TEMPLATES.get(key, [])
     return [dict(r) for r in rows]
+
+
+def approx_replacement_interval_days(lifespan_per_unit: str) -> Optional[int]:
+    """
+    Best-effort parse of template strings like "6 months" or "1 year" into approximate calendar days.
+    Returns None when the text is empty or not a simple N unit pattern (e.g. "600L of water").
+    """
+    m = _INTERVAL_RE.match((lifespan_per_unit or "").strip())
+    if not m:
+        return None
+    n = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit.startswith("year"):
+        return max(1, int(round(n * 365)))
+    if unit.startswith("month"):
+        return max(1, int(round(n * 30)))
+    if unit.startswith("day"):
+        return max(1, int(round(n)))
+    return None
