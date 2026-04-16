@@ -252,6 +252,88 @@ def fetch_clean_task_query_list_page(
     return None, 0, last_err or "query_list failed"
 
 
+def _row_time_candidates_unix_seconds(row: Dict[str, Any]) -> List[int]:
+    out: List[int] = []
+    for key in ("start_time", "end_time", "create_time"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            iv = int(v)
+            if 946684800 <= iv <= 4102444800:  # 2000-01-01 .. 2100-01-01
+                out.append(iv)
+        elif isinstance(v, str):
+            s = v.strip()
+            if s.isdigit():
+                iv = int(s)
+                if 946684800 <= iv <= 4102444800:
+                    out.append(iv)
+    return out
+
+
+def detect_robot_first_execution_ts(
+    app_key: str,
+    app_secret: str,
+    *,
+    shop_id: str,
+    robot_sn: str,
+    max_pages: int = 1200,
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Best-effort first available execution timestamp for a robot by walking query_list pages.
+    query_list is newest-first; this scans pages until exhaustion and returns the oldest ts seen.
+    """
+    end_ts = int(datetime.now(timezone.utc).timestamp())
+    start_ts = 946684800  # 2000-01-01 UTC
+    tz_off = melbourne_offset_hours(start_ts, end_ts)
+    offset = 0
+    oldest: Optional[int] = None
+    last_err: Optional[str] = None
+
+    for _ in range(max_pages):
+        rows, used_lim, err = fetch_clean_task_query_list_page(
+            app_key,
+            app_secret,
+            {
+                "shop_id": str(shop_id).strip(),
+                "sn": str(robot_sn).strip(),
+                "start_time": start_ts,
+                "end_time": end_ts,
+                "timezone_offset": tz_off,
+                "offset": offset,
+            },
+            initial_limit=50,
+        )
+        if rows is None:
+            last_err = err
+            break
+        if not rows:
+            break
+
+        filtered_rows = rows
+        if any(_execution_row_sn(r) for r in rows if isinstance(r, dict)):
+            filtered_rows = [
+                r
+                for r in rows
+                if isinstance(r, dict) and _execution_row_sn(r).strip().lower() == robot_sn.strip().lower()
+            ]
+
+        for r in filtered_rows:
+            if not isinstance(r, dict):
+                continue
+            for ts in _row_time_candidates_unix_seconds(r):
+                oldest = ts if oldest is None else min(oldest, ts)
+
+        step = used_lim if used_lim > 0 else len(rows)
+        if step <= 0:
+            break
+        offset += step
+        if len(rows) < step:
+            break
+
+    if oldest is not None:
+        return oldest, None
+    return None, last_err or "no rows found"
+
+
 def fetch_clean_paging_sn_resilient(
     app_key: str,
     app_secret: str,

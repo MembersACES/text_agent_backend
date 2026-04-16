@@ -47,15 +47,19 @@ from services import airtable_client
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
+    detect_robot_first_execution_ts,
     fetch_clean_task_detail,
     fetch_cleanbot_task_definitions,
     fetch_pudu_robots_list,
     fetch_pudu_shops_list,
+    get_pudu_credentials,
+    melbourne_offset_hours,
 )
 from services.pudu_directory import fetch_pudu_weekly_directory
 from services.pudu_open_tasks import fetch_open_task_list as pudu_fetch_open_task_list
 from services.trial_summary_dashboard import generate_dashboard_trial_report
-from services.trial_summary_report import DEFAULT_START_DATE
+from services.trial_summary_report import DEFAULT_START_DATE, get_robot_period_totals
+from services.pudu_consumables import default_consumables_for_product
 from tools.get_electricity_ci_latest_invoice_information import get_electricity_ci_latest_invoice_information
 from tools.get_electricity_sme_latest_invoice_information import get_electricity_sme_latest_invoice_information
 from tools.get_gas_latest_invoice_information import get_gas_latest_invoice_information
@@ -124,6 +128,9 @@ from models import (
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
     AutonomousSequenceTemplateStep,
+    PuduConsumable,
+    PuduConsumableRobotState,
+    PuduConsumableBaselineRun,
 )
 from schemas import (
     TaskCreate,
@@ -199,6 +206,7 @@ from utils.task_history import (
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 
@@ -632,6 +640,29 @@ class PuduTrialSummaryReportRequest(BaseModel):
     start_date: Optional[str] = None  # YYYY-MM-DD
     labor_rate: Optional[float] = None
     robots: Optional[List[PuduTrialRobotInput]] = None
+
+
+class PuduConsumableItemInput(BaseModel):
+    id: Optional[int] = None
+    mode_name: Optional[str] = None
+    sku: Optional[str] = None
+    name: str
+    quantity: Optional[float] = None
+    unit: Optional[str] = None
+    rrp: Optional[str] = None
+    lifespan_per_unit: Optional[str] = None
+    hours: Optional[float] = None
+    last_replaced_at: Optional[str] = None  # YYYY-MM-DD
+    replacement_interval_days: Optional[int] = None
+    item_type: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class PuduConsumablesReplaceRequest(BaseModel):
+    shop_id: str
+    sn: str
+    robot_label: Optional[str] = None
+    items: List[PuduConsumableItemInput]
 
 class UtilityRecordUpdateRequest(BaseModel):
     """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
@@ -1094,6 +1125,546 @@ def pudu_task_definitions_endpoint(
     return {"data": data, "user_email": user_info.get("email")}
 
 
+def _serialize_consumable_row(row: PuduConsumable) -> Dict[str, object]:
+    return {
+        "id": row.id,
+        "mode_name": row.mode_name or "",
+        "sku": row.sku or "",
+        "name": row.name or "",
+        "quantity": row.quantity,
+        "unit": row.unit or "",
+        "rrp": row.rrp or "",
+        "lifespan_per_unit": row.lifespan_per_unit or "",
+        "hours": row.hours,
+        "last_replaced_at": row.last_replaced_at.isoformat() if row.last_replaced_at else None,
+        "replacement_interval_days": row.replacement_interval_days,
+        "item_type": row.item_type or "",
+        "notes": row.notes or "",
+        "sort_order": row.sort_order,
+    }
+
+
+MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
+
+
+def _resolve_consumables_baseline_state(
+    db: Session,
+    *,
+    shop_id: str,
+    robot_sn: str,
+    app_key: Optional[str],
+    app_secret: Optional[str],
+    force_redetect: bool = False,
+) -> Optional[PuduConsumableRobotState]:
+    state = (
+        db.query(PuduConsumableRobotState)
+        .filter(
+            PuduConsumableRobotState.shop_id == shop_id,
+            PuduConsumableRobotState.robot_sn == robot_sn,
+        )
+        .first()
+    )
+    if state and state.baseline_start_date is not None and not force_redetect:
+        return state
+    if not app_key or not app_secret:
+        return state
+
+    first_ts, err = detect_robot_first_execution_ts(
+        app_key,
+        app_secret,
+        shop_id=shop_id,
+        robot_sn=robot_sn,
+    )
+    if first_ts is None:
+        if err:
+            logging.warning(
+                "Consumables baseline detection failed shop_id=%s sn=%s err=%s",
+                shop_id,
+                robot_sn,
+                err,
+            )
+        return state
+
+    detected_date = datetime.fromtimestamp(first_ts, tz=timezone.utc).astimezone(MELBOURNE_TZ).date()
+    if state is None:
+        state = PuduConsumableRobotState(shop_id=shop_id, robot_sn=robot_sn)
+        db.add(state)
+    state.baseline_start_date = detected_date
+    state.baseline_source = "auto_query_list_first_seen"
+    state.baseline_detected_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(state)
+    return state
+
+
+def _compute_robot_lifetime_runtime_hours(
+    *,
+    shop_id: str,
+    robot_sn: str,
+    baseline_start_date: Optional[date],
+    app_key: Optional[str],
+    app_secret: Optional[str],
+) -> Optional[float]:
+    if baseline_start_date is None or not app_key or not app_secret:
+        return None
+    start_local = datetime(
+        baseline_start_date.year,
+        baseline_start_date.month,
+        baseline_start_date.day,
+        0,
+        0,
+        0,
+        tzinfo=MELBOURNE_TZ,
+    )
+    start_ts = int(start_local.timestamp())
+    end_ts = int(datetime.now(timezone.utc).timestamp())
+    if start_ts >= end_ts:
+        return 0.0
+    try:
+        totals = get_robot_period_totals(
+            app_key,
+            app_secret,
+            shop_id=shop_id,
+            robot_sn=robot_sn,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        v = float(totals.get("runtime_h") or 0.0)
+        return round(v, 2)
+    except Exception:
+        logging.exception(
+            "Failed lifetime runtime calc for consumables shop_id=%s sn=%s",
+            shop_id,
+            robot_sn,
+        )
+        return None
+
+
+def _serialize_baseline_run(run: PuduConsumableBaselineRun) -> Dict[str, object]:
+    return {
+        "id": run.id,
+        "run_scope": run.run_scope,
+        "shop_id": run.shop_id,
+        "initiated_by": run.initiated_by,
+        "status": run.status,
+        "updated_count": run.updated_count,
+        "total_count": run.total_count,
+        "site_count": run.site_count,
+        "error_message": run.error_message,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+    }
+
+
+@app.get("/api/pudu/consumables")
+def pudu_consumables_list_endpoint(
+    shop_id: str = Query(..., min_length=1, description="Pudu shop id"),
+    sn: str = Query(..., min_length=2, description="Robot serial"),
+    product_code: Optional[str] = Query(None, description="Robot product code (for default template fallback)"),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    sid = shop_id.strip()
+    serial = sn.strip()
+    app_key, app_secret = get_pudu_credentials()
+    state = _resolve_consumables_baseline_state(
+        db,
+        shop_id=sid,
+        robot_sn=serial,
+        app_key=app_key,
+        app_secret=app_secret,
+    )
+    lifetime_runtime_h = _compute_robot_lifetime_runtime_hours(
+        shop_id=sid,
+        robot_sn=serial,
+        baseline_start_date=state.baseline_start_date if state else None,
+        app_key=app_key,
+        app_secret=app_secret,
+    )
+    rows = (
+        db.query(PuduConsumable)
+        .filter(PuduConsumable.shop_id == sid, PuduConsumable.robot_sn == serial)
+        .order_by(PuduConsumable.mode_name.asc(), PuduConsumable.sort_order.asc(), PuduConsumable.id.asc())
+        .all()
+    )
+    if rows:
+        return {
+            "shop_id": sid,
+            "sn": serial,
+            "items": [_serialize_consumable_row(r) for r in rows],
+            "source": "database",
+            "baseline_start_date": state.baseline_start_date.isoformat() if state and state.baseline_start_date else None,
+            "baseline_source": state.baseline_source if state else None,
+            "lifetime_runtime_h": lifetime_runtime_h,
+            "user_email": user_info.get("email"),
+        }
+    template_rows = default_consumables_for_product(product_code or "")
+    for i, row in enumerate(template_rows):
+        row["sort_order"] = i
+    return {
+        "shop_id": sid,
+        "sn": serial,
+        "items": template_rows,
+        "source": "template" if template_rows else "empty",
+        "baseline_start_date": state.baseline_start_date.isoformat() if state and state.baseline_start_date else None,
+        "baseline_source": state.baseline_source if state else None,
+        "lifetime_runtime_h": lifetime_runtime_h,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.put("/api/pudu/consumables")
+def pudu_consumables_replace_endpoint(
+    request: PuduConsumablesReplaceRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    sid = (request.shop_id or "").strip()
+    serial = (request.sn or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="shop_id is required")
+    if not serial:
+        raise HTTPException(status_code=400, detail="sn is required")
+
+    db.query(PuduConsumable).filter(PuduConsumable.shop_id == sid, PuduConsumable.robot_sn == serial).delete(
+        synchronize_session=False
+    )
+
+    new_rows: List[PuduConsumable] = []
+    for i, item in enumerate(request.items):
+        name = (item.name or "").strip()
+        if not name:
+            continue
+        qty = item.quantity if item.quantity is not None else None
+        hrs = item.hours if item.hours is not None else None
+        last_replaced_at: Optional[date] = None
+        if item.last_replaced_at:
+            try:
+                last_replaced_at = date.fromisoformat(item.last_replaced_at.strip())
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid last_replaced_at for item '{name}'. Expected YYYY-MM-DD.",
+                )
+        interval_days = item.replacement_interval_days
+        if interval_days is not None and interval_days < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"replacement_interval_days must be >= 0 for item '{name}'.",
+            )
+        new_rows.append(
+            PuduConsumable(
+                shop_id=sid,
+                robot_sn=serial,
+                robot_label=(request.robot_label or "").strip() or None,
+                mode_name=(item.mode_name or "").strip() or None,
+                sku=(item.sku or "").strip() or None,
+                name=name,
+                quantity=qty,
+                unit=(item.unit or "").strip() or None,
+                rrp=(item.rrp or "").strip() or None,
+                lifespan_per_unit=(item.lifespan_per_unit or "").strip() or None,
+                hours=hrs,
+                last_replaced_at=last_replaced_at,
+                replacement_interval_days=interval_days,
+                item_type=(item.item_type or "").strip() or None,
+                notes=(item.notes or "").strip() or None,
+                sort_order=i,
+            )
+        )
+    if new_rows:
+        db.add_all(new_rows)
+    db.commit()
+    saved = (
+        db.query(PuduConsumable)
+        .filter(PuduConsumable.shop_id == sid, PuduConsumable.robot_sn == serial)
+        .order_by(PuduConsumable.mode_name.asc(), PuduConsumable.sort_order.asc(), PuduConsumable.id.asc())
+        .all()
+    )
+    return {
+        "shop_id": sid,
+        "sn": serial,
+        "items": [_serialize_consumable_row(r) for r in saved],
+        "saved_count": len(saved),
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/pudu/consumables/baseline-refresh-status")
+def pudu_consumables_baseline_refresh_status_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    latest_global = (
+        db.query(PuduConsumableBaselineRun)
+        .filter(PuduConsumableBaselineRun.run_scope == "all_sites")
+        .order_by(PuduConsumableBaselineRun.started_at.desc(), PuduConsumableBaselineRun.id.desc())
+        .first()
+    )
+    latest_any = (
+        db.query(PuduConsumableBaselineRun)
+        .order_by(PuduConsumableBaselineRun.started_at.desc(), PuduConsumableBaselineRun.id.desc())
+        .first()
+    )
+    return {
+        "latest_global": _serialize_baseline_run(latest_global) if latest_global else None,
+        "latest_any": _serialize_baseline_run(latest_any) if latest_any else None,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.post("/api/pudu/consumables/baseline-redetect")
+def pudu_consumables_baseline_redetect_endpoint(
+    shop_id: str = Query(..., min_length=1, description="Pudu shop id"),
+    sn: Optional[str] = Query(None, description="Optional robot serial; omit to process all robots in site"),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    sid = shop_id.strip()
+    serial = (sn or "").strip()
+    app_key, app_secret = get_pudu_credentials()
+    if not app_key or not app_secret:
+        raise HTTPException(status_code=503, detail="Missing Pudu credentials for baseline detection.")
+    run = PuduConsumableBaselineRun(
+        run_scope="site",
+        shop_id=sid,
+        initiated_by=str(user_info.get("email") or ""),
+        status="running",
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    serials: List[str] = []
+    if serial:
+        serials = [serial]
+    else:
+        try:
+            robots_raw, robots_warning = fetch_pudu_robots_list(sid)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        except Exception:
+            logging.exception("Pudu robots list failed for baseline redetect")
+            raise HTTPException(status_code=500, detail="Failed to load robots for selected site")
+        if robots_warning:
+            logging.warning("Pudu baseline redetect robots warning shop_id=%s: %s", sid, robots_warning)
+        annotate_robot_list_with_canonical_sn(robots_raw)
+        seen: set[str] = set()
+        for row in robots_raw:
+            if not isinstance(row, dict):
+                continue
+            rsn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
+            if rsn and rsn not in seen:
+                seen.add(rsn)
+                serials.append(rsn)
+
+    if not serials:
+        run.status = "partial"
+        run.updated_count = 0
+        run.total_count = 0
+        run.site_count = 1
+        run.error_message = "No robots found for this site."
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        return {
+            "shop_id": sid,
+            "updated_count": 0,
+            "results": [],
+            "warning": "No robots found for this site.",
+            "run": _serialize_baseline_run(run),
+            "user_email": user_info.get("email"),
+        }
+
+    results: List[Dict[str, object]] = []
+    updated = 0
+    for rsn in serials:
+        state = _resolve_consumables_baseline_state(
+            db,
+            shop_id=sid,
+            robot_sn=rsn,
+            app_key=app_key,
+            app_secret=app_secret,
+            force_redetect=True,
+        )
+        baseline_iso = state.baseline_start_date.isoformat() if state and state.baseline_start_date else None
+        if baseline_iso:
+            updated += 1
+        results.append(
+            {
+                "sn": rsn,
+                "baseline_start_date": baseline_iso,
+                "baseline_source": state.baseline_source if state else None,
+            }
+        )
+    run.status = "success" if updated == len(serials) else "partial"
+    run.updated_count = updated
+    run.total_count = len(serials)
+    run.site_count = 1
+    run.error_message = None
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "shop_id": sid,
+        "updated_count": updated,
+        "total_count": len(serials),
+        "results": results,
+        "run": _serialize_baseline_run(run),
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.post("/api/pudu/consumables/baseline-redetect-all-sites")
+def pudu_consumables_baseline_redetect_all_sites_endpoint(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    app_key, app_secret = get_pudu_credentials()
+    if not app_key or not app_secret:
+        raise HTTPException(status_code=503, detail="Missing Pudu credentials for baseline detection.")
+    run = PuduConsumableBaselineRun(
+        run_scope="all_sites",
+        initiated_by=str(user_info.get("email") or ""),
+        status="running",
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    try:
+        shops, shops_warning = fetch_pudu_shops_list()
+    except RuntimeError as e:
+        run.status = "failed"
+        run.error_message = str(e)
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logging.exception("Pudu shops list failed for baseline redetect all-sites")
+        run.status = "failed"
+        run.error_message = "Failed to load sites for baseline redetect"
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=500, detail="Failed to load sites for baseline redetect")
+
+    if shops_warning:
+        logging.warning("Pudu baseline redetect all-sites shops warning: %s", shops_warning)
+
+    site_results: List[Dict[str, object]] = []
+    total_sites = 0
+    total_robots = 0
+    total_updated = 0
+
+    for shop in shops:
+        if not isinstance(shop, dict):
+            continue
+        sid = str(shop.get("shop_id") or shop.get("id") or shop.get("shopId") or "").strip()
+        if not sid:
+            continue
+        total_sites += 1
+        site_name = str(shop.get("shop_name") or shop.get("name") or shop.get("shopName") or "").strip()
+
+        try:
+            robots_raw, robots_warning = fetch_pudu_robots_list(sid)
+        except RuntimeError as e:
+            site_results.append(
+                {
+                    "shop_id": sid,
+                    "shop_name": site_name,
+                    "updated_count": 0,
+                    "total_count": 0,
+                    "error": str(e),
+                }
+            )
+            continue
+        except Exception:
+            logging.exception("Pudu robots list failed for baseline redetect all-sites shop_id=%s", sid)
+            site_results.append(
+                {
+                    "shop_id": sid,
+                    "shop_name": site_name,
+                    "updated_count": 0,
+                    "total_count": 0,
+                    "error": "Failed to load robots for this site",
+                }
+            )
+            continue
+
+        if robots_warning:
+            logging.warning("Pudu baseline redetect all-sites robots warning shop_id=%s: %s", sid, robots_warning)
+
+        annotate_robot_list_with_canonical_sn(robots_raw)
+        serials: List[str] = []
+        seen: set[str] = set()
+        for row in robots_raw:
+            if not isinstance(row, dict):
+                continue
+            rsn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
+            if rsn and rsn not in seen:
+                seen.add(rsn)
+                serials.append(rsn)
+
+        site_updated = 0
+        for rsn in serials:
+            state = _resolve_consumables_baseline_state(
+                db,
+                shop_id=sid,
+                robot_sn=rsn,
+                app_key=app_key,
+                app_secret=app_secret,
+                force_redetect=True,
+            )
+            if state and state.baseline_start_date:
+                site_updated += 1
+
+        total_robots += len(serials)
+        total_updated += site_updated
+        site_results.append(
+            {
+                "shop_id": sid,
+                "shop_name": site_name,
+                "updated_count": site_updated,
+                "total_count": len(serials),
+            }
+        )
+
+    run.status = "success" if total_updated == total_robots else "partial"
+    run.updated_count = total_updated
+    run.total_count = total_robots
+    run.site_count = total_sites
+    run.error_message = None
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+
+    return {
+        "site_count": total_sites,
+        "updated_count": total_updated,
+        "total_count": total_robots,
+        "sites": site_results,
+        "run": _serialize_baseline_run(run),
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.post("/api/pudu/consumables/baseline-redetect-all-sites-cron")
+def pudu_consumables_baseline_redetect_all_sites_cron(
+    db: Session = Depends(get_db),
+):
+    """
+    Cron endpoint mirroring /api/tasks/check-due-cron style (no auth dependency).
+    Intended for Cloud Scheduler daily refresh of consumables baselines.
+    """
+    logging.info("Cron job triggered: consumables baseline re-detect (all sites)")
+    try:
+        return pudu_consumables_baseline_redetect_all_sites_endpoint(
+            user_info={"email": "cron@system"},
+            db=db,
+        )
+    except Exception as e:
+        logging.error("Error during consumables baseline all-sites cron: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
 def _robot_sn_from_open_platform_row(row: Dict[str, object]) -> str:
     for key in ("sn", "SN", "robot_sn", "serial_num", "serial_number", "device_sn"):
         v = row.get(key)
@@ -1130,6 +1701,7 @@ def _robot_display_label_from_open_platform_row(row: Dict[str, object], sn: str)
 def pudu_trial_summary_report_endpoint(
     request: PuduTrialSummaryReportRequest,
     user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """
     Generate a site-level trial summary PDF for the selected Pudu shop.
@@ -1174,12 +1746,49 @@ def pudu_trial_summary_report_endpoint(
     if not robots_payload:
         raise HTTPException(status_code=400, detail="No robots available for this site")
 
+    consumables_by_sn: Dict[str, List[Dict[str, object]]] = {}
+    consumables_baseline_start_date_by_sn: Dict[str, str] = {}
+    consumables_runtime_h_by_sn: Dict[str, float] = {}
+    robots_by_sn = {r["sn"]: r for r in robots_payload if r.get("sn")}
+    app_key, app_secret = get_pudu_credentials()
+    if robots_by_sn:
+        c_rows = (
+            db.query(PuduConsumable)
+            .filter(PuduConsumable.shop_id == shop_id, PuduConsumable.robot_sn.in_(list(robots_by_sn.keys())))
+            .order_by(PuduConsumable.robot_sn.asc(), PuduConsumable.mode_name.asc(), PuduConsumable.sort_order.asc(), PuduConsumable.id.asc())
+            .all()
+        )
+        for row in c_rows:
+            consumables_by_sn.setdefault(row.robot_sn, []).append(_serialize_consumable_row(row))
+        for robot_sn in robots_by_sn.keys():
+            state = _resolve_consumables_baseline_state(
+                db,
+                shop_id=shop_id,
+                robot_sn=robot_sn,
+                app_key=app_key,
+                app_secret=app_secret,
+            )
+            if state and state.baseline_start_date:
+                consumables_baseline_start_date_by_sn[robot_sn] = state.baseline_start_date.isoformat()
+                life_h = _compute_robot_lifetime_runtime_hours(
+                    shop_id=shop_id,
+                    robot_sn=robot_sn,
+                    baseline_start_date=state.baseline_start_date,
+                    app_key=app_key,
+                    app_secret=app_secret,
+                )
+                if life_h is not None:
+                    consumables_runtime_h_by_sn[robot_sn] = life_h
+
     result = generate_dashboard_trial_report(
         shop_id=shop_id,
         shop_name=shop_name,
         robots=robots_payload,
         start_date=report_start,
         labour_rate=request.labor_rate,
+        consumables_by_sn=consumables_by_sn,
+        consumables_runtime_h_by_sn=consumables_runtime_h_by_sn,
+        consumables_baseline_start_date_by_sn=consumables_baseline_start_date_by_sn,
     )
     if not result.ok:
         raise HTTPException(status_code=400, detail=result.error or "Failed to generate report")

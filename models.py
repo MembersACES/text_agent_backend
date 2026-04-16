@@ -243,6 +243,59 @@ class Testimonial(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class PuduConsumable(Base):
+    __tablename__ = "pudu_consumables"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_id = Column(String(64), nullable=False, index=True)
+    robot_sn = Column(String(80), nullable=False, index=True)
+    robot_label = Column(String(255), nullable=True)
+    mode_name = Column(String(120), nullable=True, index=True)
+    sku = Column(String(120), nullable=True)
+    name = Column(String(255), nullable=False)
+    quantity = Column(Float, nullable=True)
+    unit = Column(String(50), nullable=True)
+    rrp = Column(String(120), nullable=True)
+    lifespan_per_unit = Column(String(120), nullable=True)
+    hours = Column(Float, nullable=True)
+    last_replaced_at = Column(Date, nullable=True)
+    replacement_interval_days = Column(Integer, nullable=True)
+    item_type = Column(String(50), nullable=True)
+    notes = Column(Text, nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PuduConsumableRobotState(Base):
+    __tablename__ = "pudu_consumable_robot_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_id = Column(String(64), nullable=False, index=True)
+    robot_sn = Column(String(80), nullable=False, index=True)
+    baseline_start_date = Column(Date, nullable=True)
+    baseline_source = Column(String(60), nullable=True)
+    baseline_detected_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PuduConsumableBaselineRun(Base):
+    __tablename__ = "pudu_consumable_baseline_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_scope = Column(String(30), nullable=False, index=True)  # site | all_sites
+    shop_id = Column(String(64), nullable=True, index=True)
+    initiated_by = Column(String(255), nullable=True)
+    status = Column(String(30), nullable=False, default="running", index=True)  # running | success | partial | failed
+    updated_count = Column(Integer, nullable=False, default=0)
+    total_count = Column(Integer, nullable=False, default=0)
+    site_count = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    started_at = Column(DateTime, server_default=func.now(), nullable=False)
+    finished_at = Column(DateTime, nullable=True)
+
+
 # --- Autonomous follow-up sequences (Base 2 / gas follow-up; n8n + Retell) ---
 
 

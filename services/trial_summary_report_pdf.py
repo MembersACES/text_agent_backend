@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 from xml.sax.saxutils import escape
@@ -50,6 +51,44 @@ def _combined_from_robots(robots: Dict[str, Any]) -> Tuple[float, float, int, fl
     return a, h, t, p, w
 
 
+def _consumable_hours_status(runtime_h: float, hours_limit: Any) -> Tuple[str, str]:
+    try:
+        limit = float(hours_limit)
+    except (TypeError, ValueError):
+        return "N/A", "No hour target set"
+    if limit <= 0:
+        return "N/A", "No hour target set"
+    remaining = limit - float(runtime_h or 0)
+    if remaining <= 0:
+        return "Due now", f"Exceeded by {_f(abs(remaining), 1)} h"
+    if remaining <= max(25.0, limit * 0.1):
+        return "Due soon", f"{_f(remaining, 1)} h remaining"
+    return "OK", f"{_f(remaining, 1)} h remaining"
+
+
+def _consumable_date_status(last_replaced_at: Any, interval_days: Any) -> Tuple[str, str]:
+    try:
+        interval = int(interval_days)
+    except (TypeError, ValueError):
+        return "N/A", "No interval set"
+    if interval <= 0:
+        return "N/A", "No interval set"
+    if not last_replaced_at:
+        return "Due soon", "Last replaced date missing"
+    try:
+        replaced = date.fromisoformat(str(last_replaced_at))
+    except ValueError:
+        return "N/A", "Invalid replacement date"
+    due = replaced + timedelta(days=interval)
+    today = date.today()
+    delta = (due - today).days
+    if delta < 0:
+        return "Due now", f"Overdue by {abs(delta)} d"
+    if delta <= max(7, interval // 10):
+        return "Due soon", f"{delta} d remaining"
+    return "OK", f"{delta} d remaining"
+
+
 def _footer_canvas(canvas, _doc, subtitle: str) -> None:
     canvas.saveState()
     canvas.setFont("Helvetica", 8)
@@ -70,6 +109,9 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
     robots: Dict[str, Any] = dict(payload.get("robots") or {})
     weekly_trend: List[dict] = list(payload.get("weekly_trend") or [])
     sample_week: dict = dict(payload.get("sample_week") or {})
+    consumables_by_sn: Dict[str, List[dict]] = dict(payload.get("consumables_by_sn") or {})
+    consumables_runtime_h_by_sn: Dict[str, Any] = dict(payload.get("consumables_runtime_h_by_sn") or {})
+    consumables_baseline_start_date_by_sn: Dict[str, Any] = dict(payload.get("consumables_baseline_start_date_by_sn") or {})
 
     styles = getSampleStyleSheet()
     title = ParagraphStyle(
@@ -207,7 +249,7 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
         story.append(_P(f"- {n}", body))
         story.append(Spacer(1, 1.5 * mm))
 
-        story.append(_P("Recent week — site totals (analytics)", h2))
+    story.append(_P("Recent week — site totals (analytics)", h2))
     sw_s = sample_week.get("start_date", "")
     sw_e = sample_week.get("end_date", "")
     story.append(_P(f"Window: {sw_s} to {sw_e}", meta))
@@ -307,6 +349,101 @@ def render_report_pdf(output_path: str, payload: dict) -> None:
             story.append(tz)
         else:
             story.append(_P("No task-level breakdown rows.", meta))
+
+    if consumables_by_sn:
+        story.append(Spacer(1, 6 * mm))
+        story.append(_P("Consumables tracking", h2))
+        story.append(
+            _P(
+                "Per robot consumables list configured in the dashboard. Status is estimated from lifetime runtime "
+                "since each robot baseline date, plus replacement date/interval where provided.",
+                meta,
+            )
+        )
+        for sn, items in consumables_by_sn.items():
+            robot_rec = robots.get(sn) if isinstance(robots.get(sn), dict) else {}
+            runtime_h = float(consumables_runtime_h_by_sn.get(sn) or (robot_rec or {}).get("runtime_h") or 0.0)
+            baseline_date = str(consumables_baseline_start_date_by_sn.get(sn) or "").strip()
+            label = str((robot_rec or {}).get("label") or (robot_rec or {}).get("model") or sn)
+            story.append(Spacer(1, 3 * mm))
+            if baseline_date:
+                story.append(_P(f"{label} ({sn}) - lifetime runtime {_f(runtime_h)} h since {baseline_date}", h3))
+            else:
+                story.append(_P(f"{label} ({sn}) - runtime {_f(runtime_h)} h", h3))
+            if not isinstance(items, list) or not items:
+                story.append(_P("No consumables configured for this robot.", meta))
+                continue
+            ch = [_P("Mode", th), _P("Item", th), _P("Qty", th), _P("Lifespan", th), _P("Hours", th), _P("Status", th), _P("Notes", th)]
+            cr: List[List[Paragraph]] = [ch]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                status_hours, status_note_hours = _consumable_hours_status(runtime_h, item.get("hours"))
+                status_date, status_note_date = _consumable_date_status(
+                    item.get("last_replaced_at"),
+                    item.get("replacement_interval_days"),
+                )
+                if status_date == "Due now" or status_hours == "Due now":
+                    status = "Due now"
+                elif status_date == "Due soon" or status_hours == "Due soon":
+                    status = "Due soon"
+                elif status_date == "OK" or status_hours == "OK":
+                    status = "OK"
+                else:
+                    status = "N/A"
+                qty_raw = item.get("quantity")
+                qty_txt = ""
+                if qty_raw is not None:
+                    try:
+                        qf = float(qty_raw)
+                        qty_txt = str(int(qf)) if qf.is_integer() else _f(qf, 2)
+                    except (TypeError, ValueError):
+                        qty_txt = str(qty_raw)
+                unit_txt = str(item.get("unit") or "").strip()
+                qty_cell = f"{qty_txt} {unit_txt}".strip() or "-"
+                life_txt = str(item.get("lifespan_per_unit") or "").strip() or "-"
+                hours_val = item.get("hours")
+                hours_txt = "-"
+                if hours_val is not None:
+                    try:
+                        hours_txt = _f(float(hours_val), 1)
+                    except (TypeError, ValueError):
+                        hours_txt = str(hours_val)
+                replacement_date = str(item.get("last_replaced_at") or "").strip() or "-"
+                interval_val = item.get("replacement_interval_days")
+                interval_txt = str(interval_val) if interval_val is not None else "-"
+                notes_txt = str(item.get("notes") or "").strip()
+                status_notes: List[str] = []
+                if status_note_hours and status_note_hours != "No hour target set":
+                    status_notes.append(status_note_hours)
+                if status_note_date and status_note_date != "No interval set":
+                    status_notes.append(status_note_date)
+                if status_notes:
+                    notes_txt = f"{' | '.join(status_notes)}. {notes_txt}".strip()
+                cr.append(
+                    [
+                        _P(str(item.get("mode_name") or "-")[:30], td),
+                        _P(str(item.get("name") or "-")[:42], td),
+                        _P(qty_cell[:16], td),
+                        _P(f"{life_txt[:24]} / rep: {replacement_date} / every {interval_txt}d", td),
+                        _P(hours_txt, td_num),
+                        _P(status, td),
+                        _P((notes_txt or "-")[:64], td),
+                    ]
+                )
+            tc = Table(cr, colWidths=[28 * mm, 42 * mm, 16 * mm, 22 * mm, 14 * mm, 16 * mm, 38 * mm], repeatRows=1)
+            tc.setStyle(
+                TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
+                        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#cbd5e1")),
+                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("FONTSIZE", (0, 1), (-1, -1), 7.5),
+                    ]
+                )
+            )
+            story.append(tc)
 
     story.append(Spacer(1, 6 * mm))
     story.append(_P("Weekly trend (combined robots)", h2))
