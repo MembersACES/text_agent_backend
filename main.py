@@ -37,6 +37,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import uuid
+import hashlib
+import secrets
 import google.auth
 import csv
 import io
@@ -209,6 +211,24 @@ from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
+# Optional: external callers (n8n, scripts) use X-Tasks-API-Key + synthetic actor email
+TASKS_EXTERNAL_API_KEY = (os.getenv("TASKS_EXTERNAL_API_KEY") or "").strip()
+TASKS_EXTERNAL_ACTOR_EMAIL = (os.getenv("TASKS_EXTERNAL_ACTOR_EMAIL") or "").strip()
+
+
+def _tasks_external_api_key_valid(expected: str, provided: Optional[str]) -> bool:
+    """Constant-time compare for API keys of any length."""
+    if not expected or not provided:
+        return False
+    got = provided.strip()
+    if not got:
+        return False
+    return secrets.compare_digest(
+        hashlib.sha256(expected.encode("utf-8")).digest(),
+        hashlib.sha256(got.encode("utf-8")).digest(),
+    )
+
 
 # Configure logging (uvicorn may configure the root logger first; keep app logs visible)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
@@ -460,6 +480,48 @@ def get_current_user_with_db(
     
     # Return both the idinfo (for compatibility) and user object
     return {"idinfo": idinfo, "user": user}
+
+
+def get_current_user_with_db_or_tasks_api_key(
+    authorization: Optional[str] = Header(None),
+    x_tasks_api_key: Optional[str] = Header(None, alias="X-Tasks-API-Key"),
+    db: Session = Depends(get_db),
+):
+    """
+    Same return shape as get_current_user_with_db: Google Bearer ID token, or
+    X-Tasks-API-Key matching TASKS_EXTERNAL_API_KEY (with TASKS_EXTERNAL_ACTOR_EMAIL set).
+    """
+    if TASKS_EXTERNAL_API_KEY and x_tasks_api_key is not None:
+        trimmed_key = x_tasks_api_key.strip()
+        if trimmed_key:
+            if _tasks_external_api_key_valid(TASKS_EXTERNAL_API_KEY, x_tasks_api_key):
+                if not TASKS_EXTERNAL_ACTOR_EMAIL:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="TASKS_EXTERNAL_ACTOR_EMAIL must be set when TASKS_EXTERNAL_API_KEY is configured",
+                    )
+                idinfo = {
+                    "email": TASKS_EXTERNAL_ACTOR_EMAIL,
+                    "name": "External tasks API",
+                    "picture": None,
+                }
+                user = get_or_create_user(
+                    db,
+                    TASKS_EXTERNAL_ACTOR_EMAIL,
+                    name=idinfo.get("name"),
+                    picture=idinfo.get("picture"),
+                )
+                logging.info("Authenticated task request via TASKS_EXTERNAL_API_KEY")
+                return {"idinfo": idinfo, "user": user}
+            raise HTTPException(status_code=401, detail="Invalid X-Tasks-API-Key")
+
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing credentials: send Authorization Bearer (Google ID token) or X-Tasks-API-Key",
+        )
+    return get_current_user_with_db(authorization=authorization, db=db)
+
 
 class BusinessInfoRequest(BaseModel):
     business_name: str
@@ -5395,7 +5457,7 @@ async def generate_testimonial_document_endpoint(
 async def create_task(
     task: TaskCreate,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Create a new task"""
     logging.info(f"Received task creation request: {task.title}")
@@ -5440,7 +5502,7 @@ async def create_task(
 @app.get("/api/tasks/my", response_model=List[TaskResponse])
 def get_my_tasks(
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Get all tasks assigned to the current user"""
     user_info = user_data["idinfo"]
@@ -5458,7 +5520,7 @@ async def update_task_status(
     task_id: int,
     status_update: TaskStatusUpdate,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Update the status of a task"""
     logging.info(f"Updating task {task_id} status to: {status_update.status}")
@@ -5505,7 +5567,7 @@ async def update_task(
     task_id: int,
     task_update: TaskUpdate,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Update task fields (title, description, due_date, assigned_to, business_id, client_id, category)"""
     logging.info(f"Updating task {task_id}")
@@ -5597,7 +5659,7 @@ async def update_task(
 def get_tasks_by_business(
     business_id: int,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Get all tasks for a specific business"""
     logging.info(f"Fetching tasks for business_id: {business_id}")
@@ -5612,7 +5674,7 @@ def get_tasks_by_business(
 def get_tasks_by_client(
     client_id: int,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db),
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key),
 ):
     """Get all tasks for a specific client"""
     logging.info(f"Fetching tasks for client_id: {client_id}")
@@ -5626,7 +5688,7 @@ def get_tasks_by_client(
 @app.get("/api/users", response_model=List[UserResponse])
 def list_users(
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Get all users (for assign dropdown)"""
     logging.info("Fetching all users")
@@ -5639,7 +5701,7 @@ def list_users(
 @app.get("/api/tasks/assigned-by-me", response_model=List[TaskResponse])
 def get_tasks_assigned_by_me(
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Get all tasks created by the current user"""
     user_info = user_data["idinfo"]
@@ -5656,7 +5718,7 @@ def get_tasks_assigned_by_me(
 def delete_task(
     task_id: int,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Delete a task"""
     logging.info(f"Deleting task {task_id}")
@@ -5698,7 +5760,7 @@ def delete_task(
 @app.get("/api/tasks/all", response_model=List[TaskResponse])
 def get_all_tasks(
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Get all tasks"""
     logging.info("Fetching all tasks")
@@ -5713,7 +5775,7 @@ def get_all_tasks(
 def get_task_history(
     task_id: int,
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db),
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key),
     page: int = Query(1, ge=1, description="Page number (starts at 1)"),
     page_size: int = Query(50, ge=1, le=100, description="Number of items per page")
 ):
@@ -5826,7 +5888,7 @@ def get_task_history(
 @app.post("/api/tasks/check-due")
 async def check_due_tasks_endpoint(
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db)
+    user_data: dict = Depends(get_current_user_with_db_or_tasks_api_key)
 ):
     """Manually trigger check for due/overdue tasks (for testing)"""
     logging.info("Manual due tasks check triggered")
