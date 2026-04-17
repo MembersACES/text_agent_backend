@@ -292,6 +292,8 @@ class PuduConsumableBaselineRun(Base):
     total_count = Column(Integer, nullable=False, default=0)
     site_count = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
+    # JSON: { "sites": [...], "robot_detail_summary": { ok, no_baseline, error } } for all_sites runs (UI + reconnects).
+    detail_json = Column(Text, nullable=True)
     started_at = Column(DateTime, server_default=func.now(), nullable=False)
     finished_at = Column(DateTime, nullable=True)
 

@@ -1429,7 +1429,7 @@ def _compute_robot_lifetime_runtime_hours(
 
 
 def _serialize_baseline_run(run: PuduConsumableBaselineRun) -> Dict[str, object]:
-    return {
+    out: Dict[str, object] = {
         "id": run.id,
         "run_scope": run.run_scope,
         "shop_id": run.shop_id,
@@ -1442,6 +1442,15 @@ def _serialize_baseline_run(run: PuduConsumableBaselineRun) -> Dict[str, object]
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
     }
+    dj = getattr(run, "detail_json", None)
+    if isinstance(dj, str) and dj.strip():
+        try:
+            parsed = json.loads(dj)
+            if isinstance(parsed, dict):
+                out["run_details"] = parsed
+        except json.JSONDecodeError:
+            logging.warning("Invalid detail_json on baseline run id=%s", run.id)
+    return out
 
 
 def _baseline_job_error_text(exc: BaseException, max_len: int = 480) -> str:
@@ -2004,7 +2013,21 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
     else:
         run.error_message = None
     run.finished_at = datetime.now(timezone.utc)
+    snapshot: Dict[str, object] = {
+        "sites": site_results,
+        "robot_detail_summary": {
+            "ok": robot_detail_ok,
+            "no_baseline": robot_detail_no_baseline,
+            "error": robot_detail_error,
+        },
+    }
+    try:
+        run.detail_json = json.dumps(snapshot, default=str)
+    except Exception:
+        logging.warning("Could not JSON-serialize consumables baseline run snapshot", exc_info=True)
+        run.detail_json = None
     db.commit()
+    db.refresh(run)
 
     return {
         "site_count": total_sites,
