@@ -1624,8 +1624,18 @@ def pudu_consumables_baseline_refresh_status_endpoint(
         .order_by(PuduConsumableBaselineRun.started_at.desc(), PuduConsumableBaselineRun.id.desc())
         .first()
     )
+    latest_global_completed = (
+        db.query(PuduConsumableBaselineRun)
+        .filter(
+            PuduConsumableBaselineRun.run_scope == "all_sites",
+            PuduConsumableBaselineRun.finished_at.is_not(None),
+        )
+        .order_by(PuduConsumableBaselineRun.started_at.desc(), PuduConsumableBaselineRun.id.desc())
+        .first()
+    )
     return {
         "latest_global": _serialize_baseline_run(latest_global) if latest_global else None,
+        "latest_global_completed": _serialize_baseline_run(latest_global_completed) if latest_global_completed else None,
         "latest_any": _serialize_baseline_run(latest_any) if latest_any else None,
         "user_email": user_info.get("email"),
     }
