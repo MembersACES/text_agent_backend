@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 import os
 import sys
 import logging
+import time
 import tempfile
 import os
 import httpx
@@ -1814,6 +1815,15 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
     db.commit()
     db.refresh(run)
 
+    t0 = time.perf_counter()
+    logging.info(
+        "Consumables baseline all-sites started run_id=%s initiated_by=%r force_redetect=%s max_pages=%s",
+        run.id,
+        initiated_by,
+        force_redetect,
+        max_pages,
+    )
+
     try:
         shops, shops_warning = fetch_pudu_shops_list()
     except RuntimeError as e:
@@ -1821,9 +1831,14 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
         run.error_message = str(e)
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
+        logging.error(
+            "Consumables baseline all-sites aborted run_id=%s phase=shops_list err=%s",
+            run.id,
+            str(e),
+        )
         raise HTTPException(status_code=503, detail=str(e))
     except Exception:
-        logging.exception("Pudu shops list failed for baseline redetect all-sites")
+        logging.exception("Pudu shops list failed for baseline redetect all-sites run_id=%s", run.id)
         run.status = "failed"
         run.error_message = "Failed to load sites for baseline redetect"
         run.finished_at = datetime.now(timezone.utc)
@@ -2028,6 +2043,28 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
         run.detail_json = None
     db.commit()
     db.refresh(run)
+
+    elapsed_s = time.perf_counter() - t0
+    logging.info(
+        "Consumables baseline all-sites finished run_id=%s status=%s duration_s=%.2f "
+        "sites=%s robots=%s updated=%s per_robot_ok=%s per_robot_no_baseline=%s per_robot_error=%s",
+        run.id,
+        run.status,
+        elapsed_s,
+        total_sites,
+        total_robots,
+        total_updated,
+        robot_detail_ok,
+        robot_detail_no_baseline,
+        robot_detail_error,
+    )
+    if elapsed_s > 90.0:
+        logging.warning(
+            "Consumables baseline all-sites took %.1fs (run_id=%s); many proxies time out before 60–120s, "
+            "which produces browser 'Failed to fetch' even if this line appears in API logs.",
+            elapsed_s,
+            run.id,
+        )
 
     return {
         "site_count": total_sites,
