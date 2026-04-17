@@ -68,6 +68,9 @@ def generate_dashboard_trial_report(
     app_key: Optional[str] = None,
     app_secret: Optional[str] = None,
     labour_rate: Optional[float] = None,
+    consumables_by_sn: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    consumables_runtime_h_by_sn: Optional[Dict[str, float]] = None,
+    consumables_baseline_start_date_by_sn: Optional[Dict[str, str]] = None,
 ) -> DashboardTrialReportResult:
     sid = str(shop_id).strip()
     sname = str(shop_name).strip() or f"Shop {sid}"
@@ -102,6 +105,12 @@ def generate_dashboard_trial_report(
         return DashboardTrialReportResult(ok=False, error=f"Report generation failed: {e!s}")
 
     payload = bundle.payload
+    if consumables_by_sn:
+        payload["consumables_by_sn"] = consumables_by_sn
+    if consumables_runtime_h_by_sn:
+        payload["consumables_runtime_h_by_sn"] = consumables_runtime_h_by_sn
+    if consumables_baseline_start_date_by_sn:
+        payload["consumables_baseline_start_date_by_sn"] = consumables_baseline_start_date_by_sn
     md = bundle.markdown
     json_text = json.dumps(payload, indent=2)
 

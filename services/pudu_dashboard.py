@@ -201,13 +201,20 @@ def fetch_clean_task_query_list_page(
     app_secret: str,
     query: Dict[str, Any],
     *,
-    initial_limit: int = 50,
+    initial_limit: int = 20,
 ) -> Tuple[Optional[List[Any]], int, Optional[str]]:
     """
-    Resilient first page of query_list: limit chain  initial_limit → 20 → 10 → 5, retries on 5xx/429.
+    Resilient first page of query_list: limit chain initial_limit → smaller, retries on 5xx/429.
+
+    Pudu often returns HTTP 500 for ``limit=50`` on this endpoint while ``limit=20`` succeeds;
+    default first attempt is therefore 20, not 50 (see clean/paging resilient helper for same pattern).
     Returns (rows, used_lim, error).
     """
-    limits = [initial_limit, 20, 10, 5]
+    raw_limits = [initial_limit, 15, 10, 5]
+    limits: List[int] = []
+    for lim in raw_limits:
+        if lim not in limits:
+            limits.append(lim)
     last_err: Optional[str] = None
     for lim in limits:
         q = {**query, "limit": lim}
@@ -250,6 +257,88 @@ def fetch_clean_task_query_list_page(
                 last_err = err or "empty body"
             break
     return None, 0, last_err or "query_list failed"
+
+
+def _row_time_candidates_unix_seconds(row: Dict[str, Any]) -> List[int]:
+    out: List[int] = []
+    for key in ("start_time", "end_time", "create_time"):
+        v = row.get(key)
+        if isinstance(v, (int, float)):
+            iv = int(v)
+            if 946684800 <= iv <= 4102444800:  # 2000-01-01 .. 2100-01-01
+                out.append(iv)
+        elif isinstance(v, str):
+            s = v.strip()
+            if s.isdigit():
+                iv = int(s)
+                if 946684800 <= iv <= 4102444800:
+                    out.append(iv)
+    return out
+
+
+def detect_robot_first_execution_ts(
+    app_key: str,
+    app_secret: str,
+    *,
+    shop_id: str,
+    robot_sn: str,
+    max_pages: int = 200,
+) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Best-effort first available execution timestamp for a robot by walking query_list pages.
+    query_list is newest-first; this scans pages until exhaustion and returns the oldest ts seen.
+    """
+    end_ts = int(datetime.now(timezone.utc).timestamp())
+    start_ts = 946684800  # 2000-01-01 UTC
+    tz_off = melbourne_offset_hours(start_ts, end_ts)
+    offset = 0
+    oldest: Optional[int] = None
+    last_err: Optional[str] = None
+
+    for _ in range(max_pages):
+        rows, used_lim, err = fetch_clean_task_query_list_page(
+            app_key,
+            app_secret,
+            {
+                "shop_id": str(shop_id).strip(),
+                "sn": str(robot_sn).strip(),
+                "start_time": start_ts,
+                "end_time": end_ts,
+                "timezone_offset": tz_off,
+                "offset": offset,
+            },
+            initial_limit=20,
+        )
+        if rows is None:
+            last_err = err
+            break
+        if not rows:
+            break
+
+        filtered_rows = rows
+        if any(_execution_row_sn(r) for r in rows if isinstance(r, dict)):
+            filtered_rows = [
+                r
+                for r in rows
+                if isinstance(r, dict) and _execution_row_sn(r).strip().lower() == robot_sn.strip().lower()
+            ]
+
+        for r in filtered_rows:
+            if not isinstance(r, dict):
+                continue
+            for ts in _row_time_candidates_unix_seconds(r):
+                oldest = ts if oldest is None else min(oldest, ts)
+
+        step = used_lim if used_lim > 0 else len(rows)
+        if step <= 0:
+            break
+        offset += step
+        if len(rows) < step:
+            break
+
+    if oldest is not None:
+        return oldest, None
+    return None, last_err or "no rows found"
 
 
 def fetch_clean_paging_sn_resilient(
@@ -465,7 +554,7 @@ def build_dashboard_payload(
         exec_query["shop_id"] = str(shop_id).strip()
 
     rows, used_lim, ex_err = fetch_clean_task_query_list_page(
-        key, secret, exec_query, initial_limit=50
+        key, secret, exec_query, initial_limit=20
     )
     if ex_err:
         degraded["executions"] = True
