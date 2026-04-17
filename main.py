@@ -205,7 +205,7 @@ from utils.task_history import (
 # Email and scheduler imports
 from email_service import send_new_task_email, send_task_completed_email, check_due_tasks
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -663,6 +663,11 @@ class PuduConsumablesReplaceRequest(BaseModel):
     sn: str
     robot_label: Optional[str] = None
     items: List[PuduConsumableItemInput]
+
+
+class PuduConsumablesMarkReplacedRequest(BaseModel):
+    item_ids: List[int]
+    replaced_at: Optional[str] = None  # YYYY-MM-DD; defaults to today (Melbourne)
 
 class UtilityRecordUpdateRequest(BaseModel):
     """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
@@ -1459,6 +1464,235 @@ def _baseline_job_error_text(exc: BaseException, max_len: int = 480) -> str:
     if len(msg) > max_len:
         return msg[: max_len - 1] + "…"
     return msg
+
+
+def _site_name_lookup_from_latest_completed_baseline_run(db: Session) -> Dict[str, str]:
+    """Best-effort map shop_id -> shop_name from the latest completed all-sites baseline run snapshot."""
+    run = (
+        db.query(PuduConsumableBaselineRun)
+        .filter(
+            PuduConsumableBaselineRun.run_scope == "all_sites",
+            PuduConsumableBaselineRun.finished_at.is_not(None),
+        )
+        .order_by(PuduConsumableBaselineRun.started_at.desc(), PuduConsumableBaselineRun.id.desc())
+        .first()
+    )
+    if run is None or not isinstance(getattr(run, "detail_json", None), str):
+        return {}
+    raw = str(run.detail_json or "").strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    sites = payload.get("sites")
+    if not isinstance(sites, list):
+        return {}
+    out: Dict[str, str] = {}
+    for s in sites:
+        if not isinstance(s, dict):
+            continue
+        sid = str(s.get("shop_id") or "").strip()
+        name = str(s.get("shop_name") or "").strip()
+        if sid and name:
+            out[sid] = name
+    return out
+
+
+@app.get("/api/pudu/consumables/hub")
+def pudu_consumables_hub_endpoint(
+    due_soon_days: int = Query(30, ge=0, le=3650, description="Items due within N days are marked due_soon."),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Phase 1 consumables hub: DB-backed overview across all deployed robots.
+    No live Pudu calls here; this endpoint is meant to be fast and stable.
+    """
+    items = (
+        db.query(PuduConsumable)
+        .order_by(
+            PuduConsumable.shop_id.asc(),
+            PuduConsumable.robot_sn.asc(),
+            PuduConsumable.mode_name.asc(),
+            PuduConsumable.sort_order.asc(),
+            PuduConsumable.id.asc(),
+        )
+        .all()
+    )
+    if not items:
+        return {
+            "summary": {
+                "total_items": 0,
+                "total_robots": 0,
+                "overdue_items": 0,
+                "due_soon_items": 0,
+                "ok_items": 0,
+                "unknown_items": 0,
+                "overdue_robots": 0,
+                "due_soon_robots": 0,
+                "unknown_robots": 0,
+                "due_soon_days": due_soon_days,
+            },
+            "items": [],
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "user_email": user_info.get("email"),
+        }
+
+    robot_keys = {(str(r.shop_id or "").strip(), str(r.robot_sn or "").strip()) for r in items}
+    shop_ids = sorted({k[0] for k in robot_keys if k[0]})
+    robot_sns = sorted({k[1] for k in robot_keys if k[1]})
+    state_rows: List[PuduConsumableRobotState] = []
+    if shop_ids and robot_sns:
+        state_rows = (
+            db.query(PuduConsumableRobotState)
+            .filter(
+                PuduConsumableRobotState.shop_id.in_(shop_ids),
+                PuduConsumableRobotState.robot_sn.in_(robot_sns),
+            )
+            .all()
+        )
+    baseline_by_robot: Dict[tuple[str, str], Optional[date]] = {}
+    for s in state_rows:
+        sid = str(s.shop_id or "").strip()
+        rsn = str(s.robot_sn or "").strip()
+        if sid and rsn:
+            baseline_by_robot[(sid, rsn)] = s.baseline_start_date
+
+    site_name_by_id = _site_name_lookup_from_latest_completed_baseline_run(db)
+    today = datetime.now(MELBOURNE_TZ).date()
+    status_rank = {"overdue": 0, "due_soon": 1, "unknown": 2, "ok": 3}
+    hub_rows: List[Dict[str, object]] = []
+    robots_by_status: Dict[str, set[str]] = {"overdue": set(), "due_soon": set(), "unknown": set()}
+    status_counts: Dict[str, int] = {"overdue": 0, "due_soon": 0, "ok": 0, "unknown": 0}
+
+    for row in items:
+        sid = str(row.shop_id or "").strip()
+        rsn = str(row.robot_sn or "").strip()
+        robot_key = f"{sid}|{rsn}"
+        baseline = baseline_by_robot.get((sid, rsn))
+        effective_last = row.last_replaced_at or baseline
+        interval_days = row.replacement_interval_days
+        if interval_days is None:
+            interval_days = approx_replacement_interval_days(row.lifespan_per_unit or "")
+
+        status = "unknown"
+        status_reason = ""
+        due_date: Optional[date] = None
+        days_until_due: Optional[int] = None
+        if effective_last is None and interval_days is None:
+            status = "unknown"
+            status_reason = "Missing last replaced date and replacement interval."
+        elif effective_last is None:
+            status = "unknown"
+            status_reason = "Missing last replaced date."
+        elif interval_days is None:
+            status = "unknown"
+            status_reason = "Missing replacement interval."
+        else:
+            due_date = effective_last + timedelta(days=max(0, int(interval_days)))
+            days_until_due = (due_date - today).days
+            if days_until_due < 0:
+                status = "overdue"
+                status_reason = f"Overdue by {abs(days_until_due)} day(s)."
+            elif days_until_due <= due_soon_days:
+                status = "due_soon"
+                status_reason = f"Due in {days_until_due} day(s)."
+            else:
+                status = "ok"
+                status_reason = f"Healthy ({days_until_due} day(s) remaining)."
+
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status in robots_by_status:
+            robots_by_status[status].add(robot_key)
+
+        hub_rows.append(
+            {
+                "id": row.id,
+                "shop_id": sid,
+                "shop_name": site_name_by_id.get(sid) or None,
+                "robot_sn": rsn,
+                "robot_label": (row.robot_label or rsn),
+                "mode_name": row.mode_name or "",
+                "sku": row.sku or "",
+                "name": row.name or "",
+                "item_type": row.item_type or "",
+                "lifespan_per_unit": row.lifespan_per_unit or "",
+                "replacement_interval_days": int(interval_days) if interval_days is not None else None,
+                "last_replaced_at": effective_last.isoformat() if effective_last else None,
+                "baseline_start_date": baseline.isoformat() if baseline else None,
+                "due_date": due_date.isoformat() if due_date else None,
+                "days_until_due": days_until_due,
+                "status": status,
+                "status_reason": status_reason,
+                "notes": row.notes or "",
+            }
+        )
+
+    hub_rows.sort(
+        key=lambda x: (
+            status_rank.get(str(x.get("status")), 9),
+            int(x.get("days_until_due")) if isinstance(x.get("days_until_due"), int) else 999999,
+            str(x.get("shop_name") or ""),
+            str(x.get("shop_id") or ""),
+            str(x.get("robot_label") or ""),
+            str(x.get("name") or ""),
+        )
+    )
+
+    return {
+        "summary": {
+            "total_items": len(hub_rows),
+            "total_robots": len({f"{str(r.shop_id or '').strip()}|{str(r.robot_sn or '').strip()}" for r in items}),
+            "overdue_items": status_counts["overdue"],
+            "due_soon_items": status_counts["due_soon"],
+            "ok_items": status_counts["ok"],
+            "unknown_items": status_counts["unknown"],
+            "overdue_robots": len(robots_by_status["overdue"]),
+            "due_soon_robots": len(robots_by_status["due_soon"]),
+            "unknown_robots": len(robots_by_status["unknown"]),
+            "due_soon_days": due_soon_days,
+        },
+        "items": hub_rows,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.post("/api/pudu/consumables/mark-replaced")
+def pudu_consumables_mark_replaced_endpoint(
+    request: PuduConsumablesMarkReplacedRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    ids = sorted({int(i) for i in (request.item_ids or []) if int(i) > 0})
+    if not ids:
+        raise HTTPException(status_code=400, detail="item_ids is required")
+
+    replace_date: date
+    if request.replaced_at and str(request.replaced_at).strip():
+        try:
+            replace_date = date.fromisoformat(str(request.replaced_at).strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid replaced_at. Expected YYYY-MM-DD.")
+    else:
+        replace_date = datetime.now(MELBOURNE_TZ).date()
+
+    updated = (
+        db.query(PuduConsumable)
+        .filter(PuduConsumable.id.in_(ids))
+        .update({PuduConsumable.last_replaced_at: replace_date}, synchronize_session=False)
+    )
+    db.commit()
+    return {
+        "updated_count": int(updated or 0),
+        "requested_count": len(ids),
+        "replaced_at": replace_date.isoformat(),
+        "user_email": user_info.get("email"),
+    }
 
 
 @app.get("/api/pudu/consumables")
