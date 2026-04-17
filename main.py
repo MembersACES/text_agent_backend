@@ -1215,6 +1215,114 @@ def _backfill_consumable_intervals_from_lifespan(
             r.replacement_interval_days = parsed
 
 
+def _robot_product_code_hint_from_open_platform_row(row: Dict[str, object]) -> str:
+    return str(
+        row.get("product_code")
+        or row.get("productCode")
+        or row.get("model")
+        or row.get("robot_model")
+        or row.get("machine_model")
+        or row.get("type")
+        or ""
+    ).strip()
+
+
+def _seed_consumables_from_default_template_if_empty(
+    db: Session,
+    *,
+    shop_id: str,
+    robot_sn: str,
+    product_code_hint: str,
+    baseline_date: Optional[date],
+) -> None:
+    """
+    If this robot has no pudu_consumables rows yet, insert the default product template with
+    baseline-based last_replaced_at / intervals — same as opening the consumables page and Save.
+    """
+    existing = (
+        db.query(PuduConsumable)
+        .filter(PuduConsumable.shop_id == shop_id, PuduConsumable.robot_sn == robot_sn)
+        .limit(1)
+        .first()
+    )
+    if existing is not None or baseline_date is None:
+        return
+
+    template_rows: List[Dict[str, Any]] = default_consumables_for_product(product_code_hint)
+    if not template_rows:
+        return
+    for i, row in enumerate(template_rows):
+        row["sort_order"] = i
+    _enrich_consumable_template_dicts(template_rows, baseline_date=baseline_date)
+
+    robot_label = (product_code_hint or "").strip() or None
+    new_rows: List[PuduConsumable] = []
+    sort_i = 0
+    for item in template_rows:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        qty = item.get("quantity")
+        if qty is not None and not isinstance(qty, (int, float)):
+            try:
+                qty = float(qty)
+            except (TypeError, ValueError):
+                qty = None
+        hrs = item.get("hours")
+        if hrs is not None and not isinstance(hrs, (int, float)):
+            try:
+                hrs = float(hrs)
+            except (TypeError, ValueError):
+                hrs = None
+
+        last_replaced_at: Optional[date] = baseline_date
+        lr_raw = item.get("last_replaced_at")
+        if isinstance(lr_raw, str) and lr_raw.strip():
+            try:
+                last_replaced_at = date.fromisoformat(lr_raw.strip())
+            except ValueError:
+                last_replaced_at = baseline_date
+
+        interval_days: Optional[int]
+        raw_iv = item.get("replacement_interval_days")
+        if raw_iv is None:
+            interval_days = approx_replacement_interval_days(str(item.get("lifespan_per_unit") or ""))
+        else:
+            try:
+                interval_days = int(raw_iv)
+            except (TypeError, ValueError):
+                interval_days = approx_replacement_interval_days(str(item.get("lifespan_per_unit") or ""))
+        if interval_days is not None and interval_days < 0:
+            interval_days = None
+
+        new_rows.append(
+            PuduConsumable(
+                shop_id=shop_id,
+                robot_sn=robot_sn,
+                robot_label=robot_label,
+                mode_name=(str(item.get("mode_name") or "").strip() or None),
+                sku=(str(item.get("sku") or "").strip() or None),
+                name=name,
+                quantity=qty,
+                unit=(str(item.get("unit") or "").strip() or None),
+                rrp=(str(item.get("rrp") or "").strip() or None),
+                lifespan_per_unit=(str(item.get("lifespan_per_unit") or "").strip() or None),
+                hours=hrs,
+                last_replaced_at=last_replaced_at,
+                replacement_interval_days=interval_days,
+                item_type=(str(item.get("item_type") or "").strip() or None),
+                notes=(str(item.get("notes") or "").strip() or None),
+                sort_order=sort_i,
+            )
+        )
+        sort_i += 1
+
+    if not new_rows:
+        return
+    db.add_all(new_rows)
+    db.commit()
+
+
 MELBOURNE_TZ = ZoneInfo("Australia/Melbourne")
 
 
@@ -1334,6 +1442,13 @@ def _serialize_baseline_run(run: PuduConsumableBaselineRun) -> Dict[str, object]
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
     }
+
+
+def _baseline_job_error_text(exc: BaseException, max_len: int = 480) -> str:
+    msg = str(exc).strip() or exc.__class__.__name__
+    if len(msg) > max_len:
+        return msg[: max_len - 1] + "…"
+    return msg
 
 
 @app.get("/api/pudu/consumables")
@@ -1529,27 +1644,30 @@ def pudu_consumables_baseline_redetect_endpoint(
     db.refresh(run)
 
     serials: List[str] = []
+    robot_row_by_sn: Dict[str, Dict[str, object]] = {}
+    try:
+        robots_raw, robots_warning = fetch_pudu_robots_list(sid)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logging.exception("Pudu robots list failed for baseline redetect")
+        raise HTTPException(status_code=500, detail="Failed to load robots for selected site")
+    if robots_warning:
+        logging.warning("Pudu baseline redetect robots warning shop_id=%s: %s", sid, robots_warning)
+    annotate_robot_list_with_canonical_sn(robots_raw)
+    seen: set[str] = set()
+    for row in robots_raw:
+        if not isinstance(row, dict):
+            continue
+        rsn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
+        if not rsn:
+            continue
+        robot_row_by_sn[rsn] = row
+        if not serial and rsn not in seen:
+            seen.add(rsn)
+            serials.append(rsn)
     if serial:
         serials = [serial]
-    else:
-        try:
-            robots_raw, robots_warning = fetch_pudu_robots_list(sid)
-        except RuntimeError as e:
-            raise HTTPException(status_code=503, detail=str(e))
-        except Exception:
-            logging.exception("Pudu robots list failed for baseline redetect")
-            raise HTTPException(status_code=500, detail="Failed to load robots for selected site")
-        if robots_warning:
-            logging.warning("Pudu baseline redetect robots warning shop_id=%s: %s", sid, robots_warning)
-        annotate_robot_list_with_canonical_sn(robots_raw)
-        seen: set[str] = set()
-        for row in robots_raw:
-            if not isinstance(row, dict):
-                continue
-            rsn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
-            if rsn and rsn not in seen:
-                seen.add(rsn)
-                serials.append(rsn)
 
     if not serials:
         run.status = "partial"
@@ -1570,27 +1688,80 @@ def pudu_consumables_baseline_redetect_endpoint(
 
     results: List[Dict[str, object]] = []
     updated = 0
+    any_robot_error = False
     for rsn in serials:
-        state = _resolve_consumables_baseline_state(
-            db,
-            shop_id=sid,
-            robot_sn=rsn,
-            app_key=app_key,
-            app_secret=app_secret,
-            force_redetect=True,
-            max_pages=600,
-        )
-        baseline_iso = state.baseline_start_date.isoformat() if state and state.baseline_start_date else None
-        if baseline_iso:
-            updated += 1
-        results.append(
-            {
-                "sn": rsn,
-                "baseline_start_date": baseline_iso,
-                "baseline_source": state.baseline_source if state else None,
-            }
-        )
-    run.status = "success" if updated == len(serials) else "partial"
+        row_dict = robot_row_by_sn.get(rsn) or {}
+        pc = _robot_product_code_hint_from_open_platform_row(row_dict)
+        try:
+            state = _resolve_consumables_baseline_state(
+                db,
+                shop_id=sid,
+                robot_sn=rsn,
+                app_key=app_key,
+                app_secret=app_secret,
+                force_redetect=True,
+                max_pages=600,
+            )
+            baseline_iso = state.baseline_start_date.isoformat() if state and state.baseline_start_date else None
+            b_source = state.baseline_source if state else None
+            if baseline_iso:
+                updated += 1
+            try:
+                _seed_consumables_from_default_template_if_empty(
+                    db,
+                    shop_id=sid,
+                    robot_sn=rsn,
+                    product_code_hint=pc,
+                    baseline_date=state.baseline_start_date if state else None,
+                )
+            except Exception as seed_exc:
+                logging.exception(
+                    "Consumables template seed failed during site baseline redetect shop_id=%s sn=%s",
+                    sid,
+                    rsn,
+                )
+                any_robot_error = True
+                results.append(
+                    {
+                        "sn": rsn,
+                        "product_hint": pc or None,
+                        "baseline_start_date": baseline_iso,
+                        "baseline_source": b_source,
+                        "status": "error",
+                        "error": _baseline_job_error_text(seed_exc),
+                    }
+                )
+                continue
+
+            results.append(
+                {
+                    "sn": rsn,
+                    "product_hint": pc or None,
+                    "baseline_start_date": baseline_iso,
+                    "baseline_source": b_source,
+                    "status": "ok" if baseline_iso else "no_baseline",
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            logging.exception(
+                "Consumables baseline redetect failed shop_id=%s sn=%s",
+                sid,
+                rsn,
+            )
+            any_robot_error = True
+            results.append(
+                {
+                    "sn": rsn,
+                    "product_hint": pc or None,
+                    "baseline_start_date": None,
+                    "baseline_source": None,
+                    "status": "error",
+                    "error": _baseline_job_error_text(exc),
+                }
+            )
+
+    run.status = "success" if not any_robot_error and updated == len(serials) else "partial"
     run.updated_count = updated
     run.total_count = len(serials)
     run.site_count = 1
@@ -1657,6 +1828,9 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
     total_sites = 0
     total_robots = 0
     total_updated = 0
+    robot_detail_ok = 0
+    robot_detail_no_baseline = 0
+    robot_detail_error = 0
 
     for shop in shops:
         if not isinstance(shop, dict):
@@ -1698,45 +1872,137 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
 
         annotate_robot_list_with_canonical_sn(robots_raw)
         serials: List[str] = []
+        robot_row_by_sn: Dict[str, Dict[str, object]] = {}
         seen: set[str] = set()
         for row in robots_raw:
             if not isinstance(row, dict):
                 continue
             rsn = str(row.get("sn_canonical") or _robot_sn_from_open_platform_row(row) or "").strip()
-            if rsn and rsn not in seen:
+            if not rsn:
+                continue
+            robot_row_by_sn[rsn] = row
+            if rsn not in seen:
                 seen.add(rsn)
                 serials.append(rsn)
 
         site_updated = 0
+        robot_results: List[Dict[str, object]] = []
+        site_warning = str(robots_warning).strip() if robots_warning else None
+
         for rsn in serials:
-            state = _resolve_consumables_baseline_state(
-                db,
-                shop_id=sid,
-                robot_sn=rsn,
-                app_key=app_key,
-                app_secret=app_secret,
-                force_redetect=force_redetect,
-                max_pages=max_pages,
-            )
-            if state and state.baseline_start_date:
-                site_updated += 1
+            row_dict = robot_row_by_sn.get(rsn) or {}
+            pc = _robot_product_code_hint_from_open_platform_row(row_dict)
+            try:
+                state = _resolve_consumables_baseline_state(
+                    db,
+                    shop_id=sid,
+                    robot_sn=rsn,
+                    app_key=app_key,
+                    app_secret=app_secret,
+                    force_redetect=force_redetect,
+                    max_pages=max_pages,
+                )
+                baseline_iso = state.baseline_start_date.isoformat() if state and state.baseline_start_date else None
+                b_source = state.baseline_source if state else None
+                if baseline_iso:
+                    site_updated += 1
+                try:
+                    _seed_consumables_from_default_template_if_empty(
+                        db,
+                        shop_id=sid,
+                        robot_sn=rsn,
+                        product_code_hint=pc,
+                        baseline_date=state.baseline_start_date if state else None,
+                    )
+                except Exception as seed_exc:
+                    logging.exception(
+                        "Consumables template seed failed during baseline redetect shop_id=%s sn=%s",
+                        sid,
+                        rsn,
+                    )
+                    robot_results.append(
+                        {
+                            "sn": rsn,
+                            "product_hint": pc or None,
+                            "baseline_start_date": baseline_iso,
+                            "baseline_source": b_source,
+                            "status": "error",
+                            "error": _baseline_job_error_text(seed_exc),
+                        }
+                    )
+                    robot_detail_error += 1
+                    continue
+
+                if baseline_iso:
+                    robot_detail_ok += 1
+                    robot_results.append(
+                        {
+                            "sn": rsn,
+                            "product_hint": pc or None,
+                            "baseline_start_date": baseline_iso,
+                            "baseline_source": b_source,
+                            "status": "ok",
+                            "error": None,
+                        }
+                    )
+                else:
+                    robot_detail_no_baseline += 1
+                    robot_results.append(
+                        {
+                            "sn": rsn,
+                            "product_hint": pc or None,
+                            "baseline_start_date": None,
+                            "baseline_source": b_source,
+                            "status": "no_baseline",
+                            "error": None,
+                        }
+                    )
+            except Exception as exc:
+                logging.exception(
+                    "Consumables baseline redetect failed shop_id=%s sn=%s",
+                    sid,
+                    rsn,
+                )
+                robot_results.append(
+                    {
+                        "sn": rsn,
+                        "product_hint": pc or None,
+                        "baseline_start_date": None,
+                        "baseline_source": None,
+                        "status": "error",
+                        "error": _baseline_job_error_text(exc),
+                    }
+                )
+                robot_detail_error += 1
 
         total_robots += len(serials)
         total_updated += site_updated
-        site_results.append(
-            {
-                "shop_id": sid,
-                "shop_name": site_name,
-                "updated_count": site_updated,
-                "total_count": len(serials),
-            }
-        )
+        site_entry: Dict[str, object] = {
+            "shop_id": sid,
+            "shop_name": site_name,
+            "updated_count": site_updated,
+            "total_count": len(serials),
+            "robot_results": robot_results,
+        }
+        if site_warning:
+            site_entry["warning"] = site_warning
+        site_results.append(site_entry)
 
-    run.status = "success" if total_updated == total_robots else "partial"
+    run.status = (
+        "success"
+        if total_robots > 0 and robot_detail_error == 0 and total_updated == total_robots
+        else "partial"
+    )
     run.updated_count = total_updated
     run.total_count = total_robots
     run.site_count = total_sites
-    run.error_message = None
+    if robot_detail_error:
+        run.error_message = (
+            f"{robot_detail_error} robot(s) failed during baseline re-detect; "
+            "expand each site in the progress log for per-robot errors."
+        )
+    else:
+        run.error_message = None
     run.finished_at = datetime.now(timezone.utc)
     db.commit()
 
@@ -1745,6 +2011,11 @@ def _pudu_consumables_baseline_redetect_all_sites_impl(
         "updated_count": total_updated,
         "total_count": total_robots,
         "sites": site_results,
+        "robot_detail_summary": {
+            "ok": robot_detail_ok,
+            "no_baseline": robot_detail_no_baseline,
+            "error": robot_detail_error,
+        },
         "run": _serialize_baseline_run(run),
         "user_email": user_email_for_response,
     }
