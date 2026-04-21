@@ -7638,6 +7638,34 @@ async def solar_cleaning_signed_offer_upload(
         created_by=user_email,
     )
 
+    # If this offer is currently in an autonomous follow-up run, stop it now that
+    # the signed offer has been received.
+    try:
+        from services.autonomous_sequence import manual_stop_run
+
+        running_runs = (
+            db.query(AutonomousSequenceRun)
+            .filter(
+                AutonomousSequenceRun.offer_id == offer.id,
+                AutonomousSequenceRun.run_status == "running",
+            )
+            .all()
+        )
+        for r in running_runs:
+            manual_stop_run(db, r.id)
+    except Exception:
+        logging.exception(
+            "Failed to stop autonomous run(s) for signed solar offer upload (offer_id=%s)",
+            offer.id,
+        )
+
+    # Signed offer returned: mark the offer accepted and propagate linked client stage.
+    accepted_offer = update_offer_status_and_propagate_client_stage(
+        db=db,
+        offer_id=offer.id,
+        new_status=OfferStatus.ACCEPTED,
+    )
+
     recorded_at = datetime.now(timezone.utc).isoformat()
     contact_email = resolve_contact_email(client)
     contact_name = resolve_contact_name(client)
@@ -7658,7 +7686,7 @@ async def solar_cleaning_signed_offer_upload(
         quote_cell,
         total_cell,
         document_link,
-        str(offer.status or ""),
+        str(getattr(accepted_offer, "status", None) or offer.status or ""),
         user_email or "",
     ]
     sheet_ok, sheet_err = append_dashboard_quotes_signed_row(row)
