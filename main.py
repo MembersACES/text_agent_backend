@@ -7556,6 +7556,7 @@ async def solar_cleaning_signed_offer_upload(
         latest_solar_quote_fields,
         pick_document_link_from_upload_response,
         resolve_client_gdrive_folder_url,
+        resolve_client_root_gdrive_folder_url,
         resolve_contact_email,
         resolve_contact_name,
         upload_signed_offer_to_n8n,
@@ -7578,6 +7579,7 @@ async def solar_cleaning_signed_offer_upload(
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
+    root_gdrive_url = resolve_client_root_gdrive_folder_url(client)
     gdrive_url = resolve_client_gdrive_folder_url(client)
     if not gdrive_url:
         raise HTTPException(
@@ -7599,7 +7601,7 @@ async def solar_cleaning_signed_offer_upload(
         ext = filename[filename.rfind(".") :].lower()
     new_filename = f"{business_name} - Signed solar offer{ext}"
 
-    parsed, http_ok = upload_signed_offer_to_n8n(
+    parsed, http_ok, upload_status = upload_signed_offer_to_n8n(
         file_bytes=content,
         filename=filename,
         content_type=file.content_type,
@@ -7607,8 +7609,29 @@ async def solar_cleaning_signed_offer_upload(
         gdrive_url=gdrive_url,
         new_filename=new_filename,
     )
+    # Fallback: if Signed Agreements target fails, retry root member folder.
+    if (not http_ok) and root_gdrive_url and root_gdrive_url != gdrive_url:
+        logging.warning(
+            "Signed Agreements upload failed for offer %s (status=%s). Retrying root folder.",
+            offer_id,
+            upload_status,
+        )
+        parsed, http_ok, upload_status = upload_signed_offer_to_n8n(
+            file_bytes=content,
+            filename=filename,
+            content_type=file.content_type,
+            business_name=business_name,
+            gdrive_url=root_gdrive_url,
+            new_filename=new_filename,
+        )
     if not http_ok:
         msg = str(parsed.get("message") or parsed.get("detail") or "Upload failed")
+        logging.error(
+            "Signed solar offer upload failed (offer_id=%s status=%s): %s",
+            offer_id,
+            upload_status,
+            msg,
+        )
         raise HTTPException(status_code=502, detail=msg)
 
     document_link = pick_document_link_from_upload_response(parsed)

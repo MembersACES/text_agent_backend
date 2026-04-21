@@ -203,6 +203,11 @@ def resolve_client_gdrive_folder_url(client: Client) -> str:
     return _ensure_signed_agreements_subfolder_url(root)
 
 
+def resolve_client_root_gdrive_folder_url(client: Client) -> str:
+    """Public helper: member's root Google Drive folder URL (no subfolder rewrite)."""
+    return _resolve_client_root_gdrive_folder_url(client)
+
+
 def resolve_contact_email(client: Client) -> str:
     em = (client.primary_contact_email or "").strip()
     if em:
@@ -331,8 +336,8 @@ def upload_signed_offer_to_n8n(
     business_name: str,
     gdrive_url: str,
     new_filename: str,
-) -> Tuple[dict, bool]:
-    """POST to n8n; returns (parsed_json_or_dict, http_ok)."""
+) -> Tuple[dict, bool, int]:
+    """POST to n8n; returns (parsed_json_or_dict, http_ok, status_code)."""
     ct = content_type or "application/octet-stream"
     files = {"file": (filename, file_bytes, ct)}
     data = {
@@ -358,7 +363,7 @@ def upload_signed_offer_to_n8n(
         parsed = parsed[0]
     if not isinstance(parsed, dict):
         parsed = {"message": text}
-    return parsed, resp.ok
+    return parsed, resp.ok, int(resp.status_code)
 
 
 def assert_solar_cleaning_offer_with_client(offer: Offer) -> None:
