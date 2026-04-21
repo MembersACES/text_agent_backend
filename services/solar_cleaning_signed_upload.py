@@ -136,9 +136,14 @@ def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
     """
     parent_url = (parent_folder_url or "").strip()
     if not parent_url:
+        logger.warning("[solar_signed_upload] parent_folder_url missing")
         return ""
     parent_id = extract_folder_id_from_url(parent_url)
     if not parent_id:
+        logger.warning(
+            "[solar_signed_upload] could not parse parent folder id from url=%s",
+            parent_url,
+        )
         return parent_url
     drive_service = get_drive_service()
     if not drive_service:
@@ -167,6 +172,12 @@ def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
         folders = result.get("files", [])
         if folders:
             subfolder_id = folders[0].get("id")
+            logger.info(
+                "[solar_signed_upload] found subfolder name=%s id=%s parent_id=%s",
+                SIGNED_OFFER_SUBFOLDER_NAME,
+                subfolder_id,
+                parent_id,
+            )
         else:
             created = (
                 drive_service.files()
@@ -182,6 +193,12 @@ def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
                 .execute()
             )
             subfolder_id = created.get("id")
+            logger.info(
+                "[solar_signed_upload] created subfolder name=%s id=%s parent_id=%s",
+                SIGNED_OFFER_SUBFOLDER_NAME,
+                subfolder_id,
+                parent_id,
+            )
         if isinstance(subfolder_id, str) and subfolder_id.strip():
             return f"https://drive.google.com/drive/folders/{subfolder_id}"
     except Exception:
@@ -199,13 +216,31 @@ def resolve_client_gdrive_folder_url(client: Client) -> str:
     """
     root = _resolve_client_root_gdrive_folder_url(client)
     if not root:
+        logger.warning(
+            "[solar_signed_upload] no root gdrive folder for client_id=%s business=%s",
+            getattr(client, "id", None),
+            getattr(client, "business_name", None),
+        )
         return ""
-    return _ensure_signed_agreements_subfolder_url(root)
+    signed_url = _ensure_signed_agreements_subfolder_url(root)
+    logger.info(
+        "[solar_signed_upload] resolved gdrive target root=%s signed_target=%s client_id=%s",
+        root,
+        signed_url,
+        getattr(client, "id", None),
+    )
+    return signed_url
 
 
 def resolve_client_root_gdrive_folder_url(client: Client) -> str:
     """Public helper: member's root Google Drive folder URL (no subfolder rewrite)."""
-    return _resolve_client_root_gdrive_folder_url(client)
+    root = _resolve_client_root_gdrive_folder_url(client)
+    logger.info(
+        "[solar_signed_upload] resolved root gdrive url=%s client_id=%s",
+        root,
+        getattr(client, "id", None),
+    )
+    return root
 
 
 def resolve_contact_email(client: Client) -> str:
@@ -338,6 +373,14 @@ def upload_signed_offer_to_n8n(
     new_filename: str,
 ) -> Tuple[dict, bool, int]:
     """POST to n8n; returns (parsed_json_or_dict, http_ok, status_code)."""
+    logger.info(
+        "[solar_signed_upload] n8n upload start target=%s filename=%s new_filename=%s bytes=%s content_type=%s",
+        gdrive_url,
+        filename,
+        new_filename,
+        len(file_bytes or b""),
+        content_type,
+    )
     ct = content_type or "application/octet-stream"
     files = {"file": (filename, file_bytes, ct)}
     data = {
@@ -363,6 +406,13 @@ def upload_signed_offer_to_n8n(
         parsed = parsed[0]
     if not isinstance(parsed, dict):
         parsed = {"message": text}
+    msg_preview = str(parsed.get("message") or parsed.get("detail") or "")[:300]
+    logger.info(
+        "[solar_signed_upload] n8n upload end status=%s ok=%s msg_preview=%s",
+        resp.status_code,
+        resp.ok,
+        msg_preview,
+    )
     return parsed, resp.ok, int(resp.status_code)
 
 

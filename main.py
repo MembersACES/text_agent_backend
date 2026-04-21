@@ -7565,22 +7565,62 @@ async def solar_cleaning_signed_offer_upload(
     )
 
     user_email = (user_data.get("idinfo") or {}).get("email")
+    logging.info(
+        "[solar_signed_upload] request start offer_id=%s user=%s filename=%s content_type=%s",
+        offer_id,
+        user_email,
+        getattr(file, "filename", None),
+        getattr(file, "content_type", None),
+    )
     offer = db.query(Offer).filter(Offer.id == offer_id).first()
     if not offer:
+        logging.warning("[solar_signed_upload] offer not found offer_id=%s", offer_id)
         raise HTTPException(status_code=404, detail="Offer not found")
+    logging.info(
+        "[solar_signed_upload] offer loaded id=%s client_id=%s utility_type=%s status=%s",
+        offer.id,
+        offer.client_id,
+        offer.utility_type,
+        offer.status,
+    )
     assert_solar_cleaning_offer_with_client(offer)
     client = db.query(Client).filter(Client.id == offer.client_id).first()
     if not client:
+        logging.warning(
+            "[solar_signed_upload] client not found client_id=%s offer_id=%s",
+            offer.client_id,
+            offer_id,
+        )
         raise HTTPException(status_code=404, detail="Client not found")
+    logging.info(
+        "[solar_signed_upload] client loaded id=%s business_name=%s",
+        client.id,
+        client.business_name,
+    )
 
     raw_name = file.filename or "document"
     filename = validate_signed_offer_filename(raw_name)
     content = await file.read()
     if not content:
+        logging.warning(
+            "[solar_signed_upload] empty upload file offer_id=%s filename=%s",
+            offer_id,
+            filename,
+        )
         raise HTTPException(status_code=400, detail="Empty file")
+    logging.info(
+        "[solar_signed_upload] file validated filename=%s size_bytes=%s",
+        filename,
+        len(content),
+    )
 
     root_gdrive_url = resolve_client_root_gdrive_folder_url(client)
     gdrive_url = resolve_client_gdrive_folder_url(client)
+    logging.info(
+        "[solar_signed_upload] drive targets root=%s signed_target=%s",
+        root_gdrive_url,
+        gdrive_url,
+    )
     if not gdrive_url:
         raise HTTPException(
             status_code=400,
@@ -7600,6 +7640,11 @@ async def solar_cleaning_signed_offer_upload(
     if "." in filename:
         ext = filename[filename.rfind(".") :].lower()
     new_filename = f"{business_name} - Signed solar offer{ext}"
+    logging.info(
+        "[solar_signed_upload] prepared upload business=%s new_filename=%s",
+        business_name,
+        new_filename,
+    )
 
     parsed, http_ok, upload_status = upload_signed_offer_to_n8n(
         file_bytes=content,
@@ -7608,6 +7653,11 @@ async def solar_cleaning_signed_offer_upload(
         business_name=business_name,
         gdrive_url=gdrive_url,
         new_filename=new_filename,
+    )
+    logging.info(
+        "[solar_signed_upload] primary upload result status=%s ok=%s",
+        upload_status,
+        http_ok,
     )
     # Fallback: if Signed Agreements target fails, retry root member folder.
     if (not http_ok) and root_gdrive_url and root_gdrive_url != gdrive_url:
@@ -7624,6 +7674,11 @@ async def solar_cleaning_signed_offer_upload(
             gdrive_url=root_gdrive_url,
             new_filename=new_filename,
         )
+        logging.info(
+            "[solar_signed_upload] fallback upload result status=%s ok=%s",
+            upload_status,
+            http_ok,
+        )
     if not http_ok:
         msg = str(parsed.get("message") or parsed.get("detail") or "Upload failed")
         logging.error(
@@ -7636,12 +7691,25 @@ async def solar_cleaning_signed_offer_upload(
 
     document_link = pick_document_link_from_upload_response(parsed)
     if not document_link:
+        logging.error(
+            "[solar_signed_upload] upload succeeded but no document link parsed. payload_keys=%s",
+            list(parsed.keys()) if isinstance(parsed, dict) else None,
+        )
         raise HTTPException(
             status_code=502,
             detail="Upload succeeded but no document link was returned",
         )
+    logging.info(
+        "[solar_signed_upload] document link parsed=%s",
+        document_link,
+    )
 
     quote_num, amount_tot, _site_meta = latest_solar_quote_fields(db, offer_id)
+    logging.info(
+        "[solar_signed_upload] quote metadata quote_num=%s amount_total=%s",
+        quote_num,
+        amount_tot,
+    )
     signed_meta = {
         "source": "solar_cleaning_signed_offer_upload",
         "upload_filename": filename,
@@ -7660,6 +7728,11 @@ async def solar_cleaning_signed_offer_upload(
         metadata=signed_meta,
         created_by=user_email,
     )
+    logging.info(
+        "[solar_signed_upload] activity created id=%s type=%s",
+        activity.id,
+        OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER.value,
+    )
 
     # If this offer is currently in an autonomous follow-up run, stop it now that
     # the signed offer has been received.
@@ -7676,6 +7749,11 @@ async def solar_cleaning_signed_offer_upload(
         )
         for r in running_runs:
             manual_stop_run(db, r.id)
+        logging.info(
+            "[solar_signed_upload] autonomous runs stopped count=%s offer_id=%s",
+            len(running_runs),
+            offer.id,
+        )
     except Exception:
         logging.exception(
             "Failed to stop autonomous run(s) for signed solar offer upload (offer_id=%s)",
@@ -7687,6 +7765,11 @@ async def solar_cleaning_signed_offer_upload(
         db=db,
         offer_id=offer.id,
         new_status=OfferStatus.ACCEPTED,
+    )
+    logging.info(
+        "[solar_signed_upload] offer accepted id=%s status=%s",
+        accepted_offer.id,
+        accepted_offer.status,
     )
 
     recorded_at = datetime.now(timezone.utc).isoformat()
@@ -7712,8 +7795,25 @@ async def solar_cleaning_signed_offer_upload(
         str(getattr(accepted_offer, "status", None) or offer.status or ""),
         user_email or "",
     ]
+    logging.info(
+        "[solar_signed_upload] sheet row prepared offer_id=%s quote=%s total=%s uploaded_by=%s",
+        offer.id,
+        quote_cell,
+        total_cell,
+        user_email,
+    )
     sheet_ok, sheet_err = append_dashboard_quotes_signed_row(row)
+    logging.info(
+        "[solar_signed_upload] sheet append result ok=%s err=%s",
+        sheet_ok,
+        (sheet_err or "")[:300],
+    )
 
+    logging.info(
+        "[solar_signed_upload] request success offer_id=%s activity_id=%s",
+        offer.id,
+        activity.id,
+    )
     return SolarCleaningSignedUploadResponse(
         document_link=document_link,
         activity_id=activity.id,
