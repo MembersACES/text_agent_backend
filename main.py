@@ -154,6 +154,7 @@ from schemas import (
     OfferResponse,
     OfferActivityCreate,
     OfferActivityResponse,
+    SolarCleaningSignedUploadResponse,
     MemberDocumentUploadActivityCreate,
     ActivityReportItem,
     OfferPipelineStage as OfferPipelineStageSchema,
@@ -7129,7 +7130,11 @@ def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
         return "DMA"
     if at == "comparison":
         return "Comparison"
-    if at in ("solar_cleaning_quote_generated", "solar_cleaning_quote_sent"):
+    if at in (
+        "solar_cleaning_quote_generated",
+        "solar_cleaning_quote_sent",
+        "solar_cleaning_signed_offer",
+    ):
         return "Solar cleaning"
     return None
 
@@ -7528,6 +7533,141 @@ def post_offer_activity(
         created_by=created_by,
     )
     return OfferActivityResponse.model_validate(activity)
+
+
+@app.post(
+    "/api/offers/{offer_id}/solar-cleaning-signed-upload",
+    response_model=SolarCleaningSignedUploadResponse,
+)
+async def solar_cleaning_signed_offer_upload(
+    offer_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Upload a signed solar cleaning offer PDF (or same file types as Additional Documents)
+    to the member's Drive folder via n8n, log a CRM activity, and append a row to
+    the Dashboard Quotes Signed sheet (best-effort for the sheet).
+    """
+    from services.solar_cleaning_signed_upload import (
+        append_dashboard_quotes_signed_row,
+        assert_solar_cleaning_offer_with_client,
+        latest_solar_quote_fields,
+        pick_document_link_from_upload_response,
+        resolve_client_gdrive_folder_url,
+        resolve_contact_email,
+        upload_signed_offer_to_n8n,
+        utility_offer_title,
+        validate_signed_offer_filename,
+    )
+
+    user_email = (user_data.get("idinfo") or {}).get("email")
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    assert_solar_cleaning_offer_with_client(offer)
+    client = db.query(Client).filter(Client.id == offer.client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    raw_name = file.filename or "document"
+    filename = validate_signed_offer_filename(raw_name)
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    gdrive_url = resolve_client_gdrive_folder_url(client)
+    if not gdrive_url:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Google Drive folder URL for this member. "
+                "Set gdrive folder on the client or ensure business info returns a folder."
+            ),
+        )
+
+    business_name = (client.business_name or offer.business_name or "").strip()
+    if not business_name:
+        raise HTTPException(
+            status_code=400, detail="Business name is required for upload"
+        )
+
+    ext = ""
+    if "." in filename:
+        ext = filename[filename.rfind(".") :].lower()
+    new_filename = f"{business_name} - Signed solar offer{ext}"
+
+    parsed, http_ok = upload_signed_offer_to_n8n(
+        file_bytes=content,
+        filename=filename,
+        content_type=file.content_type,
+        business_name=business_name,
+        gdrive_url=gdrive_url,
+        new_filename=new_filename,
+    )
+    if not http_ok:
+        msg = str(parsed.get("message") or parsed.get("detail") or "Upload failed")
+        raise HTTPException(status_code=502, detail=msg)
+
+    document_link = pick_document_link_from_upload_response(parsed)
+    if not document_link:
+        raise HTTPException(
+            status_code=502,
+            detail="Upload succeeded but no document link was returned",
+        )
+
+    quote_num, amount_tot, site_meta = latest_solar_quote_fields(db, offer_id)
+    signed_meta = {
+        "source": "solar_cleaning_signed_offer_upload",
+        "upload_filename": filename,
+        "new_filename": new_filename,
+    }
+    if getattr(offer, "utility_type", None):
+        signed_meta["utility_type"] = offer.utility_type
+    if getattr(offer, "utility_type_identifier", None):
+        signed_meta["utility_type_identifier"] = offer.utility_type_identifier
+    activity = create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER,
+        document_link=document_link,
+        metadata=signed_meta,
+        created_by=user_email,
+    )
+
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    contact_email = resolve_contact_email(client)
+    site_id = (offer.identifier or "").strip() or (site_meta or "") or ""
+    util_title = utility_offer_title(offer)
+    quote_cell = quote_num or ""
+    total_cell = ""
+    if amount_tot is not None:
+        total_cell = f"{amount_tot:.2f}"
+
+    row = [
+        recorded_at,
+        str(offer.id),
+        str(offer.client_id or ""),
+        business_name,
+        contact_email,
+        site_id,
+        util_title,
+        quote_cell,
+        total_cell,
+        document_link,
+        str(offer.status or ""),
+        user_email or "",
+    ]
+    sheet_ok, sheet_err = append_dashboard_quotes_signed_row(row)
+
+    return SolarCleaningSignedUploadResponse(
+        document_link=document_link,
+        activity_id=activity.id,
+        sheet_appended=sheet_ok,
+        sheet_error=sheet_err,
+    )
 
 
 def verify_autonomous_inbound_secret(

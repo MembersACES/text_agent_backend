@@ -460,6 +460,15 @@ class OfferActivityResponse(BaseModel):
         return super().model_validate(data, **kwargs)
 
 
+class SolarCleaningSignedUploadResponse(BaseModel):
+    """Result of POST /api/offers/{id}/solar-cleaning-signed-upload."""
+
+    document_link: Optional[str] = None
+    activity_id: int
+    sheet_appended: bool
+    sheet_error: Optional[str] = None
+
+
 class ActivityReportItem(BaseModel):
     """Single row for activity report list (with business_name from offer)."""
     id: int
