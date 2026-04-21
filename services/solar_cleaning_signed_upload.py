@@ -3,6 +3,7 @@ Solar panel cleaning: signed offer file → n8n Drive upload, CRM activity, opti
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -65,11 +66,6 @@ def validate_signed_offer_filename(filename: str) -> str:
 
 def pick_document_link_from_upload_response(d: Any) -> Optional[str]:
     """Match DocumentsTab.pickDocumentLinkFromUploadResponse."""
-    if isinstance(d, list) and d:
-        d = d[0]
-    if not d or not isinstance(d, dict):
-        return None
-    o: Dict[str, Any] = d
     keys = [
         "webViewLink",
         "web_view_link",
@@ -80,21 +76,50 @@ def pick_document_link_from_upload_response(d: Any) -> Optional[str]:
         "document_url",
         "view_link",
     ]
-    for k in keys:
-        v = o.get(k)
-        if isinstance(v, str) and (
-            v.startswith("http://") or v.startswith("https://")
-        ):
-            return v
-    id_val = (
-        o.get("file_id")
-        or o.get("fileId")
-        or o.get("File_ID")
-        or o.get("File ID")
-        or o.get("id")
-    )
-    if isinstance(id_val, str) and re.match(r"^[\w-]{10,}$", id_val):
-        return f"https://drive.google.com/file/d/{id_val}/view?usp=drivesdk"
+
+    def _extract_url(s: str) -> Optional[str]:
+        raw = (s or "").strip()
+        if raw.startswith("http://") or raw.startswith("https://"):
+            return raw
+        m = re.search(r"https?://[^\s\"'<>]+", raw)
+        if m:
+            return m.group(0)
+        return None
+
+    def _walk(node: Any) -> Optional[str]:
+        if isinstance(node, dict):
+            for k in keys:
+                v = node.get(k)
+                if isinstance(v, str):
+                    url = _extract_url(v)
+                    if url:
+                        return url
+            id_val = (
+                node.get("file_id")
+                or node.get("fileId")
+                or node.get("File_ID")
+                or node.get("File ID")
+                or node.get("id")
+            )
+            if isinstance(id_val, str) and re.match(r"^[\w-]{10,}$", id_val):
+                return f"https://drive.google.com/file/d/{id_val}/view?usp=drivesdk"
+            for v in node.values():
+                found = _walk(v)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = _walk(item)
+                if found:
+                    return found
+        elif isinstance(node, str):
+            return _extract_url(node)
+        return None
+
+    if isinstance(d, list) and d:
+        return _walk(d)
+    if isinstance(d, dict):
+        return _walk(d)
     return None
 
 
@@ -151,7 +176,11 @@ def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
             "Drive service unavailable; using parent folder for signed offer upload"
         )
         return parent_url
-    try:
+    timeout_seconds = float(
+        (os.getenv("SOLAR_SIGNED_SUBFOLDER_LOOKUP_TIMEOUT_SECONDS") or "3").strip()
+    )
+
+    def _lookup_or_create() -> Optional[str]:
         query = (
             f"name='{SIGNED_OFFER_SUBFOLDER_NAME}' "
             f"and '{parent_id}' in parents "
@@ -199,6 +228,26 @@ def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
                 subfolder_id,
                 parent_id,
             )
+        if isinstance(subfolder_id, str) and subfolder_id.strip():
+            return subfolder_id
+        return None
+
+    try:
+        logger.info(
+            "[solar_signed_upload] subfolder lookup start parent_id=%s timeout=%ss",
+            parent_id,
+            timeout_seconds,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_lookup_or_create)
+            try:
+                subfolder_id = future.result(timeout=timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "[solar_signed_upload] subfolder lookup timeout parent_id=%s, using root",
+                    parent_id,
+                )
+                return parent_url
         if isinstance(subfolder_id, str) and subfolder_id.strip():
             return f"https://drive.google.com/drive/folders/{subfolder_id}"
     except Exception:
@@ -407,11 +456,14 @@ def upload_signed_offer_to_n8n(
     if not isinstance(parsed, dict):
         parsed = {"message": text}
     msg_preview = str(parsed.get("message") or parsed.get("detail") or "")[:300]
+    raw_preview = (text or "").strip().replace("\n", " ")[:300]
     logger.info(
-        "[solar_signed_upload] n8n upload end status=%s ok=%s msg_preview=%s",
+        "[solar_signed_upload] n8n upload end status=%s ok=%s msg_preview=%s raw_preview=%s payload_keys=%s",
         resp.status_code,
         resp.ok,
         msg_preview,
+        raw_preview,
+        list(parsed.keys()) if isinstance(parsed, dict) else None,
     )
     return parsed, resp.ok, int(resp.status_code)
 
