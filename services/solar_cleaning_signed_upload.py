@@ -468,6 +468,84 @@ def upload_signed_offer_to_n8n(
     return parsed, resp.ok, int(resp.status_code)
 
 
+def recover_document_link_from_drive(
+    *,
+    folder_url: str,
+    filename: str,
+) -> Optional[str]:
+    """
+    Best-effort recovery when webhook returns 200 with no link payload.
+    Searches target folder for newest file matching filename.
+    """
+    folder_id = extract_folder_id_from_url((folder_url or "").strip())
+    if not folder_id:
+        logger.warning(
+            "[solar_signed_upload] recover link skipped: no folder id folder_url=%s",
+            folder_url,
+        )
+        return None
+    drive = get_drive_service()
+    if not drive:
+        logger.warning(
+            "[solar_signed_upload] recover link skipped: drive service unavailable"
+        )
+        return None
+    safe_name = (filename or "").replace("\\", "\\\\").replace("'", "\\'")
+    if not safe_name:
+        return None
+    query = (
+        f"name='{safe_name}' and '{folder_id}' in parents and trashed=false"
+    )
+    try:
+        res = (
+            drive.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id,name,webViewLink,createdTime)",
+                orderBy="createdTime desc",
+                pageSize=1,
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        files = res.get("files", [])
+        if not files:
+            logger.warning(
+                "[solar_signed_upload] recover link: no matching file found folder_id=%s filename=%s",
+                folder_id,
+                filename,
+            )
+            return None
+        f0 = files[0] or {}
+        file_id = f0.get("id")
+        web_link = f0.get("webViewLink")
+        out = (
+            web_link
+            if isinstance(web_link, str) and web_link.startswith("http")
+            else (
+                f"https://drive.google.com/file/d/{file_id}/view?usp=drivesdk"
+                if isinstance(file_id, str) and file_id
+                else None
+            )
+        )
+        logger.info(
+            "[solar_signed_upload] recover link success folder_id=%s filename=%s file_id=%s",
+            folder_id,
+            filename,
+            file_id,
+        )
+        return out
+    except Exception:
+        logger.exception(
+            "[solar_signed_upload] recover link failed folder_id=%s filename=%s",
+            folder_id,
+            filename,
+        )
+        return None
+
+
 def assert_solar_cleaning_offer_with_client(offer: Offer) -> None:
     if (offer.utility_type or "").strip() != SOLAR_PANEL_CLEANING_UTILITY:
         raise HTTPException(

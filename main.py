@@ -7555,6 +7555,7 @@ async def solar_cleaning_signed_offer_upload(
         assert_solar_cleaning_offer_with_client,
         latest_solar_quote_fields,
         pick_document_link_from_upload_response,
+        recover_document_link_from_drive,
         resolve_client_gdrive_folder_url,
         resolve_client_root_gdrive_folder_url,
         resolve_contact_email,
@@ -7691,14 +7692,25 @@ async def solar_cleaning_signed_offer_upload(
 
     document_link = pick_document_link_from_upload_response(parsed)
     if not document_link:
-        logging.error(
-            "[solar_signed_upload] upload succeeded but no document link parsed. payload_keys=%s",
+        logging.warning(
+            "[solar_signed_upload] no document link from webhook payload; attempting Drive recovery. payload_keys=%s",
             list(parsed.keys()) if isinstance(parsed, dict) else None,
         )
-        raise HTTPException(
-            status_code=502,
-            detail="Upload succeeded but no document link was returned",
+        # Try the signed target folder first, then root folder.
+        document_link = recover_document_link_from_drive(
+            folder_url=gdrive_url,
+            filename=new_filename,
         )
+        if not document_link and root_gdrive_url and root_gdrive_url != gdrive_url:
+            document_link = recover_document_link_from_drive(
+                folder_url=root_gdrive_url,
+                filename=new_filename,
+            )
+        if not document_link:
+            logging.warning(
+                "[solar_signed_upload] continuing without document link after successful upload; offer_id=%s",
+                offer_id,
+            )
     logging.info(
         "[solar_signed_upload] document link parsed=%s",
         document_link,
