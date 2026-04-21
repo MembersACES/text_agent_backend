@@ -17,7 +17,11 @@ from sqlalchemy.orm import Session
 from crm_enums import OfferActivityType
 from models import Client, Offer, OfferActivity
 from tools.business_info import get_business_information
-from tools.one_month_savings import get_sheets_service
+from tools.one_month_savings import (
+    extract_folder_id_from_url,
+    get_drive_service,
+    get_sheets_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ SOLAR_PANEL_CLEANING_UTILITY = "Solar panel cleaning"
 
 DEFAULT_SIGNED_QUOTES_SHEET_ID = "1WiLksDOwrQkEwVhF25F_RQ1G0zxF5VHiu9lAxQhQox4"
 DEFAULT_SIGNED_QUOTES_TAB = "Dashboard Quotes Signed"
+SIGNED_OFFER_SUBFOLDER_NAME = "Signed Agreements"
 
 
 def validate_signed_offer_filename(filename: str) -> str:
@@ -106,7 +111,7 @@ def _parse_activity_metadata_row(meta_raw: Any) -> Optional[dict]:
     return None
 
 
-def resolve_client_gdrive_folder_url(client: Client) -> str:
+def _resolve_client_root_gdrive_folder_url(client: Client) -> str:
     direct = (client.gdrive_folder_url or "").strip()
     if direct:
         return direct
@@ -122,6 +127,80 @@ def resolve_client_gdrive_folder_url(client: Client) -> str:
         return ""
     g = info.get("gdrive") or {}
     return (g.get("folder_url") or "").strip()
+
+
+def _ensure_signed_agreements_subfolder_url(parent_folder_url: str) -> str:
+    """
+    Resolve/create the 'Signed Agreements' subfolder and return its folder URL.
+    Falls back to parent_folder_url if Drive API lookup/create fails.
+    """
+    parent_url = (parent_folder_url or "").strip()
+    if not parent_url:
+        return ""
+    parent_id = extract_folder_id_from_url(parent_url)
+    if not parent_id:
+        return parent_url
+    drive_service = get_drive_service()
+    if not drive_service:
+        logger.warning(
+            "Drive service unavailable; using parent folder for signed offer upload"
+        )
+        return parent_url
+    try:
+        query = (
+            f"name='{SIGNED_OFFER_SUBFOLDER_NAME}' "
+            f"and '{parent_id}' in parents "
+            "and mimeType='application/vnd.google-apps.folder' "
+            "and trashed=false"
+        )
+        result = (
+            drive_service.files()
+            .list(
+                q=query,
+                spaces="drive",
+                fields="files(id,name)",
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        folders = result.get("files", [])
+        if folders:
+            subfolder_id = folders[0].get("id")
+        else:
+            created = (
+                drive_service.files()
+                .create(
+                    body={
+                        "name": SIGNED_OFFER_SUBFOLDER_NAME,
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "parents": [parent_id],
+                    },
+                    fields="id",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+            subfolder_id = created.get("id")
+        if isinstance(subfolder_id, str) and subfolder_id.strip():
+            return f"https://drive.google.com/drive/folders/{subfolder_id}"
+    except Exception:
+        logger.exception(
+            "Failed to resolve/create Signed Agreements subfolder for parent %s",
+            parent_id,
+        )
+    return parent_url
+
+
+def resolve_client_gdrive_folder_url(client: Client) -> str:
+    """
+    Return the Drive folder URL used for signed solar offer uploads.
+    We target the member's 'Signed Agreements' subfolder when possible.
+    """
+    root = _resolve_client_root_gdrive_folder_url(client)
+    if not root:
+        return ""
+    return _ensure_signed_agreements_subfolder_url(root)
 
 
 def resolve_contact_email(client: Client) -> str:
@@ -140,6 +219,30 @@ def resolve_contact_email(client: Client) -> str:
         return ""
     ci = info.get("contact_information") or {}
     return (ci.get("email") or "").strip()
+
+
+def resolve_contact_name(client: Client) -> str:
+    """
+    Best-effort contact name for sheet logging.
+    Uses business info representative_details.contact_name when available.
+    """
+    bn = (client.business_name or "").strip()
+    if not bn:
+        return ""
+    try:
+        info = get_business_information(bn)
+    except Exception:
+        logger.exception("get_business_information failed for contact name %s", bn)
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    rep = info.get("representative_details") or {}
+    contact = (rep.get("contact_name") or "").strip()
+    if contact:
+        return contact
+    # Fallback: sometimes n8n payloads expose contact details in other sections.
+    ci = info.get("contact_information") or {}
+    return (ci.get("contact_name") or "").strip()
 
 
 def latest_solar_quote_fields(

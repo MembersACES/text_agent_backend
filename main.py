@@ -7557,6 +7557,7 @@ async def solar_cleaning_signed_offer_upload(
         pick_document_link_from_upload_response,
         resolve_client_gdrive_folder_url,
         resolve_contact_email,
+        resolve_contact_name,
         upload_signed_offer_to_n8n,
         utility_offer_title,
         validate_signed_offer_filename,
@@ -7617,7 +7618,7 @@ async def solar_cleaning_signed_offer_upload(
             detail="Upload succeeded but no document link was returned",
         )
 
-    quote_num, amount_tot, site_meta = latest_solar_quote_fields(db, offer_id)
+    quote_num, amount_tot, _site_meta = latest_solar_quote_fields(db, offer_id)
     signed_meta = {
         "source": "solar_cleaning_signed_offer_upload",
         "upload_filename": filename,
@@ -7639,7 +7640,7 @@ async def solar_cleaning_signed_offer_upload(
 
     recorded_at = datetime.now(timezone.utc).isoformat()
     contact_email = resolve_contact_email(client)
-    site_id = (offer.identifier or "").strip() or (site_meta or "") or ""
+    contact_name = resolve_contact_name(client)
     util_title = utility_offer_title(offer)
     quote_cell = quote_num or ""
     total_cell = ""
@@ -7652,7 +7653,7 @@ async def solar_cleaning_signed_offer_upload(
         str(offer.client_id or ""),
         business_name,
         contact_email,
-        site_id,
+        contact_name,
         util_title,
         quote_cell,
         total_cell,
