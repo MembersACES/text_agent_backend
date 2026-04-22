@@ -7911,6 +7911,21 @@ def autonomous_sequence_start(
         sequence_context["email_ID"] = incoming_email_id
         sequence_context.setdefault("email_id", incoming_email_id)
 
+    # Provide consistent offer timing fields for prompts/workflows.
+    # The offer validity window defaults to exactly 7 days from generation.
+    anchor_dt = body.anchor_at
+    if anchor_dt.tzinfo is None:
+        anchor_utc = anchor_dt.replace(tzinfo=timezone.utc)
+    else:
+        anchor_utc = anchor_dt.astimezone(timezone.utc)
+    valid_until_utc = anchor_utc + timedelta(days=7)
+    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
+
+    sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
+    sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+    sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+    sequence_context.setdefault("offer_validity_days", 7)
+
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:
         raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")

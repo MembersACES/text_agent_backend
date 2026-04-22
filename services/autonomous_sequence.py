@@ -515,6 +515,17 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
 
     anchor_at = datetime.now(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
     ctx = _parse_context(run)
+    # Restart should refresh offer validity window from the new anchor.
+    if anchor_at.tzinfo is None:
+        anchor_utc = anchor_at.replace(tzinfo=timezone.utc)
+    else:
+        anchor_utc = anchor_at.astimezone(timezone.utc)
+    valid_until_utc = anchor_utc + timedelta(days=7)
+    valid_until_local = valid_until_utc.astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    ctx["offer_generated_at"] = anchor_utc.isoformat()
+    ctx["offer_valid_until"] = valid_until_utc.isoformat()
+    ctx["offer_validity_date"] = valid_until_local.date().isoformat()
+    ctx["offer_validity_days"] = 7
     client_id = run.client_id if run.client_id is not None else offer.client_id
 
     out = start_gas_base2_sequence(
