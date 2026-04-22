@@ -7849,12 +7849,22 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
     business_name = offer.business_name if offer else None
-    pending = [s for s in steps if s.step_status in ("ready", "to_start") and s.scheduled_at]
+    pending = [
+        s
+        for s in steps
+        if s.step_status in ("ready", "to_start", "in_progress") and s.scheduled_at
+    ]
     next_ch, next_at = None, None
     if pending:
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
-    done = len([s for s in steps if s.step_status in ("completed", "failed", "skipped")])
+    done = len(
+        [
+            s
+            for s in steps
+            if s.step_status in ("executed", "completed", "error", "failed", "skipped")
+        ]
+    )
     return AutonomousSequenceRunListItem(
         id=run.id,
         offer_id=run.offer_id,

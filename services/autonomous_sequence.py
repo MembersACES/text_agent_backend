@@ -24,7 +24,6 @@ from models import (
     Offer,
 )
 
-
 def _is_postgresql(bind) -> bool:
     return bind.dialect.name == "postgresql"
 
@@ -904,12 +903,15 @@ def execute_due_steps_sync(db: Session) -> int:
             continue
 
         for step in sorted(run.steps, key=lambda s: s.step_index):
-            if step.step_status not in ("ready", "to_start"):
-                continue
             if step.scheduled_at is None or step.scheduled_at > now:
                 continue
+            # Runner only picks `ready`; promote due `to_start` so autonomous_agent_backend can execute.
+            if step.step_status == "to_start":
+                step.step_status = "ready"
+                db.flush()
+            if step.step_status != "ready":
+                continue
 
-            step.step_status = "in_progress"
             step.started_at = now
             db.flush()
 
@@ -939,7 +941,7 @@ def execute_due_steps_sync(db: Session) -> int:
                 else:
                     out = {"ok": False, "error": "unknown_channel", "channel": step.channel}
 
-                step.step_status = "completed"
+                step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
                 _log_event(
@@ -952,7 +954,7 @@ def execute_due_steps_sync(db: Session) -> int:
                 executed += 1
             except Exception as e:
                 logger.exception("Autonomous step failed run_id=%s step_id=%s", run.id, step.id)
-                step.step_status = "failed"
+                step.step_status = "error"
                 step.last_outcome_summary = str(e)[:4000]
                 _log_event(
                     db,
