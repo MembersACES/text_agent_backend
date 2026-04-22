@@ -154,6 +154,7 @@ from schemas import (
     OfferResponse,
     OfferActivityCreate,
     OfferActivityResponse,
+    SolarCleaningSignedUploadResponse,
     MemberDocumentUploadActivityCreate,
     ActivityReportItem,
     OfferPipelineStage as OfferPipelineStageSchema,
@@ -7129,7 +7130,11 @@ def _activity_type_to_source_prefix(activity_type: str) -> Optional[str]:
         return "DMA"
     if at == "comparison":
         return "Comparison"
-    if at in ("solar_cleaning_quote_generated", "solar_cleaning_quote_sent"):
+    if at in (
+        "solar_cleaning_quote_generated",
+        "solar_cleaning_quote_sent",
+        "solar_cleaning_signed_offer",
+    ):
         return "Solar cleaning"
     return None
 
@@ -7530,6 +7535,305 @@ def post_offer_activity(
     return OfferActivityResponse.model_validate(activity)
 
 
+@app.post(
+    "/api/offers/{offer_id}/solar-cleaning-signed-upload",
+    response_model=SolarCleaningSignedUploadResponse,
+)
+async def solar_cleaning_signed_offer_upload(
+    offer_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Upload a signed solar cleaning offer PDF (or same file types as Additional Documents)
+    to the member's Drive folder via n8n, log a CRM activity, and append a row to
+    the Dashboard Quotes Signed sheet (best-effort for the sheet).
+    """
+    from services.solar_cleaning_signed_upload import (
+        append_dashboard_quotes_signed_row,
+        assert_solar_cleaning_offer_with_client,
+        latest_solar_quote_fields,
+        pick_document_link_from_upload_response,
+        recover_document_link_from_drive,
+        resolve_client_gdrive_folder_url,
+        resolve_client_root_gdrive_folder_url,
+        resolve_contact_email,
+        resolve_contact_name,
+        upload_signed_offer_to_n8n,
+        utility_offer_title,
+        validate_signed_offer_filename,
+    )
+
+    user_email = (user_data.get("idinfo") or {}).get("email")
+    logging.info(
+        "[solar_signed_upload] request start offer_id=%s user=%s filename=%s content_type=%s",
+        offer_id,
+        user_email,
+        getattr(file, "filename", None),
+        getattr(file, "content_type", None),
+    )
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if not offer:
+        logging.warning("[solar_signed_upload] offer not found offer_id=%s", offer_id)
+        raise HTTPException(status_code=404, detail="Offer not found")
+    logging.info(
+        "[solar_signed_upload] offer loaded id=%s client_id=%s utility_type=%s status=%s",
+        offer.id,
+        offer.client_id,
+        offer.utility_type,
+        offer.status,
+    )
+    assert_solar_cleaning_offer_with_client(offer)
+    client = db.query(Client).filter(Client.id == offer.client_id).first()
+    if not client:
+        logging.warning(
+            "[solar_signed_upload] client not found client_id=%s offer_id=%s",
+            offer.client_id,
+            offer_id,
+        )
+        raise HTTPException(status_code=404, detail="Client not found")
+    logging.info(
+        "[solar_signed_upload] client loaded id=%s business_name=%s",
+        client.id,
+        client.business_name,
+    )
+
+    raw_name = file.filename or "document"
+    filename = validate_signed_offer_filename(raw_name)
+    content = await file.read()
+    if not content:
+        logging.warning(
+            "[solar_signed_upload] empty upload file offer_id=%s filename=%s",
+            offer_id,
+            filename,
+        )
+        raise HTTPException(status_code=400, detail="Empty file")
+    logging.info(
+        "[solar_signed_upload] file validated filename=%s size_bytes=%s",
+        filename,
+        len(content),
+    )
+
+    root_gdrive_url = resolve_client_root_gdrive_folder_url(client)
+    gdrive_url = resolve_client_gdrive_folder_url(client)
+    logging.info(
+        "[solar_signed_upload] drive targets root=%s signed_target=%s",
+        root_gdrive_url,
+        gdrive_url,
+    )
+    if not gdrive_url:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No Google Drive folder URL for this member. "
+                "Set gdrive folder on the client or ensure business info returns a folder."
+            ),
+        )
+
+    business_name = (client.business_name or offer.business_name or "").strip()
+    if not business_name:
+        raise HTTPException(
+            status_code=400, detail="Business name is required for upload"
+        )
+
+    ext = ""
+    if "." in filename:
+        ext = filename[filename.rfind(".") :].lower()
+    new_filename = f"{business_name} - Signed solar offer{ext}"
+    logging.info(
+        "[solar_signed_upload] prepared upload business=%s new_filename=%s",
+        business_name,
+        new_filename,
+    )
+
+    parsed, http_ok, upload_status = upload_signed_offer_to_n8n(
+        file_bytes=content,
+        filename=filename,
+        content_type=file.content_type,
+        business_name=business_name,
+        gdrive_url=gdrive_url,
+        new_filename=new_filename,
+    )
+    logging.info(
+        "[solar_signed_upload] primary upload result status=%s ok=%s",
+        upload_status,
+        http_ok,
+    )
+    # Fallback: if Signed Agreements target fails, retry root member folder.
+    if (not http_ok) and root_gdrive_url and root_gdrive_url != gdrive_url:
+        logging.warning(
+            "Signed Agreements upload failed for offer %s (status=%s). Retrying root folder.",
+            offer_id,
+            upload_status,
+        )
+        parsed, http_ok, upload_status = upload_signed_offer_to_n8n(
+            file_bytes=content,
+            filename=filename,
+            content_type=file.content_type,
+            business_name=business_name,
+            gdrive_url=root_gdrive_url,
+            new_filename=new_filename,
+        )
+        logging.info(
+            "[solar_signed_upload] fallback upload result status=%s ok=%s",
+            upload_status,
+            http_ok,
+        )
+    if not http_ok:
+        msg = str(parsed.get("message") or parsed.get("detail") or "Upload failed")
+        logging.error(
+            "Signed solar offer upload failed (offer_id=%s status=%s): %s",
+            offer_id,
+            upload_status,
+            msg,
+        )
+        raise HTTPException(status_code=502, detail=msg)
+
+    document_link = pick_document_link_from_upload_response(parsed)
+    if not document_link:
+        logging.warning(
+            "[solar_signed_upload] no document link from webhook payload; attempting Drive recovery. payload_keys=%s",
+            list(parsed.keys()) if isinstance(parsed, dict) else None,
+        )
+        # Try the signed target folder first, then root folder.
+        document_link = recover_document_link_from_drive(
+            folder_url=gdrive_url,
+            filename=new_filename,
+        )
+        if not document_link and root_gdrive_url and root_gdrive_url != gdrive_url:
+            document_link = recover_document_link_from_drive(
+                folder_url=root_gdrive_url,
+                filename=new_filename,
+            )
+        if not document_link:
+            logging.warning(
+                "[solar_signed_upload] continuing without document link after successful upload; offer_id=%s",
+                offer_id,
+            )
+    logging.info(
+        "[solar_signed_upload] document link parsed=%s",
+        document_link,
+    )
+
+    quote_num, amount_tot, _site_meta = latest_solar_quote_fields(db, offer_id)
+    logging.info(
+        "[solar_signed_upload] quote metadata quote_num=%s amount_total=%s",
+        quote_num,
+        amount_tot,
+    )
+    signed_meta = {
+        "source": "solar_cleaning_signed_offer_upload",
+        "upload_filename": filename,
+        "new_filename": new_filename,
+    }
+    if getattr(offer, "utility_type", None):
+        signed_meta["utility_type"] = offer.utility_type
+    if getattr(offer, "utility_type_identifier", None):
+        signed_meta["utility_type_identifier"] = offer.utility_type_identifier
+    activity = create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER,
+        document_link=document_link,
+        metadata=signed_meta,
+        created_by=user_email,
+    )
+    logging.info(
+        "[solar_signed_upload] activity created id=%s type=%s",
+        activity.id,
+        OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER.value,
+    )
+
+    # If this offer is currently in an autonomous follow-up run, stop it now that
+    # the signed offer has been received.
+    try:
+        from services.autonomous_sequence import manual_stop_run
+
+        running_runs = (
+            db.query(AutonomousSequenceRun)
+            .filter(
+                AutonomousSequenceRun.offer_id == offer.id,
+                AutonomousSequenceRun.run_status == "running",
+            )
+            .all()
+        )
+        for r in running_runs:
+            manual_stop_run(db, r.id)
+        logging.info(
+            "[solar_signed_upload] autonomous runs stopped count=%s offer_id=%s",
+            len(running_runs),
+            offer.id,
+        )
+    except Exception:
+        logging.exception(
+            "Failed to stop autonomous run(s) for signed solar offer upload (offer_id=%s)",
+            offer.id,
+        )
+
+    # Signed offer returned: mark the offer accepted and propagate linked client stage.
+    accepted_offer = update_offer_status_and_propagate_client_stage(
+        db=db,
+        offer_id=offer.id,
+        new_status=OfferStatus.ACCEPTED,
+    )
+    logging.info(
+        "[solar_signed_upload] offer accepted id=%s status=%s",
+        accepted_offer.id,
+        accepted_offer.status,
+    )
+
+    recorded_at = datetime.now(timezone.utc).isoformat()
+    contact_email = resolve_contact_email(client)
+    contact_name = resolve_contact_name(client)
+    util_title = utility_offer_title(offer)
+    quote_cell = quote_num or ""
+    total_cell = ""
+    if amount_tot is not None:
+        total_cell = f"{amount_tot:.2f}"
+
+    row = [
+        recorded_at,
+        str(offer.id),
+        str(offer.client_id or ""),
+        business_name,
+        contact_email,
+        contact_name,
+        util_title,
+        quote_cell,
+        total_cell,
+        document_link,
+        str(getattr(accepted_offer, "status", None) or offer.status or ""),
+        user_email or "",
+    ]
+    logging.info(
+        "[solar_signed_upload] sheet row prepared offer_id=%s quote=%s total=%s uploaded_by=%s",
+        offer.id,
+        quote_cell,
+        total_cell,
+        user_email,
+    )
+    sheet_ok, sheet_err = append_dashboard_quotes_signed_row(row)
+    logging.info(
+        "[solar_signed_upload] sheet append result ok=%s err=%s",
+        sheet_ok,
+        (sheet_err or "")[:300],
+    )
+
+    logging.info(
+        "[solar_signed_upload] request success offer_id=%s activity_id=%s",
+        offer.id,
+        activity.id,
+    )
+    return SolarCleaningSignedUploadResponse(
+        document_link=document_link,
+        activity_id=activity.id,
+        sheet_appended=sheet_ok,
+        sheet_error=sheet_err,
+    )
+
+
 def verify_autonomous_inbound_secret(
     x_autonomous_inbound_secret: Optional[str] = Header(None, alias="X-Autonomous-Inbound-Secret"),
 ):
@@ -7545,12 +7849,22 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
     business_name = offer.business_name if offer else None
-    pending = [s for s in steps if s.step_status in ("ready", "to_start") and s.scheduled_at]
+    pending = [
+        s
+        for s in steps
+        if s.step_status in ("ready", "to_start", "in_progress") and s.scheduled_at
+    ]
     next_ch, next_at = None, None
     if pending:
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
-    done = len([s for s in steps if s.step_status in ("completed", "failed", "skipped")])
+    done = len(
+        [
+            s
+            for s in steps
+            if s.step_status in ("executed", "completed", "error", "failed", "skipped")
+        ]
+    )
     return AutonomousSequenceRunListItem(
         id=run.id,
         offer_id=run.offer_id,
@@ -7606,6 +7920,21 @@ def autonomous_sequence_start(
         # Keep canonical key used internally, while also preserving snake_case for compatibility.
         sequence_context["email_ID"] = incoming_email_id
         sequence_context.setdefault("email_id", incoming_email_id)
+
+    # Provide consistent offer timing fields for prompts/workflows.
+    # The offer validity window defaults to exactly 7 days from generation.
+    anchor_dt = body.anchor_at
+    if anchor_dt.tzinfo is None:
+        anchor_utc = anchor_dt.replace(tzinfo=timezone.utc)
+    else:
+        anchor_utc = anchor_dt.astimezone(timezone.utc)
+    valid_until_utc = anchor_utc + timedelta(days=7)
+    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
+
+    sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
+    sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+    sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+    sequence_context.setdefault("offer_validity_days", 7)
 
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:

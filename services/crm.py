@@ -521,6 +521,7 @@ ACTIVITY_TYPE_LABELS = {
     OfferActivityType.SERVICE_AGREEMENT: "Service agreement",
     OfferActivityType.SOLAR_CLEANING_QUOTE_GENERATED: "Solar panel cleaning quote generated",
     OfferActivityType.SOLAR_CLEANING_QUOTE_SENT: "Solar panel cleaning quote sent to client",
+    OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER: "Solar panel cleaning signed offer uploaded",
     OfferActivityType.MEMBER_DOCUMENT_UPLOAD: "Member document uploaded",
 }
 

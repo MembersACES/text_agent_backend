@@ -79,4 +79,5 @@ class OfferActivityType(str, Enum):
     # ACES solar panel cleaning quote (Docs/PDF + email via n8n)
     SOLAR_CLEANING_QUOTE_GENERATED = "solar_cleaning_quote_generated"
     SOLAR_CLEANING_QUOTE_SENT = "solar_cleaning_quote_sent"
+    SOLAR_CLEANING_SIGNED_OFFER = "solar_cleaning_signed_offer"
 

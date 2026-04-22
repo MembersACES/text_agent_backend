@@ -24,7 +24,6 @@ from models import (
     Offer,
 )
 
-
 def _is_postgresql(bind) -> bool:
     return bind.dialect.name == "postgresql"
 
@@ -43,6 +42,25 @@ def _inspector_schema_kw(bind) -> dict:
 
 def _qualified_table(bind, table: str) -> str:
     return f"public.{table}" if _is_postgresql(bind) else table
+
+
+def _set_run_validity_date_if_supported(db: Session, run_id: int, validity: date) -> None:
+    """Persist validity_date when the DB column exists (safe across mixed env schemas)."""
+    if not validity:
+        return
+    insp = inspect(db.bind)
+    tables = _reflect_table_names(insp, db.bind)
+    if "autonomous_sequence_runs" not in tables:
+        return
+    skw = _inspector_schema_kw(db.bind)
+    cols = [str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_runs", **skw)]
+    if "validity_date" not in cols:
+        return
+    runs_tbl = _qualified_table(db.bind, "autonomous_sequence_runs")
+    db.execute(
+        text(f"UPDATE {runs_tbl} SET validity_date = :validity_date WHERE id = :run_id"),
+        {"validity_date": validity, "run_id": run_id},
+    )
 
 
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
@@ -515,6 +533,17 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
 
     anchor_at = datetime.now(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
     ctx = _parse_context(run)
+    # Restart should refresh offer validity window from the new anchor.
+    if anchor_at.tzinfo is None:
+        anchor_utc = anchor_at.replace(tzinfo=timezone.utc)
+    else:
+        anchor_utc = anchor_at.astimezone(timezone.utc)
+    valid_until_utc = anchor_utc + timedelta(days=7)
+    valid_until_local = valid_until_utc.astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    ctx["offer_generated_at"] = anchor_utc.isoformat()
+    ctx["offer_valid_until"] = valid_until_utc.isoformat()
+    ctx["offer_validity_date"] = valid_until_local.date().isoformat()
+    ctx["offer_validity_days"] = 7
     client_id = run.client_id if run.client_id is not None else offer.client_id
 
     out = start_gas_base2_sequence(
@@ -657,8 +686,25 @@ def start_gas_base2_sequence(
         return existing
 
     anchor_utc = _to_utc_naive(anchor_at)
+    context_payload = dict(context or {})
+    validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
+    run_validity_date: Optional[date] = None
+    if validity_raw:
+        try:
+            run_validity_date = date.fromisoformat(validity_raw[:10])
+        except ValueError:
+            logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
+    if run_validity_date is None:
+        anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
+        run_validity_date = (
+            (anchor_aware_utc + timedelta(days=7))
+            .astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+            .date()
+        )
+        context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
+
     _ = tz  # caller may pass client timezone; scheduling is always AEST
-    contact_fields = _context_contact_fields(context)
+    contact_fields = _context_contact_fields(context_payload)
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
         offer_id=offer_id,
@@ -667,7 +713,7 @@ def start_gas_base2_sequence(
         run_status="running",
         anchor_at=anchor_utc,
         timezone=AUTONOMOUS_SCHEDULE_TZ,
-        context_json=json.dumps(context) if context else None,
+        context_json=json.dumps(context_payload) if context_payload else None,
         email_ID=contact_fields["email_ID"],
         contact_phone=contact_fields["contact_phone"],
         contact_name=contact_fields["contact_name"],
@@ -675,6 +721,7 @@ def start_gas_base2_sequence(
     )
     db.add(run)
     db.flush()
+    _set_run_validity_date_if_supported(db, run.id, run_validity_date)
 
     template = get_sequence_template_by_type(db, sequence_type)
     if template and bool(template.is_active):
@@ -687,7 +734,7 @@ def start_gas_base2_sequence(
         fallback_plan = plan_gas_base2_followup_times(anchor_at)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
 
-    ctx_retell_agent_id = context.get("retell_agent_id")
+    ctx_retell_agent_id = context_payload.get("retell_agent_id")
 
     for idx, (day_num, channel, scheduled_utc_naive, prompt_text, step_retell_agent_id) in enumerate(plan):
         resolved_retell_agent_id = step_retell_agent_id or (
@@ -856,12 +903,15 @@ def execute_due_steps_sync(db: Session) -> int:
             continue
 
         for step in sorted(run.steps, key=lambda s: s.step_index):
-            if step.step_status not in ("ready", "to_start"):
-                continue
             if step.scheduled_at is None or step.scheduled_at > now:
                 continue
+            # Runner only picks `ready`; promote due `to_start` so autonomous_agent_backend can execute.
+            if step.step_status == "to_start":
+                step.step_status = "ready"
+                db.flush()
+            if step.step_status != "ready":
+                continue
 
-            step.step_status = "in_progress"
             step.started_at = now
             db.flush()
 
@@ -891,7 +941,7 @@ def execute_due_steps_sync(db: Session) -> int:
                 else:
                     out = {"ok": False, "error": "unknown_channel", "channel": step.channel}
 
-                step.step_status = "completed"
+                step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
                 _log_event(
@@ -904,7 +954,7 @@ def execute_due_steps_sync(db: Session) -> int:
                 executed += 1
             except Exception as e:
                 logger.exception("Autonomous step failed run_id=%s step_id=%s", run.id, step.id)
-                step.step_status = "failed"
+                step.step_status = "error"
                 step.last_outcome_summary = str(e)[:4000]
                 _log_event(
                     db,
