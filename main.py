@@ -99,6 +99,7 @@ from tools.one_month_savings import (
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
 from tools.solar_cleaning_quote import generate_solar_cleaning_quote, preview_solar_quote_extract
+from services.vinyl_wrap_spec import generate_vinyl_wrap_spec_payload
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
 from tools.discrepancy_check_sheet import (
     get_discrepancy_rows,
@@ -5112,6 +5113,44 @@ async def solar_cleaning_quote_generate(
         status = 400 if "no drive folder" in detail.lower() else 502
         raise HTTPException(status_code=status, detail=detail)
     return result
+
+
+@app.post("/api/vinyl-wrap/generate")
+async def vinyl_wrap_generate_endpoint(
+    client_name: str = Form(...),
+    primary_colour: str = Form(...),
+    secondary_colour: str = Form(...),
+    text_colour: str = Form(...),
+    extra_colours_json: str = Form("[]"),
+    extra_details: str = Form(""),
+    wrap_style: str = Form("commercial"),
+    logo_file: UploadFile | None = File(default=None),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Deterministic SVG spec board for PUDU CC1 vinyl wrap (multipart)."""
+    _ = user_info
+    logo_bytes = None
+    logo_mime = None
+    if logo_file is not None:
+        raw = await logo_file.read()
+        if len(raw) == 0:
+            raise HTTPException(status_code=400, detail="Empty logo upload")
+        logo_bytes = raw
+        logo_mime = logo_file.content_type
+    try:
+        return generate_vinyl_wrap_spec_payload(
+            client_name=client_name,
+            primary_colour=primary_colour,
+            secondary_colour=secondary_colour,
+            text_colour=text_colour,
+            extra_colours_json=extra_colours_json or "[]",
+            extra_details=extra_details or "",
+            logo_bytes=logo_bytes,
+            logo_mime=logo_mime,
+            wrap_style=wrap_style or "commercial",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 # --- Testimonials API (member testimonials, optional link to 1st Month Savings) ---
