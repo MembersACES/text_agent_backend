@@ -741,6 +741,20 @@ class UtilityRecordUpdateRequest(BaseModel):
     data_requested: Optional[str] = None   # YYYY-MM-DD
     data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
     contract_end_date: Optional[str] = None  # YYYY-MM-DD
+
+
+class UtilityInvoiceRowsRequest(BaseModel):
+    """Fetch invoice table rows for a utility identifier via account->invoice links in Airtable."""
+    utility_type: str
+    identifier: str
+    max_records: Optional[int] = 50
+    offset: Optional[int] = 0
+    sort_by: Optional[str] = None
+    sort_dir: Optional[str] = "desc"
+    match_strategy: Optional[str] = "exact"
+    fallback_fields: Optional[List[str]] = None
+
+
 # Add these Pydantic models with your other BaseModel classes
 class BusinessSolution(BaseModel):
     id: str
@@ -2630,23 +2644,52 @@ def get_utility_information(
     return data
 
 @app.post("/api/drive-filing")
-def drive_filing_endpoint(
-    business_name: str = Form(...),
-    gdrive_url: str = Form(...),
-    filing_type: str = Form(...),
-    contract_status: str = Form(None),
-    file: UploadFile = File(...),
+async def drive_filing_endpoint(
+    request: StarletteRequest,
     user_info: dict = Depends(verify_google_token)
 ):
-    logging.info(f"Received drive filing request: business_name={business_name}, gdrive_url={gdrive_url}, filing_type={filing_type}, filename={file.filename}")
-    file_bytes = file.file.read()
+    """Accept `file` (single) and/or `files` (one or more). Optional contract_update_mode for signed contracts."""
+    form = await request.form()
+    business_name = str(form.get("business_name") or "").strip()
+    gdrive_url = str(form.get("gdrive_url") or "").strip()
+    filing_type = str(form.get("filing_type") or "").strip()
+    cs = form.get("contract_status")
+    contract_status = str(cs).strip() if cs not in (None, "") else None
+    cm = form.get("contract_update_mode")
+    contract_update_mode = str(cm).strip() if cm not in (None, "") else None
+
+    file_list = []
+    if "files" in form:
+        for item in form.getlist("files"):
+            if item is not None and hasattr(item, "read"):
+                file_list.append(item)
+    if not file_list and "file" in form:
+        u = form.get("file")
+        if u is not None and hasattr(u, "read"):
+            file_list.append(u)
+
+    if not file_list:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
+    file_payloads = []
+    for uf in file_list:
+        content = await uf.read()
+        name = getattr(uf, "filename", None) or "upload"
+        file_payloads.append((content, name))
+
+    names = [p[1] for p in file_payloads]
+    logging.info(
+        f"Received drive filing request: business_name={business_name}, gdrive_url={gdrive_url}, "
+        f"filing_type={filing_type}, contract_update_mode={contract_update_mode}, files={names}"
+    )
+
     result = drive_filing(
-        file_bytes=file_bytes,
-        filename=file.filename,
+        file_payloads=file_payloads,
         business_name=business_name,
         gdrive_url=gdrive_url,
         filing_type=filing_type,
-        contract_status=contract_status
+        contract_status=contract_status,
+        contract_update_mode=contract_update_mode,
     )
     result["user_email"] = user_info.get("email")
     logging.info(f"Returning drive filing response to frontend: {result}")
@@ -2819,6 +2862,49 @@ def update_utility_record_endpoint(
             detail="Utility record not found or update failed. Check business name, utility type, and identifier. See server logs for Airtable response.",
         )
     return {"status": "success", "message": "Utility record updated"}
+
+
+@app.post("/api/utility-invoice-rows")
+def get_utility_invoice_rows_endpoint(
+    request: UtilityInvoiceRowsRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Get invoice rows by utility identifier, using account table links to invoice tables."""
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    if not getattr(airtable_client, "USE_AIRTABLE_DIRECT", False):
+        raise HTTPException(status_code=503, detail="Airtable direct mode is not enabled")
+
+    max_records = request.max_records if isinstance(request.max_records, int) else 50
+    max_records = max(1, min(max_records, 500))
+    offset = request.offset if isinstance(request.offset, int) else 0
+    offset = max(0, offset)
+    payload = airtable_client.get_utility_invoice_rows_by_identifier(
+        request.utility_type,
+        request.identifier,
+        max_records=max_records,
+        offset=offset,
+        sort_by=request.sort_by,
+        sort_dir=request.sort_dir or "desc",
+        match_strategy=request.match_strategy or "exact",
+        fallback_fields=request.fallback_fields or [],
+    )
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    diagnostics = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+    total_count = payload.get("total_count", len(rows)) if isinstance(payload, dict) else len(rows)
+    return {
+        "rows": rows,
+        "utility_type": request.utility_type,
+        "identifier": request.identifier,
+        "count": len(rows),
+        "total_count": total_count,
+        "offset": offset,
+        "limit": max_records,
+        "sort_by": request.sort_by,
+        "sort_dir": request.sort_dir or "desc",
+        "diagnostics": diagnostics,
+        "user_email": user_info.get("email"),
+    }
 
 
 @app.get("/api/resources/contract-ending")
