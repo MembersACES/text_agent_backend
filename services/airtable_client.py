@@ -80,6 +80,53 @@ UTILITY_CONFIG = [
 # Fields we read from utility tables (identifier, retailer, and the new tracking fields)
 UTILITY_EXTRA_FIELDS = ["Data Requested", "Data Recieved", "Contract End Date"]
 
+# Utility -> account table -> linked invoice table mapping
+# Used by GHG page when user clicks an identifier and wants invoice rows inline.
+UTILITY_INVOICE_SOURCE_CONFIG = {
+    "C&I Electricity": {
+        "account_table": "C&I Electricity Records",
+        "identifier_field": "NMI",
+        "invoice_link_field": "Link to C&I invoices",
+        "invoice_table": "2nd Sheet - Electricity details from the invoice",
+    },
+    "SME Electricity": {
+        "account_table": "SME Electricity Records",
+        "identifier_field": "NMI",
+        "invoice_link_field": "Link to SME invoices",
+        "invoice_table": "3rd Sheet - SME Electricity",
+    },
+    "C&I Gas": {
+        "account_table": "C&I Gas Clients",
+        "identifier_field": "MRIN",
+        "invoice_link_field": "Link to C&I Gas Invoices",
+        "invoice_table": "4th Sheet - Large Gas",
+    },
+    "SME Gas": {
+        "account_table": "SME Gas Accounts",
+        "identifier_field": "MRIN",
+        "invoice_link_field": "Link to SME Gas Invoices",
+        "invoice_table": "5th Sheet - Small Gas",
+    },
+    "Waste": {
+        "account_table": "Waste Clients",
+        "identifier_field": "Account Number or Customer Number",
+        "invoice_link_field": "Link to Waste invoices",
+        "invoice_table": "7th Sheet - Waste",
+    },
+    "Oil": {
+        "account_table": "Oil Clients",
+        "identifier_field": "Client Name",
+        "invoice_link_field": "Link to oil invoices",
+        "invoice_table": "8th Sheet - Oil",
+    },
+    "Cleaning": {
+        "account_table": "Cleaning Clients",
+        "identifier_field": "Client Name",
+        "invoice_link_field": "Link to cleaning invoices",
+        "invoice_table": "14th Sheet - Cleaning Invoices",
+    },
+}
+
 
 def _normalize_identifier_raw(ident: Any) -> str:
     """
@@ -512,6 +559,224 @@ def find_utility_record_by_identifier(
             logger.debug("Airtable find_utility_record failed: %s", e)
             return None
     return None
+
+
+def _normalize_match_value(value: Any, strategy: str) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if strategy in ("case_insensitive", "normalized_whitespace"):
+        s = s.lower()
+    if strategy == "normalized_whitespace":
+        s = " ".join(s.split())
+    return s
+
+
+def _date_like_to_timestamp(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        pass
+    for fmt in (
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%d %b %Y",
+        "%d %B %Y",
+    ):
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def _sort_invoice_rows(rows: list[dict], sort_by: Optional[str], sort_dir: str) -> list[dict]:
+    if not rows:
+        return []
+    reverse = (sort_dir or "desc").lower() != "asc"
+    if sort_by:
+        key_name = str(sort_by)
+        return sorted(
+            rows,
+            key=lambda row: _date_like_to_timestamp(row.get(key_name))
+            if "date" in key_name.lower() or "period" in key_name.lower()
+            else str(row.get(key_name, "")),
+            reverse=reverse,
+        )
+    priority_fields = (
+        "Invoice Date",
+        "invoice_date",
+        "Invoice Date Formatted",
+        "Invoice Review Period",
+        "Review Period",
+        "Billing Period",
+    )
+    for field in priority_fields:
+        if any(field in r for r in rows):
+            return sorted(rows, key=lambda row: _date_like_to_timestamp(row.get(field)), reverse=reverse)
+    return rows
+
+
+def get_utility_invoice_rows_by_identifier(
+    utility_type_identifier: str,
+    identifier: str,
+    *,
+    max_records: int = 50,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: str = "desc",
+    match_strategy: str = "exact",
+    fallback_fields: Optional[list[str]] = None,
+) -> dict:
+    """
+    Resolve utility account row by identifier, follow linked invoice record IDs,
+    and return invoice table rows for inline display in GHG Reporting.
+    """
+    if not AIRTABLE_API_KEY:
+        return {"rows": [], "total_count": 0, "diagnostics": {"error": "airtable_not_configured"}}
+    cfg = UTILITY_INVOICE_SOURCE_CONFIG.get(utility_type_identifier)
+    if not cfg:
+        return {"rows": [], "total_count": 0, "diagnostics": {"error": "unsupported_utility_type"}}
+    identifier_raw = str(identifier or "").strip()
+    if not identifier_raw:
+        return {"rows": [], "total_count": 0, "diagnostics": {"error": "empty_identifier"}}
+
+    account_table = cfg["account_table"]
+    identifier_field = cfg["identifier_field"]
+    invoice_link_field = cfg["invoice_link_field"]
+    invoice_table = cfg["invoice_table"]
+    identifier_norm = _normalize_identifier_raw(identifier_raw)
+    strategies = [match_strategy] if match_strategy != "exact" else ["exact", "case_insensitive", "normalized_whitespace"]
+    fields_to_try = [identifier_field]
+    if fallback_fields:
+        for f in fallback_fields:
+            if isinstance(f, str) and f.strip() and f.strip() not in fields_to_try:
+                fields_to_try.append(f.strip())
+    if utility_type_identifier == "Oil":
+        for oil_fallback in ("Client Name", "Account Number / Customer Code"):
+            if oil_fallback not in fields_to_try:
+                fields_to_try.append(oil_fallback)
+
+    account_record = None
+    used_field = ""
+    used_strategy = ""
+    formula_used = ""
+    lookup_attempts: list[dict[str, str]] = []
+    for field_name in fields_to_try:
+        escaped = _escape_formula_value(identifier_raw)
+        formula_parts = [f"{{{field_name}}}='{escaped}'"]
+        if identifier_norm and identifier_norm.isdigit():
+            formula_parts.append(f"{{{field_name}}}={identifier_norm}")
+        formula = (
+            "OR(" + ",".join(formula_parts) + ")"
+            if len(formula_parts) > 1
+            else formula_parts[0]
+        )
+        try:
+            r = requests.get(
+                _url(account_table),
+                headers=_headers(),
+                params={"filterByFormula": formula, "maxRecords": 8},
+                timeout=20,
+            )
+            r.raise_for_status()
+            accounts = r.json().get("records", [])
+        except requests.RequestException as e:
+            logger.warning(
+                "[utility-invoice-rows] account lookup failed for %s %r: %s",
+                utility_type_identifier,
+                identifier_raw,
+                e,
+            )
+            return {"rows": [], "total_count": 0, "diagnostics": {"error": "account_lookup_failed", "detail": str(e)}}
+
+        for strategy in strategies:
+            wanted = _normalize_match_value(identifier_raw, strategy)
+            for rec in accounts:
+                fields = rec.get("fields") or {}
+                got = _normalize_match_value(fields.get(field_name), strategy)
+                if got and wanted and got == wanted:
+                    account_record = rec
+                    used_field = field_name
+                    used_strategy = strategy
+                    formula_used = formula
+                    break
+            if account_record:
+                break
+        lookup_attempts.append({"field": field_name, "formula": formula})
+        if account_record:
+            break
+
+    if not account_record:
+        return {
+            "rows": [],
+            "total_count": 0,
+            "diagnostics": {
+                "account_table": account_table,
+                "invoice_table": invoice_table,
+                "account_record_found": False,
+                "lookup_attempts": lookup_attempts,
+            },
+        }
+
+    account_fields = account_record.get("fields") or {}
+    link_ids = account_fields.get(invoice_link_field)
+    if not isinstance(link_ids, list):
+        return {
+            "rows": [],
+            "total_count": 0,
+            "diagnostics": {
+                "account_table": account_table,
+                "invoice_table": invoice_table,
+                "account_record_found": True,
+                "account_record_id": account_record.get("id", ""),
+                "invoice_link_field": invoice_link_field,
+                "linked_invoice_ids_count": 0,
+                "matched_field": used_field,
+                "matched_strategy": used_strategy,
+            },
+        }
+
+    limit = max(1, min(int(max_records), 500))
+    start = max(0, int(offset))
+    selected_link_ids = link_ids[start : start + limit]
+    out: list[dict] = []
+    for rec_id in selected_link_ids:
+        if not isinstance(rec_id, str) or not rec_id.startswith("rec"):
+            continue
+        rec = _fetch_record(invoice_table, rec_id)
+        if not rec:
+            continue
+        fields = rec.get("fields") or {}
+        out.append({"record_id": rec.get("id", ""), **fields})
+    out = _sort_invoice_rows(out, sort_by, sort_dir)
+    return {
+        "rows": out,
+        "total_count": len(link_ids),
+        "diagnostics": {
+            "account_table": account_table,
+            "invoice_table": invoice_table,
+            "account_record_found": True,
+            "account_record_id": account_record.get("id", ""),
+            "invoice_link_field": invoice_link_field,
+            "linked_invoice_ids_count": len(link_ids),
+            "linked_invoice_ids_returned_count": len(selected_link_ids),
+            "records_returned_count": len(out),
+            "matched_field": used_field,
+            "matched_strategy": used_strategy,
+            "formula_used": formula_used,
+            "lookup_attempts": lookup_attempts,
+        },
+    }
 
 
 def update_utility_record_data_requested(
