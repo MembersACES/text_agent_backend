@@ -8,11 +8,11 @@ _backend_env = Path(__file__).resolve().parent / ".env"
 if _backend_env.is_file():
     load_dotenv(_backend_env, override=True)
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, status
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.oauth2 import id_token
 from google.auth.transport import requests as grequests
 from google.oauth2.service_account import Credentials as ServiceCredentials
@@ -29,7 +29,7 @@ import time
 import tempfile
 import os
 import httpx
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 import json
 from fastapi import HTTPException, Depends
 from fastapi.responses import JSONResponse, Response
@@ -364,7 +364,8 @@ async def root():
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
-    
+
+
 def verify_google_access_token(authorization: str = Header(...)):
     """Verify Google access token for API access (needed for presentations)"""
     if not authorization.startswith("Bearer "):
@@ -561,6 +562,98 @@ class UtilityInfoRequest(BaseModel):
     business_name: str
     service_type: str
     identifier: Optional[str]
+
+
+class UtilityLinkedDetailItem(BaseModel):
+    identifier: Optional[str] = None
+    identifier_type: Optional[str] = None
+    client_name: Optional[str] = None
+    retailer: Optional[str] = None
+    site_address: Optional[str] = None
+
+
+class UtilityLinkedWebhookRequest(BaseModel):
+    """Payload from utility-linking UI after Airtable/n8n link succeeds; drives post-link automation."""
+
+    event: str = "UTILITY_LINKED"
+    business_name: str
+    utility_type: str
+    utility_details: List[UtilityLinkedDetailItem] = Field(default_factory=list)
+    linked_at: Optional[str] = None
+    linked_by: Optional[str] = None
+
+
+def _dispatch_utility_linked_placeholder(utility_type: str) -> None:
+    """Branch per utility for future n8n/Drive steps (placeholder)."""
+    if utility_type == "ELECTRICITY_CI":
+        pass
+    elif utility_type == "ELECTRICITY_SME":
+        pass
+    elif utility_type == "GAS_CI":
+        pass
+    elif utility_type == "GAS_SME":
+        pass
+    elif utility_type == "WASTE":
+        pass
+    elif utility_type == "COOKING_OIL":
+        pass
+    elif utility_type == "GREASE_TRAP":
+        pass
+    elif utility_type == "WATER":
+        pass
+    elif utility_type == "CLEANING":
+        pass
+    else:
+        logging.warning("utility-linked webhook: unknown utility_type %r", utility_type)
+
+
+N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK = (
+    "https://membersaces.app.n8n.cloud/webhook/utility_linked_post_process"
+)
+
+
+async def _maybe_forward_utility_linked_to_n8n(payload: dict) -> None:
+    """POST payload to n8n after utility link (path: update here if your webhook URL differs)."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK, json=payload)
+            response.raise_for_status()
+    except Exception:
+        logging.exception(
+            "utility-linked: forward to n8n failed (url=%s)",
+            N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK,
+        )
+
+
+@app.post("/api/webhooks/utility-linked")
+@app.post("/api/post-utility-linked")  # alias: avoids bad clients building …/api/api/webhooks…
+async def utility_linked_webhook(
+    *,
+    authorization: Annotated[str, Header(..., description="Bearer BACKEND_API_KEY or Google ID token")],
+    request_body: Annotated[UtilityLinkedWebhookRequest, Body(..., description="Utility-linked payload JSON")],
+):
+    """
+    Called after a utility is linked in Airtable (via n8n). Placeholder branches per utility_type;
+    forwards the same JSON to the hardcoded n8n webhook below.
+    Auth: Bearer BACKEND_API_KEY (from Next.js proxy) or Google ID token.
+
+    Must be defined *after* ``UtilityLinkedWebhookRequest`` so Pydantic/FastAPI do not see a
+    forward reference that is "not fully defined".
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        verify_google_token(authorization)
+
+    _dispatch_utility_linked_placeholder(request_body.utility_type)
+    payload = request_body.model_dump()
+    await _maybe_forward_utility_linked_to_n8n(payload)
+    return {
+        "ok": True,
+        "message": "utility-linked placeholder accepted",
+        "utility_type": request_body.utility_type,
+    }
 
 
 class ClientSearchRequest(BaseModel):
