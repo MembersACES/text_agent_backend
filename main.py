@@ -45,6 +45,11 @@ import io
 
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
+from tools.invoicing_retailer_sheets import (
+    get_commission_figures_client_count,
+    get_trojan_oil_unique_client_count,
+    list_retailer_keys,
+)
 from services import airtable_client
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
@@ -3492,6 +3497,45 @@ def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google
     except Exception as e:
         logging.error(f"Error fetching Base 1 landing responses: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to load Base 1 landing responses")
+
+
+@app.get("/api/invoicing/commission-figures-client-count")
+def invoicing_commission_figures_client_count_endpoint(
+    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Count data rows on the Commission Figures tab (excludes header) for Origin Gas / Origin Elec / Alinta Gas retailer sheets.
+    """
+    allowed = set(list_retailer_keys())
+    key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
+    if key not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid retailer. Use one of: {', '.join(sorted(allowed))}",
+        )
+    count, err = get_commission_figures_client_count(key)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "retailer": key,
+        "client_count": count,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/trojan-oil-unique-clients")
+def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Distinct client names (column A) on Trojan Oil workbook tab 'All Data'.
+    """
+    count, err = get_trojan_oil_unique_client_count()
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "unique_client_count": count,
+        "user_email": user_info.get("email"),
+    }
 
 
 @app.get("/api/base1-leads")
