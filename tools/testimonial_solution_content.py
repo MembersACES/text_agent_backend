@@ -41,9 +41,10 @@ SOLUTION_TYPE_LABELS: Dict[str, str] = {
     "resource_recovery": "Oil / Resource Recovery",
 }
 
-# Optional extra solution types (e.g. case studies like Automated Cleaning Robot)
+# Optional extra solution types (e.g. case studies like Automated Cleaning Robot, DMA)
 EXTRA_SOLUTION_TYPES: Dict[str, str] = {
     "automated_cleaning_robot": "Automated Cleaning Robot",
+    "dma": "Direct Metering Agreement",
 }
 
 ALL_SOLUTION_TYPE_IDS = SOLUTION_TYPE_IDS + list(EXTRA_SOLUTION_TYPES.keys())
@@ -175,6 +176,21 @@ DEFAULT_CONTENT["resource_recovery"].update({
     "conclusion": "Resource recovery transforms waste streams into cost-saving opportunities.",
     "esg_scope_for_solution": "SCOPE 3",
     "sdg_impact_for_solution": "SDG 6, 12, 13",
+})
+
+DEFAULT_CONTENT["dma"].update({
+    "key_outcome_metrics": "DMA metering cost reduction",
+    "key_challenge_of_solution": "Direct Metering Agreement charges were uncompetitive versus expected metering rates.",
+    "key_approach_of_solution": "Forensic review of metering line items and the agreement against benchmarks.",
+    "key_outcome_of_solution": "Lower metering costs quantified with a clear annual and multi-year saving.",
+    "key_outcome_dotpoints_1": "Annual metering spend and net saving identified.",
+    "key_outcome_dotpoints_2": "Agreement and invoice-led review—not retail-only benchmarking.",
+    "key_outcome_dotpoints_3": "Savings articulated for budgeting and approvals.",
+    "key_outcome_dotpoints_4": "Transparent metrics for CFO and committees.",
+    "key_outcome_dotpoints_5": "ESG: typically minimal GHG change where savings are metering-commercial.",
+    "conclusion": "DMA reviews deliver concise, defensible metering savings on a single-page summary.",
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 12",
 })
 
 DEFAULT_CONTENT["automated_cleaning_robot"] = {

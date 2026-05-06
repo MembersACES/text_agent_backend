@@ -5569,6 +5569,29 @@ async def update_testimonial(
     return TestimonialResponse.model_validate(testimonial)
 
 
+@app.delete("/api/testimonials/{testimonial_id}", status_code=204)
+async def delete_testimonial(
+    testimonial_id: int,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Remove a testimonial row from the CRM (does not delete the Google Drive file)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    db.delete(testimonial)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 # --- Testimonial solution content (defaults in code, overridable via API) ---
 
 
