@@ -623,6 +623,8 @@ class TestimonialResponse(BaseModel):
 class TestimonialUpdate(BaseModel):
     status: Optional[str] = None
     invoice_number: Optional[str] = None
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
 
 
 class TestimonialCheckApprovedResponse(BaseModel):
