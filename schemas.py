@@ -473,6 +473,7 @@ class ActivityReportItem(BaseModel):
     """Single row for activity report list (with business_name from offer)."""
     id: int
     offer_id: int
+    task_id: Optional[int] = None
     client_id: Optional[int] = None
     business_name: Optional[str] = None
     activity_type: str

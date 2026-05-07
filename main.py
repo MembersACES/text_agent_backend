@@ -9220,6 +9220,7 @@ def activities_report_list(
             ActivityReportItem(
                 id=act.id,
                 offer_id=act.offer_id,
+                task_id=None,
                 client_id=act.client_id,
                 business_name=offer.business_name,
                 activity_type=act.activity_type,
@@ -9284,6 +9285,7 @@ def activities_report_testimonials(
             ActivityReportItem(
                 id=-(t.id + 1000000),
                 offer_id=0,
+                task_id=None,
                 client_id=inferred_client_id,
                 business_name=t.business_name,
                 activity_type="testimonial_activity",
@@ -9343,10 +9345,10 @@ def activities_report_tasks(
         action = (hist.action or "").strip().lower()
         if action == "task_created":
             activity_type = "task_created"
-        elif action == "status_changed":
-            activity_type = "task_status_changed"
+        elif action == "status_changed" and (hist.new_value or "").strip().lower() == "completed":
+            activity_type = "task_completed"
         else:
-            activity_type = "task_updated"
+            activity_type = "task_edited"
 
         if action == "status_changed":
             change = f"status: {(hist.old_value or '—')} -> {(hist.new_value or '—')}"
@@ -9360,6 +9362,7 @@ def activities_report_tasks(
             ActivityReportItem(
                 id=-(hist.id + 2000000),
                 offer_id=0,
+                task_id=task.id,
                 client_id=task.client_id,
                 business_name=client.business_name if client else None,
                 activity_type=activity_type,
