@@ -396,6 +396,17 @@ class OfferActivityCreate(BaseModel):
     created_by: Optional[str] = None
 
 
+class MemberDocumentUploadActivityCreate(BaseModel):
+    """Log a member-area file upload on the activity report (offer resolved server-side)."""
+    upload_kind: str
+    filename: Optional[str] = None
+    document_link: Optional[str] = None
+    filing_type: Optional[str] = None
+    utility_key: Optional[str] = None
+    offer_id: Optional[int] = None
+    metadata: Optional[dict] = None
+
+
 def _parse_metadata(v: Any) -> Optional[dict]:
     """Parse metadata from DB: may be stored as JSON string."""
     if v is None:
@@ -447,6 +458,15 @@ class OfferActivityResponse(BaseModel):
             "created_by": obj.created_by,
         }
         return super().model_validate(data, **kwargs)
+
+
+class SolarCleaningSignedUploadResponse(BaseModel):
+    """Result of POST /api/offers/{id}/solar-cleaning-signed-upload."""
+
+    document_link: Optional[str] = None
+    activity_id: int
+    sheet_appended: bool
+    sheet_error: Optional[str] = None
 
 
 class ActivityReportItem(BaseModel):
@@ -603,6 +623,8 @@ class TestimonialResponse(BaseModel):
 class TestimonialUpdate(BaseModel):
     status: Optional[str] = None
     invoice_number: Optional[str] = None
+    file_id: Optional[str] = None
+    file_name: Optional[str] = None
 
 
 class TestimonialCheckApprovedResponse(BaseModel):

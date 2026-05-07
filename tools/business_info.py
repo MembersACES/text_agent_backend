@@ -20,6 +20,34 @@ FILE_IDS_SHEET_ID = os.getenv("FILE_IDS_SHEET_ID", "1l_ShkAcpS1HBqX8EdXLEVmn3pkl
 FILE_IDS_SHEET_NAME = os.getenv("FILE_IDS_SHEET_NAME", "Data from Airtable")  # Sheet name or can use GID
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service-account-key.json")
 
+def _normalize_drive_cell_value(raw_value: object) -> str:
+    """Normalize comma-separated Google Drive IDs/URLs into comma-separated URLs."""
+    if raw_value is None:
+        return ""
+    raw_text = str(raw_value).strip()
+    if not raw_text:
+        return ""
+
+    normalized_parts = []
+    for part in raw_text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+
+        # Already a URL.
+        if token.startswith("http://") or token.startswith("https://"):
+            normalized_parts.append(token)
+            continue
+
+        # Handle malformed legacy values like "<id>/view" or "<id>/edit".
+        token = token.split("/", 1)[0].strip()
+        if not token:
+            continue
+
+        normalized_parts.append(f"https://drive.google.com/file/d/{token}/view")
+
+    return ",".join(normalized_parts)
+
 def get_sheets_service():
     """Get Google Sheets service using service account credentials"""
     try:
@@ -247,10 +275,9 @@ def get_business_information(business_name: str) -> dict:
         
         # Process all file IDs from N8N data
         for n8n_key, mapped_key in file_mapping.items():
-            file_id = file_ids_dict.get(n8n_key)
-            if file_id and file_id.strip():  # Check if file_id exists and is not empty
-                file_link = f"https://drive.google.com/file/d/{file_id}/view"
-                processed_file_ids[mapped_key] = file_link
+            normalized_value = _normalize_drive_cell_value(file_ids_dict.get(n8n_key))
+            if normalized_value:
+                processed_file_ids[mapped_key] = normalized_value
         
         # NEW: Process all status fields from N8N data
         for n8n_key, mapped_key in status_mapping.items():
@@ -260,9 +287,7 @@ def get_business_information(business_name: str) -> dict:
 
         # Prepare LOA file link for Representative Details
         loa_file_id = file_ids_dict.get('LOA File ID')
-        loa_file_link = None
-        if loa_file_id and loa_file_id.strip():
-            loa_file_link = f"https://drive.google.com/file/d/{loa_file_id}/view"
+        loa_file_link = _normalize_drive_cell_value(loa_file_id)
 
         # Format the response message in a clear and organized way
         formatted_response = f"""Here is the information for {business_name}:
@@ -340,17 +365,27 @@ def get_business_information(business_name: str) -> dict:
         for sc_key, sc_label, status_key in sc_fields:
             sc_file_id = file_ids_dict.get(sc_key)
             sc_status = file_ids_dict.get(status_key, "")
-            
-            if sc_file_id and sc_file_id.strip():
-                sc_link = f"https://drive.google.com/file/d/{sc_file_id}/view"
-                status_text = f" ({sc_status})" if sc_status else ""
-                formatted_response += f"- **{sc_label}:** [In File]({sc_link}){status_text}\n"
+
+            normalized_sc_value = _normalize_drive_cell_value(sc_file_id)
+            if normalized_sc_value:
+                sc_links = [v.strip() for v in normalized_sc_value.split(",") if v.strip()]
+                status_values = [v.strip() for v in str(sc_status).split(",") if v.strip()] if sc_status else []
+                if len(sc_links) == 1:
+                    status_text = f" ({status_values[0]})" if status_values else ""
+                    formatted_response += f"- **{sc_label}:** [In File]({sc_links[0]}){status_text}\n"
+                else:
+                    formatted_response += f"- **{sc_label}:**\n"
+                    for idx, link in enumerate(sc_links):
+                        status_text = ""
+                        if status_values:
+                            status_text = f" ({status_values[idx] if idx < len(status_values) else status_values[0]})"
+                        formatted_response += f"  - [In File #{idx + 1}]({link}){status_text}\n"
             else:
                 formatted_response += f"- **{sc_label}:** Not Available\n"
 
         wip_file_id = file_ids_dict.get('WIP')
-        if wip_file_id and wip_file_id.strip():
-            wip_file_link = f"https://drive.google.com/file/d/{wip_file_id}/view"
+        wip_file_link = _normalize_drive_cell_value(wip_file_id)
+        if wip_file_link:
             processed_file_ids["business_WIP"] = wip_file_link
 
         formatted_response += "\n### Linked Utilities and Retailers:"

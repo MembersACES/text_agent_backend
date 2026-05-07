@@ -188,3 +188,34 @@ def init_db():
                 logging.info("✅ Added clients.advocacy_meeting_completed column")
     except Exception as e:
         logging.warning("Could not ensure clients advocacy meeting columns: %s", e)
+
+    # Pudu consumables: lifecycle tracking fields for replacement planning.
+    try:
+        insp = inspect(engine)
+        if "pudu_consumables" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("pudu_consumables")]
+            if "last_replaced_at" not in cols:
+                logging.info("Adding missing pudu_consumables.last_replaced_at column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE pudu_consumables ADD COLUMN last_replaced_at DATE"))
+                logging.info("✅ Added pudu_consumables.last_replaced_at column")
+            if "replacement_interval_days" not in cols:
+                logging.info("Adding missing pudu_consumables.replacement_interval_days column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE pudu_consumables ADD COLUMN replacement_interval_days INTEGER"))
+                logging.info("✅ Added pudu_consumables.replacement_interval_days column")
+    except Exception as e:
+        logging.warning("Could not ensure pudu_consumables lifecycle columns: %s", e)
+
+    # Pudu consumables: persist full baseline re-detect snapshot for UI when HTTP times out.
+    try:
+        insp = inspect(engine)
+        if "pudu_consumable_baseline_runs" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("pudu_consumable_baseline_runs")]
+            if "detail_json" not in cols:
+                logging.info("Adding missing pudu_consumable_baseline_runs.detail_json column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE pudu_consumable_baseline_runs ADD COLUMN detail_json TEXT"))
+                logging.info("✅ Added pudu_consumable_baseline_runs.detail_json column")
+    except Exception as e:
+        logging.warning("Could not ensure pudu_consumable_baseline_runs.detail_json column: %s", e)
