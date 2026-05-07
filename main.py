@@ -5733,6 +5733,8 @@ async def generate_testimonial_document_endpoint(
     result = generate_testimonial_document(
         business_name=business_name,
         trading_as=(body.get("trading_as") or "").strip(),
+        testimonial_business_name=(body.get("testimonial_business_name") or "").strip(),
+        testimonial_business_name_source=(body.get("testimonial_business_name_source") or "business_name").strip(),
         contact_name=(body.get("contact_name") or "").strip(),
         position=(body.get("position") or "").strip(),
         email=(body.get("email") or "").strip(),
