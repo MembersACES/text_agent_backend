@@ -19,6 +19,7 @@ from google.oauth2.service_account import Credentials as ServiceCredentials
 from googleapiclient.discovery import build as google_build
 import tempfile
 import requests
+import re
 import copy
 from google.auth.transport.requests import Request
 from urllib.parse import urlparse, parse_qs
@@ -116,7 +117,11 @@ from tools.resources_drive_videos import (
     get_resources_videos_folder_id,
     list_resources_folder_videos,
 )
-from tools.testimonial_solution_content import get_merged_content, save_override
+from tools.testimonial_solution_content import (
+    get_merged_content,
+    save_override,
+    build_testimonial_file_name,
+)
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
 # Database imports
@@ -5524,9 +5529,23 @@ async def upload_testimonial(
         logging.error(f"testimonial-upload webhook missing file_id in response: {result_json}")
         raise HTTPException(status_code=500, detail="Testimonial upload workflow did not return file_id.")
 
+    type_label_for_name = norm_testimonial_type
+    if not type_label_for_name and norm_solution_type_id:
+        merged_type = get_merged_content(norm_solution_type_id)
+        if isinstance(merged_type, dict):
+            type_label_for_name = (
+                (merged_type.get("solution_type_label") or "").strip() or norm_solution_type_id
+            )
+
+    stored_file_name = build_testimonial_file_name(
+        type_label_for_name,
+        business_name.strip(),
+        original_upload_basename=filename,
+    )
+
     testimonial = Testimonial(
         business_name=business_name.strip(),
-        file_name=filename,
+        file_name=stored_file_name,
         file_id=file_id,
         invoice_number=invoice_number.strip() if invoice_number and invoice_number.strip() else None,
         status=status_val,
@@ -5547,7 +5566,7 @@ async def update_testimonial(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Update testimonial status and/or linked invoice number."""
+    """Update testimonial status, invoice number, and/or linked Drive document (file_id, file_name)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -5564,9 +5583,51 @@ async def update_testimonial(
             testimonial.status = body.status.strip()
     if body.invoice_number is not None:
         testimonial.invoice_number = body.invoice_number.strip() or None
+    if body.file_id is not None:
+        raw = body.file_id.strip()
+        extracted = extract_folder_id_from_url(raw) if raw else None
+        if extracted:
+            testimonial.file_id = extracted
+        elif raw and re.match(r"^[a-zA-Z0-9_-]{6,}$", raw):
+            testimonial.file_id = raw
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file_id: paste a Google Drive file link or the file ID string.",
+            )
+    if body.file_name is not None:
+        fn = body.file_name.strip()
+        if not fn:
+            raise HTTPException(status_code=400, detail="file_name cannot be empty")
+        if len(fn) > 512:
+            raise HTTPException(status_code=400, detail="file_name is too long")
+        testimonial.file_name = fn
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)
+
+
+@app.delete("/api/testimonials/{testimonial_id}", status_code=204)
+async def delete_testimonial(
+    testimonial_id: int,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Remove a testimonial row from the CRM (does not delete the Google Drive file)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    db.delete(testimonial)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # --- Testimonial solution content (defaults in code, overridable via API) ---
@@ -5695,14 +5756,23 @@ async def generate_testimonial_document_endpoint(
             # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
             file_id = extract_folder_id_from_url(document_link)
             if file_id:
-                file_name = f"Testimonial - {business_name}" if business_name else "Testimonial"
+                merged = get_merged_content(solution_type_id)
+                label = (
+                    (merged.get("solution_type_label") if merged else None)
+                    or solution_type_id
+                )
+                file_name = result.get("file_name") or build_testimonial_file_name(
+                    str(label or "").strip(),
+                    business_name,
+                )
+                testimonial_type_val = result.get("testimonial_type") or str(label or "").strip() or None
                 testimonial = Testimonial(
                     business_name=business_name.strip(),
                     file_name=file_name,
                     file_id=file_id,
                     invoice_number=None,
                     status="Draft",
-                    testimonial_type=result.get("testimonial_type") or None,
+                    testimonial_type=testimonial_type_val or None,
                     testimonial_solution_type_id=solution_type_id or None,
                     testimonial_savings=str(savings_val) if savings_val is not None else None,
                 )

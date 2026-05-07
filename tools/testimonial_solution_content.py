@@ -6,6 +6,7 @@ Used to populate testimonial document templates (challenge, approach, outcome, d
 import os
 import json
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -41,14 +42,50 @@ SOLUTION_TYPE_LABELS: Dict[str, str] = {
     "resource_recovery": "Oil / Resource Recovery",
 }
 
-# Optional extra solution types (e.g. case studies like Automated Cleaning Robot)
+# Optional extra solution types (e.g. case studies like Automated Cleaning Robot, DMA)
 EXTRA_SOLUTION_TYPES: Dict[str, str] = {
     "automated_cleaning_robot": "Automated Cleaning Robot",
+    "dma": "Direct Metering Agreement",
 }
 
 ALL_SOLUTION_TYPE_IDS = SOLUTION_TYPE_IDS + list(EXTRA_SOLUTION_TYPES.keys())
 for k, v in EXTRA_SOLUTION_TYPES.items():
     SOLUTION_TYPE_LABELS[k] = v
+
+
+def build_testimonial_file_name(
+    type_label: str,
+    business_name: str,
+    *,
+    original_upload_basename: Optional[str] = None,
+) -> str:
+    """
+    Human-readable name for CRM / Drive including testimonial category (e.g. DMA, C&I Electricity Reviews).
+    Strips characters that are problematic in file names. Max length 512 for DB column.
+    """
+    def _scrub(s: str) -> str:
+        t = (s or "").strip()
+        for ch in '\\/:*?"<>|':
+            t = t.replace(ch, "-")
+        return " ".join(t.split())
+
+    tl = _scrub(type_label) if type_label else ""
+    biz = _scrub(business_name) or "Member"
+
+    if original_upload_basename is not None:
+        p = Path(original_upload_basename)
+        stem = _scrub(p.stem) or "document"
+        ext = (p.suffix or "").lower()
+        if ext not in (".pdf", ".docx", ".doc"):
+            ext = ""
+        base = f"{stem}{ext}"
+        out = f"Testimonial - {tl} - {base}" if tl else base
+    else:
+        out = f"Testimonial - {tl} - {biz}" if tl else f"Testimonial - {biz}"
+
+    if len(out) > 512:
+        out = out[:509] + "..."
+    return out
 
 
 def _default_content(solution_type_id: str) -> Dict[str, Any]:
@@ -175,6 +212,21 @@ DEFAULT_CONTENT["resource_recovery"].update({
     "conclusion": "Resource recovery transforms waste streams into cost-saving opportunities.",
     "esg_scope_for_solution": "SCOPE 3",
     "sdg_impact_for_solution": "SDG 6, 12, 13",
+})
+
+DEFAULT_CONTENT["dma"].update({
+    "key_outcome_metrics": "DMA metering cost reduction",
+    "key_challenge_of_solution": "Direct Metering Agreement charges were uncompetitive versus expected metering rates.",
+    "key_approach_of_solution": "Forensic review of metering line items and the agreement against benchmarks.",
+    "key_outcome_of_solution": "Lower metering costs quantified with a clear annual and multi-year saving.",
+    "key_outcome_dotpoints_1": "Annual metering spend and net saving identified.",
+    "key_outcome_dotpoints_2": "Agreement and invoice-led review—not retail-only benchmarking.",
+    "key_outcome_dotpoints_3": "Savings articulated for budgeting and approvals.",
+    "key_outcome_dotpoints_4": "Transparent metrics for CFO and committees.",
+    "key_outcome_dotpoints_5": "ESG: typically minimal GHG change where savings are metering-commercial.",
+    "conclusion": "DMA reviews deliver concise, defensible metering savings on a single-page summary.",
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 12",
 })
 
 DEFAULT_CONTENT["automated_cleaning_robot"] = {

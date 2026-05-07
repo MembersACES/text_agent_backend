@@ -446,7 +446,11 @@ def generate_testimonial_document(
     Merges business info, calculated savings, and solution-type content (from testimonial_solution_content),
     then calls the n8n testimonial-generation webhook.
     """
-    from tools.testimonial_solution_content import get_merged_content, TESTIMONIAL_TEMPLATE_DOC_ID
+    from tools.testimonial_solution_content import (
+        get_merged_content,
+        TESTIMONIAL_TEMPLATE_DOC_ID,
+        build_testimonial_file_name,
+    )
 
     current_date = datetime.datetime.now()
     current_year = current_date.year
@@ -462,6 +466,9 @@ def generate_testimonial_document(
     monthly_savings = round(float(savings_amount), 2)
     annual_savings = round(monthly_savings * 12, 2)
     net_outcome = annual_savings  # Template may show optional cost later
+
+    type_label = (content.get("solution_type_label") or solution_type_id or "").strip()
+    crm_file_name = build_testimonial_file_name(type_label, business_name or "")
 
     # Build data dict for n8n: keys match template placeholders {{key}}
     data = {
@@ -500,7 +507,7 @@ def generate_testimonial_document(
     payload = {
         "data": data,
         "template_id": TESTIMONIAL_TEMPLATE_DOC_ID,
-        "file_name": f"Testimonial - {business_name or 'Member'}",
+        "file_name": crm_file_name,
     }
 
     try:
@@ -529,6 +536,8 @@ def generate_testimonial_document(
             "message": f'Testimonial for "{business_name}" has been generated.',
             "document_link": document_link,
             "client_folder_url": client_folder_url,
+            "testimonial_type": type_label,
+            "file_name": crm_file_name,
         }
     except requests.exceptions.Timeout:
         logger.error("Testimonial document generation timed out")
