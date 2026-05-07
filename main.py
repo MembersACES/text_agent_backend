@@ -9232,6 +9232,146 @@ def activities_report_list(
     return out
 
 
+@app.get("/api/reports/activities/testimonials", response_model=List[ActivityReportItem])
+def activities_report_testimonials(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List testimonial rows as activity report items (no DB schema changes)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    query = db.query(Testimonial)
+    client: Optional[Client] = None
+    if client_id is not None:
+        client = db.query(Client).filter(Client.id == client_id).first()
+        if not client or not (client.business_name or "").strip():
+            return []
+        query = query.filter(
+            func.lower(Testimonial.business_name) == client.business_name.strip().lower()
+        )
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(Testimonial.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(Testimonial.created_at < end_inclusive)
+        except ValueError:
+            pass
+
+    rows = (
+        query.order_by(Testimonial.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    out: List[ActivityReportItem] = []
+    for t in rows:
+        inferred_client_id = client.id if client else None
+        drive_link = f"https://drive.google.com/file/d/{t.file_id}/view" if t.file_id else None
+        out.append(
+            ActivityReportItem(
+                id=-(t.id + 1000000),
+                offer_id=0,
+                client_id=inferred_client_id,
+                business_name=t.business_name,
+                activity_type="testimonial_activity",
+                document_link=drive_link,
+                created_at=t.created_at,
+                created_by=None,
+                offer_display=f"{t.file_name} ({t.status})" if t.status else t.file_name,
+            )
+        )
+    return out
+
+
+@app.get("/api/reports/activities/tasks", response_model=List[ActivityReportItem])
+def activities_report_tasks(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List task history rows as activity report items (created/updated/status changes)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    query = (
+        db.query(TaskHistory, Task, Client)
+        .join(Task, TaskHistory.task_id == Task.id)
+        .outerjoin(Client, Task.client_id == Client.id)
+    )
+    if client_id is not None:
+        query = query.filter(Task.client_id == client_id)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(TaskHistory.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(TaskHistory.created_at < end_inclusive)
+        except ValueError:
+            pass
+
+    rows = (
+        query.order_by(TaskHistory.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    out: List[ActivityReportItem] = []
+    for hist, task, client in rows:
+        action = (hist.action or "").strip().lower()
+        if action == "task_created":
+            activity_type = "task_created"
+        elif action == "status_changed":
+            activity_type = "task_status_changed"
+        else:
+            activity_type = "task_updated"
+
+        if action == "status_changed":
+            change = f"status: {(hist.old_value or '—')} -> {(hist.new_value or '—')}"
+        elif action == "field_updated":
+            field_name = (hist.field or "field").strip()
+            change = f"{field_name}: {(hist.old_value or '—')} -> {(hist.new_value or '—')}"
+        else:
+            change = task.title or f"Task #{task.id}"
+
+        out.append(
+            ActivityReportItem(
+                id=-(hist.id + 2000000),
+                offer_id=0,
+                client_id=task.client_id,
+                business_name=client.business_name if client else None,
+                activity_type=activity_type,
+                document_link=None,
+                created_at=hist.created_at,
+                created_by=hist.user_email,
+                offer_display=change,
+            )
+        )
+    return out
+
+
 @app.get("/api/reports/activities/summary")
 def activities_summary(
     db: Session = Depends(get_db),
