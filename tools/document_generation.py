@@ -430,6 +430,8 @@ def get_available_engagement_form_types():
 def generate_testimonial_document(
     business_name: str,
     trading_as: str,
+    testimonial_business_name: str,
+    testimonial_business_name_source: str,
     contact_name: str,
     position: str,
     email: str,
@@ -466,14 +468,18 @@ def generate_testimonial_document(
     monthly_savings = round(float(savings_amount), 2)
     annual_savings = round(monthly_savings * 12, 2)
     net_outcome = annual_savings  # Template may show optional cost later
+    display_name = (testimonial_business_name or "").strip() or (business_name or "").strip()
+    legal_business_name = (business_name or "").strip()
 
     type_label = (content.get("solution_type_label") or solution_type_id or "").strip()
-    crm_file_name = build_testimonial_file_name(type_label, business_name or "")
+    crm_file_name = build_testimonial_file_name(type_label, display_name or "")
 
     # Build data dict for n8n: keys match template placeholders {{key}}
     data = {
-        "business_name": business_name or "",
+        "business_name": display_name or "",
+        "legal_business_name": legal_business_name or "",
         "trading_as": trading_as or "",
+        "business_name_source": (testimonial_business_name_source or "business_name"),
         "abn": abn or "",
         "postal_address": postal_address or "",
         "site_address": site_address or "",
@@ -530,14 +536,16 @@ def generate_testimonial_document(
                 "message": "Document generated but no link returned",
                 "document_link": None,
             }
-        logger.info(f"Testimonial document generated for {business_name}")
+        logger.info(f"Testimonial document generated for {legal_business_name}")
         return {
             "status": "success",
-            "message": f'Testimonial for "{business_name}" has been generated.',
+            "message": f'Testimonial for "{display_name}" has been generated.',
             "document_link": document_link,
             "client_folder_url": client_folder_url,
             "testimonial_type": type_label,
             "file_name": crm_file_name,
+            "testimonial_business_name": display_name,
+            "legal_business_name": legal_business_name,
         }
     except requests.exceptions.Timeout:
         logger.error("Testimonial document generation timed out")
