@@ -5730,6 +5730,20 @@ async def generate_testimonial_document_endpoint(
         savings_val = float(savings_amount) if savings_amount is not None else 0.0
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="savings_amount must be a number")
+
+    def _parse_optional_float(val):
+        if val is None:
+            return None
+        if isinstance(val, str) and not val.strip():
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    solar_pre = _parse_optional_float(body.get("solar_pre_daily_generation_kwh"))
+    solar_post = _parse_optional_float(body.get("solar_post_daily_generation_kwh"))
+
     result = generate_testimonial_document(
         business_name=business_name,
         trading_as=(body.get("trading_as") or "").strip(),
@@ -5746,6 +5760,8 @@ async def generate_testimonial_document_endpoint(
         postal_address=(body.get("postal_address") or "").strip(),
         site_address=(body.get("site_address") or "").strip(),
         pv_system_size=(body.get("pv_system_size") or "").strip(),
+        solar_pre_daily_kwh=solar_pre,
+        solar_post_daily_kwh=solar_post,
     )
     if result.get("status") == "error":
         raise HTTPException(

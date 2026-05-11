@@ -1,12 +1,94 @@
 # tools/document_generation.py
 
+import re
 import requests
 import datetime
 import logging
 from enum import Enum
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+# kg CO₂-e per kWh grid offset (solar cleaning testimonial methodology)
+SOLAR_GRID_CO2_KG_PER_KWH = 0.75
+
+
+def _format_solar_pv_kw_headline_fragment(pv_user: str) -> str:
+    """
+    User enters capacity only (e.g. 99.6); output is always '99.6 kW' for the Doc headline.
+    If they already included kW, strip it first so we do not double up.
+    """
+    t = (pv_user or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"\s*kw\s*$", "", t, flags=re.IGNORECASE).strip()
+    if not t:
+        return ""
+    return f"{t} kW"
+
+
+def _build_solar_n8n_fields(
+    *,
+    pre_daily_kwh: float,
+    post_daily_kwh: float,
+    content: Dict[str, Any],
+) -> Dict[str, str]:
+    """
+    Derived metrics for solar_panel_cleaning testimonials (passed through to n8n merge/replace).
+
+    yield_kwh = post - pre
+    production_increase_percent = round((yield / pre) * 100, 1) — same as emission_decrease_percent here
+    grid_usage_reduction_kwh_annual = yield * 365
+    co2_daily_kg_avoided = yield * SOLAR_GRID_CO2_KG_PER_KWH
+    co2_emission_reduction_kg_annual = grid_annual * SOLAR_GRID_CO2_KG_PER_KWH
+    co2_emission_reduction_tonnes_si = co2_kg_annual / 1000
+    """
+    yield_kwh = post_daily_kwh - pre_daily_kwh
+    pct = round((yield_kwh / pre_daily_kwh) * 100, 1)
+    annual_grid_kwh = yield_kwh * 365.0
+    co2_daily_kg = yield_kwh * SOLAR_GRID_CO2_KG_PER_KWH
+    co2_annual_kg = annual_grid_kwh * SOLAR_GRID_CO2_KG_PER_KWH
+    co2_tonnes_si = co2_annual_kg / 1000.0
+
+    pct_s = f"{pct:.1f}"
+    pre_s = f"{pre_daily_kwh:.2f}"
+    post_s = f"{post_daily_kwh:.2f}"
+    yield_s = f"{yield_kwh:.2f}"
+    grid_s = f"{annual_grid_kwh:,.1f}"
+    co2_daily_s = f"{co2_daily_kg:.2f}"
+    co2_annual_kg_s = f"{co2_annual_kg:,.2f}"
+    co2_t_si_s = f"{co2_tonnes_si:,.2f}"
+
+    dot4 = (content.get("key_outcome_dotpoints_5") or "").strip() or (
+        "Lower risk of undetected degradation shortening asset life or warranty exposure."
+    )
+
+    dot1 = f"Previously measured generation of {pre_s} kWh new generation {post_s} kWh"
+    dot2 = f"{pct_s}% increase in electricity production observed for the day {yield_s} kWh gained."
+    dot3 = f"{pct_s}% decrease in greenhouse gas emissions {co2_daily_s} kg CO₂ avoided."
+
+    return {
+        "solar_pre_daily_generation_kwh": pre_s,
+        "solar_post_daily_generation_kwh": post_s,
+        "solar_yield_kwh_daily": yield_s,
+        "yield_kwh_daily": yield_s,
+        "production_increase": pct_s,
+        "production_increase_percent": pct_s,
+        "estimated_annual_production_increase_percent": pct_s,
+        "emission_decrease_percent": pct_s,
+        "grid_usage_reduction_kwh_annual": grid_s,
+        "grid_usage_reduction_kwh": grid_s,
+        "co2_daily_kg_avoided": co2_daily_s,
+        "co2_emission_reduction_kg_annual": co2_annual_kg_s,
+        "co2_emission_reduction_tonnes_si": co2_t_si_s,
+        "key_outcome_dotpoints_1": dot1,
+        "key_outcome_dotpoints_2": dot2,
+        "key_outcome_dotpoints_3": dot3,
+        "key_outcome_dotpoints_4": dot4,
+        "key_outcome_dotpoints_5": "",
+    }
+
 
 class ExpressionOfInterestType(Enum):
     DIRECT_METER_AGREEMENT = (
@@ -443,6 +525,8 @@ def generate_testimonial_document(
     postal_address: str = "",
     site_address: str = "",
     pv_system_size: str = "",
+    solar_pre_daily_kwh: Optional[float] = None,
+    solar_post_daily_kwh: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Generate a testimonial document using the testimonial Google Doc template.
@@ -481,10 +565,41 @@ def generate_testimonial_document(
 
     key_outcome_metrics = (content.get("key_outcome_metrics") or "").strip()
     pv_trim = (pv_system_size or "").strip()
-    # Template subtitle is {key_outcome_metrics} — {business_name}; fold PV size here for solar—no extra Doc placeholders.
+    # Subtitle: {key_outcome_metrics} — {business_name}. Solar: "{n} kW PV System Size Clean" (user may enter n or n kW).
     if solution_type_id == "solar_panel_cleaning" and pv_trim:
-        key_outcome_metrics = (
-            f"{pv_trim} — {key_outcome_metrics}" if key_outcome_metrics else pv_trim
+        kw_fragment = _format_solar_pv_kw_headline_fragment(pv_trim)
+        if kw_fragment:
+            key_outcome_metrics = f"{kw_fragment} PV System Size Clean".strip()
+
+    solar_extra: Dict[str, str] = {}
+    if solution_type_id == "solar_panel_cleaning":
+        if not pv_trim or solar_pre_daily_kwh is None or solar_post_daily_kwh is None:
+            return {
+                "status": "error",
+                "message": (
+                    "Solar Panel Cleaning requires solar system size (kW number only), "
+                    "pre clean daily generation (kWh), and post clean daily generation (kWh)."
+                ),
+                "document_link": None,
+            }
+        pre_f = float(solar_pre_daily_kwh)
+        post_f = float(solar_post_daily_kwh)
+        if pre_f <= 0:
+            return {
+                "status": "error",
+                "message": "Pre clean daily generation must be greater than zero.",
+                "document_link": None,
+            }
+        if post_f <= pre_f:
+            return {
+                "status": "error",
+                "message": "Post clean daily generation must be greater than pre clean daily generation.",
+                "document_link": None,
+            }
+        solar_extra = _build_solar_n8n_fields(
+            pre_daily_kwh=pre_f,
+            post_daily_kwh=post_f,
+            content=dict(content),
         )
 
     # Build data dict for n8n: keys match template placeholders {{key}}
@@ -526,6 +641,9 @@ def generate_testimonial_document(
         "annual_savings": annual_savings_formatted,
         "net_outcome": net_outcome_formatted,
     }
+
+    if solar_extra:
+        data.update(solar_extra)
 
     payload = {
         "data": data,
