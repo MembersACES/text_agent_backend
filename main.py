@@ -5745,6 +5745,7 @@ async def generate_testimonial_document_endpoint(
         abn=(body.get("abn") or "").strip(),
         postal_address=(body.get("postal_address") or "").strip(),
         site_address=(body.get("site_address") or "").strip(),
+        pv_system_size=(body.get("pv_system_size") or "").strip(),
     )
     if result.get("status") == "error":
         raise HTTPException(

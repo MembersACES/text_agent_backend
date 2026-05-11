@@ -442,6 +442,7 @@ def generate_testimonial_document(
     abn: str = "",
     postal_address: str = "",
     site_address: str = "",
+    pv_system_size: str = "",
 ) -> Dict[str, Any]:
     """
     Generate a testimonial document using the testimonial Google Doc template.
@@ -461,7 +462,11 @@ def generate_testimonial_document(
     if not content:
         return {
             "status": "error",
-            "message": f"Unknown solution type: {solution_type_id}",
+            "message": (
+                f"Unknown solution type: {solution_type_id}. "
+                "Redeploy the API service so it includes the latest "
+                "`tools/testimonial_solution_content.py` (extra testimonial types are defined there)."
+            ),
             "document_link": None,
         }
 
@@ -474,7 +479,19 @@ def generate_testimonial_document(
     type_label = (content.get("solution_type_label") or solution_type_id or "").strip()
     crm_file_name = build_testimonial_file_name(type_label, display_name or "")
 
+    key_outcome_metrics = (content.get("key_outcome_metrics") or "").strip()
+    pv_trim = (pv_system_size or "").strip()
+    # Template subtitle is {key_outcome_metrics} — {business_name}; fold PV size here for solar—no extra Doc placeholders.
+    if solution_type_id == "solar_panel_cleaning" and pv_trim:
+        key_outcome_metrics = (
+            f"{pv_trim} — {key_outcome_metrics}" if key_outcome_metrics else pv_trim
+        )
+
     # Build data dict for n8n: keys match template placeholders {{key}}
+    monthly_savings_formatted = f"{monthly_savings:,.2f}"
+    annual_savings_formatted = f"{annual_savings:,.2f}"
+    net_outcome_formatted = f"{net_outcome:,.2f}"
+
     data = {
         "business_name": display_name or "",
         "legal_business_name": legal_business_name or "",
@@ -493,7 +510,7 @@ def generate_testimonial_document(
         "client_folder_url": client_folder_url or "",
         "current_year": str(current_year),
         "solution_type": content.get("solution_type_label", solution_type_id),
-        "key_outcome_metrics": content.get("key_outcome_metrics", ""),
+        "key_outcome_metrics": key_outcome_metrics,
         "key_challenge_of_solution": content.get("key_challenge_of_solution", ""),
         "key_approach_of_solution": content.get("key_approach_of_solution", ""),
         "key_outcome_of_solution": content.get("key_outcome_of_solution", ""),
@@ -505,9 +522,9 @@ def generate_testimonial_document(
         "conclusion": content.get("conclusion", ""),
         "esg_scope_for_solution": content.get("esg_scope_for_solution", ""),
         "sdg_impact_for_solution": content.get("sdg_impact_for_solution", ""),
-        "monthly_savings": f"{monthly_savings:.2f}",
-        "annual_savings": f"{annual_savings:.2f}",
-        "net_outcome": f"{net_outcome:.2f}",
+        "monthly_savings": monthly_savings_formatted,
+        "annual_savings": annual_savings_formatted,
+        "net_outcome": net_outcome_formatted,
     }
 
     payload = {
