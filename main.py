@@ -135,6 +135,7 @@ from models import (
     ClientReferral,
     Offer,
     OfferActivity,
+    ClientManualActivity,
     StrategyItem,
     Testimonial,
     AutonomousSequenceRun,
@@ -168,6 +169,7 @@ from schemas import (
     SolarCleaningSignedUploadResponse,
     MemberDocumentUploadActivityCreate,
     ActivityReportItem,
+    ClientManualActivityCreate,
     OfferPipelineStage as OfferPipelineStageSchema,
     StrategyItemCreate,
     StrategyItemUpdate,
@@ -955,7 +957,7 @@ def get_base2_ci_gas_energy_reference(
     postcode: str = Query(..., min_length=3, max_length=32, description="Postcode or address fragment (4-digit AU postcode extracted server-side)"),
     relax_postcode: bool = Query(
         False,
-        description="If true and few exact postcode matches, include same first-3-digit postcode area",
+        description="Legacy query param; ignored. Matching uses a fixed numeric postcode band (see AIRTABLE_CI_GAS_REF_POSTCODE_NUMERIC_BAND).",
     ),
     debug: bool = Query(
         False,
@@ -964,8 +966,8 @@ def get_base2_ci_gas_energy_reference(
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Median (energy charges ÷ invoice total) from C&I Gas Clients in Airtable for Base 2 SME→C&I comparison.
-    Field names are configurable via AIRTABLE_CI_GAS_REF_* env vars.
+    Median (energy charges ÷ invoice total) from C&I Gas Clients whose address postcodes fall in a numeric
+    band around the target (default ±10). Field names are configurable via AIRTABLE_CI_GAS_REF_* env vars.
     """
     email = user_info.get("email") if isinstance(user_info, dict) else None
     result = airtable_client.fetch_ci_gas_energy_share_reference(
@@ -7177,6 +7179,11 @@ def delete_client(
         {ClientReferral.advocate_client_id: None}, synchronize_session=False
     )
 
+    # 4b) Client manual activity report lines (no offer link)
+    db.query(ClientManualActivity).filter(ClientManualActivity.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
     # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
@@ -9053,6 +9060,155 @@ def delete_activity_report_item(
     return {"status": "success", "message": "Activity deleted"}
 
 
+CLIENT_MANUAL_OFFER_TYPE_LABELS = {
+    "electricity": "Electricity",
+    "gas": "Gas",
+    "waste": "Waste",
+    "oil": "Oil",
+    "cleaning": "Cleaning",
+    "solar_cleaning": "Solar cleaning",
+    "ghg": "GHG",
+    "other": "Other",
+}
+
+
+def _client_manual_activity_offer_display(
+    note: str,
+    offer_type_preset: Optional[str],
+    offer_type_custom: Optional[str],
+) -> str:
+    parts: List[str] = []
+    n = (note or "").strip()
+    if n:
+        parts.append(n)
+    type_bits: List[str] = []
+    p = (offer_type_preset or "").strip().lower()
+    if p and p not in ("", "unspecified"):
+        type_bits.append(
+            CLIENT_MANUAL_OFFER_TYPE_LABELS.get(p, p.replace("_", " ").title())
+        )
+    c = (offer_type_custom or "").strip()
+    if c:
+        type_bits.append(c)
+    if type_bits:
+        parts.append(" · ".join(type_bits))
+    return " · ".join(parts) if parts else (n or "—")
+
+
+def _client_manual_row_to_report_item(
+    row: ClientManualActivity,
+    business_name: Optional[str],
+) -> ActivityReportItem:
+    disp = _client_manual_activity_offer_display(
+        row.note or "",
+        row.offer_type_preset,
+        row.offer_type_custom,
+    )
+    return ActivityReportItem(
+        id=row.id,
+        offer_id=0,
+        task_id=None,
+        client_id=row.client_id,
+        business_name=business_name,
+        activity_type="client_manual_activity",
+        document_link=row.document_link,
+        created_at=row.created_at,
+        created_by=row.created_by,
+        offer_display=disp or None,
+        manual_activity_id=row.id,
+    )
+
+
+@app.delete("/api/reports/activities/client-manual/{manual_activity_id}", response_model=dict)
+def delete_client_manual_activity(
+    manual_activity_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Delete a client-scoped manual activity report line."""
+    row = db.query(ClientManualActivity).filter(ClientManualActivity.id == manual_activity_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Manual activity not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Manual activity deleted"}
+
+
+@app.post("/api/reports/activities/client-manual", response_model=ActivityReportItem)
+def create_client_manual_activity(
+    body: ClientManualActivityCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Log manual work for a client without linking to an offer."""
+    note = (body.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Note is required")
+    client = db.query(Client).filter(Client.id == body.client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    created_by = (user_data.get("idinfo") or {}).get("email") if user_data else None
+    preset = (body.offer_type_preset or "").strip() or None
+    if preset and preset.lower() == "unspecified":
+        preset = None
+    custom = (body.offer_type_custom or "").strip() or None
+    link = (body.document_link or "").strip() or None
+    row = ClientManualActivity(
+        client_id=body.client_id,
+        note=note,
+        document_link=link,
+        offer_type_preset=preset,
+        offer_type_custom=custom,
+        created_by=created_by,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _client_manual_row_to_report_item(row, client.business_name)
+
+
+@app.get("/api/reports/activities/client-manual", response_model=List[ActivityReportItem])
+def activities_report_client_manual(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List client manual activity lines for the activity report."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    q = db.query(ClientManualActivity, Client).join(Client, ClientManualActivity.client_id == Client.id)
+    if client_id is not None:
+        q = q.filter(ClientManualActivity.client_id == client_id)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            q = q.filter(ClientManualActivity.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            q = q.filter(ClientManualActivity.created_at < end_inclusive)
+        except ValueError:
+            pass
+    rows = (
+        q.order_by(ClientManualActivity.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    out: List[ActivityReportItem] = []
+    for act, cli in rows:
+        out.append(_client_manual_row_to_report_item(act, cli.business_name))
+    return out
+
+
 @app.get("/api/reports/clients/offer-counts")
 def clients_offer_counts(
     db: Session = Depends(get_db),
@@ -9233,6 +9389,12 @@ def activities_report_list(
         offer_display = (resp.utility_display or "Offer")
         if resp.identifier:
             offer_display = f"{offer_display} {resp.identifier}"
+        if act.activity_type == OfferActivityType.MANUAL_ACTIVITY.value:
+            meta = _parse_activity_metadata(getattr(act, "metadata_", None))
+            if isinstance(meta, dict):
+                note = meta.get("note")
+                if note is not None and str(note).strip():
+                    offer_display = f"{str(note).strip()} · {offer_display}"
         out.append(
             ActivityReportItem(
                 id=act.id,

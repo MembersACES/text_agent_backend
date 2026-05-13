@@ -158,6 +158,25 @@ class OfferActivity(Base):
     created_by = Column(String(255), nullable=True)
 
 
+class ClientManualActivity(Base):
+    """
+    Client-scoped manual log lines for the activity report (no linked offer).
+    Used when work was done outside normal offer-linked flows.
+    """
+
+    __tablename__ = "client_manual_activities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id", ondelete="CASCADE"), nullable=False, index=True)
+    note = Column(Text, nullable=False)
+    document_link = Column(Text, nullable=True)
+    # Preset category (electricity, gas, …) or "other"; optional if only custom text is used.
+    offer_type_preset = Column(String(80), nullable=True, index=True)
+    offer_type_custom = Column(String(500), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    created_by = Column(String(255), nullable=True)
+
+
 class StrategyItem(Base):
     """
     Normalised rows for the Strategy & WIP template per client and year.
