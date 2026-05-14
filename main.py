@@ -5145,7 +5145,7 @@ async def upload_invoice_pdf_endpoint(
                 detail="Missing required fields: pdf_base64 and filename"
             )
         
-        logging.info(f"Uploading PDF for invoice {invoice_number} (business: {business_name})")
+        user_email = request_data.get("user_email", "unknown@example.com")
         
         # Decode base64 PDF
         pdf_bytes = base64.b64decode(pdf_base64)
@@ -5161,6 +5161,14 @@ async def upload_invoice_pdf_endpoint(
                 detail="Invoice storage folder ID not configured"
             )
         
+        logging.info(
+            "INVOICE_UPLOAD_START | invoice=%s | business=%s | user_email=%s | folder_id=%s",
+            invoice_number,
+            business_name,
+            user_email,
+            folder_id,
+        )
+        logging.info(f"Uploading PDF for invoice {invoice_number} (business: {business_name})")
         logging.info(f"Using invoice storage folder ID: {folder_id}")
         
         # Try user's OAuth token first (works for My Drive folders)
@@ -5204,21 +5212,51 @@ async def upload_invoice_pdf_endpoint(
                     )
                     user_drive_service = build('drive', 'v3', credentials=user_creds)
                     logging.info(f"Created Drive service with user credentials, attempting upload to folder {folder_id}")
-                    file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, user_drive_service)
+                    file_id = upload_pdf_to_drive(
+                        pdf_bytes, filename, folder_id, user_drive_service, credential_label="user_oauth"
+                    )
                     if file_id:
-                        logging.info("Successfully uploaded using user's OAuth token")
+                        logging.info(
+                            "INVOICE_UPLOAD_SUCCESS | via=user_oauth | invoice=%s | user_email=%s | file_id=%s",
+                            invoice_number,
+                            user_email,
+                            file_id,
+                        )
                     else:
-                        logging.warning("Upload with user token returned None (check logs above for error details)")
+                        logging.warning(
+                            "INVOICE_UPLOAD_USER_OAUTH_FAILED | invoice=%s | user_email=%s | folder_id=%s | "
+                            "See preceding [INVOICE_UPLOAD][user_oauth] lines. "
+                            "Typical fix: sign out/in so Google grants Drive scope, or grant this user Editor on the folder. "
+                            "Attempting service_account fallback next.",
+                            invoice_number,
+                            user_email,
+                            folder_id,
+                        )
             except Exception as e:
-                logging.warning(f"Upload with user token failed with exception: {str(e)}")
+                logging.warning(
+                    "INVOICE_UPLOAD_USER_OAUTH_EXCEPTION | invoice=%s | user_email=%s | error=%s | "
+                    "Will try service_account fallback.",
+                    invoice_number,
+                    user_email,
+                    str(e),
+                )
                 logging.exception(e)
-                logging.info("Will try service account as fallback")
         else:
-            logging.info("No access token available, skipping user token attempt")
+            logging.info(
+                "INVOICE_UPLOAD_SKIP_USER_OAUTH | invoice=%s | reason=no_google_access_token_in_authorization",
+                invoice_number,
+            )
+
+        file_id_after_user_oauth = file_id
         
         # If user token failed or wasn't available, try service account (for Shared Drives)
         if not file_id:
-            logging.info("Attempting upload with service account (for Shared Drives)")
+            logging.info(
+                "INVOICE_UPLOAD_FALLBACK_SERVICE_ACCOUNT | invoice=%s | user_email=%s | folder_id=%s",
+                invoice_number,
+                user_email,
+                folder_id,
+            )
             drive_service = get_drive_service()
             
             if not drive_service:
@@ -5230,19 +5268,40 @@ async def upload_invoice_pdf_endpoint(
                 logging.error(error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
             
-            file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, drive_service)
+            file_id = upload_pdf_to_drive(
+                pdf_bytes, filename, folder_id, drive_service, credential_label="service_account"
+            )
             
             if not file_id:
                 # Provide helpful error message based on the error type
-                user_email = request_data.get("user_email", "your Google account")
                 error_msg = (
                     f"Failed to upload PDF to Google Drive. "
                     f"The invoice storage folder (ID: {folder_id}) is not accessible. "
                     f"To fix: Open the folder in Google Drive and share it with '{user_email}' with 'Editor' permissions. "
                     f"Alternatively, if using a Shared Drive, add the service account to the Shared Drive with 'Content Manager' role."
                 )
+                logging.error(
+                    "INVOICE_UPLOAD_COMPLETE_FAILURE | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
+                    "had_user_access_token=%s | user_oauth_returned_file_id=%s | service_account_returned_file_id=false | "
+                    "REMEDIATION_USER=Sign out and sign in with Google in the app (Drive scope); confirm token is not expired. | "
+                    "REMEDIATION_OPS=Move folder into a Google Shared Drive; add backend service account as Content manager "
+                    "(service accounts cannot use My Drive quota). Search logs for DIAGNOSIS= lines above.",
+                    invoice_number,
+                    business_name,
+                    user_email,
+                    folder_id,
+                    bool(access_token),
+                    bool(file_id_after_user_oauth),
+                )
                 logging.error(error_msg)
                 raise HTTPException(status_code=403, detail=error_msg)
+            logging.info(
+                "INVOICE_UPLOAD_SUCCESS | via=service_account | invoice=%s | user_email=%s | file_id=%s | "
+                "note=user_oauth_did_not_produce_file_id",
+                invoice_number,
+                user_email,
+                file_id,
+            )
         
         file_url = f"https://drive.google.com/file/d/{file_id}/view"
         
