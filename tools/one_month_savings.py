@@ -351,7 +351,39 @@ def upload_file_to_drive(
         return None
 
 
-def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_service=None) -> Optional[str]:
+def _drive_api_error_summary(exc: BaseException) -> str:
+    """Short, log-friendly summary for Drive upload failures."""
+    parts: List[str] = []
+    code = getattr(exc, "status_code", None)
+    if code is None and hasattr(exc, "resp") and getattr(exc.resp, "status", None):
+        code = exc.resp.status
+    if code is not None:
+        parts.append(f"http={code}")
+    reason = getattr(exc, "reason", None) or getattr(exc, "_reason", None)
+    if reason:
+        parts.append(f"reason={reason!s}")
+    err_details = getattr(exc, "error_details", None)
+    if err_details:
+        parts.append(f"details={err_details!s}")
+    content = getattr(exc, "content", None)
+    if isinstance(content, bytes) and content:
+        try:
+            text = content.decode("utf-8", errors="replace")[:400]
+            if text.strip():
+                parts.append(f"body={text.strip()}")
+        except Exception:
+            pass
+    return " ".join(parts) if parts else repr(exc)
+
+
+def upload_pdf_to_drive(
+    pdf_bytes: bytes,
+    filename: str,
+    folder_id: str,
+    drive_service=None,
+    *,
+    credential_label: str = "upload",
+) -> Optional[str]:
     """
     Upload PDF file to Google Drive folder (supports both My Drive and Shared Drives)
     
@@ -360,12 +392,19 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         filename: Name for the file
         folder_id: ID of the folder to upload to
         drive_service: Optional Google Drive service (will create if not provided)
+        credential_label: Log tag, e.g. ``user_oauth`` or ``service_account``, for supportability
         
     Returns:
         File ID of the uploaded file, or None if error
     """
     try:
-        logger.info(f"Uploading PDF '{filename}' to folder {folder_id}")
+        logger.info(
+            "[INVOICE_UPLOAD][%s] Starting upload | filename=%r folder_id=%s bytes=%s",
+            credential_label,
+            filename,
+            folder_id,
+            len(pdf_bytes) if pdf_bytes else 0,
+        )
         
         if not drive_service:
             drive_service = get_drive_service()
@@ -387,7 +426,12 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
             ).execute()
             
             drive_id = folder_info.get('driveId')
-            logger.info(f"Folder info - Name: {folder_info.get('name')}, Drive ID: {drive_id}")
+            logger.info(
+                "[INVOICE_UPLOAD][%s] Folder resolved | name=%r driveId=%s (null driveId => My Drive of credential owner)",
+                credential_label,
+                folder_info.get("name"),
+                drive_id,
+            )
             
             if drive_id:
                 logger.info(f"Folder is in Shared Drive: {drive_id}")
@@ -429,24 +473,63 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         
         file_id = file.get('id')
         file_url = file.get('webViewLink')
-        logger.info(f"Successfully uploaded PDF. File ID: {file_id}, URL: {file_url}")
+        logger.info(
+            "[INVOICE_UPLOAD][%s] SUCCESS | file_id=%s webViewLink=%s",
+            credential_label,
+            file_id,
+            file_url,
+        )
         
         return file_id
         
     except HttpError as e:
-        logger.error(f"Google Drive API error uploading PDF: {e.status_code} - {e.reason}")
-        logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
-        if e.status_code == 403:
-            if 'insufficientPermissions' in str(e) or 'insufficient authentication scopes' in str(e):
-                logger.error("Access token does not have Google Drive permissions.")
-                logger.error("User needs to sign out and sign back in to grant Drive access.")
-            elif 'storageQuotaExceeded' in str(e):
-                logger.error("Service accounts cannot upload to My Drive folders. The folder must be in a Google Shared Drive (Team Drive).")
-                logger.error("To fix: Move the folder to a Shared Drive or create the folder in a Shared Drive.")
-        logger.exception(e)
+        summary = _drive_api_error_summary(e)
+        low = summary.lower()
+        logger.error(
+            "[INVOICE_UPLOAD][%s] DRIVE_API_FAILED | %s",
+            credential_label,
+            summary,
+        )
+        if getattr(e, "status_code", None) == 403 or "403" in summary or "http=403" in low:
+            if "insufficientpermissions" in low or "insufficient authentication scopes" in low or "insufficient_permission" in low:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=OAUTH_SCOPES_OR_FOLDER_ACCESS | "
+                    "The Google account used for this request cannot create files in this folder with the current token. "
+                    "Fix: (1) In the app, sign out and sign in with Google again so Drive scope is granted. "
+                    "(2) Ensure this folder is shared with the user with Editor (or use a Shared Drive + SA).",
+                    credential_label,
+                )
+            elif "storagequotaexceeded" in low or "service accounts do not have storage quota" in low:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=SERVICE_ACCOUNT_MY_DRIVE_QUOTA | "
+                    "Google blocks service accounts from using personal My Drive storage. "
+                    "Fix: Move folder %s (or its parent) into a **Google Shared Drive** and add the backend service account "
+                    "with **Content manager** (or higher).",
+                    credential_label,
+                    folder_id,
+                )
+            else:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=FORBIDDEN_OTHER | See DRIVE_API_FAILED line above for Google's message.",
+                    credential_label,
+                )
+        elif getattr(e, "status_code", None) == 404 or "http=404" in low:
+            logger.error(
+                "[INVOICE_UPLOAD][%s] DIAGNOSIS=NOT_FOUND | Folder or parent may be wrong, deleted, or not visible to this credential.",
+                credential_label,
+            )
+        else:
+            logger.error(
+                "[INVOICE_UPLOAD][%s] DIAGNOSIS=DRIVE_API_ERROR | See DRIVE_API_FAILED line above.",
+                credential_label,
+            )
         return None
     except Exception as e:
-        logger.error(f"Error uploading PDF to Drive: {str(e)}")
+        logger.error(
+            "[INVOICE_UPLOAD][%s] UNEXPECTED_ERROR | %s",
+            credential_label,
+            str(e),
+        )
         logger.exception(e)
         return None
 
