@@ -273,7 +273,7 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
     From an LOA record, resolve linked utility records and build:
     - linked_utilities: { "C&I Electricity": [id1, id2], ... }
     - utility_retailers: { "C&I Electricity": [retailer1, retailer2], ... }
-    - linked_utility_extra: { "C&I Electricity": [ { identifier, retailer, contract_end_date, data_requested, data_recieved }, ... ], ... }
+    - linked_utility_extra: { "C&I Electricity": [ { identifier, retailer, contract_end_date, dma_end_date, data_requested, data_recieved }, ... ], ... }
     """
     linked_utilities = {}
     utility_retailers = {}
@@ -315,6 +315,7 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
             data_req = f.get("Data Requested")
             data_rec = f.get("Data Recieved") or f.get("Data Received")  # support both spellings
             contract_end = f.get("Contract End Date")
+            dma_end = f.get("DMA End Date")
             if isinstance(data_req, str) and len(data_req) >= 10:
                 data_req = data_req[:10]
             if isinstance(data_rec, str) and len(data_rec) >= 10:
@@ -325,16 +326,19 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
                 data_rec = ""
             if isinstance(contract_end, str) and len(contract_end) >= 10:
                 contract_end = contract_end[:10]
+            if isinstance(dma_end, str) and len(dma_end) >= 10:
+                dma_end = dma_end[:10]
             # Log what we read for date fields (first record per utility type) to debug missing end dates
-            if len(extras) == 0 and (data_req or data_rec or contract_end):
+            if len(extras) == 0 and (data_req or data_rec or contract_end or dma_end):
                 logger.info(
-                    "[utility-extra] First record for %s: identifier=%r, contract_end_date=%r, data_requested=%r, data_recieved=%r",
-                    app_key, str(ident).strip() if ident is not None else "", contract_end, data_req, data_rec,
+                    "[utility-extra] First record for %s: identifier=%r, contract_end_date=%r, dma_end_date=%r, data_requested=%r, data_recieved=%r",
+                    app_key, str(ident).strip() if ident is not None else "", contract_end, dma_end, data_req, data_rec,
                 )
             extras.append({
                 "identifier": str(ident).strip() if ident is not None else "",
                 "retailer": retailers[-1],
                 "contract_end_date": contract_end,
+                "dma_end_date": dma_end,
                 "data_requested": data_req,
                 "data_recieved": data_rec,
             })
@@ -808,10 +812,11 @@ def update_utility_record(
     data_requested: Optional[str] = None,
     data_recieved: Optional[Any] = None,  # Checkbox: pass True/False (or "Yes"/"No" string, we convert to bool)
     contract_end_date: Optional[str] = None,
+    dma_end_date: Optional[str] = None,
 ) -> bool:
     """
-    Update one or more of Data Requested, Data Received (checkbox), Contract End Date on the
-    first matching utility record. data_recieved is sent as boolean to Airtable (checkbox field).
+    Update one or more of Data Requested, Data Received (checkbox), Contract End Date, DMA End Date
+    on the first matching utility record. data_recieved is sent as boolean to Airtable (checkbox field).
     Returns True if update succeeded.
     """
     found = find_utility_record_by_identifier(utility_type_identifier, identifier)
@@ -833,6 +838,8 @@ def update_utility_record(
         fields["Data Received"] = bool_val
     if contract_end_date is not None and contract_end_date != "":
         fields["Contract End Date"] = contract_end_date
+    if dma_end_date is not None and dma_end_date != "":
+        fields["DMA End Date"] = dma_end_date
     if not fields:
         return True
     url = _url(table_name, record_id)

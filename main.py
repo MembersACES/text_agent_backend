@@ -839,13 +839,14 @@ class PuduConsumablesMarkReplacedRequest(BaseModel):
     replaced_at: Optional[str] = None  # YYYY-MM-DD; defaults to today (Melbourne)
 
 class UtilityRecordUpdateRequest(BaseModel):
-    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
+    """Update Data Requested, Data Recieved (checkbox), Contract End Date, or DMA End Date on an Airtable utility record."""
     business_name: str
     utility_type: str  # e.g. "C&I Electricity", "SME Gas", "Waste"
     identifier: str    # NMI, MRIN, account number, etc.
     data_requested: Optional[str] = None   # YYYY-MM-DD
     data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
     contract_end_date: Optional[str] = None  # YYYY-MM-DD
+    dma_end_date: Optional[str] = None  # YYYY-MM-DD
 
 
 class UtilityInvoiceRowsRequest(BaseModel):
@@ -2939,11 +2940,11 @@ def update_utility_record_endpoint(
     request: UtilityRecordUpdateRequest,
     user_info: dict = Depends(verify_google_token),
 ):
-    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on a member's utility record in Airtable."""
+    """Update Data Requested, Data Recieved (checkbox), Contract End Date, or DMA End Date on a member's utility record in Airtable."""
     logging.info(
-        "[utility-record PATCH] request: business_name=%r, utility_type=%r, identifier=%r, data_requested=%r, data_recieved=%r, contract_end_date=%r",
+        "[utility-record PATCH] request: business_name=%r, utility_type=%r, identifier=%r, data_requested=%r, data_recieved=%r, contract_end_date=%r, dma_end_date=%r",
         request.business_name, request.utility_type, request.identifier,
-        request.data_requested, request.data_recieved, request.contract_end_date,
+        request.data_requested, request.data_recieved, request.contract_end_date, request.dma_end_date,
     )
     if not airtable_client.AIRTABLE_API_KEY:
         raise HTTPException(status_code=503, detail="Airtable integration is not configured")
@@ -2956,6 +2957,7 @@ def update_utility_record_endpoint(
             data_requested=request.data_requested,
             data_recieved=request.data_recieved,
             contract_end_date=request.contract_end_date,
+            dma_end_date=request.dma_end_date,
         )
     except Exception as e:
         logging.exception("[utility-record PATCH] Airtable update raised: %s", e)
