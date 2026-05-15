@@ -111,13 +111,17 @@ def generate_email_template(
     yearly_shoulder_est: int = 0,
     yearly_off_peak_est: int = 0,
     yearly_consumption_est: int = 0,
-    interval_data_file_id: Optional[str] = None
+    interval_data_file_id: Optional[str] = None,
+    request_kind: Optional[str] = None,
 ) -> dict:
     """Generate email subject and HTML content based on utility type"""
     
     # Generate subject line based on utility type
     if utility_type_identifier == "C&I Electricity":
-        subject = f"Quote Request - {business_name} - NMI: {nmi}"
+        if request_kind == "blend_extend":
+            subject = f"Blend & Extend Request - {business_name} - NMI: {nmi}"
+        else:
+            subject = f"Quote Request - {business_name} - NMI: {nmi}"
         identifier_display = f"NMI - {nmi}"
         consumption_unit = "kWh"
     elif utility_type_identifier == "C&I Gas":
@@ -182,7 +186,7 @@ def generate_email_template(
 <body>
   <p>Hello Team, </p>
   <p>I hope this email finds you well. </p>
-  <p>I am requesting a quote for my client {business_name} {identifier_display}. Can you please provide a quote with the provided information below:</p>
+  <p>I am requesting a {"blend & extend" if request_kind == "blend_extend" else "quote"} for my client {business_name} {identifier_display}. Can you please provide a quote with the provided information below:</p>
   <ul>
     <li>Start Date - {start_date}</li>
     <li>Contract Options - {quote_details} </li>
@@ -246,7 +250,8 @@ def send_supplier_quote_request(
     loa_file_id: Optional[str] = None,
     invoice_file_id: Optional[str] = None,
     interval_data_file_id: Optional[str] = None,
-    user_email: Optional[str] = None
+    user_email: Optional[str] = None,
+    request_kind: Optional[str] = None,
 ) -> str:
     """
     Send quote requests to multiple selected retailers via n8n webhook with email templates.
@@ -292,7 +297,8 @@ def send_supplier_quote_request(
             yearly_shoulder_est=yearly_shoulder_est,
             yearly_off_peak_est=yearly_off_peak_est,
             yearly_consumption_est=yearly_consumption_est,
-            interval_data_file_id=interval_data_file_id
+            interval_data_file_id=interval_data_file_id,
+            request_kind=request_kind,
         )
         
         # Prepare the main payload for n8n
@@ -323,6 +329,7 @@ def send_supplier_quote_request(
             "invoice_file_id": invoice_file_id,
             "interval_data_file_id": interval_data_file_id,
             "user_email": user_email,
+            "request_kind": request_kind,
             "timestamp": datetime.now().isoformat(),
             "email_subject": email_template["subject"],
             "email_html_content": email_template["html_content"],
@@ -345,7 +352,7 @@ def send_supplier_quote_request(
         
         # Send to n8n webhook
         response = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook/supplier-quote-request",
+            "https://membersaces.app.n8n.cloud/webhook-test/supplier-quote-request",
             json=n8n_payload,
             headers={"Content-Type": "application/json"},
             timeout=30

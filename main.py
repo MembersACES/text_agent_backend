@@ -3284,6 +3284,7 @@ async def send_quote_request_endpoint(
         invoice_file_id = request_data.get("invoice_file_id")
         interval_data_file_id = request_data.get("interval_data_file_id")
         user_email = user_info.get("email")
+        request_kind = request_data.get("request_kind")
         
         # Validate required fields
         if not business_name:
@@ -3323,7 +3324,8 @@ async def send_quote_request_endpoint(
             loa_file_id=loa_file_id,
             invoice_file_id=invoice_file_id,
             interval_data_file_id=interval_data_file_id,
-            user_email=user_email
+            user_email=user_email,
+            request_kind=request_kind,
         )
         
         logging.info(f"Quote request completed successfully for {business_name}")
@@ -3366,7 +3368,11 @@ async def send_quote_request_endpoint(
                         "utility_type_identifier": request_data.get("utility_type_identifier", "") or None,
                         "nmi": nmi or None,
                         "mrin": mrin or None,
-                        "source": "quote_request_page",
+                        "source": (
+                            "blend_extend_page"
+                            if request_data.get("request_kind") == "blend_extend"
+                            else "quote_request_page"
+                        ),
                     },
                     created_by=user_email,
                 )
