@@ -8356,10 +8356,13 @@ def autonomous_sequence_start(
     valid_until_utc = anchor_utc + timedelta(days=7)
     valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
 
+    from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
+
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-    sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-    sequence_context.setdefault("offer_validity_days", 7)
+    if body.sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+        sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+        sequence_context.setdefault("offer_validity_days", 7)
 
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:

@@ -95,6 +95,47 @@ N8N_ENGAGEMENT_FORM_URL = os.getenv("N8N_AUTONOMOUS_ENGAGEMENT_FORM_WEBHOOK_URL"
 
 SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE = "Solar Panel Cleaning"
 SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE = "solar_panel_cleaning_engagement_form_v1"
+
+SOLAR_ENGAGEMENT_INITIAL_SUBJECT = (
+    "Solar cleaning — quick win to protect performance and your solar investment"
+)
+
+# HTML signature aligned with the Document Generation / send-eoi outbound email.
+SOLAR_ENGAGEMENT_SIGNATURE_HTML = """<p style="margin-bottom:0;"><strong>Amelia Williams</strong><br>
+<span style="color:#666;">Customer Success Manager (CSM) – Implementation: Connects onboarding directly to future success.</span></p>
+<p style="margin-top:16px; margin-bottom:0;"><strong>Carbon Zero Australasia</strong><br>
+Australian Circular Economy Solutions Division<br>
+Direct: 1300 938 638<br>
+Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">business@acesolutions.com.au</a><br>
+470 St Kilda Road, Melbourne VIC 3004<br>
+Ph: 1300 849 908 | Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
+
+SOLAR_ENGAGEMENT_SYSTEM_PROMPT = """You write follow-up emails for ACES Solar Panel Cleaning engagement forms.
+
+The client already received the initial email with the engagement form and testimonial PDFs attached. These follow-ups must REPLY on that Gmail thread (do not start a new email). Do not include Google Drive links — the client cannot access them; attachments are on the original message.
+
+Solar Panel Cleaning engagement forms do NOT have offer validity dates — never mention "valid until", expiry, or deadlines unless explicitly provided in context.
+
+Tone: professional, warm, Australian English. Sign as Amelia Williams with the HTML signature provided in context.
+
+Step 0: light follow-up. Step 1: polite reminder. Step 2: final friendly nudge (offer to close out if not proceeding). Keep body under 120 words before the signature."""
+
+SOLAR_ENGAGEMENT_EMAIL_EXAMPLE = """Hi {{contact_name}},
+
+Just following up on the Solar Panel Cleaning engagement form for {{business_name}}.
+
+Regular cleaning helps protect generation and your solar investment — dust and buildup can reduce output over time. If you're happy to proceed, we only need the signed Engagement Form returned so we can lock in the next steps.
+
+Happy to run through the form or answer any questions.
+
+Best regards,"""
+
+SOLAR_ENGAGEMENT_STEP_PROMPTS: tuple[str, str, str] = (
+    "Follow-up 1 (reply on thread): gentle check-in; no validity date; no Drive links; do not re-attach files.",
+    "Follow-up 2 (reply on thread): polite reminder to return signed engagement form; no validity; no links.",
+    "Follow-up 3 (reply on thread): final friendly nudge; offer to close out if not proceeding; no validity; no links.",
+)
+
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
 
@@ -475,6 +516,10 @@ def ensure_default_sequence_templates(db: Session) -> None:
 
     if sync_solar_engagement_form_template_steps(db):
         db.commit()
+    elif sync_solar_engagement_step_prompts_only(db):
+        db.commit()
+    if ensure_solar_engagement_type_prompts(db):
+        db.commit()
 
     # Bootstrap templates from existing run data where needed.
     # This migrates pre-existing sequence types into template-driven scheduling.
@@ -583,11 +628,12 @@ def sync_solar_engagement_form_template_steps(db: Session) -> bool:
     db.query(AutonomousSequenceTemplateStep).filter(
         AutonomousSequenceTemplateStep.template_id == tpl.id
     ).delete(synchronize_session=False)
-    for idx, day_num, channel, hhmm in [
-        (0, 1, "email", "09:00"),
-        (1, 2, "email", "09:00"),
-        (2, 3, "email", "09:00"),
-    ]:
+    step_rows = [
+        (0, 1, "email", "09:00", SOLAR_ENGAGEMENT_STEP_PROMPTS[0]),
+        (1, 2, "email", "09:00", SOLAR_ENGAGEMENT_STEP_PROMPTS[1]),
+        (2, 3, "email", "09:00", SOLAR_ENGAGEMENT_STEP_PROMPTS[2]),
+    ]
+    for idx, day_num, channel, hhmm, prompt in step_rows:
         db.add(
             AutonomousSequenceTemplateStep(
                 template_id=tpl.id,
@@ -595,17 +641,107 @@ def sync_solar_engagement_form_template_steps(db: Session) -> bool:
                 day_number=day_num,
                 channel=channel,
                 send_time_local=hhmm,
-                prompt_text=None,
+                prompt_text=prompt,
                 retell_agent_id=None,
                 is_active=1,
             )
         )
     tpl.description = (
         "Three follow-up emails (every 2 business days) after the engagement form is "
-        "emailed to the client from Document Generation."
+        "emailed to the client from Document Generation. Replies on the original Gmail thread."
     )
     logger.info("Synced solar engagement form template to 3 email steps (template_id=%s)", tpl.id)
     return True
+
+
+def ensure_solar_engagement_type_prompts(db: Session) -> bool:
+    """Seed / refresh autonomous_sequence_type prompts for solar engagement follow-ups."""
+    if not ensure_autonomous_sequence_type_row(db, SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE):
+        return False
+    insp = inspect(db.bind)
+    tables = _reflect_table_names(insp, db.bind)
+    if "autonomous_sequence_type" not in tables:
+        return False
+    ast_tbl = _qualified_table(db.bind, "autonomous_sequence_type")
+    row = db.execute(
+        text(f"SELECT system_prompt, email_example FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE},
+    ).mappings().first()
+    if not row:
+        return False
+    cur_sys = str(row.get("system_prompt") or "")
+    cur_email = str(row.get("email_example") or "")
+    needs = (
+        not cur_sys.strip()
+        or not cur_email.strip()
+        or "valid until" in cur_email.lower()
+        or "access the document" in cur_email.lower()
+        or "drive.google" in cur_email.lower()
+    )
+    if not needs:
+        return False
+    db.execute(
+        text(
+            f"UPDATE {ast_tbl} SET system_prompt = :system_prompt, email_example = :email_example "
+            "WHERE sequence_type = :st"
+        ),
+        {
+            "st": SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+            "system_prompt": SOLAR_ENGAGEMENT_SYSTEM_PROMPT,
+            "email_example": SOLAR_ENGAGEMENT_EMAIL_EXAMPLE,
+        },
+    )
+    logger.info("Updated solar engagement form type prompts in autonomous_sequence_type")
+    return True
+
+
+def sync_solar_engagement_step_prompts_only(db: Session) -> bool:
+    """Update step prompt_text on existing 3-step template without resetting schedules."""
+    tpl = get_sequence_template_by_type(db, SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE)
+    if not tpl or len(tpl.steps) != 3:
+        return False
+    changed = False
+    ordered = sorted([s for s in tpl.steps if bool(s.is_active)], key=lambda s: int(s.step_index))
+    for i, st in enumerate(ordered):
+        if i >= len(SOLAR_ENGAGEMENT_STEP_PROMPTS):
+            break
+        want = SOLAR_ENGAGEMENT_STEP_PROMPTS[i]
+        if (st.prompt_text or "").strip() != want:
+            st.prompt_text = want
+            changed = True
+    return changed
+
+
+def _prepare_email_context(
+    run: AutonomousSequenceRun,
+    step: AutonomousSequenceStep,
+    ctx: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(ctx)
+    out["sequence_type"] = run.sequence_type
+    out["step_index"] = int(step.step_index)
+    msg_id = str(run.email_ID or out.get("email_ID") or out.get("email_id") or "").strip()
+    if msg_id:
+        out["email_ID"] = msg_id
+        out["email_id"] = msg_id
+        out["gmail_message_id"] = msg_id
+    thread_id = str(
+        out.get("gmail_thread_id") or out.get("thread_id") or out.get("gmail_threadId") or ""
+    ).strip()
+    if thread_id:
+        out["gmail_thread_id"] = thread_id
+        out["thread_id"] = thread_id
+    if run.sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        out["reply_in_thread"] = True
+        out["omit_validity"] = True
+        out["omit_document_links"] = True
+        out.pop("offer_validity_date", None)
+        out.pop("offer_valid_until", None)
+        out.pop("offer_validity_days", None)
+        out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        out.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
+        out.setdefault("use_html_signature", True)
+    return out
 
 
 def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[AutonomousSequenceTemplate]:
@@ -807,21 +943,31 @@ def start_gas_base2_sequence(
 
     anchor_utc = _to_utc_naive(anchor_at)
     context_payload = dict(context or {})
-    validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
     run_validity_date: Optional[date] = None
-    if validity_raw:
-        try:
-            run_validity_date = date.fromisoformat(validity_raw[:10])
-        except ValueError:
-            logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
-    if run_validity_date is None:
-        anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
-        run_validity_date = (
-            (anchor_aware_utc + timedelta(days=7))
-            .astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
-            .date()
-        )
-        context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
+    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        context_payload.pop("offer_validity_date", None)
+        context_payload.pop("offer_valid_until", None)
+        context_payload.pop("offer_validity_days", None)
+        context_payload.setdefault("reply_in_thread", True)
+        context_payload.setdefault("omit_validity", True)
+        context_payload.setdefault("omit_document_links", True)
+        context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        context_payload.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
+    else:
+        validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
+        if validity_raw:
+            try:
+                run_validity_date = date.fromisoformat(validity_raw[:10])
+            except ValueError:
+                logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
+        if run_validity_date is None:
+            anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
+            run_validity_date = (
+                (anchor_aware_utc + timedelta(days=7))
+                .astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+                .date()
+            )
+            context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
 
     _ = tz  # caller may pass client timezone; scheduling is always AEST
     contact_fields = _context_contact_fields(context_payload)
@@ -841,7 +987,8 @@ def start_gas_base2_sequence(
     )
     db.add(run)
     db.flush()
-    _set_run_validity_date_if_supported(db, run.id, run_validity_date)
+    if run_validity_date is not None:
+        _set_run_validity_date_if_supported(db, run.id, run_validity_date)
 
     template = get_sequence_template_by_type(db, sequence_type)
     if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
@@ -1113,7 +1260,23 @@ def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: d
             step_id,
         )
         return {"ok": True, "mode": "placeholder", "channel": "email"}
-    payload = {"channel": "email", "offer_id": offer_id, "run_id": run_id, "step_id": step_id, "context": context}
+    payload = {
+        "channel": "email",
+        "offer_id": offer_id,
+        "run_id": run_id,
+        "step_id": step_id,
+        "sequence_type": context.get("sequence_type"),
+        "step_index": context.get("step_index"),
+        "reply_in_thread": bool(context.get("reply_in_thread")),
+        "gmail_message_id": context.get("gmail_message_id") or context.get("email_ID") or context.get("email_id"),
+        "gmail_thread_id": context.get("gmail_thread_id") or context.get("thread_id"),
+        "omit_validity": bool(context.get("omit_validity")),
+        "omit_document_links": bool(context.get("omit_document_links")),
+        "initial_email_subject": context.get("initial_email_subject"),
+        "signature_html": context.get("signature_html"),
+        "use_html_signature": context.get("use_html_signature"),
+        "context": context,
+    }
     with httpx.Client(timeout=30.0) as client:
         r = client.post(N8N_EMAIL_URL, json=payload)
         r.raise_for_status()
@@ -1222,7 +1385,8 @@ def execute_due_steps_sync(db: Session) -> int:
 
             try:
                 if step.channel == "email":
-                    out = _send_email_placeholder(run.offer_id, run.id, step.id, ctx)
+                    email_ctx = _prepare_email_context(run, step, ctx)
+                    out = _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
                 elif step.channel == "sms":
                     out = _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
                 elif step.channel == "voice_call":
