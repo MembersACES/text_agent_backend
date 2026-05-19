@@ -127,6 +127,19 @@ def ensure_weekday(d: date) -> date:
     return n
 
 
+def add_business_days(start: date, business_days: int) -> date:
+    """Advance `start` by `business_days` Mon–Fri days (weekends skipped)."""
+    if business_days <= 0:
+        return ensure_weekday(start)
+    current = start
+    added = 0
+    while added < business_days:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            added += 1
+    return current
+
+
 def _parse_local_time_hhmm(value: str) -> tuple[int, int]:
     raw = (value or "").strip()
     parts = raw.split(":")
@@ -178,10 +191,25 @@ def _plan_template_times(
 
 
 def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
-    """Single engagement-form generation step ~2 minutes after anchor (UTC naive)."""
+    """
+    Three follow-up emails after the client has already received the engagement form (n8n send).
+    Email 1 at +2 business days, email 2 at +4, email 3 at +6 — all 09:00 AEST. Returns UTC-naive.
+    """
+    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
-    scheduled = (a + timedelta(minutes=2)).astimezone(timezone.utc).replace(tzinfo=None)
-    return [(1, "engagement_form_generation", scheduled)]
+    base_date = a.astimezone(tz).date()
+    out: list[tuple[int, str, datetime]] = []
+    for step_num, offset in enumerate((2, 4, 6), start=1):
+        target_date = add_business_days(base_date, offset)
+        local_dt = datetime.combine(target_date, time(9, 0), tzinfo=tz)
+        out.append(
+            (
+                step_num,
+                "email",
+                local_dt.astimezone(timezone.utc).replace(tzinfo=None),
+            )
+        )
+    return out
 
 
 def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
@@ -373,7 +401,10 @@ def ensure_default_sequence_templates(db: Session) -> None:
         {
             "sequence_type": SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
             "display_name": "Solar Panel Cleaning — Engagement Form v1",
-            "description": "Generate Solar Panel Cleaning engagement form after quote sent to client.",
+            "description": (
+                "Three follow-up emails (every 2 business days) after the engagement form is "
+                "emailed to the client from Document Generation."
+            ),
             "is_restartable": 0,
         },
         {
@@ -392,7 +423,9 @@ def ensure_default_sequence_templates(db: Session) -> None:
         (4, 3, "email", "11:30"),
     ]
     solar_engagement_step_defaults = [
-        (0, 1, "engagement_form_generation", "09:00"),
+        (0, 1, "email", "09:00"),
+        (1, 2, "email", "09:00"),
+        (2, 3, "email", "09:00"),
     ]
     solar_followup_step_defaults = step_defaults
     changed = False
@@ -438,6 +471,9 @@ def ensure_default_sequence_templates(db: Session) -> None:
         ensure_autonomous_sequence_type_row(db, d["sequence_type"])
         changed = True
     if changed:
+        db.commit()
+
+    if sync_solar_engagement_form_template_steps(db):
         db.commit()
 
     # Bootstrap templates from existing run data where needed.
@@ -519,6 +555,57 @@ def ensure_default_sequence_templates(db: Session) -> None:
             )
         ensure_autonomous_sequence_type_row(db, seq_type)
         db.commit()
+
+
+def sync_solar_engagement_form_template_steps(db: Session) -> bool:
+    """
+    Keep the engagement-form template aligned with the 3× email / 2-business-day cadence.
+    Upgrades legacy single-step templates idempotently.
+    """
+    tpl = get_sequence_template_by_type(db, SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE)
+    if not tpl:
+        return False
+    steps = sorted(
+        [s for s in tpl.steps if bool(s.is_active)],
+        key=lambda s: int(s.step_index),
+    )
+    needs_sync = len(steps) != 3 or any(str(s.channel) != "email" for s in steps)
+    if not needs_sync:
+        new_desc = (
+            "Three follow-up emails (every 2 business days) after the engagement form is "
+            "emailed to the client from Document Generation."
+        )
+        if (tpl.description or "").strip() != new_desc:
+            tpl.description = new_desc
+            return True
+        return False
+
+    db.query(AutonomousSequenceTemplateStep).filter(
+        AutonomousSequenceTemplateStep.template_id == tpl.id
+    ).delete(synchronize_session=False)
+    for idx, day_num, channel, hhmm in [
+        (0, 1, "email", "09:00"),
+        (1, 2, "email", "09:00"),
+        (2, 3, "email", "09:00"),
+    ]:
+        db.add(
+            AutonomousSequenceTemplateStep(
+                template_id=tpl.id,
+                step_index=idx,
+                day_number=day_num,
+                channel=channel,
+                send_time_local=hhmm,
+                prompt_text=None,
+                retell_agent_id=None,
+                is_active=1,
+            )
+        )
+    tpl.description = (
+        "Three follow-up emails (every 2 business days) after the engagement form is "
+        "emailed to the client from Document Generation."
+    )
+    logger.info("Synced solar engagement form template to 3 email steps (template_id=%s)", tpl.id)
+    return True
 
 
 def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[AutonomousSequenceTemplate]:
