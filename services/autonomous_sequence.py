@@ -91,6 +91,10 @@ logger = logging.getLogger(__name__)
 
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
 N8N_SMS_URL = os.getenv("N8N_AUTONOMOUS_SMS_WEBHOOK_URL", "").strip()
+N8N_ENGAGEMENT_FORM_URL = os.getenv("N8N_AUTONOMOUS_ENGAGEMENT_FORM_WEBHOOK_URL", "").strip()
+
+SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE = "Solar Panel Cleaning"
+SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE = "solar_panel_cleaning_engagement_form_v1"
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
 
@@ -171,6 +175,13 @@ def _plan_template_times(
             )
         )
     return plan
+
+
+def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
+    """Single engagement-form generation step ~2 minutes after anchor (UTC naive)."""
+    a = anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
+    scheduled = (a + timedelta(minutes=2)).astimezone(timezone.utc).replace(tzinfo=None)
+    return [(1, "engagement_form_generation", scheduled)]
 
 
 def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
@@ -359,6 +370,18 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "description": "Default Base 2 cadence for C&I electricity offers.",
             "is_restartable": 1,
         },
+        {
+            "sequence_type": SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+            "display_name": "Solar Panel Cleaning — Engagement Form v1",
+            "description": "Generate Solar Panel Cleaning engagement form after quote sent to client.",
+            "is_restartable": 0,
+        },
+        {
+            "sequence_type": "solar_panel_cleaning_followup_v1",
+            "display_name": "Solar Panel Cleaning Follow-up v1",
+            "description": "Outreach cadence (email, voice, SMS) after solar cleaning quote sent.",
+            "is_restartable": 0,
+        },
     ]
     step_defaults = [
         # step_index, day_number, channel, send_time_local
@@ -368,6 +391,10 @@ def ensure_default_sequence_templates(db: Session) -> None:
         (3, 3, "voice_call", "11:00"),
         (4, 3, "email", "11:30"),
     ]
+    solar_engagement_step_defaults = [
+        (0, 1, "engagement_form_generation", "09:00"),
+    ]
+    solar_followup_step_defaults = step_defaults
     changed = False
     for d in defaults:
         existing = (
@@ -389,7 +416,13 @@ def ensure_default_sequence_templates(db: Session) -> None:
         )
         db.add(t)
         db.flush()
-        for idx, day_num, channel, hhmm in step_defaults:
+        if d["sequence_type"] == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+            steps_for_template = solar_engagement_step_defaults
+        elif d["sequence_type"] == "solar_panel_cleaning_followup_v1":
+            steps_for_template = solar_followup_step_defaults
+        else:
+            steps_for_template = step_defaults
+        for idx, day_num, channel, hhmm in steps_for_template:
             db.add(
                 AutonomousSequenceTemplateStep(
                     template_id=t.id,
@@ -724,7 +757,10 @@ def start_gas_base2_sequence(
     _set_run_validity_date_if_supported(db, run.id, run_validity_date)
 
     template = get_sequence_template_by_type(db, sequence_type)
-    if template and bool(template.is_active):
+    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        fallback_plan = plan_solar_engagement_form_times(anchor_at)
+        plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
+    elif template and bool(template.is_active):
         plan = _plan_template_times(
             anchor_at,
             template.steps,
@@ -807,6 +843,178 @@ def apply_inbound(db: Session, run: AutonomousSequenceRun, payload: dict[str, An
     db.commit()
     db.refresh(run)
     return run
+
+
+def _str_from_ctx(ctx: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        raw = ctx.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text and text.lower() not in ("n/a", "none", "null"):
+            return text
+    return ""
+
+
+def _engagement_form_fields_from_context(context: dict[str, Any]) -> dict[str, str]:
+    """Build engagement form merge fields; prefer context, then optional n8n business lookup."""
+    business_name = _str_from_ctx(context, "business_name", "site_name", "client_name")
+    fields = {
+        "business_name": business_name,
+        "abn": _str_from_ctx(context, "abn"),
+        "trading_as": _str_from_ctx(context, "trading_as", "trading_name"),
+        "postal_address": _str_from_ctx(context, "postal_address"),
+        "site_address": _str_from_ctx(context, "site_address", "street_address"),
+        "telephone": _str_from_ctx(context, "telephone", "contact_phone", "phone"),
+        "email": _str_from_ctx(context, "contact_email", "email"),
+        "contact_name": _str_from_ctx(context, "contact_name", "site_contact"),
+        "position": _str_from_ctx(context, "position"),
+        "client_folder_url": _str_from_ctx(context, "client_folder_url"),
+        "engagement_form_type": _str_from_ctx(
+            context, "engagement_form_type"
+        ) or SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE,
+    }
+    if business_name and not fields["client_folder_url"]:
+        try:
+            from tools.business_info import get_business_information
+
+            info = get_business_information(business_name)
+            if isinstance(info, dict) and info.get("business_details"):
+                bd = info.get("business_details") or {}
+                ci = info.get("contact_information") or {}
+                rd = info.get("representative_details") or {}
+                gdrive = info.get("gdrive") or {}
+                fields["abn"] = fields["abn"] or str(bd.get("abn") or "").strip()
+                fields["trading_as"] = fields["trading_as"] or str(
+                    bd.get("trading_name") or bd.get("name") or ""
+                ).strip()
+                fields["postal_address"] = fields["postal_address"] or str(
+                    ci.get("postal_address") or ""
+                ).strip()
+                fields["site_address"] = fields["site_address"] or str(
+                    ci.get("site_address") or ""
+                ).strip()
+                fields["telephone"] = fields["telephone"] or str(ci.get("telephone") or "").strip()
+                fields["email"] = fields["email"] or str(ci.get("email") or "").strip()
+                fields["contact_name"] = fields["contact_name"] or str(
+                    rd.get("contact_name") or ""
+                ).strip()
+                fields["position"] = fields["position"] or str(rd.get("position") or "").strip()
+                fields["client_folder_url"] = fields["client_folder_url"] or str(
+                    gdrive.get("folder_url") or ""
+                ).strip()
+                fields["business_name"] = fields["business_name"] or str(bd.get("name") or "").strip()
+        except Exception:
+            logger.exception(
+                "[autonomous] business lookup failed for engagement form business_name=%s",
+                business_name,
+            )
+    return fields
+
+
+def _execute_engagement_form_generation(
+    db: Session,
+    offer_id: int,
+    run_id: int,
+    step_id: int,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    if N8N_ENGAGEMENT_FORM_URL:
+        payload = {
+            "channel": "engagement_form_generation",
+            "offer_id": offer_id,
+            "run_id": run_id,
+            "step_id": step_id,
+            "context": context,
+            "engagement_form_type": context.get("engagement_form_type")
+            or SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE,
+        }
+        with httpx.Client(timeout=120.0) as client:
+            r = client.post(N8N_ENGAGEMENT_FORM_URL, json=payload)
+            r.raise_for_status()
+            try:
+                return {"ok": True, "channel": "engagement_form_generation", "response": r.json()}
+            except Exception:
+                return {
+                    "ok": True,
+                    "channel": "engagement_form_generation",
+                    "response_text": r.text[:2000],
+                }
+
+    from crm_enums import OfferActivityType
+    from services.crm import create_offer_activity
+    from tools.document_generation import engagement_form_generation
+
+    fields = _engagement_form_fields_from_context(context)
+    if not fields["business_name"]:
+        return {"ok": False, "error": "business_name missing in sequence context"}
+
+    result = engagement_form_generation(
+        business_name=fields["business_name"],
+        abn=fields.get("abn") or "",
+        trading_as=fields.get("trading_as") or fields["business_name"],
+        postal_address=fields.get("postal_address") or "",
+        site_address=fields.get("site_address") or "",
+        telephone=fields.get("telephone") or "",
+        email=fields.get("email") or "",
+        contact_name=fields.get("contact_name") or "",
+        position=fields.get("position") or "",
+        engagement_form_type=fields["engagement_form_type"],
+        client_folder_url=fields.get("client_folder_url") or "",
+    )
+
+    offer = db.query(Offer).filter(Offer.id == offer_id).first()
+    if (
+        isinstance(result, dict)
+        and result.get("status") == "success"
+        and offer is not None
+    ):
+        doc_link = result.get("document_link")
+        try:
+            client = None
+            if offer.client_id:
+                from models import Client
+
+                client = db.query(Client).filter(Client.id == offer.client_id).first()
+            create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.ENGAGEMENT_FORM,
+                document_link=doc_link if isinstance(doc_link, str) else None,
+                metadata={
+                    "form_type": fields["engagement_form_type"],
+                    "source": "autonomous_solar_engagement_form_v1",
+                    "run_id": run_id,
+                    "step_id": step_id,
+                },
+                created_by="autonomous_agent",
+            )
+            db.commit()
+        except Exception:
+            logger.exception(
+                "[autonomous] failed to log engagement_form activity offer_id=%s run_id=%s",
+                offer_id,
+                run_id,
+            )
+        run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
+        if run:
+            _merge_context(
+                db,
+                run,
+                {
+                    "engagement_form_document_link": doc_link,
+                    "engagement_form_type": fields["engagement_form_type"],
+                },
+            )
+            db.commit()
+
+    ok = isinstance(result, dict) and result.get("status") == "success"
+    return {
+        "ok": ok,
+        "channel": "engagement_form_generation",
+        "result": result if isinstance(result, dict) else {"raw": str(result)[:500]},
+    }
 
 
 def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: dict[str, Any]) -> dict[str, Any]:
@@ -937,6 +1145,14 @@ def execute_due_steps_sync(db: Session) -> int:
                         step.id,
                         step.retell_agent_id,
                         ctx,
+                    )
+                elif step.channel == "engagement_form_generation":
+                    ctx.setdefault(
+                        "engagement_form_type",
+                        SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE,
+                    )
+                    out = _execute_engagement_form_generation(
+                        db, run.offer_id, run.id, step.id, ctx
                     )
                 else:
                     out = {"ok": False, "error": "unknown_channel", "channel": step.channel}
