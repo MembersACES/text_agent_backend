@@ -224,7 +224,7 @@ def _read_tab(
         logger.warning("[discrepancy_check_sheet] could not get Sheets service")
         return []
 
-    range_str = f"'{tab_name}'!A1:Z1000"
+    range_str = f"'{tab_name}'!A1:AZ1000"
     try:
         resp = service.spreadsheets().values().get(
             spreadsheetId=FILE_IDS_SHEET_ID,
