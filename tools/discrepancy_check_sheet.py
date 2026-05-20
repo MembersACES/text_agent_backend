@@ -5,6 +5,7 @@ Uses the same Sheets service and sheet ID as business_info (FILE_IDS_SHEET_ID).
 """
 
 import logging
+import re
 from typing import Any
 
 from tools.business_info import FILE_IDS_SHEET_ID, get_sheets_service
@@ -155,23 +156,43 @@ DEMAND_TAB_NAME = "Demand Check"
 HEADER_TO_KEY_DEMAND = {
     # Core identifying columns
     "review type": "review_type",
+    "maximum demand review invoice vs data": "review_type",
     "risk / opportunity": "risk_or_opportunity",
     "risk/opportunity": "risk_or_opportunity",
+    "risk / opporunity": "risk_or_opportunity",
     "utility identifier (nmi)": "utility_identifier",
+    "utility identifier (nmi / mrin)": "utility_identifier",
     "utility identifier": "utility_identifier",
+    "nmi": "utility_identifier",
+    "mrin": "utility_identifier",
+    "mirn": "utility_identifier",
     "linked business name": "linked_business_name",
+    "linked business": "linked_business_name",
     "site address": "site_address",
     "network provider": "network_provider",
+    "network": "network_provider",
     "demand type": "demand_type",
     # Demand numbers
     "highest invoice demand": "highest_invoice_demand",
+    "highest invoice demand (kw)": "highest_invoice_demand",
+    "highest invoice demand (kva)": "highest_invoice_demand",
     "actual interval demand": "actual_interval_demand",
+    "actual interval demand (kw)": "actual_interval_demand",
+    "actual interval demand (kva)": "actual_interval_demand",
     "demand difference": "demand_difference",
+    "demand difference (kw)": "demand_difference",
+    "demand difference (kva)": "demand_difference",
     # Charges
     "actual invoice charge": "actual_invoice_charge",
+    "actual invoice charge ($)": "actual_invoice_charge",
     "expected charge": "expected_charge",
+    "expected charge ($)": "expected_charge",
     "difference": "difference",
+    "difference ($)": "difference",
+    "charge difference": "difference",
     "status": "status",
+    "result": "status",
+    "notes": "status",
 }
 
 DEMAND_KEYS = [
@@ -195,7 +216,56 @@ DEMAND_KEYS = [
 def _normalize_header(h: Any) -> str:
     if h is None:
         return ""
-    return str(h).strip().lower()
+    s = str(h).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _header_without_parens(h: str) -> str:
+    """Strip parenthetical units so 'Highest Invoice Demand (kW)' maps like 'highest invoice demand'."""
+    s = re.sub(r"\s*\([^)]*\)", "", h)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _build_header_map(base: dict[str, str]) -> dict[str, str]:
+    """Expand header map with parenthesis-stripped variants."""
+    out = dict(base)
+    for header, key in base.items():
+        stripped = _header_without_parens(header)
+        if stripped and stripped not in out:
+            out[stripped] = key
+    return out
+
+
+def _resolve_header_key(header: str, header_map: dict[str, str]) -> str | None:
+    if not header:
+        return None
+    key = header_map.get(header)
+    if key:
+        return key
+    return header_map.get(_header_without_parens(header))
+
+
+def _find_header_row_index(values: list[list[Any]], header_map: dict[str, str]) -> int:
+    """Pick the row that looks most like column headers (within first 5 rows)."""
+    best_idx = 0
+    best_score = -1
+    scan = min(5, len(values))
+    for idx in range(scan):
+        row = values[idx]
+        score = sum(
+            1
+            for cell in row
+            if _resolve_header_key(_normalize_header(cell), header_map)
+        )
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return best_idx
+
+
+def _row_has_content(obj: dict[str, str]) -> bool:
+    return any((v or "").strip() for v in obj.values())
 
 
 def _normalize_identifier(raw: Any) -> str:
@@ -239,20 +309,25 @@ def _read_tab(
     if not values:
         return []
 
-    raw_headers = values[0]
+    header_map = _build_header_map(header_to_key)
+    header_idx = _find_header_row_index(values, header_map)
+    raw_headers = values[header_idx]
     rows: list[dict[str, str]] = []
-    for row in values[1:]:
+    for row in values[header_idx + 1 :]:
         obj: dict[str, str] = {k: "" for k in normalized_keys}
         for i, raw in enumerate(row):
             if i >= len(raw_headers):
                 break
             h = _normalize_header(raw_headers[i])
-            key = header_to_key.get(h)
+            key = _resolve_header_key(h, header_map)
             if key:
                 val = raw if raw is None else str(raw).strip()
                 if key == "utility_identifier":
                     val = _normalize_identifier(raw)
                 obj[key] = val
+
+        if not _row_has_content(obj):
+            continue
 
         if business_name:
             linked = (obj.get("linked_business_name") or "").strip()
