@@ -352,7 +352,7 @@ def send_supplier_quote_request(
         
         # Send to n8n webhook
         response = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook-test/supplier-quote-request",
+            "https://membersaces.app.n8n.cloud/webhook/supplier-quote-request",
             json=n8n_payload,
             headers={"Content-Type": "application/json"},
             timeout=30

@@ -5160,7 +5160,10 @@ async def upload_invoice_pdf_endpoint(
         logging.info(f"Decoded PDF, size: {len(pdf_bytes)} bytes")
         
         # Use fixed folder ID from environment variable or default
-        from tools.one_month_savings import INVOICE_STORAGE_FOLDER_ID
+        from tools.one_month_savings import (
+            INVOICE_STORAGE_FOLDER_ID,
+            log_invoice_upload_environment,
+        )
         folder_id = INVOICE_STORAGE_FOLDER_ID
         
         if not folder_id:
@@ -5169,34 +5172,46 @@ async def upload_invoice_pdf_endpoint(
                 detail="Invoice storage folder ID not configured"
             )
         
-        logging.info(
-            "INVOICE_UPLOAD_START | invoice=%s | business=%s | user_email=%s | folder_id=%s",
-            invoice_number,
-            business_name,
-            user_email,
-            folder_id,
-        )
-        logging.info(f"Uploading PDF for invoice {invoice_number} (business: {business_name})")
-        logging.info(f"Using invoice storage folder ID: {folder_id}")
-        
         # Try user's OAuth token first (works for My Drive folders)
         # If that fails, fall back to service account (works for Shared Drives)
         file_id = None
         access_token = None
         refresh_token = request_data.get("refresh_token")
-        
-        logging.info(f"Authorization header present: {bool(authorization)}")
-        logging.info(f"Refresh token present: {bool(refresh_token)}")
+        auth_via_api_key = False
         
         if authorization.startswith("Bearer "):
             token = authorization.split("Bearer ")[1]
             if token != os.getenv("BACKEND_API_KEY", "test-key"):
                 access_token = token
-                logging.info(f"Access token extracted (length: {len(access_token) if access_token else 0})")
             else:
-                logging.info("Token is API key, not user OAuth token")
+                auth_via_api_key = True
         else:
             logging.warning("Authorization header does not start with 'Bearer '")
+
+        log_invoice_upload_environment(
+            invoice_number=invoice_number,
+            business_name=business_name,
+            user_email=user_email,
+            filename=filename,
+            pdf_byte_count=len(pdf_bytes),
+            folder_id=folder_id,
+            has_user_access_token=bool(access_token),
+            has_refresh_token=bool(refresh_token),
+            auth_via_api_key=auth_via_api_key,
+        )
+
+        logging.info(
+            "INVOICE_UPLOAD_START | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
+            "has_user_access_token=%s | has_refresh_token=%s | access_token_len=%s | auth_via_api_key=%s",
+            invoice_number,
+            business_name,
+            user_email,
+            folder_id,
+            bool(access_token),
+            bool(refresh_token),
+            len(access_token) if access_token else 0,
+            auth_via_api_key,
+        )
         
         # First, try with user's OAuth token (for My Drive folders)
         if access_token:
@@ -5219,9 +5234,19 @@ async def upload_invoice_pdf_endpoint(
                         client_secret=client_secret
                     )
                     user_drive_service = build('drive', 'v3', credentials=user_creds)
-                    logging.info(f"Created Drive service with user credentials, attempting upload to folder {folder_id}")
+                    logging.info(
+                        "INVOICE_UPLOAD_USER_OAUTH_ATTEMPT | invoice=%s | user_email=%s | folder_id=%s",
+                        invoice_number,
+                        user_email,
+                        folder_id,
+                    )
                     file_id = upload_pdf_to_drive(
-                        pdf_bytes, filename, folder_id, user_drive_service, credential_label="user_oauth"
+                        pdf_bytes,
+                        filename,
+                        folder_id,
+                        user_drive_service,
+                        credential_label="user_oauth",
+                        user_email_hint=user_email,
                     )
                     if file_id:
                         logging.info(
@@ -5265,6 +5290,8 @@ async def upload_invoice_pdf_endpoint(
                 user_email,
                 folder_id,
             )
+            from tools.one_month_savings import get_configured_service_account_email
+
             drive_service = get_drive_service()
             
             if not drive_service:
@@ -5275,9 +5302,24 @@ async def upload_invoice_pdf_endpoint(
                 )
                 logging.error(error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
+
+            sa_email = get_configured_service_account_email()
+            logging.info(
+                "INVOICE_UPLOAD_SERVICE_ACCOUNT_ATTEMPT | invoice=%s | portal_user=%s | "
+                "folder_id=%s | service_account_email=%s",
+                invoice_number,
+                user_email,
+                folder_id,
+                sa_email or "(unknown)",
+            )
             
             file_id = upload_pdf_to_drive(
-                pdf_bytes, filename, folder_id, drive_service, credential_label="service_account"
+                pdf_bytes,
+                filename,
+                folder_id,
+                drive_service,
+                credential_label="service_account",
+                user_email_hint=user_email,
             )
             
             if not file_id:
@@ -8356,10 +8398,13 @@ def autonomous_sequence_start(
     valid_until_utc = anchor_utc + timedelta(days=7)
     valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
 
+    from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
+
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-    sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-    sequence_context.setdefault("offer_validity_days", 7)
+    if body.sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+        sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+        sequence_context.setdefault("offer_validity_days", 7)
 
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:
