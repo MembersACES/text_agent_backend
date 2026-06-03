@@ -35,6 +35,9 @@ class Client(Base):
     advocacy_meeting_time = Column(String(20), nullable=True)  # e.g. "11:03 AM"
     advocacy_meeting_completed = Column(Integer, nullable=False, default=0)  # 0=no, 1=yes
 
+    # Sustainability reporting: A1 entity_id slug (many CRM clients may share one value)
+    reporting_entity = Column(String(128), nullable=True, index=True)
+
 
 class ClientReferral(Base):
     """

@@ -9,6 +9,23 @@ from utils.timezone import to_melbourne_iso
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 
 
+def _normalize_reporting_entity(v: Optional[str]) -> Optional[str]:
+    """A1 entity_id slug: lowercase kebab-case, e.g. agn-holdings."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    if len(s) > 128:
+        raise ValueError("reporting_entity must be 128 characters or fewer")
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    if not all(c in allowed for c in s) or s.startswith("-") or s.endswith("-") or "--" in s:
+        raise ValueError(
+            "reporting_entity must be a lowercase slug (letters, numbers, single hyphens), e.g. agn-holdings"
+        )
+    return s
+
+
 class TaskCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -122,6 +139,12 @@ class ClientCreate(BaseModel):
     gdrive_folder_url: Optional[str] = None
     stage: Optional[ClientStage] = ClientStage.LEAD
     owner_email: Optional[str] = None
+    reporting_entity: Optional[str] = None
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -164,6 +187,12 @@ class ClientUpdate(BaseModel):
     advocacy_meeting_date: Optional[str] = None
     advocacy_meeting_time: Optional[str] = None
     advocacy_meeting_completed: Optional[bool] = None
+    reporting_entity: Optional[str] = None
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -205,6 +234,7 @@ class ClientResponse(BaseModel):
     advocacy_meeting_date: Optional[str] = None  # ISO date YYYY-MM-DD
     advocacy_meeting_time: Optional[str] = None  # e.g. "11:03 AM"
     advocacy_meeting_completed: Optional[bool] = False
+    reporting_entity: Optional[str] = None  # A1 entity_id slug for sustainability disclosures
 
     @field_serializer("created_at", "updated_at", "stage_changed_at")
     def serialize_datetime(self, dt: Optional[datetime], _info):

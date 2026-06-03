@@ -189,6 +189,19 @@ def init_db():
     except Exception as e:
         logging.warning("Could not ensure clients advocacy meeting columns: %s", e)
 
+    # Clients: sustainability reporting entity (A1 entity_id slug; many clients may share one)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "reporting_entity" not in cols:
+                logging.info("Adding missing clients.reporting_entity column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN reporting_entity VARCHAR(128)"))
+                logging.info("✅ Added clients.reporting_entity column")
+    except Exception as e:
+        logging.warning("Could not ensure clients.reporting_entity column: %s", e)
+
     # Pudu consumables: lifecycle tracking fields for replacement planning.
     try:
         insp = inspect(engine)

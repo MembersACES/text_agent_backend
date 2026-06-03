@@ -6924,6 +6924,7 @@ def create_client(
         gdrive_folder_url=client.gdrive_folder_url,
         stage=client.stage or "lead",
         owner_email=client.owner_email or (user_data.get("idinfo") or {}).get("email"),
+        reporting_entity=client.reporting_entity,
     )
     db.add(db_client)
     db.commit()
@@ -6940,13 +6941,14 @@ def list_clients(
     created_after: Optional[str] = Query(None, description="Filter clients created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
+    reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
     """
-    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients).
+    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients), reporting_entity.
     When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
     """
     from datetime import datetime as dt
@@ -6964,6 +6966,8 @@ def list_clients(
         user_email = (user_data.get("idinfo") or {}).get("email")
         if user_email:
             base_query = base_query.filter(Client.owner_email == user_email)
+    if reporting_entity is not None and reporting_entity.strip():
+        base_query = base_query.filter(Client.reporting_entity == reporting_entity.strip().lower())
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -7111,6 +7115,8 @@ def update_client(
         db_client.advocacy_meeting_time = (client_update.advocacy_meeting_time or "").strip() or None
     if "advocacy_meeting_completed" in update_payload:
         db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
+    if "reporting_entity" in update_payload:
+        db_client.reporting_entity = client_update.reporting_entity
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
