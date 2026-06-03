@@ -135,6 +135,7 @@ from models import (
     ClientReferral,
     Offer,
     OfferActivity,
+    ClientManualActivity,
     StrategyItem,
     Testimonial,
     AutonomousSequenceRun,
@@ -168,6 +169,7 @@ from schemas import (
     SolarCleaningSignedUploadResponse,
     MemberDocumentUploadActivityCreate,
     ActivityReportItem,
+    ClientManualActivityCreate,
     OfferPipelineStage as OfferPipelineStageSchema,
     StrategyItemCreate,
     StrategyItemUpdate,
@@ -837,13 +839,14 @@ class PuduConsumablesMarkReplacedRequest(BaseModel):
     replaced_at: Optional[str] = None  # YYYY-MM-DD; defaults to today (Melbourne)
 
 class UtilityRecordUpdateRequest(BaseModel):
-    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on an Airtable utility record."""
+    """Update Data Requested, Data Recieved (checkbox), Contract End Date, or DMA End Date on an Airtable utility record."""
     business_name: str
     utility_type: str  # e.g. "C&I Electricity", "SME Gas", "Waste"
     identifier: str    # NMI, MRIN, account number, etc.
     data_requested: Optional[str] = None   # YYYY-MM-DD
     data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
     contract_end_date: Optional[str] = None  # YYYY-MM-DD
+    dma_end_date: Optional[str] = None  # YYYY-MM-DD
 
 
 class UtilityInvoiceRowsRequest(BaseModel):
@@ -955,7 +958,7 @@ def get_base2_ci_gas_energy_reference(
     postcode: str = Query(..., min_length=3, max_length=32, description="Postcode or address fragment (4-digit AU postcode extracted server-side)"),
     relax_postcode: bool = Query(
         False,
-        description="If true and few exact postcode matches, include same first-3-digit postcode area",
+        description="Legacy query param; ignored. Matching uses a fixed numeric postcode band (see AIRTABLE_CI_GAS_REF_POSTCODE_NUMERIC_BAND).",
     ),
     debug: bool = Query(
         False,
@@ -964,8 +967,8 @@ def get_base2_ci_gas_energy_reference(
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Median (energy charges ÷ invoice total) from C&I Gas Clients in Airtable for Base 2 SME→C&I comparison.
-    Field names are configurable via AIRTABLE_CI_GAS_REF_* env vars.
+    Median (energy charges ÷ invoice total) from C&I Gas Clients whose address postcodes fall in a numeric
+    band around the target (default ±10). Field names are configurable via AIRTABLE_CI_GAS_REF_* env vars.
     """
     email = user_info.get("email") if isinstance(user_info, dict) else None
     result = airtable_client.fetch_ci_gas_energy_share_reference(
@@ -2937,11 +2940,11 @@ def update_utility_record_endpoint(
     request: UtilityRecordUpdateRequest,
     user_info: dict = Depends(verify_google_token),
 ):
-    """Update Data Requested, Data Recieved (checkbox), or Contract End Date on a member's utility record in Airtable."""
+    """Update Data Requested, Data Recieved (checkbox), Contract End Date, or DMA End Date on a member's utility record in Airtable."""
     logging.info(
-        "[utility-record PATCH] request: business_name=%r, utility_type=%r, identifier=%r, data_requested=%r, data_recieved=%r, contract_end_date=%r",
+        "[utility-record PATCH] request: business_name=%r, utility_type=%r, identifier=%r, data_requested=%r, data_recieved=%r, contract_end_date=%r, dma_end_date=%r",
         request.business_name, request.utility_type, request.identifier,
-        request.data_requested, request.data_recieved, request.contract_end_date,
+        request.data_requested, request.data_recieved, request.contract_end_date, request.dma_end_date,
     )
     if not airtable_client.AIRTABLE_API_KEY:
         raise HTTPException(status_code=503, detail="Airtable integration is not configured")
@@ -2954,6 +2957,7 @@ def update_utility_record_endpoint(
             data_requested=request.data_requested,
             data_recieved=request.data_recieved,
             contract_end_date=request.contract_end_date,
+            dma_end_date=request.dma_end_date,
         )
     except Exception as e:
         logging.exception("[utility-record PATCH] Airtable update raised: %s", e)
@@ -3282,6 +3286,7 @@ async def send_quote_request_endpoint(
         invoice_file_id = request_data.get("invoice_file_id")
         interval_data_file_id = request_data.get("interval_data_file_id")
         user_email = user_info.get("email")
+        request_kind = request_data.get("request_kind")
         
         # Validate required fields
         if not business_name:
@@ -3321,7 +3326,8 @@ async def send_quote_request_endpoint(
             loa_file_id=loa_file_id,
             invoice_file_id=invoice_file_id,
             interval_data_file_id=interval_data_file_id,
-            user_email=user_email
+            user_email=user_email,
+            request_kind=request_kind,
         )
         
         logging.info(f"Quote request completed successfully for {business_name}")
@@ -3364,7 +3370,11 @@ async def send_quote_request_endpoint(
                         "utility_type_identifier": request_data.get("utility_type_identifier", "") or None,
                         "nmi": nmi or None,
                         "mrin": mrin or None,
-                        "source": "quote_request_page",
+                        "source": (
+                            "blend_extend_page"
+                            if request_data.get("request_kind") == "blend_extend"
+                            else "quote_request_page"
+                        ),
                     },
                     created_by=user_email,
                 )
@@ -5143,14 +5153,17 @@ async def upload_invoice_pdf_endpoint(
                 detail="Missing required fields: pdf_base64 and filename"
             )
         
-        logging.info(f"Uploading PDF for invoice {invoice_number} (business: {business_name})")
+        user_email = request_data.get("user_email", "unknown@example.com")
         
         # Decode base64 PDF
         pdf_bytes = base64.b64decode(pdf_base64)
         logging.info(f"Decoded PDF, size: {len(pdf_bytes)} bytes")
         
         # Use fixed folder ID from environment variable or default
-        from tools.one_month_savings import INVOICE_STORAGE_FOLDER_ID
+        from tools.one_month_savings import (
+            INVOICE_STORAGE_FOLDER_ID,
+            log_invoice_upload_environment,
+        )
         folder_id = INVOICE_STORAGE_FOLDER_ID
         
         if not folder_id:
@@ -5159,26 +5172,46 @@ async def upload_invoice_pdf_endpoint(
                 detail="Invoice storage folder ID not configured"
             )
         
-        logging.info(f"Using invoice storage folder ID: {folder_id}")
-        
         # Try user's OAuth token first (works for My Drive folders)
         # If that fails, fall back to service account (works for Shared Drives)
         file_id = None
         access_token = None
         refresh_token = request_data.get("refresh_token")
-        
-        logging.info(f"Authorization header present: {bool(authorization)}")
-        logging.info(f"Refresh token present: {bool(refresh_token)}")
+        auth_via_api_key = False
         
         if authorization.startswith("Bearer "):
             token = authorization.split("Bearer ")[1]
             if token != os.getenv("BACKEND_API_KEY", "test-key"):
                 access_token = token
-                logging.info(f"Access token extracted (length: {len(access_token) if access_token else 0})")
             else:
-                logging.info("Token is API key, not user OAuth token")
+                auth_via_api_key = True
         else:
             logging.warning("Authorization header does not start with 'Bearer '")
+
+        log_invoice_upload_environment(
+            invoice_number=invoice_number,
+            business_name=business_name,
+            user_email=user_email,
+            filename=filename,
+            pdf_byte_count=len(pdf_bytes),
+            folder_id=folder_id,
+            has_user_access_token=bool(access_token),
+            has_refresh_token=bool(refresh_token),
+            auth_via_api_key=auth_via_api_key,
+        )
+
+        logging.info(
+            "INVOICE_UPLOAD_START | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
+            "has_user_access_token=%s | has_refresh_token=%s | access_token_len=%s | auth_via_api_key=%s",
+            invoice_number,
+            business_name,
+            user_email,
+            folder_id,
+            bool(access_token),
+            bool(refresh_token),
+            len(access_token) if access_token else 0,
+            auth_via_api_key,
+        )
         
         # First, try with user's OAuth token (for My Drive folders)
         if access_token:
@@ -5201,22 +5234,64 @@ async def upload_invoice_pdf_endpoint(
                         client_secret=client_secret
                     )
                     user_drive_service = build('drive', 'v3', credentials=user_creds)
-                    logging.info(f"Created Drive service with user credentials, attempting upload to folder {folder_id}")
-                    file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, user_drive_service)
+                    logging.info(
+                        "INVOICE_UPLOAD_USER_OAUTH_ATTEMPT | invoice=%s | user_email=%s | folder_id=%s",
+                        invoice_number,
+                        user_email,
+                        folder_id,
+                    )
+                    file_id = upload_pdf_to_drive(
+                        pdf_bytes,
+                        filename,
+                        folder_id,
+                        user_drive_service,
+                        credential_label="user_oauth",
+                        user_email_hint=user_email,
+                    )
                     if file_id:
-                        logging.info("Successfully uploaded using user's OAuth token")
+                        logging.info(
+                            "INVOICE_UPLOAD_SUCCESS | via=user_oauth | invoice=%s | user_email=%s | file_id=%s",
+                            invoice_number,
+                            user_email,
+                            file_id,
+                        )
                     else:
-                        logging.warning("Upload with user token returned None (check logs above for error details)")
+                        logging.warning(
+                            "INVOICE_UPLOAD_USER_OAUTH_FAILED | invoice=%s | user_email=%s | folder_id=%s | "
+                            "See preceding [INVOICE_UPLOAD][user_oauth] lines. "
+                            "Typical fix: sign out/in so Google grants Drive scope, or grant this user Editor on the folder. "
+                            "Attempting service_account fallback next.",
+                            invoice_number,
+                            user_email,
+                            folder_id,
+                        )
             except Exception as e:
-                logging.warning(f"Upload with user token failed with exception: {str(e)}")
+                logging.warning(
+                    "INVOICE_UPLOAD_USER_OAUTH_EXCEPTION | invoice=%s | user_email=%s | error=%s | "
+                    "Will try service_account fallback.",
+                    invoice_number,
+                    user_email,
+                    str(e),
+                )
                 logging.exception(e)
-                logging.info("Will try service account as fallback")
         else:
-            logging.info("No access token available, skipping user token attempt")
+            logging.info(
+                "INVOICE_UPLOAD_SKIP_USER_OAUTH | invoice=%s | reason=no_google_access_token_in_authorization",
+                invoice_number,
+            )
+
+        file_id_after_user_oauth = file_id
         
         # If user token failed or wasn't available, try service account (for Shared Drives)
         if not file_id:
-            logging.info("Attempting upload with service account (for Shared Drives)")
+            logging.info(
+                "INVOICE_UPLOAD_FALLBACK_SERVICE_ACCOUNT | invoice=%s | user_email=%s | folder_id=%s",
+                invoice_number,
+                user_email,
+                folder_id,
+            )
+            from tools.one_month_savings import get_configured_service_account_email
+
             drive_service = get_drive_service()
             
             if not drive_service:
@@ -5227,20 +5302,56 @@ async def upload_invoice_pdf_endpoint(
                 )
                 logging.error(error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
+
+            sa_email = get_configured_service_account_email()
+            logging.info(
+                "INVOICE_UPLOAD_SERVICE_ACCOUNT_ATTEMPT | invoice=%s | portal_user=%s | "
+                "folder_id=%s | service_account_email=%s",
+                invoice_number,
+                user_email,
+                folder_id,
+                sa_email or "(unknown)",
+            )
             
-            file_id = upload_pdf_to_drive(pdf_bytes, filename, folder_id, drive_service)
+            file_id = upload_pdf_to_drive(
+                pdf_bytes,
+                filename,
+                folder_id,
+                drive_service,
+                credential_label="service_account",
+                user_email_hint=user_email,
+            )
             
             if not file_id:
                 # Provide helpful error message based on the error type
-                user_email = request_data.get("user_email", "your Google account")
                 error_msg = (
                     f"Failed to upload PDF to Google Drive. "
                     f"The invoice storage folder (ID: {folder_id}) is not accessible. "
                     f"To fix: Open the folder in Google Drive and share it with '{user_email}' with 'Editor' permissions. "
                     f"Alternatively, if using a Shared Drive, add the service account to the Shared Drive with 'Content Manager' role."
                 )
+                logging.error(
+                    "INVOICE_UPLOAD_COMPLETE_FAILURE | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
+                    "had_user_access_token=%s | user_oauth_returned_file_id=%s | service_account_returned_file_id=false | "
+                    "REMEDIATION_USER=Sign out and sign in with Google in the app (Drive scope); confirm token is not expired. | "
+                    "REMEDIATION_OPS=Move folder into a Google Shared Drive; add backend service account as Content manager "
+                    "(service accounts cannot use My Drive quota). Search logs for DIAGNOSIS= lines above.",
+                    invoice_number,
+                    business_name,
+                    user_email,
+                    folder_id,
+                    bool(access_token),
+                    bool(file_id_after_user_oauth),
+                )
                 logging.error(error_msg)
                 raise HTTPException(status_code=403, detail=error_msg)
+            logging.info(
+                "INVOICE_UPLOAD_SUCCESS | via=service_account | invoice=%s | user_email=%s | file_id=%s | "
+                "note=user_oauth_did_not_produce_file_id",
+                invoice_number,
+                user_email,
+                file_id,
+            )
         
         file_url = f"https://drive.google.com/file/d/{file_id}/view"
         
@@ -5730,9 +5841,25 @@ async def generate_testimonial_document_endpoint(
         savings_val = float(savings_amount) if savings_amount is not None else 0.0
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="savings_amount must be a number")
+
+    def _parse_optional_float(val):
+        if val is None:
+            return None
+        if isinstance(val, str) and not val.strip():
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    solar_pre = _parse_optional_float(body.get("solar_pre_daily_generation_kwh"))
+    solar_post = _parse_optional_float(body.get("solar_post_daily_generation_kwh"))
+
     result = generate_testimonial_document(
         business_name=business_name,
         trading_as=(body.get("trading_as") or "").strip(),
+        testimonial_business_name=(body.get("testimonial_business_name") or "").strip(),
+        testimonial_business_name_source=(body.get("testimonial_business_name_source") or "business_name").strip(),
         contact_name=(body.get("contact_name") or "").strip(),
         position=(body.get("position") or "").strip(),
         email=(body.get("email") or "").strip(),
@@ -5743,6 +5870,9 @@ async def generate_testimonial_document_endpoint(
         abn=(body.get("abn") or "").strip(),
         postal_address=(body.get("postal_address") or "").strip(),
         site_address=(body.get("site_address") or "").strip(),
+        pv_system_size=(body.get("pv_system_size") or "").strip(),
+        solar_pre_daily_kwh=solar_pre,
+        solar_post_daily_kwh=solar_post,
     )
     if result.get("status") == "error":
         raise HTTPException(
@@ -7158,6 +7288,11 @@ def delete_client(
         {ClientReferral.advocate_client_id: None}, synchronize_session=False
     )
 
+    # 4b) Client manual activity report lines (no offer link)
+    db.query(ClientManualActivity).filter(ClientManualActivity.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
     # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
@@ -8263,10 +8398,13 @@ def autonomous_sequence_start(
     valid_until_utc = anchor_utc + timedelta(days=7)
     valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
 
+    from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
+
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-    sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-    sequence_context.setdefault("offer_validity_days", 7)
+    if body.sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+        sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+        sequence_context.setdefault("offer_validity_days", 7)
 
     template = get_sequence_template_by_type(db, body.sequence_type)
     if not template:
@@ -9034,6 +9172,155 @@ def delete_activity_report_item(
     return {"status": "success", "message": "Activity deleted"}
 
 
+CLIENT_MANUAL_OFFER_TYPE_LABELS = {
+    "electricity": "Electricity",
+    "gas": "Gas",
+    "waste": "Waste",
+    "oil": "Oil",
+    "cleaning": "Cleaning",
+    "solar_cleaning": "Solar cleaning",
+    "ghg": "GHG",
+    "other": "Other",
+}
+
+
+def _client_manual_activity_offer_display(
+    note: str,
+    offer_type_preset: Optional[str],
+    offer_type_custom: Optional[str],
+) -> str:
+    parts: List[str] = []
+    n = (note or "").strip()
+    if n:
+        parts.append(n)
+    type_bits: List[str] = []
+    p = (offer_type_preset or "").strip().lower()
+    if p and p not in ("", "unspecified"):
+        type_bits.append(
+            CLIENT_MANUAL_OFFER_TYPE_LABELS.get(p, p.replace("_", " ").title())
+        )
+    c = (offer_type_custom or "").strip()
+    if c:
+        type_bits.append(c)
+    if type_bits:
+        parts.append(" · ".join(type_bits))
+    return " · ".join(parts) if parts else (n or "—")
+
+
+def _client_manual_row_to_report_item(
+    row: ClientManualActivity,
+    business_name: Optional[str],
+) -> ActivityReportItem:
+    disp = _client_manual_activity_offer_display(
+        row.note or "",
+        row.offer_type_preset,
+        row.offer_type_custom,
+    )
+    return ActivityReportItem(
+        id=row.id,
+        offer_id=0,
+        task_id=None,
+        client_id=row.client_id,
+        business_name=business_name,
+        activity_type="client_manual_activity",
+        document_link=row.document_link,
+        created_at=row.created_at,
+        created_by=row.created_by,
+        offer_display=disp or None,
+        manual_activity_id=row.id,
+    )
+
+
+@app.delete("/api/reports/activities/client-manual/{manual_activity_id}", response_model=dict)
+def delete_client_manual_activity(
+    manual_activity_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Delete a client-scoped manual activity report line."""
+    row = db.query(ClientManualActivity).filter(ClientManualActivity.id == manual_activity_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Manual activity not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Manual activity deleted"}
+
+
+@app.post("/api/reports/activities/client-manual", response_model=ActivityReportItem)
+def create_client_manual_activity(
+    body: ClientManualActivityCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Log manual work for a client without linking to an offer."""
+    note = (body.note or "").strip()
+    if not note:
+        raise HTTPException(status_code=400, detail="Note is required")
+    client = db.query(Client).filter(Client.id == body.client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    created_by = (user_data.get("idinfo") or {}).get("email") if user_data else None
+    preset = (body.offer_type_preset or "").strip() or None
+    if preset and preset.lower() == "unspecified":
+        preset = None
+    custom = (body.offer_type_custom or "").strip() or None
+    link = (body.document_link or "").strip() or None
+    row = ClientManualActivity(
+        client_id=body.client_id,
+        note=note,
+        document_link=link,
+        offer_type_preset=preset,
+        offer_type_custom=custom,
+        created_by=created_by,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _client_manual_row_to_report_item(row, client.business_name)
+
+
+@app.get("/api/reports/activities/client-manual", response_model=List[ActivityReportItem])
+def activities_report_client_manual(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List client manual activity lines for the activity report."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    q = db.query(ClientManualActivity, Client).join(Client, ClientManualActivity.client_id == Client.id)
+    if client_id is not None:
+        q = q.filter(ClientManualActivity.client_id == client_id)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            q = q.filter(ClientManualActivity.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            q = q.filter(ClientManualActivity.created_at < end_inclusive)
+        except ValueError:
+            pass
+    rows = (
+        q.order_by(ClientManualActivity.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    out: List[ActivityReportItem] = []
+    for act, cli in rows:
+        out.append(_client_manual_row_to_report_item(act, cli.business_name))
+    return out
+
+
 @app.get("/api/reports/clients/offer-counts")
 def clients_offer_counts(
     db: Session = Depends(get_db),
@@ -9214,10 +9501,17 @@ def activities_report_list(
         offer_display = (resp.utility_display or "Offer")
         if resp.identifier:
             offer_display = f"{offer_display} {resp.identifier}"
+        if act.activity_type == OfferActivityType.MANUAL_ACTIVITY.value:
+            meta = _parse_activity_metadata(getattr(act, "metadata_", None))
+            if isinstance(meta, dict):
+                note = meta.get("note")
+                if note is not None and str(note).strip():
+                    offer_display = f"{str(note).strip()} · {offer_display}"
         out.append(
             ActivityReportItem(
                 id=act.id,
                 offer_id=act.offer_id,
+                task_id=None,
                 client_id=act.client_id,
                 business_name=offer.business_name,
                 activity_type=act.activity_type,
@@ -9225,6 +9519,148 @@ def activities_report_list(
                 created_at=act.created_at,
                 created_by=act.created_by,
                 offer_display=offer_display or None,
+            )
+        )
+    return out
+
+
+@app.get("/api/reports/activities/testimonials", response_model=List[ActivityReportItem])
+def activities_report_testimonials(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List testimonial rows as activity report items (no DB schema changes)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    query = db.query(Testimonial)
+    client: Optional[Client] = None
+    if client_id is not None:
+        client = db.query(Client).filter(Client.id == client_id).first()
+        if not client or not (client.business_name or "").strip():
+            return []
+        query = query.filter(
+            func.lower(Testimonial.business_name) == client.business_name.strip().lower()
+        )
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(Testimonial.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(Testimonial.created_at < end_inclusive)
+        except ValueError:
+            pass
+
+    rows = (
+        query.order_by(Testimonial.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    out: List[ActivityReportItem] = []
+    for t in rows:
+        inferred_client_id = client.id if client else None
+        drive_link = f"https://drive.google.com/file/d/{t.file_id}/view" if t.file_id else None
+        out.append(
+            ActivityReportItem(
+                id=-(t.id + 1000000),
+                offer_id=0,
+                task_id=None,
+                client_id=inferred_client_id,
+                business_name=t.business_name,
+                activity_type="testimonial_activity",
+                document_link=drive_link,
+                created_at=t.created_at,
+                created_by=None,
+                offer_display=f"{t.file_name} ({t.status})" if t.status else t.file_name,
+            )
+        )
+    return out
+
+
+@app.get("/api/reports/activities/tasks", response_model=List[ActivityReportItem])
+def activities_report_tasks(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List task history rows as activity report items (created/updated/status changes)."""
+    from datetime import datetime as dt
+    from datetime import timedelta
+
+    query = (
+        db.query(TaskHistory, Task, Client)
+        .join(Task, TaskHistory.task_id == Task.id)
+        .outerjoin(Client, Task.client_id == Client.id)
+    )
+    if client_id is not None:
+        query = query.filter(Task.client_id == client_id)
+    if created_after:
+        try:
+            start = dt.strptime(created_after, "%Y-%m-%d")
+            query = query.filter(TaskHistory.created_at >= start)
+        except ValueError:
+            pass
+    if created_before:
+        try:
+            end = dt.strptime(created_before, "%Y-%m-%d")
+            end_inclusive = end + timedelta(days=1)
+            query = query.filter(TaskHistory.created_at < end_inclusive)
+        except ValueError:
+            pass
+
+    rows = (
+        query.order_by(TaskHistory.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    out: List[ActivityReportItem] = []
+    for hist, task, client in rows:
+        action = (hist.action or "").strip().lower()
+        if action == "task_created":
+            activity_type = "task_created"
+        elif action == "status_changed" and (hist.new_value or "").strip().lower() == "completed":
+            activity_type = "task_completed"
+        else:
+            activity_type = "task_edited"
+
+        if action == "status_changed":
+            change = f"status: {(hist.old_value or '—')} -> {(hist.new_value or '—')}"
+        elif action == "field_updated":
+            field_name = (hist.field or "field").strip()
+            change = f"{field_name}: {(hist.old_value or '—')} -> {(hist.new_value or '—')}"
+        else:
+            change = task.title or f"Task #{task.id}"
+
+        out.append(
+            ActivityReportItem(
+                id=-(hist.id + 2000000),
+                offer_id=0,
+                task_id=task.id,
+                client_id=task.client_id,
+                business_name=client.business_name if client else None,
+                activity_type=activity_type,
+                document_link=None,
+                created_at=hist.created_at,
+                created_by=hist.user_email,
+                offer_display=change,
             )
         )
     return out

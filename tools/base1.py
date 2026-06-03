@@ -1396,10 +1396,22 @@ def analyze_savings_opportunities(grouped_data, totals):
     opportunities = []
     critical_issues = []
     warnings = []
+
+    def _is_ci_invoice(invoice: Dict) -> bool:
+        utility_type = str(invoice.get("utility_type", "")).lower()
+        return any(marker in utility_type for marker in ("c&i", "ci", "commercial", "industrial"))
+
+    # If at least one C&I invoice exists for a utility, ignore SME for that utility in analysis.
+    electricity_invoices = [inv for invoices in grouped_data["electricity"].values() for inv in invoices]
+    gas_invoices = [inv for invoices in grouped_data["gas"].values() for inv in invoices]
+    electricity_has_ci = any(_is_ci_invoice(inv) for inv in electricity_invoices)
+    gas_has_ci = any(_is_ci_invoice(inv) for inv in gas_invoices)
     
     # Analyze electricity
     for nmi, invoices in grouped_data["electricity"].items():
         for invoice in invoices:
+            if electricity_has_ci and not _is_ci_invoice(invoice):
+                continue
             opps = analyze_electricity_invoice(invoice)
             opportunities.extend(opps)
             
@@ -1413,6 +1425,8 @@ def analyze_savings_opportunities(grouped_data, totals):
     # Analyze gas
     for mrin, invoices in grouped_data["gas"].items():
         for invoice in invoices:
+            if gas_has_ci and not _is_ci_invoice(invoice):
+                continue
             opps = analyze_gas_invoice(invoice)
             opportunities.extend(opps)
             for opp in opps:

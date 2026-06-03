@@ -9,7 +9,7 @@ import logging
 import re
 import os
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -351,7 +351,375 @@ def upload_file_to_drive(
         return None
 
 
-def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_service=None) -> Optional[str]:
+def get_configured_service_account_email() -> Optional[str]:
+    """Return service account client_email from env/file without building Drive service."""
+    try:
+        if os.path.exists(SERVICE_ACCOUNT_FILE):
+            with open(SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("client_email")
+        raw = os.getenv("SERVICE_ACCOUNT_JSON")
+        if raw:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            return data.get("client_email")
+    except Exception as e:
+        logger.warning("[INVOICE_UPLOAD] Could not read service account email: %s", e)
+    return None
+
+
+def log_invoice_upload_environment(
+    *,
+    invoice_number: Optional[str],
+    business_name: Optional[str],
+    user_email: Optional[str],
+    filename: Optional[str],
+    pdf_byte_count: int,
+    folder_id: str,
+    has_user_access_token: bool,
+    has_refresh_token: bool,
+    auth_via_api_key: bool,
+) -> None:
+    """Log static config and request context (no secrets)."""
+    env_folder = os.getenv("ONE_MONTH_SAVINGS_DRIVE_FOLDER_ID", "")
+    sa_email = get_configured_service_account_email()
+    logger.info(
+        "[INVOICE_UPLOAD][ENV] === Upload context === | invoice=%s | business=%r | "
+        "portal_user_email=%s | filename=%r | pdf_bytes=%s",
+        invoice_number,
+        business_name,
+        user_email,
+        filename,
+        pdf_byte_count,
+    )
+    logger.info(
+        "[INVOICE_UPLOAD][ENV] folder_id=%s | folder_from_env_var=%s | "
+        "env_ONE_MONTH_SAVINGS_DRIVE_FOLDER_ID_set=%s | default_folder_used=%s",
+        folder_id,
+        env_folder or "(not set, using code default)",
+        bool(env_folder),
+        folder_id == "1cb5qJ7IMPg8_Bim3vjj-5y7s0aWB_jBd" and not env_folder,
+    )
+    logger.info(
+        "[INVOICE_UPLOAD][ENV] auth | has_user_access_token=%s | has_refresh_token=%s | "
+        "auth_via_backend_api_key_only=%s | service_account_email=%s | "
+        "GOOGLE_CLIENT_ID_set=%s | GOOGLE_CLIENT_SECRET_set=%s",
+        has_user_access_token,
+        has_refresh_token,
+        auth_via_api_key,
+        sa_email or "(unknown — check SERVICE_ACCOUNT_JSON / service-account-key.json)",
+        bool(os.getenv("GOOGLE_CLIENT_ID")),
+        bool(os.getenv("GOOGLE_CLIENT_SECRET")),
+    )
+    logger.info(
+        "[INVOICE_UPLOAD][ENV] remediation_hints | user_fix=Share folder %s with %s as Editor, "
+        "or sign out/in for drive.file scope | ops_fix=Shared Drive + SA Content manager on folder",
+        folder_id,
+        user_email or "(portal user)",
+    )
+
+
+def probe_drive_folder_access(
+    drive_service,
+    folder_id: str,
+    credential_label: str,
+    *,
+    user_email_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Probe Google Drive folder visibility and permissions for the active credential.
+    Logs extensively; never logs tokens. Returns a summary dict for callers.
+    """
+    tag = f"[INVOICE_UPLOAD][{credential_label}][PROBE]"
+    summary: Dict[str, Any] = {
+        "credential_label": credential_label,
+        "folder_id": folder_id,
+        "user_email_hint": user_email_hint,
+        "folder_visible": False,
+        "can_add_children": None,
+        "drive_id": None,
+        "folder_name": None,
+        "authenticated_as": None,
+        "permissions_listed": False,
+        "permission_summary": [],
+        "errors": [],
+    }
+
+    logger.info("%s === Drive access probe start === | folder_id=%s | portal_user_hint=%s", tag, folder_id, user_email_hint)
+
+    # Who is this credential acting as?
+    try:
+        about = drive_service.about().get(
+            fields="user(emailAddress,displayName,permissionId),storageQuota(limit,usage,usageInDrive)"
+        ).execute()
+        user = about.get("user") or {}
+        summary["authenticated_as"] = user.get("emailAddress")
+        quota = about.get("storageQuota") or {}
+        logger.info(
+            "%s about() | authenticated_as=%s | display_name=%r | "
+            "storage_usage=%s | storage_limit=%s | matches_portal_user=%s",
+            tag,
+            user.get("emailAddress"),
+            user.get("displayName"),
+            quota.get("usage"),
+            quota.get("limit"),
+            (
+                (user.get("emailAddress") or "").lower() == (user_email_hint or "").lower()
+                if user_email_hint and user.get("emailAddress")
+                else "unknown"
+            ),
+        )
+        if user_email_hint and user.get("emailAddress"):
+            if (user.get("emailAddress") or "").lower() != (user_email_hint or "").lower():
+                logger.warning(
+                    "%s MISMATCH | portal session email=%s but Drive credential is %s — "
+                    "upload uses OAuth token identity, not necessarily session email",
+                    tag,
+                    user_email_hint,
+                    user.get("emailAddress"),
+                )
+    except HttpError as e:
+        err = _drive_api_error_summary(e)
+        summary["errors"].append(f"about(): {err}")
+        logger.warning("%s about() FAILED | %s", tag, err)
+    except Exception as e:
+        summary["errors"].append(f"about(): {e!s}")
+        logger.warning("%s about() EXCEPTION | %s", tag, e, exc_info=True)
+
+    # Folder metadata + capabilities
+    folder_fields = (
+        "id,name,mimeType,driveId,parents,shared,ownedByMe,owners(emailAddress,displayName),"
+        "capabilities(canAddChildren,canEdit,canDelete,canShare,canReadRevisions,canListChildren),"
+        "permissions(emailAddress,role,type,displayName,domain,deleted)"
+    )
+    try:
+        folder_info = drive_service.files().get(
+            fileId=folder_id,
+            fields=folder_fields,
+            supportsAllDrives=True,
+        ).execute()
+        summary["folder_visible"] = True
+        summary["folder_name"] = folder_info.get("name")
+        summary["drive_id"] = folder_info.get("driveId")
+        caps = folder_info.get("capabilities") or {}
+        summary["can_add_children"] = caps.get("canAddChildren")
+        owners = folder_info.get("owners") or []
+        owner_emails = [o.get("emailAddress") for o in owners if o.get("emailAddress")]
+
+        logger.info(
+            "%s files().get() OK | name=%r | mimeType=%s | driveId=%s | "
+            "shared=%s | ownedByMe=%s | parents=%s | owners=%s | "
+            "capabilities canAddChildren=%s canEdit=%s canDelete=%s canShare=%s",
+            tag,
+            folder_info.get("name"),
+            folder_info.get("mimeType"),
+            folder_info.get("driveId"),
+            folder_info.get("shared"),
+            folder_info.get("ownedByMe"),
+            folder_info.get("parents"),
+            owner_emails,
+            caps.get("canAddChildren"),
+            caps.get("canEdit"),
+            caps.get("canDelete"),
+            caps.get("canShare"),
+        )
+        if folder_info.get("driveId"):
+            logger.info(
+                "%s folder is on Shared Drive | driveId=%s (service account fallback needs SA on this drive)",
+                tag,
+                folder_info.get("driveId"),
+            )
+        else:
+            logger.info(
+                "%s folder appears to be My Drive (no driveId) | owner(s)=%s | "
+                "service account cannot use personal My Drive quota for new files",
+                tag,
+                owner_emails,
+            )
+
+        if caps.get("canAddChildren") is False:
+            logger.error(
+                "%s BLOCKED | canAddChildren=false for this credential on folder %s — upload will fail",
+                tag,
+                folder_id,
+            )
+        elif caps.get("canAddChildren") is True:
+            logger.info("%s OK | canAddChildren=true — credential should be able to upload", tag)
+
+        # Inline permissions on get (often truncated); log if present
+        inline_perms = folder_info.get("permissions") or []
+        if inline_perms:
+            perm_lines = []
+            for p in inline_perms[:25]:
+                if p.get("deleted"):
+                    continue
+                perm_lines.append(
+                    f"{p.get('type')}:{p.get('role')}:{p.get('emailAddress') or p.get('domain') or p.get('displayName')}"
+                )
+            logger.info("%s inline permissions (from files.get, max 25) | %s", tag, " | ".join(perm_lines) or "(none)")
+
+    except HttpError as e:
+        err = _drive_api_error_summary(e)
+        summary["errors"].append(f"files().get(): {err}")
+        code = getattr(e, "status_code", None)
+        logger.error(
+            "%s files().get() FAILED | folder_id=%s | %s",
+            tag,
+            folder_id,
+            err,
+        )
+        if code == 404:
+            logger.error(
+                "%s DIAGNOSIS | Folder not found or not visible to credential '%s' — "
+                "share folder with this account or move to Shared Drive + grant SA",
+                tag,
+                summary.get("authenticated_as") or credential_label,
+            )
+        elif code == 403:
+            logger.error(
+                "%s DIAGNOSIS | 403 on folder metadata — insufficient scope or no folder access for '%s'",
+                tag,
+                summary.get("authenticated_as") or credential_label,
+            )
+    except Exception as e:
+        summary["errors"].append(f"files().get(): {e!s}")
+        logger.error("%s files().get() EXCEPTION | %s", tag, e, exc_info=True)
+
+    # Explicit permissions list (more complete than inline)
+    try:
+        perm_response = drive_service.permissions().list(
+            fileId=folder_id,
+            fields="permissions(emailAddress,role,type,displayName,domain,deleted,id)",
+            supportsAllDrives=True,
+        ).execute()
+        perms = perm_response.get("permissions") or []
+        summary["permissions_listed"] = True
+        lines: List[str] = []
+        for p in perms:
+            if p.get("deleted"):
+                continue
+            ident = p.get("emailAddress") or p.get("domain") or p.get("displayName") or p.get("type")
+            line = f"{p.get('type')}:{p.get('role')}:{ident}"
+            lines.append(line)
+            if user_email_hint and p.get("emailAddress"):
+                if p.get("emailAddress", "").lower() == user_email_hint.lower():
+                    logger.info(
+                        "%s portal user FOUND on folder ACL | email=%s | role=%s",
+                        tag,
+                        p.get("emailAddress"),
+                        p.get("role"),
+                    )
+        summary["permission_summary"] = lines
+        logger.info(
+            "%s permissions().list() OK | count=%s | acl=%s",
+            tag,
+            len(lines),
+            " | ".join(lines) if lines else "(empty)",
+        )
+        sa_email = get_configured_service_account_email()
+        if sa_email:
+            sa_match = [ln for ln in lines if sa_email.lower() in ln.lower()]
+            if sa_match:
+                logger.info("%s service account on folder ACL | %s", tag, " | ".join(sa_match))
+            else:
+                logger.warning(
+                    "%s service account NOT in folder ACL | sa_email=%s — SA fallback upload may fail",
+                    tag,
+                    sa_email,
+                )
+        if user_email_hint:
+            user_match = [ln for ln in lines if user_email_hint.lower() in ln.lower()]
+            if user_match:
+                logger.info("%s portal user on folder ACL | %s", tag, " | ".join(user_match))
+            elif summary["folder_visible"]:
+                logger.warning(
+                    "%s portal user %s NOT listed on folder permissions — "
+                    "user OAuth upload may still work via domain/link access",
+                    tag,
+                    user_email_hint,
+                )
+    except HttpError as e:
+        err = _drive_api_error_summary(e)
+        summary["errors"].append(f"permissions().list(): {err}")
+        logger.warning(
+            "%s permissions().list() FAILED (non-fatal) | %s — "
+            "credential may lack permission to enumerate ACLs",
+            tag,
+            err,
+        )
+    except Exception as e:
+        summary["errors"].append(f"permissions().list(): {e!s}")
+        logger.warning("%s permissions().list() EXCEPTION | %s", tag, e, exc_info=True)
+
+    # Shared Drive metadata when applicable
+    if summary.get("drive_id"):
+        try:
+            drive_meta = drive_service.drives().get(
+                driveId=summary["drive_id"],
+                fields="id,name,capabilities(canAddChildren,canEdit,canDelete,canShare)",
+            ).execute()
+            dc = drive_meta.get("capabilities") or {}
+            logger.info(
+                "%s drives().get() | shared_drive_name=%r | drive_capabilities "
+                "canAddChildren=%s canEdit=%s",
+                tag,
+                drive_meta.get("name"),
+                dc.get("canAddChildren"),
+                dc.get("canEdit"),
+            )
+        except HttpError as e:
+            err = _drive_api_error_summary(e)
+            summary["errors"].append(f"drives().get(): {err}")
+            logger.warning("%s drives().get() FAILED | %s", tag, err)
+        except Exception as e:
+            summary["errors"].append(f"drives().get(): {e!s}")
+            logger.warning("%s drives().get() EXCEPTION | %s", tag, e, exc_info=True)
+
+    logger.info(
+        "%s === Probe complete === | folder_visible=%s | can_add_children=%s | "
+        "authenticated_as=%s | errors=%s",
+        tag,
+        summary["folder_visible"],
+        summary["can_add_children"],
+        summary.get("authenticated_as"),
+        summary["errors"] or "(none)",
+    )
+    return summary
+
+
+def _drive_api_error_summary(exc: BaseException) -> str:
+    """Short, log-friendly summary for Drive upload failures."""
+    parts: List[str] = []
+    code = getattr(exc, "status_code", None)
+    if code is None and hasattr(exc, "resp") and getattr(exc.resp, "status", None):
+        code = exc.resp.status
+    if code is not None:
+        parts.append(f"http={code}")
+    reason = getattr(exc, "reason", None) or getattr(exc, "_reason", None)
+    if reason:
+        parts.append(f"reason={reason!s}")
+    err_details = getattr(exc, "error_details", None)
+    if err_details:
+        parts.append(f"details={err_details!s}")
+    content = getattr(exc, "content", None)
+    if isinstance(content, bytes) and content:
+        try:
+            text = content.decode("utf-8", errors="replace")[:400]
+            if text.strip():
+                parts.append(f"body={text.strip()}")
+        except Exception:
+            pass
+    return " ".join(parts) if parts else repr(exc)
+
+
+def upload_pdf_to_drive(
+    pdf_bytes: bytes,
+    filename: str,
+    folder_id: str,
+    drive_service=None,
+    *,
+    credential_label: str = "upload",
+    user_email_hint: Optional[str] = None,
+) -> Optional[str]:
     """
     Upload PDF file to Google Drive folder (supports both My Drive and Shared Drives)
     
@@ -360,45 +728,61 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         filename: Name for the file
         folder_id: ID of the folder to upload to
         drive_service: Optional Google Drive service (will create if not provided)
+        credential_label: Log tag, e.g. ``user_oauth`` or ``service_account``, for supportability
         
     Returns:
         File ID of the uploaded file, or None if error
     """
     try:
-        logger.info(f"Uploading PDF '{filename}' to folder {folder_id}")
+        logger.info(
+            "[INVOICE_UPLOAD][%s] Starting upload | filename=%r folder_id=%s bytes=%s",
+            credential_label,
+            filename,
+            folder_id,
+            len(pdf_bytes) if pdf_bytes else 0,
+        )
         
         if not drive_service:
             drive_service = get_drive_service()
             if not drive_service:
-                logger.error("Could not create Google Drive service")
+                logger.error("[INVOICE_UPLOAD][%s] Could not create Google Drive service", credential_label)
                 return None
+
+        probe_result = probe_drive_folder_access(
+            drive_service,
+            folder_id,
+            credential_label,
+            user_email_hint=user_email_hint,
+        )
+        if probe_result.get("can_add_children") is False:
+            logger.error(
+                "[INVOICE_UPLOAD][%s] Pre-flight: canAddChildren=false — skipping upload attempt",
+                credential_label,
+            )
+            return None
         
         from io import BytesIO
         from googleapiclient.http import MediaIoBaseUpload
         
-        # First, check if the folder is in a Shared Drive
-        # This is optional - if it fails, we'll proceed with the upload anyway
-        drive_id = None
-        try:
-            folder_info = drive_service.files().get(
-                fileId=folder_id,
-                fields='id, name, driveId, parents',
-                supportsAllDrives=True
-            ).execute()
-            
-            drive_id = folder_info.get('driveId')
-            logger.info(f"Folder info - Name: {folder_info.get('name')}, Drive ID: {drive_id}")
-            
-            if drive_id:
-                logger.info(f"Folder is in Shared Drive: {drive_id}")
-        except HttpError as e:
-            # 404 is common if folder is in My Drive or permissions are limited
-            # Since upload works, we'll just log as info and continue
-            if e.status_code == 404:
-                logger.info(f"Folder info not accessible (likely My Drive folder): {folder_id}")
-            else:
-                logger.info(f"Could not get folder info (will proceed with upload): {e.status_code} - {e.reason}")
-            drive_id = None
+        drive_id = probe_result.get("drive_id")
+        if drive_id:
+            logger.info(
+                "[INVOICE_UPLOAD][%s] Using Shared Drive from probe | driveId=%s folder_name=%r",
+                credential_label,
+                drive_id,
+                probe_result.get("folder_name"),
+            )
+        elif probe_result.get("folder_visible"):
+            logger.info(
+                "[INVOICE_UPLOAD][%s] My Drive folder (probe) | folder_name=%r",
+                credential_label,
+                probe_result.get("folder_name"),
+            )
+        else:
+            logger.warning(
+                "[INVOICE_UPLOAD][%s] Folder not visible in probe — will still attempt files().create",
+                credential_label,
+            )
         
         file_metadata = {
             'name': filename,
@@ -429,24 +813,63 @@ def upload_pdf_to_drive(pdf_bytes: bytes, filename: str, folder_id: str, drive_s
         
         file_id = file.get('id')
         file_url = file.get('webViewLink')
-        logger.info(f"Successfully uploaded PDF. File ID: {file_id}, URL: {file_url}")
+        logger.info(
+            "[INVOICE_UPLOAD][%s] SUCCESS | file_id=%s webViewLink=%s",
+            credential_label,
+            file_id,
+            file_url,
+        )
         
         return file_id
         
     except HttpError as e:
-        logger.error(f"Google Drive API error uploading PDF: {e.status_code} - {e.reason}")
-        logger.error(f"Error details: {e.error_details if hasattr(e, 'error_details') else 'No details'}")
-        if e.status_code == 403:
-            if 'insufficientPermissions' in str(e) or 'insufficient authentication scopes' in str(e):
-                logger.error("Access token does not have Google Drive permissions.")
-                logger.error("User needs to sign out and sign back in to grant Drive access.")
-            elif 'storageQuotaExceeded' in str(e):
-                logger.error("Service accounts cannot upload to My Drive folders. The folder must be in a Google Shared Drive (Team Drive).")
-                logger.error("To fix: Move the folder to a Shared Drive or create the folder in a Shared Drive.")
-        logger.exception(e)
+        summary = _drive_api_error_summary(e)
+        low = summary.lower()
+        logger.error(
+            "[INVOICE_UPLOAD][%s] DRIVE_API_FAILED | %s",
+            credential_label,
+            summary,
+        )
+        if getattr(e, "status_code", None) == 403 or "403" in summary or "http=403" in low:
+            if "insufficientpermissions" in low or "insufficient authentication scopes" in low or "insufficient_permission" in low:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=OAUTH_SCOPES_OR_FOLDER_ACCESS | "
+                    "The Google account used for this request cannot create files in this folder with the current token. "
+                    "Fix: (1) In the app, sign out and sign in with Google again so Drive scope is granted. "
+                    "(2) Ensure this folder is shared with the user with Editor (or use a Shared Drive + SA).",
+                    credential_label,
+                )
+            elif "storagequotaexceeded" in low or "service accounts do not have storage quota" in low:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=SERVICE_ACCOUNT_MY_DRIVE_QUOTA | "
+                    "Google blocks service accounts from using personal My Drive storage. "
+                    "Fix: Move folder %s (or its parent) into a **Google Shared Drive** and add the backend service account "
+                    "with **Content manager** (or higher).",
+                    credential_label,
+                    folder_id,
+                )
+            else:
+                logger.error(
+                    "[INVOICE_UPLOAD][%s] DIAGNOSIS=FORBIDDEN_OTHER | See DRIVE_API_FAILED line above for Google's message.",
+                    credential_label,
+                )
+        elif getattr(e, "status_code", None) == 404 or "http=404" in low:
+            logger.error(
+                "[INVOICE_UPLOAD][%s] DIAGNOSIS=NOT_FOUND | Folder or parent may be wrong, deleted, or not visible to this credential.",
+                credential_label,
+            )
+        else:
+            logger.error(
+                "[INVOICE_UPLOAD][%s] DIAGNOSIS=DRIVE_API_ERROR | See DRIVE_API_FAILED line above.",
+                credential_label,
+            )
         return None
     except Exception as e:
-        logger.error(f"Error uploading PDF to Drive: {str(e)}")
+        logger.error(
+            "[INVOICE_UPLOAD][%s] UNEXPECTED_ERROR | %s",
+            credential_label,
+            str(e),
+        )
         logger.exception(e)
         return None
 

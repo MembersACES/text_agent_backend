@@ -46,6 +46,7 @@ SOLUTION_TYPE_LABELS: Dict[str, str] = {
 EXTRA_SOLUTION_TYPES: Dict[str, str] = {
     "automated_cleaning_robot": "Automated Cleaning Robot",
     "dma": "Direct Metering Agreement",
+    "solar_panel_cleaning": "Solar Panel Cleaning",
 }
 
 ALL_SOLUTION_TYPE_IDS = SOLUTION_TYPE_IDS + list(EXTRA_SOLUTION_TYPES.keys())
@@ -198,20 +199,33 @@ DEFAULT_CONTENT["waste"].update({
 })
 
 DEFAULT_CONTENT["resource_recovery"].update({
-    "key_outcome_metrics": "Resource Recovery, Cost Offset",
+    "key_outcome_metrics": "Reduced oil consumption, revenue from used oil, kitchen efficiency",
     "key_challenge_of_solution": (
-        "Recoverable resources are often treated as waste, resulting in lost value and higher disposal costs."
+        "Used cooking oil is often treated only as waste with disposal costs, while biodiesel pathways "
+        "can turn it into revenue. Sites may also overspend through high volumes of standard oil blends."
     ),
-    "key_approach_of_solution": "Identification and implementation of recovery pathways for reusable materials.",
-    "key_outcome_of_solution": "Reduced waste costs and improved sustainability outcomes.",
-    "key_outcome_dotpoints_1": "Recovery of reusable materials.",
-    "key_outcome_dotpoints_2": "Reduced disposal costs.",
-    "key_outcome_dotpoints_3": "Improved sustainability performance.",
-    "key_outcome_dotpoints_4": "Operational efficiency gains.",
-    "key_outcome_dotpoints_5": "Alignment with ESG goals.",
-    "conclusion": "Resource recovery transforms waste streams into cost-saving opportunities.",
+    "key_approach_of_solution": (
+        "Combine resource recovery with a tighter cooking-oil procurement and usage model: benchmarking "
+        "current vs optimised supply, aligning fry practices, and embedding monitoring so usage drops "
+        "without hurting throughput or plate quality."
+    ),
+    "key_outcome_of_solution": (
+        "Lower litres purchased, measurable kitchen efficiency gains, and a clearer link between fry "
+        "performance, labour in the kitchen, and total oil spend."
+    ),
+    "key_outcome_dotpoints_1": "Revenue from used oil instead of disposal-only treatment.",
+    "key_outcome_dotpoints_2": "Lower litres used for comparable output.",
+    "key_outcome_dotpoints_3": "Improved sales-per-litre and fry-life performance.",
+    "key_outcome_dotpoints_4": "Lower cost intensity per dollar of food throughput.",
+    "key_outcome_dotpoints_5": (
+        "Reduced cleaning burden where cold filtration and blend optimisation support workflows."
+    ),
+    "conclusion": (
+        "The approach stacks resource recovery with blend and behaviour change—so savings appear in "
+        "procurement and operations, validated with a bounded before-and-after measurement window."
+    ),
     "esg_scope_for_solution": "SCOPE 3",
-    "sdg_impact_for_solution": "SDG 6, 12, 13",
+    "sdg_impact_for_solution": "SDG 7, 9, 12, 13",
 })
 
 DEFAULT_CONTENT["dma"].update({
@@ -232,18 +246,61 @@ DEFAULT_CONTENT["dma"].update({
 DEFAULT_CONTENT["automated_cleaning_robot"] = {
     "solution_type": "automated_cleaning_robot",
     "solution_type_label": "Automated Cleaning Robot",
-    "key_outcome_metrics": "Labour Optimisation, Efficiency Gains",
-    "key_challenge_of_solution": "Manual cleaning processes are time-intensive, inconsistent, and labour-dependent.",
-    "key_approach_of_solution": "Deployment of autonomous cleaning technology to support routine operations.",
-    "key_outcome_of_solution": "Improved cleaning consistency and reduced reliance on manual labour.",
-    "key_outcome_dotpoints_1": "Reduced manual labour requirements.",
-    "key_outcome_dotpoints_2": "Increased cleaning frequency.",
-    "key_outcome_dotpoints_3": "Improved operational efficiency.",
-    "key_outcome_dotpoints_4": "Enhanced safety outcomes.",
-    "key_outcome_dotpoints_5": "Reduced resource usage.",
-    "conclusion": "Automated cleaning solutions deliver consistent outcomes while reducing operational costs.",
+    "key_outcome_metrics": "Labour reduction, repeatable operating savings, safer consistent cleaning",
+    "key_challenge_of_solution": (
+        "Routine floor cleaning absorbs repeated staff time and pulls people away from higher-value "
+        "guest- or revenue-facing tasks."
+    ),
+    "key_approach_of_solution": (
+        "Pilot an autonomous vacuum/mop robot on representative shifts, benchmark against incumbent "
+        "methods (time, quality, rework), then standardise rostering once performance is proven."
+    ),
+    "key_outcome_of_solution": (
+        "Freed labour hours redirected to core operations (e.g. service and member-facing work), "
+        "alongside more consistent cleaning coverage and lower exposure to slips from wet floors."
+    ),
+    "key_outcome_dotpoints_1": "Measurable reduction in baseline cleaning labour.",
+    "key_outcome_dotpoints_2": "Annual labour cost avoidance at agreed rates once hours are contractual.",
+    "key_outcome_dotpoints_3": "Faster floor dry-down and slip-risk reduction versus manual mop cycles.",
+    "key_outcome_dotpoints_4": "Often lower water use for comparable floor-care outcomes.",
+    "key_outcome_dotpoints_5": "Consistent cadence suitable for scaling to additional units or zones.",
+    "conclusion": (
+        "Phased robot deployment converts a repeatable manual task into a documented annual saving, "
+        "with a pathway to replicate once the first asset proves utilisation and coverage."
+    ),
     "esg_scope_for_solution": "SCOPE 3",
-    "sdg_impact_for_solution": "SDG 3, 8, 9, 11, 12",
+    "sdg_impact_for_solution": "SDG 3, 6, 8, 9, 11, 12",
+}
+
+DEFAULT_CONTENT["solar_panel_cleaning"] = {
+    "solution_type": "solar_panel_cleaning",
+    "solution_type_label": "Solar Panel Cleaning",
+    "key_outcome_metrics": "Higher yield after clean plus inspection, reduced grid reliance, GHG avoidance",
+    "key_challenge_of_solution": (
+        "Soiling and minor defects erode PV yield over time; many sites underservice cleaning while "
+        "assuming periodic checks alone are sufficient."
+    ),
+    "key_approach_of_solution": (
+        "Perform a systematic clean paired with at least a level 1 electrical inspection—then compare "
+        "equivalent production intervals (aligned seasonality and metering) rather than anecdotal spikes."
+    ),
+    "key_outcome_of_solution": (
+        "Restored yield on measured comparison intervals, translating to incremental kWh and an "
+        "indicative emissions wedge where grid factors apply."
+    ),
+    "key_outcome_dotpoints_1": "Measured uplift in daily energy harvest post-service.",
+    "key_outcome_dotpoints_2": "Indicative dollar benefit from incremental kWh at agreed tariffs.",
+    "key_outcome_dotpoints_3": "Estimated grid-energy and emissions displacement from incremental generation.",
+    "key_outcome_dotpoints_4": (
+        "Confidence the asset has no flagged electrical safety or performance faults post-inspection."
+    ),
+    "key_outcome_dotpoints_5": "Lower risk of undetected degradation shortening asset life or warranty exposure.",
+    "conclusion": (
+        "Treating PV as an operating asset—clean plus inspection—helps protect returns: production "
+        "recovers relative to baseline, and faults surface before outages or larger losses."
+    ),
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 7, 8, 9, 13",
 }
 
 

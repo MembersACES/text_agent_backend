@@ -1,7 +1,7 @@
 """
 Pydantic schemas for API requests and responses
 """
-from pydantic import BaseModel, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 from typing import Optional, List, Any, Dict
 from datetime import datetime
 import json
@@ -473,6 +473,7 @@ class ActivityReportItem(BaseModel):
     """Single row for activity report list (with business_name from offer)."""
     id: int
     offer_id: int
+    task_id: Optional[int] = None
     client_id: Optional[int] = None
     business_name: Optional[str] = None
     activity_type: str
@@ -481,10 +482,21 @@ class ActivityReportItem(BaseModel):
     created_by: Optional[str] = None
     # Full label "Base 2 Gas 5321568754" (source + utility + identifier) for Offer column
     offer_display: Optional[str] = None
+    # When set, row is from client_manual_activities; delete via /client-manual/{id}
+    manual_activity_id: Optional[int] = None
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime, _info):
         return to_melbourne_iso(dt)
+
+
+class ClientManualActivityCreate(BaseModel):
+    """Create a client-scoped manual activity report line (no offer)."""
+    client_id: int = Field(..., ge=1)
+    note: str = Field(..., min_length=1)
+    document_link: Optional[str] = None
+    offer_type_preset: Optional[str] = None
+    offer_type_custom: Optional[str] = None
 
 
 # --- Strategy & WIP (per-client strategy items) ---

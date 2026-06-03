@@ -6,6 +6,9 @@ import logging
 import os
 import re
 import statistics
+import threading
+import time
+from collections import defaultdict
 from datetime import date, datetime
 from typing import Any, Optional
 from urllib.parse import quote
@@ -270,7 +273,7 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
     From an LOA record, resolve linked utility records and build:
     - linked_utilities: { "C&I Electricity": [id1, id2], ... }
     - utility_retailers: { "C&I Electricity": [retailer1, retailer2], ... }
-    - linked_utility_extra: { "C&I Electricity": [ { identifier, retailer, contract_end_date, data_requested, data_recieved }, ... ], ... }
+    - linked_utility_extra: { "C&I Electricity": [ { identifier, retailer, contract_end_date, dma_end_date, data_requested, data_recieved }, ... ], ... }
     """
     linked_utilities = {}
     utility_retailers = {}
@@ -312,6 +315,7 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
             data_req = f.get("Data Requested")
             data_rec = f.get("Data Recieved") or f.get("Data Received")  # support both spellings
             contract_end = f.get("Contract End Date")
+            dma_end = f.get("DMA End Date")
             if isinstance(data_req, str) and len(data_req) >= 10:
                 data_req = data_req[:10]
             if isinstance(data_rec, str) and len(data_rec) >= 10:
@@ -322,16 +326,19 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
                 data_rec = ""
             if isinstance(contract_end, str) and len(contract_end) >= 10:
                 contract_end = contract_end[:10]
+            if isinstance(dma_end, str) and len(dma_end) >= 10:
+                dma_end = dma_end[:10]
             # Log what we read for date fields (first record per utility type) to debug missing end dates
-            if len(extras) == 0 and (data_req or data_rec or contract_end):
+            if len(extras) == 0 and (data_req or data_rec or contract_end or dma_end):
                 logger.info(
-                    "[utility-extra] First record for %s: identifier=%r, contract_end_date=%r, data_requested=%r, data_recieved=%r",
-                    app_key, str(ident).strip() if ident is not None else "", contract_end, data_req, data_rec,
+                    "[utility-extra] First record for %s: identifier=%r, contract_end_date=%r, dma_end_date=%r, data_requested=%r, data_recieved=%r",
+                    app_key, str(ident).strip() if ident is not None else "", contract_end, dma_end, data_req, data_rec,
                 )
             extras.append({
                 "identifier": str(ident).strip() if ident is not None else "",
                 "retailer": retailers[-1],
                 "contract_end_date": contract_end,
+                "dma_end_date": dma_end,
                 "data_requested": data_req,
                 "data_recieved": data_rec,
             })
@@ -805,10 +812,11 @@ def update_utility_record(
     data_requested: Optional[str] = None,
     data_recieved: Optional[Any] = None,  # Checkbox: pass True/False (or "Yes"/"No" string, we convert to bool)
     contract_end_date: Optional[str] = None,
+    dma_end_date: Optional[str] = None,
 ) -> bool:
     """
-    Update one or more of Data Requested, Data Received (checkbox), Contract End Date on the
-    first matching utility record. data_recieved is sent as boolean to Airtable (checkbox field).
+    Update one or more of Data Requested, Data Received (checkbox), Contract End Date, DMA End Date
+    on the first matching utility record. data_recieved is sent as boolean to Airtable (checkbox field).
     Returns True if update succeeded.
     """
     found = find_utility_record_by_identifier(utility_type_identifier, identifier)
@@ -830,6 +838,8 @@ def update_utility_record(
         fields["Data Received"] = bool_val
     if contract_end_date is not None and contract_end_date != "":
         fields["Contract End Date"] = contract_end_date
+    if dma_end_date is not None and dma_end_date != "":
+        fields["DMA End Date"] = dma_end_date
     if not fields:
         return True
     url = _url(table_name, record_id)
@@ -896,8 +906,7 @@ _CI_GAS_REF_BUSINESS_NAME_FIELDS = [
     ).split(",")
     if s.strip()
 ]
-_CI_GAS_REF_MIN_EXACT = int(os.environ.get("AIRTABLE_CI_GAS_REF_MIN_EXACT_SAMPLES", "1"))
-_CI_GAS_REF_DEFAULT_SHARE = float(os.environ.get("AIRTABLE_CI_GAS_REF_DEFAULT_ENERGY_SHARE", "0.72"))
+_CI_GAS_REF_DEFAULT_SHARE = float(os.environ.get("AIRTABLE_CI_GAS_REF_DEFAULT_ENERGY_SHARE", "0.75"))
 
 # C&I Gas *Clients* often have no $ fields; charges live on linked *Invoices* rows.
 # Comma-separated table names or tbl... IDs (try in order until a linked recId returns 200).
@@ -910,19 +919,28 @@ _CI_GAS_REF_CLIENT_INVOICE_LINK_FIELDS = [
     if s.strip()
 ]
 _CI_GAS_REF_MAX_INVOICE_FETCHES = int(os.environ.get("AIRTABLE_CI_GAS_REF_MAX_INVOICE_FETCHES", "120"))
-# Tier 3: nearest by numeric postcode difference (not geographic proximity — API labels this clearly).
-_CI_GAS_REF_NEAREST_MAX_POSTCODES = int(os.environ.get("AIRTABLE_CI_GAS_REF_NEAREST_MAX_POSTCODES", "3"))
-_CI_GAS_REF_NEAREST_MAX_NUMERIC_GAP = int(os.environ.get("AIRTABLE_CI_GAS_REF_NEAREST_MAX_NUMERIC_GAP", "150"))
-# Tier 5: max client rows to scan for global median (linked-invoice fetches still capped by budget).
-_CI_GAS_REF_GLOBAL_MEDIAN_MAX_ROWS = int(os.environ.get("AIRTABLE_CI_GAS_REF_GLOBAL_MEDIAN_MAX_ROWS", "200"))
+# Numeric postcode window: include clients whose address postcode parses to [target − band, target + band] (e.g. 4000 ± 10 → 3990–4010).
+_CI_GAS_REF_POSTCODE_NUMERIC_BAND = int(os.environ.get("AIRTABLE_CI_GAS_REF_POSTCODE_NUMERIC_BAND", "10"))
+# Reuse full C&I Gas Clients table between requests (seconds; 0 disables cache).
+_CI_GAS_REF_CLIENTS_CACHE_TTL_SEC = float(os.environ.get("AIRTABLE_CI_GAS_REF_CLIENTS_CACHE_TTL_SEC", "300"))
 
 _CI_GAS_REF_CONFIDENCE_BY_STRATEGY = {
+    "postcode_band": "medium",
     "exact_postcode": "high",
     "prefix_3digit": "medium",
     "nearest_numeric_postcode": "medium",
     "global_dataset_median": "low",
     "default_share": "low",
 }
+
+
+def _ci_gas_ref_default_fallback_message(detail: str) -> str:
+    """User-facing copy when no reference ratios are available; percentage follows AIRTABLE_CI_GAS_REF_DEFAULT_ENERGY_SHARE."""
+    pct = int(round(_CI_GAS_REF_DEFAULT_SHARE * 100))
+    d = detail.strip()
+    if d and d[-1] not in ".!?":
+        d += "."
+    return f"{d} Defaulting to standard {pct}% energy share of invoice total."
 
 
 def get_ci_gas_invoices_table_candidates() -> list[str]:
@@ -1180,6 +1198,52 @@ def _ci_gas_ref_log(msg: str, *args: Any) -> None:
     print(f"[ci-gas-ref] {line}", flush=True)
 
 
+_ci_gas_clients_cache_lock = threading.Lock()
+_ci_gas_clients_cache_table: Optional[str] = None
+_ci_gas_clients_cache_rows: Optional[list[dict]] = None
+_ci_gas_clients_cache_mono: float = 0.0
+
+
+def _get_ci_gas_client_rows_cached(table_name: str) -> list[dict]:
+    """
+    Paginate full C&I Gas Clients table with optional in-process TTL cache.
+    Repeated Base 2 postcode checks hit Airtable once per TTL instead of every request.
+    """
+    global _ci_gas_clients_cache_table, _ci_gas_clients_cache_rows, _ci_gas_clients_cache_mono
+    ttl = _CI_GAS_REF_CLIENTS_CACHE_TTL_SEC
+    now = time.monotonic()
+    if ttl > 0:
+        with _ci_gas_clients_cache_lock:
+            if (
+                _ci_gas_clients_cache_rows is not None
+                and _ci_gas_clients_cache_table == table_name
+                and (now - _ci_gas_clients_cache_mono) < ttl
+            ):
+                _ci_gas_ref_log(
+                    "clients_cache_hit table=%r rows=%s age_sec=%.1f ttl_sec=%s",
+                    table_name,
+                    len(_ci_gas_clients_cache_rows),
+                    now - _ci_gas_clients_cache_mono,
+                    ttl,
+                )
+                return _ci_gas_clients_cache_rows
+    rows = _paginate_full_table(table_name)
+    if ttl > 0:
+        with _ci_gas_clients_cache_lock:
+            _ci_gas_clients_cache_table = table_name
+            _ci_gas_clients_cache_rows = rows
+            _ci_gas_clients_cache_mono = time.monotonic()
+            _ci_gas_ref_log(
+                "clients_cache_store table=%r rows=%s ttl_sec=%s",
+                table_name,
+                len(rows),
+                ttl,
+            )
+    else:
+        _ci_gas_ref_log("clients_cache_disabled table=%r rows=%s", table_name, len(rows))
+    return rows
+
+
 def fetch_ci_gas_energy_share_reference(
     postcode: str,
     *,
@@ -1187,9 +1251,9 @@ def fetch_ci_gas_energy_share_reference(
     debug: bool = False,
 ) -> dict[str, Any]:
     """
-    Scan C&I Gas Clients for rows whose address contains a postcode matching `postcode`.
-    For each matching row, compute energy_charges / total_ex_gst using env-configurable field names.
-    Returns median share in (0,1], or a default with used_fallback=True when Airtable is empty or misconfigured.
+    Scan C&I Gas Clients whose address postcode falls in a numeric band around the target
+    (default ±10, e.g. 4000 → 3990–4010). Median energy÷invoice from those rows; default share if none.
+    ``relax_postcode`` is accepted for API compatibility and ignored.
     """
     diagnostics: dict[str, Any] = {}
 
@@ -1217,7 +1281,9 @@ def fetch_ci_gas_energy_share_reference(
             "sample_count": 0,
             "used_fallback": True,
             "relax_used": False,
-            "message": "Airtable not configured",
+            "message": _ci_gas_ref_default_fallback_message(
+                "Airtable is not connected, so C&I gas reference bills could not be loaded"
+            ),
             "match_strategy": "default_share",
             "matched_postcodes": [],
             "matched_postcode_reference": [],
@@ -1234,7 +1300,9 @@ def fetch_ci_gas_energy_share_reference(
             "sample_count": 0,
             "used_fallback": True,
             "relax_used": False,
-            "message": "C&I Gas table not configured",
+            "message": _ci_gas_ref_default_fallback_message(
+                "C&I Gas is not configured, so reference bills could not be loaded"
+            ),
             "match_strategy": "default_share",
             "matched_postcodes": [],
             "matched_postcode_reference": [],
@@ -1245,21 +1313,20 @@ def fetch_ci_gas_energy_share_reference(
     table_name = cfg["table_name"]
     invoice_table_candidates = get_ci_gas_invoices_table_candidates()
     _ci_gas_ref_log(
-        "start postcode_raw=%r postcode_norm=%r relax=%s table=%r invoice_table_candidates=%s address_fields=%s energy_fields=%s total_fields=%s business_name_fields=%s min_exact=%s default_share=%s",
+        "start postcode_raw=%r postcode_norm=%r table=%r band=±%s invoice_table_candidates=%s address_fields=%s energy_fields=%s total_fields=%s business_name_fields=%s default_share=%s",
         postcode,
         norm,
-        relax_postcode,
         table_name,
+        _CI_GAS_REF_POSTCODE_NUMERIC_BAND,
         invoice_table_candidates,
         _CI_GAS_REF_ADDRESS_FIELDS,
         _CI_GAS_REF_ENERGY_FIELDS,
         _CI_GAS_REF_TOTAL_FIELDS,
         _CI_GAS_REF_BUSINESS_NAME_FIELDS,
-        _CI_GAS_REF_MIN_EXACT,
         _CI_GAS_REF_DEFAULT_SHARE,
     )
 
-    rows = _paginate_full_table(table_name)
+    rows = _get_ci_gas_client_rows_cached(table_name)
     total_rows = len(rows)
     if not rows:
         _ci_gas_ref_log("no rows returned from Airtable table=%r (check base id / table name / API key)", table_name)
@@ -1306,13 +1373,10 @@ def fetch_ci_gas_energy_share_reference(
         addr = _address_text_from_fields(f)
         return _extract_postcode_from_address_text(addr)
 
-    entries: list[tuple[float, str, Optional[str]]] = []
+    records_by_pc: dict[str, list[dict]] = defaultdict(list)
+    postcode_histogram: dict[str, int] = {}
     rows_with_address = 0
     rows_with_pc = 0
-    exact_pc_rows = 0
-    exact_pc_with_ratio = 0
-    no_ratio_samples: list[dict[str, Any]] = []
-    postcode_histogram: dict[str, int] = {}
 
     for rec in rows:
         f = rec.get("fields") or {}
@@ -1323,115 +1387,45 @@ def fetch_ci_gas_energy_share_reference(
         if pc:
             rows_with_pc += 1
             postcode_histogram[pc] = postcode_histogram.get(pc, 0) + 1
-        if pc != norm:
-            continue
-        exact_pc_rows += 1
-        ratio = _energy_share_ratio_from_client_or_linked_invoices(
-            f,
-            invoice_fetches_remaining=invoice_fetches_remaining,
-            invoice_table_candidates=invoice_table_candidates,
-            invoice_probe_failures=invoice_probe_failures,
-            invoice_table_cache=resolved_invoice_table_cache,
-        )
-        if ratio is not None:
-            entries.append((ratio, norm, _ci_gas_ref_business_display_name(f)))
-            exact_pc_with_ratio += 1
-        elif len(no_ratio_samples) < 8:
-            eng = _first_numeric_from_fields(f, _CI_GAS_REF_ENERGY_FIELDS)
-            tot = _first_numeric_from_fields(f, _CI_GAS_REF_TOTAL_FIELDS)
-            fk = sorted(f.keys())
-            link_n = len(_linked_invoice_record_ids(f))
-            no_ratio_samples.append(
-                {
-                    "record_id": (rec.get("id") or "")[:14],
-                    "address_field_used": next(
-                        (n for n in _CI_GAS_REF_ADDRESS_FIELDS if f.get(n)), None
-                    ),
-                    "address_preview": (addr[:70] + "…") if len(addr) > 70 else addr,
-                    "extracted_postcode": pc,
-                    "energy_numeric": eng,
-                    "total_numeric": tot,
-                    "linked_invoice_record_count": link_n,
-                    "field_key_count": len(fk),
-                    "field_keys_sample": fk[:35],
-                }
-            )
+            records_by_pc[pc].append(rec)
 
-    prefix = norm[:3] if len(norm) >= 3 else ""
-    prefix_pc_rows = sum(
-        1 for rec in rows if (p := row_pc(rec.get("fields") or {})) and p.startswith(prefix)
-    )
+    entries: list[tuple[float, str, Optional[str]]] = []
+    no_ratio_samples: list[dict[str, Any]] = []
+    band_lo = -1
+    band_hi = -1
+    band_rows = 0
+    band_with_ratio = 0
 
-    if exact_pc_rows == 0 and rows_with_pc > 0:
-        top_pcs = sorted(postcode_histogram.items(), key=lambda x: -x[1])[:12]
-        _ci_gas_ref_log("postcode_histogram_top=%s (no row matched target %s)", top_pcs, norm)
-
-    if exact_pc_rows > 0 and exact_pc_with_ratio == 0 and no_ratio_samples:
-        _ci_gas_ref_log(
-            "exact_postcode_rows_found_but_no_ratio: showing up to %s samples (fix field names or data types)",
-            len(no_ratio_samples),
-        )
-        for i, s in enumerate(no_ratio_samples):
-            _ci_gas_ref_log("  sample[%s] %s", i, s)
-
-    relax_used = False
-    relax_added = 0
-    if (
-        relax_postcode
-        and len(entries) < _CI_GAS_REF_MIN_EXACT
-        and len(norm) >= 3
-    ):
-        relax_used = True
-        seen_ids = {rec["id"] for rec in rows if row_pc(rec.get("fields") or {}) == norm}
-        for rec in rows:
-            if rec.get("id") in seen_ids:
-                continue
-            f = rec.get("fields") or {}
-            pc = row_pc(f)
-            if not pc or not pc.startswith(prefix):
-                continue
-            ratio = _energy_share_ratio_from_client_or_linked_invoices(
-                f,
-                invoice_fetches_remaining=invoice_fetches_remaining,
-                invoice_table_candidates=invoice_table_candidates,
-                invoice_probe_failures=invoice_probe_failures,
-                invoice_table_cache=resolved_invoice_table_cache,
-            )
-            if ratio is not None:
-                entries.append((ratio, pc, _ci_gas_ref_business_display_name(f)))
-                relax_added += 1
-        _ci_gas_ref_log(
-            "relax_postcode: prefix=%s ratios_added_beyond_exact=%s total_ratios=%s",
-            prefix,
-            relax_added,
-            len(entries),
-        )
-
-    tier3_filled = False
-    nearest_numeric_candidates: list[str] = []
-    if len(entries) == 0 and len(norm) == 4 and norm.isdigit():
+    if len(norm) == 4 and norm.isdigit():
         target_i = int(norm)
-        sorted_pcs = sorted(
-            (p for p in postcode_histogram if len(p) == 4 and p.isdigit()),
-            key=lambda p: abs(int(p) - target_i),
-        )
-        nearest_numeric_candidates = [
-            p
-            for p in sorted_pcs
-            if abs(int(p) - target_i) <= _CI_GAS_REF_NEAREST_MAX_NUMERIC_GAP
-        ][: _CI_GAS_REF_NEAREST_MAX_POSTCODES]
+        b = max(0, _CI_GAS_REF_POSTCODE_NUMERIC_BAND)
+        band_lo = max(0, target_i - b)
+        band_hi = min(9999, target_i + b)
         _ci_gas_ref_log(
-            "fallback_nearest_numeric_postcodes: target=%s max_gap=%s max_pc_groups=%s candidates=%s",
+            "postcode_band: target=%s numeric_range_inclusive=%s–%s (±%s)",
             norm,
-            _CI_GAS_REF_NEAREST_MAX_NUMERIC_GAP,
-            _CI_GAS_REF_NEAREST_MAX_POSTCODES,
-            nearest_numeric_candidates,
+            band_lo,
+            band_hi,
+            b,
         )
-        for pc_pick in nearest_numeric_candidates:
-            for rec in rows:
-                if row_pc(rec.get("fields") or {}) != pc_pick:
-                    continue
+    else:
+        _ci_gas_ref_log("postcode_band: skip (normalized postcode not 4 digits): %r", norm)
+
+    if band_lo >= 0:
+        for pc_key in sorted(records_by_pc.keys()):
+            if len(pc_key) != 4 or not pc_key.isdigit():
+                continue
+            try:
+                pi = int(pc_key)
+            except ValueError:
+                continue
+            if pi < band_lo or pi > band_hi:
+                continue
+            for rec in records_by_pc[pc_key]:
+                band_rows += 1
                 f = rec.get("fields") or {}
+                addr = _address_text_from_fields(f)
+                pc = row_pc(f) or pc_key
                 ratio = _energy_share_ratio_from_client_or_linked_invoices(
                     f,
                     invoice_fetches_remaining=invoice_fetches_remaining,
@@ -1440,44 +1434,43 @@ def fetch_ci_gas_energy_share_reference(
                     invoice_table_cache=resolved_invoice_table_cache,
                 )
                 if ratio is not None:
-                    entries.append((ratio, pc_pick, _ci_gas_ref_business_display_name(f)))
-        if entries:
-            tier3_filled = True
-        _ci_gas_ref_log(
-            "fallback_nearest_numeric_postcodes: valid_ratio_count=%s matched_postcodes=%s",
-            len(entries),
-            sorted({e[1] for e in entries}),
-        )
+                    entries.append((ratio, pc_key, _ci_gas_ref_business_display_name(f)))
+                    band_with_ratio += 1
+                elif len(no_ratio_samples) < 8:
+                    eng = _first_numeric_from_fields(f, _CI_GAS_REF_ENERGY_FIELDS)
+                    tot = _first_numeric_from_fields(f, _CI_GAS_REF_TOTAL_FIELDS)
+                    fk = sorted(f.keys())
+                    link_n = len(_linked_invoice_record_ids(f))
+                    no_ratio_samples.append(
+                        {
+                            "record_id": (rec.get("id") or "")[:14],
+                            "address_field_used": next(
+                                (n for n in _CI_GAS_REF_ADDRESS_FIELDS if f.get(n)), None
+                            ),
+                            "address_preview": (addr[:70] + "…") if len(addr) > 70 else addr,
+                            "extracted_postcode": pc,
+                            "energy_numeric": eng,
+                            "total_numeric": tot,
+                            "linked_invoice_record_count": link_n,
+                            "field_key_count": len(fk),
+                            "field_keys_sample": fk[:35],
+                        }
+                    )
 
-    tier5_filled = False
-    if len(entries) == 0:
+    if band_rows > 0 and band_with_ratio == 0 and no_ratio_samples:
         _ci_gas_ref_log(
-            "fallback_global_dataset: scanning up to %s rows (invoice_fetches_remaining=%s)",
-            _CI_GAS_REF_GLOBAL_MEDIAN_MAX_ROWS,
-            invoice_fetches_remaining[0],
+            "postcode_band: rows_in_band=%s but no_ratio: showing up to %s samples",
+            band_rows,
+            len(no_ratio_samples),
         )
-        scanned = 0
-        for rec in rows:
-            if scanned >= _CI_GAS_REF_GLOBAL_MEDIAN_MAX_ROWS:
-                break
-            scanned += 1
-            f = rec.get("fields") or {}
-            pc = row_pc(f) or ""
-            ratio = _energy_share_ratio_from_client_or_linked_invoices(
-                f,
-                invoice_fetches_remaining=invoice_fetches_remaining,
-                invoice_table_candidates=invoice_table_candidates,
-                invoice_probe_failures=invoice_probe_failures,
-                invoice_table_cache=resolved_invoice_table_cache,
-            )
-            if ratio is not None:
-                entries.append((ratio, pc if pc else "unknown", _ci_gas_ref_business_display_name(f)))
-        if entries:
-            tier5_filled = True
-        _ci_gas_ref_log(
-            "fallback_global_dataset: valid_ratio_count=%s",
-            len(entries),
-        )
+        for i, s in enumerate(no_ratio_samples):
+            _ci_gas_ref_log("  sample[%s] %s", i, s)
+
+    if band_rows == 0 and rows_with_pc > 0:
+        top_pcs = sorted(postcode_histogram.items(), key=lambda x: -x[1])[:12]
+        _ci_gas_ref_log("postcode_histogram_top=%s (no row in band for target %s)", top_pcs, norm)
+
+    relax_used = any(pc != norm for _, pc, _ in entries) if entries else False
 
     invoice_fetches_used = invoice_budget_start - invoice_fetches_remaining[0]
     if invoice_probe_failures:
@@ -1497,14 +1490,13 @@ def fetch_ci_gas_energy_share_reference(
             )
 
     _ci_gas_ref_log(
-        "match_stats: rows_with_address_text=%s rows_with_any_postcode=%s exact_postcode_%s=%s exact_with_valid_energy_total_ratio=%s rows_same_prefix_%s=%s invoice_record_fetches_used=%s resolved_invoice_table=%s",
+        "match_stats: rows_with_address_text=%s rows_with_any_postcode=%s band=%s–%s band_client_rows=%s band_ratios=%s invoice_record_fetches_used=%s resolved_invoice_table=%s",
         rows_with_address,
         rows_with_pc,
-        norm,
-        exact_pc_rows,
-        exact_pc_with_ratio,
-        prefix,
-        prefix_pc_rows,
+        band_lo if band_lo >= 0 else "n/a",
+        band_hi if band_hi >= 0 else "n/a",
+        band_rows,
+        band_with_ratio,
         invoice_fetches_used,
         resolved_invoice_table_cache[0] if resolved_invoice_table_cache else None,
     )
@@ -1529,36 +1521,31 @@ def fetch_ci_gas_energy_share_reference(
         matched_postcode_reference = [
             {"postcode": pc, "business_names": pc_to_names.get(pc, [])} for pc in matched_postcodes
         ]
-        if tier5_filled:
-            match_strategy = "global_dataset_median"
-        elif tier3_filled:
-            match_strategy = "nearest_numeric_postcode"
-        elif relax_used and any(pc != norm for _, pc, _ in entries):
-            match_strategy = "prefix_3digit"
-        else:
-            match_strategy = "exact_postcode"
-        used_fb = match_strategy != "exact_postcode"
+        match_strategy = "postcode_band"
+        used_fb = relax_used
         confidence = _CI_GAS_REF_CONFIDENCE_BY_STRATEGY.get(match_strategy, "low")
-        msg: Optional[str] = None
-        if match_strategy == "nearest_numeric_postcode":
-            pcs_disp_parts: list[str] = []
-            for pc in matched_postcodes:
-                names = pc_to_names.get(pc, [])
-                if names:
-                    pcs_disp_parts.append(f"{pc} ({', '.join(names)})")
-                else:
-                    pcs_disp_parts.append(pc)
-            pcs_disp = ", ".join(pcs_disp_parts) if pcs_disp_parts else "(see data)"
-            msg = (
-                f"No exact or same-prefix C&I gas match for {norm}; energy share uses "
-                f"nearest_numeric_postcode_fallback (numeric distance, not map geography). "
-                f"Postcodes used: {pcs_disp}."
-            )
-        elif match_strategy == "global_dataset_median":
-            msg = (
-                f"No local postcode match for {norm}; energy share is the median from "
-                f"scanned C&I client records (up to {_CI_GAS_REF_GLOBAL_MEDIAN_MAX_ROWS} rows)."
-            )
+        b = _CI_GAS_REF_POSTCODE_NUMERIC_BAND
+        if band_lo >= 0 and band_hi >= 0:
+            if used_fb:
+                pcs_disp_parts: list[str] = []
+                for pc in matched_postcodes:
+                    names = pc_to_names.get(pc, [])
+                    if names:
+                        pcs_disp_parts.append(f"{pc} ({', '.join(names)})")
+                    else:
+                        pcs_disp_parts.append(pc)
+                pcs_disp = ", ".join(pcs_disp_parts) if pcs_disp_parts else "(see data)"
+                msg = (
+                    f"Energy share is the median of C&I gas bills for postcodes {band_lo}–{band_hi} "
+                    f"(±{b} numeric window around {norm}; not map distance). Postcodes used: {pcs_disp}."
+                )
+            else:
+                msg = (
+                    f"Energy share is the median of C&I gas bills for postcode {norm} "
+                    f"(within ±{b} numeric window; only this postcode had usable data in the band)."
+                )
+        else:
+            msg = None
         _ci_gas_ref_log(
             "success match_strategy=%s median_energy_share=%.4f sample_count=%s relax_used=%s invoice_record_fetches_used=%s",
             match_strategy,
@@ -1592,14 +1579,11 @@ def fetch_ci_gas_energy_share_reference(
                 "total_rows": total_rows,
                 "rows_with_address_text": rows_with_address,
                 "rows_with_extracted_postcode": rows_with_pc,
-                "exact_postcode_rows": exact_pc_rows,
-                "exact_postcode_with_ratio": exact_pc_with_ratio,
-                "prefix": prefix,
-                "rows_matching_prefix": prefix_pc_rows,
-                "relax_added_ratios": relax_added,
-                "tier3_nearest_numeric_candidates": nearest_numeric_candidates,
-                "tier3_filled": tier3_filled,
-                "tier5_filled": tier5_filled,
+                "postcode_band_lo": band_lo,
+                "postcode_band_hi": band_hi,
+                "postcode_band_numeric_plusminus": _CI_GAS_REF_POSTCODE_NUMERIC_BAND,
+                "band_client_rows": band_rows,
+                "band_valid_ratio_count": band_with_ratio,
                 "match_strategy": match_strategy,
                 "matched_postcodes": matched_postcodes,
                 "airtable_field_keys_sample": keys_sorted[:80],
@@ -1612,12 +1596,12 @@ def fetch_ci_gas_energy_share_reference(
             out["diagnostics"] = diagnostics
         return out
 
+    band_desc = f"{band_lo}–{band_hi}" if band_lo >= 0 and band_hi >= 0 else "the configured postcode band"
     _ci_gas_ref_log(
-        "FALLBACK default_share=%s reason=no_ratios (exact_pc_rows=%s exact_with_ratio=%s relax_added=%s invoice_record_fetches_used=%s)",
+        "FALLBACK default_share=%s reason=no_ratios_in_band band=%s band_rows=%s invoice_record_fetches_used=%s",
         _CI_GAS_REF_DEFAULT_SHARE,
-        exact_pc_rows,
-        exact_pc_with_ratio,
-        relax_added,
+        band_desc,
+        band_rows,
         invoice_fetches_used,
     )
     out = {
@@ -1625,13 +1609,15 @@ def fetch_ci_gas_energy_share_reference(
         "median_energy_share": _CI_GAS_REF_DEFAULT_SHARE,
         "sample_count": 0,
         "used_fallback": True,
-        "relax_used": relax_used,
-        "message": "No matching C&I gas rows with energy and total fields; using default share",
+        "relax_used": False,
+        "message": _ci_gas_ref_default_fallback_message(
+            f"No C&I gas reference bills with usable energy and total amounts were found for postcodes {band_desc} (±{_CI_GAS_REF_POSTCODE_NUMERIC_BAND} around {norm})"
+        ),
         "match_strategy": "default_share",
         "matched_postcodes": [],
         "matched_postcode_reference": [],
         "confidence": "low",
-        "fallback_reason": "no_ratios_after_exact_prefix_nearest_global",
+        "fallback_reason": "no_ratios_in_postcode_band",
     }
     if debug:
         diagnostics = {
@@ -1645,14 +1631,10 @@ def fetch_ci_gas_energy_share_reference(
             "total_rows": total_rows,
             "rows_with_address_text": rows_with_address,
             "rows_with_extracted_postcode": rows_with_pc,
-            "exact_postcode_rows": exact_pc_rows,
-            "exact_postcode_with_ratio": exact_pc_with_ratio,
-            "prefix": prefix,
-            "rows_matching_prefix": prefix_pc_rows,
-            "relax_added_ratios": relax_added,
-            "tier3_nearest_numeric_candidates": nearest_numeric_candidates,
-            "tier3_filled": tier3_filled,
-            "tier5_filled": tier5_filled,
+            "postcode_band_lo": band_lo,
+            "postcode_band_hi": band_hi,
+            "postcode_band_numeric_plusminus": _CI_GAS_REF_POSTCODE_NUMERIC_BAND,
+            "band_client_rows": band_rows,
             "airtable_field_keys_sample": keys_sorted[:80],
             "address_config_hits": address_hits,
             "energy_config_hits": energy_hits,
