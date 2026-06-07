@@ -8,7 +8,7 @@ _backend_env = Path(__file__).resolve().parent / ".env"
 if _backend_env.is_file():
     load_dotenv(_backend_env, override=True)
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status, Request
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
@@ -21,7 +21,6 @@ import tempfile
 import requests
 import re
 import copy
-from google.auth.transport.requests import Request
 from urllib.parse import urlparse, parse_qs
 import os
 import sys
@@ -52,6 +51,17 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_keys,
 )
 from services import airtable_client
+from services.prograde_drift_webhook import get_nonce_cache, verify_signature
+from services.climate_store import (
+    activity_record_to_summary,
+    create_ingest_run,
+    drift_event_to_dict,
+    list_activity_records,
+    list_drift_events,
+    save_drift_event,
+    upsert_activity_record,
+)
+from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -665,6 +675,255 @@ async def utility_linked_webhook(
         "ok": True,
         "message": "utility-linked placeholder accepted",
         "utility_type": request_body.utility_type,
+    }
+
+
+@app.post("/api/webhooks/prograde-drift")
+async def prograde_drift_webhook(
+    request: StarletteRequest,
+    db: Session = Depends(get_db),
+    x_prograde_signature: Annotated[Optional[str], Header(alias="X-Prograde-Signature")] = None,
+    x_prograde_event: Annotated[Optional[str], Header(alias="X-Prograde-Event")] = None,
+    x_prograde_delivery: Annotated[Optional[str], Header(alias="X-Prograde-Delivery")] = None,
+):
+    """
+    Inbound Prograde DRIFT_EVENT v1 (DRIFT_EVENT_v1.md §4.2).
+    Verifies HMAC, dedupes on event_id, persists to climate_drift_events (plus in-memory cache for dev).
+    """
+    secret = os.getenv("PROGRADE_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PROGRADE_WEBHOOK_SECRET not configured")
+
+    raw_body = await request.body()
+    if not x_prograde_signature:
+        raise HTTPException(status_code=400, detail="missing signature")
+
+    verified = verify_signature(raw_body, x_prograde_signature, secret)
+    if not verified.ok:
+        logging.warning("[prograde-drift] signature rejected: %s", verified.reason)
+        raise HTTPException(status_code=401, detail=verified.reason)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="schema mismatch: body must be object")
+
+    event_id = str(payload.get("event_id") or x_prograde_delivery or "").strip()
+    if event_id and not get_nonce_cache().check_and_store(event_id):
+        logging.info("[prograde-drift] duplicate event_id=%s", event_id[:24])
+        raise HTTPException(status_code=409, detail="duplicate event_id")
+
+    entry = {
+        "received_at": time.time(),
+        "event_id": event_id,
+        "event_type": payload.get("event_type") or x_prograde_event,
+        "severity": payload.get("severity"),
+        "standard": payload.get("standard"),
+        "payload": payload,
+    }
+    _prograde_drift_events.append(entry)
+    if len(_prograde_drift_events) > 500:
+        del _prograde_drift_events[: len(_prograde_drift_events) - 500]
+
+    try:
+        save_drift_event(db, payload)
+    except Exception:
+        logging.exception("[prograde-drift] failed to persist to climate_drift_events")
+
+    logging.info(
+        "[prograde-drift] accepted event_id=%s type=%s",
+        event_id[:24] if event_id else "?",
+        entry.get("event_type"),
+    )
+    return {"ok": True, "event_id": event_id}
+
+
+_prograde_drift_events: list[dict] = []
+
+
+@app.get("/api/climate/drift-events")
+def list_prograde_drift_events(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    reporting_entity: Optional[str] = Query(None),
+    unacknowledged_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Consultant-facing drift event list for G1 badges."""
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=limit,
+    )
+    if not rows and _prograde_drift_events:
+        events = list(_prograde_drift_events)
+        if unacknowledged_only:
+            events = [e for e in events if not e.get("acknowledged")]
+        return {"events": events, "count": len(events), "source": "memory"}
+    return {
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+        "source": "database",
+    }
+
+
+class ClimateEtlSyncRequest(BaseModel):
+    utility_type: str = Field(..., description="e.g. C&I Electricity, C&I Gas")
+    identifier: str = Field(..., description="NMI, MRIN, or account identifier")
+    reporting_period_label: str = Field("FY26", description="FY label e.g. FY26")
+    max_records: int = Field(100, ge=1, le=500)
+    dry_run: bool = Field(False, description="If true, transform only — do not write climate_activity_records")
+
+
+@app.get("/api/clients/{client_id}/climate/drift-events")
+def list_client_climate_drift_events(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    unacknowledged_only: bool = Query(True),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    reporting_entity = (client.reporting_entity or "").strip() or None
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=50,
+    )
+    return {
+        "client_id": client_id,
+        "reporting_entity": reporting_entity,
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.get("/api/clients/{client_id}/climate/activity-records")
+def list_client_climate_activity_records(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    rows = list_activity_records(db, client_id=client_id, limit=limit)
+    return {
+        "client_id": client_id,
+        "records": [activity_record_to_summary(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.post("/api/clients/{client_id}/climate/etl/sync")
+def sync_client_climate_activity_records(
+    client_id: int,
+    request: ClimateEtlSyncRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Pull Airtable invoice rows for a utility identifier and stage ActivityRecord v1 rows
+    in climate_activity_records (separate from CRM tables). Post-Tuesday: forward to B4/Prograde.
+    """
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    entity_id = (client.reporting_entity or "").strip()
+    if not entity_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Client has no reporting_entity — set on Strategy & WIP tab first",
+        )
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+
+    period_start, period_end = default_fy_period(request.reporting_period_label)
+    payload = airtable_client.get_utility_invoice_rows_by_identifier(
+        request.utility_type,
+        request.identifier,
+        max_records=request.max_records,
+    )
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    ctx = EtlContext(
+        entity_id=entity_id,
+        client_id=client_id,
+        loa_client_id=client.external_business_id,
+        site_id=str(request.identifier).strip(),
+        utility_type=request.utility_type,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    results, diagnostics = transform_invoice_rows(rows, ctx)
+    diagnostics["airtable"] = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+
+    created = 0
+    updated = 0
+    skipped = 0
+    preview: list[dict] = []
+
+    for res in results:
+        if res.skipped:
+            skipped += 1
+            preview.append(
+                {"source_row_id": res.source_row_id, "skipped": True, "reason": res.skip_reason}
+            )
+            continue
+        preview.append(
+            {
+                "record_id": res.record_id,
+                "activity_type": res.body.get("activity_type"),
+                "quantity": res.body.get("quantity"),
+            }
+        )
+        if request.dry_run:
+            continue
+        _, was_created = upsert_activity_record(
+            db,
+            record_id=res.record_id,
+            client_id=client_id,
+            body=res.body,
+            source_utility_type=request.utility_type,
+            source_row_id=res.source_row_id,
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    status = "dry_run" if request.dry_run else "completed"
+    if not request.dry_run:
+        create_ingest_run(
+            db,
+            client_id=client_id,
+            utility_type=request.utility_type,
+            identifier=request.identifier,
+            period_start=period_start,
+            period_end=period_end,
+            records_created=created,
+            records_updated=updated,
+            records_skipped=skipped,
+            status=status,
+            diagnostics=diagnostics,
+        )
+
+    return {
+        "client_id": client_id,
+        "entity_id": entity_id,
+        "dry_run": request.dry_run,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "diagnostics": diagnostics,
+        "preview": preview[:20],
     }
 
 
