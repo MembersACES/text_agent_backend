@@ -57,6 +57,7 @@ from services.climate_store import (
     create_ingest_run,
     drift_event_to_dict,
     list_activity_records,
+    list_climate_roster,
     list_drift_events,
     save_drift_event,
     upsert_activity_record,
@@ -334,8 +335,14 @@ CORS_ORIGINS = [
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
+    "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
 
@@ -742,6 +749,54 @@ async def prograde_drift_webhook(
 
 
 _prograde_drift_events: list[dict] = []
+
+
+def verify_roster_access(
+    authorization: Optional[str] = Header(None),
+    x_aces_service_key: Optional[str] = Header(None, alias="X-ACES-Service-Key"),
+):
+    """Google JWT or shared service key (Prograde server proxy)."""
+    roster_key = (os.environ.get("CLIMATE_ROSTER_SERVICE_KEY") or "").strip()
+    if roster_key and x_aces_service_key and secrets.compare_digest(x_aces_service_key, roster_key):
+        return {"auth": "service_key", "email": "roster@prograde.internal"}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        return idinfo
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/api/climate/roster")
+def get_climate_roster(
+    period: str = Query("FY26", description="Reporting period label for deep links"),
+    q: Optional[str] = Query(None, description="Filter by business name"),
+    limit: int = Query(200, ge=1, le=500),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Clients with reporting_entity — for Prograde launcher (ACES live roster)."""
+    rows = list_climate_roster(db, query=q, limit=limit)
+    clients = [
+        {
+            **row,
+            "period": period,
+            "deep_link": f"/?entity={row['reporting_entity']}&period={period}",
+        }
+        for row in rows
+    ]
+    return {
+        "period": period,
+        "count": len(clients),
+        "clients": clients,
+        "source": "database",
+    }
 
 
 @app.get("/api/climate/drift-events")

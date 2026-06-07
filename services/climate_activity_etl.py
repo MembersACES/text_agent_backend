@@ -19,6 +19,36 @@ UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
         "scope": 2,
         "unit": "kWh",
         "quantity_fields": [
+            "Activity data kWh",
+            "Monthly Consumption",
+            "kWh",
+            "Total kWh",
+            "Usage (kWh)",
+            "Usage kWh",
+            "Energy (kWh)",
+            "Total Usage (kWh)",
+            "Consumption (kWh)",
+            "General Usage Quantity",
+        ],
+        "tou_sum_field_groups": [
+            ["Peak Usage (kWh)", "Shoulder Usage (kWh)", "Off-Peak Usage (kWh)"],
+            ["Peak (kWh)", "Shoulder (kWh)", "Off-Peak (kWh)"],
+            [
+                "Retail Quantity Peak (kWh)",
+                "Retail Quantity Shoulder (kWh)",
+                "Retail Quantity Off-Peak (kWh)",
+            ],
+        ],
+    },
+    "SME Electricity": {
+        "activity_type": "electricity_grid",
+        "scope": 2,
+        "unit": "kWh",
+        "quantity_fields": [
+            "Activity data kWh",
+            "Monthly Consumption",
+            "Total Usage",
+            "General Usage Quantity",
             "kWh",
             "Total kWh",
             "Usage (kWh)",
@@ -27,42 +57,83 @@ UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
             "Total Usage (kWh)",
             "Consumption (kWh)",
         ],
-    },
-    "SME Electricity": {
-        "activity_type": "electricity_grid",
-        "scope": 2,
-        "unit": "kWh",
-        "quantity_fields": [
-            "kWh",
-            "Total kWh",
-            "Usage (kWh)",
-            "Usage kWh",
-            "Energy (kWh)",
+        "tou_sum_field_groups": [
+            ["Peak Consumption (kWh)", "Shoulder Consumption (kWh)", "Off-Peak Consumption (kWh)"],
+            ["Peak Usage (kWh)", "Shoulder Usage (kWh)", "Off-Peak Usage (kWh)"],
+            ["Peak (kWh)", "Shoulder (kWh)", "Off-Peak (kWh)"],
         ],
     },
     "C&I Gas": {
         "activity_type": "natural_gas",
         "scope": 1,
         "unit": "GJ",
-        "quantity_fields": ["GJ", "Total GJ", "Usage (GJ)", "Gas Usage (GJ)", "Consumption (GJ)"],
+        "quantity_fields": [
+            "Energy Charge Quantity in GJ",
+            "Energy Charge Quantity",
+            "GJ",
+            "Total GJ",
+            "Usage (GJ)",
+            "Gas Usage (GJ)",
+            "Gas Usage",
+            "Consumption (GJ)",
+            "Quantity",
+        ],
+        "mj_fields": ["General Usage MJ", "Energy Quantity (MJ)", "Invoice Consumption MJ"],
     },
     "SME Gas": {
         "activity_type": "natural_gas",
         "scope": 1,
         "unit": "GJ",
-        "quantity_fields": ["GJ", "Total GJ", "Usage (GJ)"],
+        "quantity_fields": ["GJ", "Total GJ", "Usage (GJ)", "Total Consumption GJ"],
+        "mj_fields": [
+            "Total Consumption MJ",
+            "Total MJ",
+            "Total Usage MJ",
+            "Consumption (MJ)",
+            "Consumption MJ",
+            "General Usage MJ",
+            "Energy Quantity (MJ)",
+            "Invoice Consumption MJ",
+            "Total Consumption (MJ)",
+            "Total usage (MJ)",
+            "Annual consumption MJ",
+        ],
+        "mj_sum_field_groups": [
+            ["General Usage Quantity", "General Usage Next Quantity"],
+            ["General Usage Peak Quantity", "General Usage Next Quantity"],
+        ],
     },
     "Waste": {
         "activity_type": "waste_generated_operations",
         "scope": 3,
         "unit": "t",
-        "quantity_fields": ["Tonnes", "Tonnage", "Weight (t)", "Total (t)", "Quantity (t)"],
+        # Airtable waste invoices track bin pickups, not mass — tonnes fields are rare.
+        "quantity_fields": [
+            "Tonnes",
+            "Tonnage",
+            "Weight (t)",
+            "Total (t)",
+            "Quantity (t)",
+            "Total Weight (t)",
+            "Waste Weight (t)",
+        ],
     },
     "Oil": {
         "activity_type": "diesel",
         "scope": 1,
         "unit": "L",
-        "quantity_fields": ["Litres", "Liters", "Volume (L)", "Quantity (L)", "Total (L)"],
+        "quantity_fields": [
+            "Litres",
+            "Liters",
+            "Volume (L)",
+            "Quantity (L)",
+            "Total (L)",
+            "Total Quantity",
+        ],
+        "tou_sum_field_groups": [
+            ["Quantity 1", "Quantity 2"],
+            ["Quantity 1", "Quantity 2", "Quantity 3"],
+        ],
     },
 }
 
@@ -135,10 +206,54 @@ def _parse_number(raw: Any) -> Optional[float]:
         return None
 
 
+def _normalize_field_key(key: str) -> str:
+    return re.sub(r"\s+", " ", str(key or "").strip().lower())
+
+
 def _first_field(row: dict, names: list[str]) -> Any:
+    if not row:
+        return None
+    norm_to_key = {_normalize_field_key(k): k for k in row.keys()}
     for name in names:
         if name in row and row[name] not in (None, ""):
             return row[name]
+        actual = norm_to_key.get(_normalize_field_key(name))
+        if actual is not None and row.get(actual) not in (None, ""):
+            return row[actual]
+    return None
+
+
+def _sum_fields(row: dict, names: list[str]) -> Optional[float]:
+    total = 0.0
+    found = False
+    for name in names:
+        val = _parse_number(_first_field(row, [name]))
+        if val is not None and val > 0:
+            total += val
+            found = True
+    return total if found else None
+
+
+def _resolve_quantity(row: dict, cfg: dict) -> Optional[float]:
+    direct = _parse_number(_first_field(row, cfg.get("quantity_fields", [])))
+    if direct is not None and direct > 0:
+        return direct
+
+    for group in cfg.get("tou_sum_field_groups") or []:
+        summed = _sum_fields(row, group)
+        if summed is not None and summed > 0:
+            return summed
+
+    for group in cfg.get("mj_sum_field_groups") or []:
+        summed_mj = _sum_fields(row, group)
+        if summed_mj is not None and summed_mj > 0:
+            return summed_mj / 1000.0
+
+    for mj_field in cfg.get("mj_fields") or []:
+        mj = _parse_number(_first_field(row, [mj_field]))
+        if mj is not None and mj > 0:
+            return mj / 1000.0
+
     return None
 
 
@@ -195,7 +310,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
     if not source_row_id:
         return EtlRowResult("", "", {}, True, "missing airtable record_id")
 
-    quantity = _parse_number(_first_field(row, cfg["quantity_fields"]))
+    quantity = _resolve_quantity(row, cfg)
     if quantity is None or quantity <= 0:
         return EtlRowResult(source_row_id, "", {}, True, "missing or zero quantity")
 
@@ -232,6 +347,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
             "uncertainty_pct": 8,
             "completeness_pct": 85,
             "flags": ["etl_from_airtable", f"utility:{ctx.utility_type}"],
+            "quantity_source": "airtable_invoice_etl",
         },
         "notes": f"ETL from Airtable invoice row {source_row_id}",
     }

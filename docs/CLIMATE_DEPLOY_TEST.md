@@ -20,6 +20,7 @@ Use this after deploying **text_agent_backend** and **text_agent_interface** wit
 | `AIRTABLE_API_KEY` | ✓ for ETL | Invoice row fetch |
 | `USE_AIRTABLE_DIRECT` | `true` | Direct Airtable mode |
 | `PROGRADE_WEBHOOK_SECRET` | ✓ for drift test | HMAC verify on `/api/webhooks/prograde-drift` |
+| `CLIMATE_ROSTER_SERVICE_KEY` | ✓ for Prograde launcher | Shared with `ACES_ROSTER_SERVICE_KEY` on `prograde-sustainability-dev` |
 
 ```powershell
 gcloud run services update text-agent-backend `
@@ -33,15 +34,19 @@ Tables created automatically on first startup after deploy:
 - `climate_activity_records`
 - `climate_ingest_runs`
 
-## Interface env (optional)
+## Interface env (Climate iframe only — **not** backend)
 
-Build arg or `.env.local`:
+`NEXT_PUBLIC_SUSTAINABILITY_PLATFORM_URL` is **interface only**. The backend does not use it.
+
+**Cloud Run:** baked in at **Docker build** via `cloudbuild.yaml` + `Dockerfile` (runtime env on Cloud Run is too late for `NEXT_PUBLIC_*`).
+
+**Local:** `.env.local`:
 
 ```bash
-NEXT_PUBLIC_SUSTAINABILITY_PLATFORM_URL=https://prograde-climate-dev-672026052958.australia-southeast2.run.app
+NEXT_PUBLIC_SUSTAINABILITY_PLATFORM_URL=https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app
 ```
 
-Omit to use the dev default baked into `ClimateTab.tsx`.
+Current dev Prograde service: `prograde-sustainability-dev` → URL above (`/ready` must return `ok`).
 
 ---
 

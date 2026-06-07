@@ -174,6 +174,52 @@ def upsert_activity_record(
     return row, created
 
 
+def list_climate_roster(
+    db: Session,
+    *,
+    query: Optional[str] = None,
+    limit: int = 200,
+) -> list[dict]:
+    """CRM clients with reporting_entity set — for Prograde launcher."""
+    from sqlalchemy import func
+
+    from models import Client
+
+    q = (
+        db.query(Client)
+        .filter(Client.reporting_entity.isnot(None))
+        .filter(Client.reporting_entity != "")
+    )
+    if query and query.strip():
+        pattern = f"%{query.strip()}%"
+        q = q.filter(Client.business_name.ilike(pattern))
+
+    clients = q.order_by(Client.business_name.asc()).limit(max(1, min(limit, 500))).all()
+    out: list[dict] = []
+    for client in clients:
+        entity_id = (client.reporting_entity or "").strip().lower()
+        if not entity_id:
+            continue
+        activity_count = (
+            db.query(func.count(ClimateActivityRecord.id))
+            .filter(ClimateActivityRecord.client_id == client.id)
+            .scalar()
+            or 0
+        )
+        out.append(
+            {
+                "aces_client_id": client.id,
+                "business_name": client.business_name,
+                "reporting_entity": entity_id,
+                "stage": client.stage,
+                "owner_email": client.owner_email,
+                "loa_record_id": client.external_business_id,
+                "activity_record_count": int(activity_count),
+            }
+        )
+    return out
+
+
 def list_activity_records(
     db: Session,
     *,
