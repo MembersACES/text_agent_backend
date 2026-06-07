@@ -9551,6 +9551,17 @@ def _client_manual_activity_offer_display(
     return " · ".join(parts) if parts else (n or "—")
 
 
+def _report_actor_email(user_data: dict) -> str:
+    """Email of the authenticated user for activity report filters."""
+    idinfo = user_data.get("idinfo") or {}
+    email = (idinfo.get("email") or "").strip()
+    if not email:
+        user = user_data.get("user")
+        if user is not None:
+            email = (getattr(user, "email", None) or "").strip()
+    return email.lower()
+
+
 def _client_manual_row_to_report_item(
     row: ClientManualActivity,
     business_name: Optional[str],
@@ -9628,6 +9639,7 @@ def activities_report_client_manual(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9640,6 +9652,12 @@ def activities_report_client_manual(
     q = db.query(ClientManualActivity, Client).join(Client, ClientManualActivity.client_id == Client.id)
     if client_id is not None:
         q = q.filter(ClientManualActivity.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            q = q.filter(func.lower(ClientManualActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9803,6 +9821,7 @@ def activities_report_list(
     activity_type: Optional[str] = Query(None, description="Filter by activity type"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9820,6 +9839,12 @@ def activities_report_list(
         query = query.filter(Offer.client_id == client_id)
     if activity_type is not None and activity_type.strip():
         query = query.filter(OfferActivity.activity_type == activity_type.strip())
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(OfferActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9938,6 +9963,7 @@ def activities_report_tasks(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only task events performed by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9954,6 +9980,12 @@ def activities_report_tasks(
     )
     if client_id is not None:
         query = query.filter(Task.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(TaskHistory.user_email) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
