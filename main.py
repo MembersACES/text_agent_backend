@@ -63,6 +63,7 @@ from services.climate_store import (
     upsert_activity_record,
 )
 from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
+from services.climate_entity_sources import build_entity_activity_sources
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -797,6 +798,29 @@ def get_climate_roster(
         "clients": clients,
         "source": "database",
     }
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources")
+def get_climate_entity_activity_sources(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label for ETL preview"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """
+    LOA linked utilities + Airtable invoice samples + ETL preview + staged SQL activity
+  for a reporting_entity. Prograde Scope 1/2 integration review (Marcus raw dump).
+    """
+    payload = build_entity_activity_sources(
+        db,
+        entity_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
 
 
 @app.get("/api/climate/drift-events")
