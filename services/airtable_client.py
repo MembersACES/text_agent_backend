@@ -453,6 +453,81 @@ def _normalize_contract_end_date(value: Any) -> Optional[str]:
     return None
 
 
+def _normalize_drive_folder_id(raw: Any) -> str:
+    """Normalize a Drive folder cell (raw ID or URL) to a canonical folder ID string."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        m = re.search(r"/folders/([a-zA-Z0-9_-]+)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", s)
+        if m:
+            return m.group(1)
+        return ""
+    # Raw folder ID (may include trailing path fragments)
+    return s.split("/", 1)[0].strip()
+
+
+def list_all_loa_records() -> list[dict]:
+    """
+    List all LOA Business Details records with fields needed for sheet reconciliation.
+    Returns dicts: record_id, business_name, trading_as, abn, drive_folder_id.
+    Uses pagination (offset) on LOA_TABLE_ID.
+    """
+    if not AIRTABLE_API_KEY:
+        logger.warning("[list_all_loa_records] AIRTABLE_API_KEY not set")
+        return []
+    out: list[dict] = []
+    try:
+        print("[airtable] list_all_loa_records: fetching LOA Business Details...", flush=True)
+        offset: Optional[str] = None
+        page = 0
+        max_pages = 100
+        while page < max_pages:
+            page += 1
+            params: dict[str, Any] = {"pageSize": 100}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(
+                _url(LOA_TABLE_ID),
+                headers=_headers(),
+                params=params,
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+            records = data.get("records", [])
+            for rec in records:
+                rid = (rec.get("id") or "").strip()
+                fields = rec.get("fields") or {}
+                folder_raw = fields.get("File ID Google Drive Client Folder")
+                out.append({
+                    "record_id": rid,
+                    "business_name": (fields.get("Business Name") or "").strip(),
+                    "trading_as": (fields.get("Trading As") or "").strip(),
+                    "abn": (fields.get("Business ABN") or "").strip(),
+                    "drive_folder_id": _normalize_drive_folder_id(folder_raw),
+                })
+            next_offset = data.get("offset")
+            print(
+                f"[airtable] list_all_loa_records: page {page} -> {len(records)} records "
+                f"(total so far: {len(out)}), next_offset={bool(next_offset)}",
+                flush=True,
+            )
+            if not next_offset:
+                break
+            offset = next_offset
+        logger.info("[list_all_loa_records] fetched %s records in %s page(s)", len(out), page)
+    except requests.RequestException as e:
+        logger.warning("[list_all_loa_records] Airtable request failed: %s", e)
+    print(f"[airtable] list_all_loa_records -> {len(out)} records", flush=True)
+    return out
+
+
 def list_all_utility_records(utility_type: str) -> list[dict]:
     """
     List all records from the Airtable table for the given utility type.

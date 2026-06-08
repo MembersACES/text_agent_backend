@@ -38,6 +38,11 @@ class Client(Base):
     # Sustainability reporting: A1 entity_id slug (many CRM clients may share one value)
     reporting_entity = Column(String(128), nullable=True, index=True)
 
+    # Signed-via-ACES contract flag (synced from FILE_IDS sheet; does not drive stage)
+    has_signed_contract = Column(Integer, nullable=False, default=0)  # 0=no, 1=yes
+    signed_contract_utilities = Column(JSON_COLUMN_TYPE, nullable=True)  # JSON array of utility labels
+    signed_contract_checked_at = Column(DateTime, nullable=True)
+
 
 class ClientReferral(Base):
     """

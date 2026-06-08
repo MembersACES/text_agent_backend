@@ -235,8 +235,11 @@ class ClientResponse(BaseModel):
     advocacy_meeting_time: Optional[str] = None  # e.g. "11:03 AM"
     advocacy_meeting_completed: Optional[bool] = False
     reporting_entity: Optional[str] = None  # A1 entity_id slug for sustainability disclosures
+    has_signed_contract: bool = False
+    signed_contract_utilities: Optional[list[str]] = None
+    signed_contract_checked_at: Optional[datetime] = None
 
-    @field_serializer("created_at", "updated_at", "stage_changed_at")
+    @field_serializer("created_at", "updated_at", "stage_changed_at", "signed_contract_checked_at")
     def serialize_datetime(self, dt: Optional[datetime], _info):
         if dt is None:
             return None
@@ -274,6 +277,35 @@ class ClientResponse(BaseModel):
         if isinstance(v, int):
             return bool(v)
         return False
+
+    @field_validator("has_signed_contract", mode="before")
+    @classmethod
+    def _has_signed_contract_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return False
+
+    @field_validator("signed_contract_utilities", mode="before")
+    @classmethod
+    def _signed_contract_utilities_list(cls, v: Optional[object]) -> Optional[list[str]]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            try:
+                import json
+
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
 
     class Config:
         from_attributes = True

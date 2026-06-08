@@ -202,6 +202,36 @@ def init_db():
     except Exception as e:
         logging.warning("Could not ensure clients.reporting_entity column: %s", e)
 
+    # Clients: signed-via-ACES contract flag (sheet sync; does not change stage)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "has_signed_contract" not in cols:
+                logging.info("Adding missing clients.has_signed_contract column")
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("ALTER TABLE clients ADD COLUMN has_signed_contract INTEGER NOT NULL DEFAULT 0")
+                    )
+                logging.info("✅ Added clients.has_signed_contract column")
+            if "signed_contract_utilities" not in cols:
+                logging.info("Adding missing clients.signed_contract_utilities column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN signed_contract_utilities TEXT"))
+                logging.info("✅ Added clients.signed_contract_utilities column")
+            if "signed_contract_checked_at" not in cols:
+                logging.info("Adding missing clients.signed_contract_checked_at column")
+                ts_type = "TIMESTAMP" if DB_TYPE == "postgresql" else "DATETIME"
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE clients ADD COLUMN signed_contract_checked_at {ts_type}"
+                        )
+                    )
+                logging.info("✅ Added clients.signed_contract_checked_at column")
+    except Exception as e:
+        logging.warning("Could not ensure clients signed contract columns: %s", e)
+
     # Pudu consumables: lifecycle tracking fields for replacement planning.
     try:
         insp = inspect(engine)

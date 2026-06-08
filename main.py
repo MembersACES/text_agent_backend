@@ -7280,6 +7280,10 @@ def list_clients(
     created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
     reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
+    signed_not_promoted: Optional[bool] = Query(
+        None,
+        description="If true, only clients with has_signed_contract and stage lead or qualified",
+    ),
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
@@ -7306,6 +7310,11 @@ def list_clients(
             base_query = base_query.filter(Client.owner_email == user_email)
     if reporting_entity is not None and reporting_entity.strip():
         base_query = base_query.filter(Client.reporting_entity == reporting_entity.strip().lower())
+    if signed_not_promoted:
+        base_query = base_query.filter(
+            Client.has_signed_contract == 1,
+            Client.stage.in_(["lead", "qualified"]),
+        )
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9696,6 +9705,56 @@ def clients_offer_counts(
         .all()
     )
     return {str(client_id): count for client_id, count in rows}
+
+
+def _require_aces_staff(user_data: dict = Depends(get_current_user_with_db)) -> dict:
+    """Internal diagnostics: same Google auth as CRM, restricted to ACES staff domain."""
+    email = ((user_data.get("idinfo") or {}).get("email") or "").strip().lower()
+    if not email.endswith("@acesolutions.com.au"):
+        raise HTTPException(status_code=403, detail="ACES staff access required")
+    return user_data
+
+
+@app.get("/api/admin/signed-contract-dry-run")
+def signed_contract_dry_run(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Read-only diagnostic: Signed via ACES contract status vs CRM client stage.
+    Bulk-reads FILE_IDS sheet once; no DB or sheet writes.
+    """
+    from services.signed_contract_dry_run import run_signed_contract_dry_run
+
+    logging.info(
+        "signed-contract-dry-run requested by %s",
+        (user_data.get("idinfo") or {}).get("email"),
+    )
+    try:
+        return run_signed_contract_dry_run(db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/api/admin/sync-signed-contracts")
+def sync_signed_contracts(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Sync has_signed_contract from FILE_IDS sheet for all CRM clients.
+    Updates flags only — never changes client stage.
+    """
+    from services.signed_contract_dry_run import recompute_signed_contracts
+
+    logging.info(
+        "sync-signed-contracts requested by %s",
+        (user_data.get("idinfo") or {}).get("email"),
+    )
+    try:
+        return recompute_signed_contracts(db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.get("/api/reports/pipeline/summary")
