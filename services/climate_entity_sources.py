@@ -188,6 +188,61 @@ def _etl_preview(
     }
 
 
+def _resolve_loa_for_client(
+    client: Client,
+    *,
+    airtable_configured: bool,
+) -> tuple[Optional[dict], Optional[str]]:
+    loa_record_id = (client.external_business_id or "").strip() or None
+    if not airtable_configured:
+        return None, loa_record_id
+    loa_record = None
+    if loa_record_id:
+        loa_record = airtable_client.get_loa_record_by_id(loa_record_id)
+    if not loa_record and client.business_name:
+        loa_record = airtable_client.get_loa_record_by_business_name(client.business_name)
+    if loa_record:
+        loa_record_id = loa_record.get("id") or loa_record_id
+    return loa_record, loa_record_id
+
+
+def _merge_loa_utility_maps(
+    linked_utilities: dict,
+    utility_retailers: dict,
+    linked_utility_extra: dict,
+    new_linked: dict,
+    new_retailers: dict,
+    new_extra: dict,
+) -> None:
+    for app_key, identifiers in (new_linked or {}).items():
+        if not isinstance(identifiers, list):
+            continue
+        existing_ids = linked_utilities.setdefault(app_key, [])
+        existing_retailers = utility_retailers.setdefault(app_key, [])
+        existing_extras = linked_utility_extra.setdefault(app_key, [])
+        seen = {str(x).strip() for x in existing_ids if str(x).strip()}
+        retailers = new_retailers.get(app_key) or []
+        extras = new_extra.get(app_key) or []
+        if not isinstance(retailers, list):
+            retailers = [str(retailers)] if retailers else []
+        if not isinstance(extras, list):
+            extras = []
+        for idx, ident in enumerate(identifiers):
+            ident_str = str(ident or "").strip()
+            if not ident_str or ident_str in seen:
+                continue
+            seen.add(ident_str)
+            existing_ids.append(ident_str)
+            retailer = ""
+            if idx < len(retailers):
+                retailer = str(retailers[idx] or "").strip()
+            extra: dict = {}
+            if idx < len(extras) and isinstance(extras[idx], dict):
+                extra = extras[idx]
+            existing_retailers.append(retailer)
+            existing_extras.append(extra)
+
+
 def build_entity_activity_sources(
     db: Session,
     entity_id: str,
@@ -204,12 +259,13 @@ def build_entity_activity_sources(
     if not slug:
         raise ValueError("entity_id required")
 
-    client = (
+    clients = (
         db.query(Client)
         .filter(Client.reporting_entity == slug)
-        .first()
+        .order_by(Client.id.asc())
+        .all()
     )
-    if not client:
+    if not clients:
         return {
             "found": False,
             "entity_id": slug,
@@ -217,39 +273,50 @@ def build_entity_activity_sources(
             "message": "No CRM client with this reporting_entity",
         }
 
-    linked_utilities: dict = {}
-    utility_retailers: dict = {}
-    linked_utility_extra: dict = {}
-    loa_record_id = (client.external_business_id or "").strip() or None
+    primary_client = clients[0]
     airtable_configured = bool(
         airtable_client.AIRTABLE_API_KEY and getattr(airtable_client, "USE_AIRTABLE_DIRECT", False)
     )
 
+    linked_utilities: dict = {}
+    utility_retailers: dict = {}
+    linked_utility_extra: dict = {}
+    loa_record_ids: list[str] = []
+
     if airtable_configured:
-        loa_record = None
-        if loa_record_id:
-            loa_record = airtable_client._fetch_record(  # noqa: SLF001
-                airtable_client.LOA_TABLE_ID,
-                loa_record_id,
+        for client in clients:
+            loa_record, loa_record_id = _resolve_loa_for_client(
+                client, airtable_configured=airtable_configured
             )
-        if not loa_record and client.business_name:
-            loa_record = airtable_client.get_loa_record_by_business_name(client.business_name)
-        if loa_record:
-            loa_record_id = loa_record.get("id") or loa_record_id
-            linked_utilities, utility_retailers, linked_utility_extra = (
-                airtable_client.get_linked_utility_records(loa_record)
-            )
+            if loa_record_id and loa_record_id not in loa_record_ids:
+                loa_record_ids.append(loa_record_id)
+            if loa_record:
+                new_linked, new_retailers, new_extra = airtable_client.get_linked_utility_records(
+                    loa_record
+                )
+                _merge_loa_utility_maps(
+                    linked_utilities,
+                    utility_retailers,
+                    linked_utility_extra,
+                    new_linked,
+                    new_retailers,
+                    new_extra,
+                )
 
     sites = _sites_from_loa(linked_utilities, utility_retailers, linked_utility_extra)
-    staged_all = list_activity_records(db, client_id=client.id, limit=200)
+    staged_all: list = []
     staged_by_key: dict[str, list[dict]] = {}
-    for row in staged_all:
-        summary = activity_record_to_summary(row)
-        sid = (summary.get("site_id") or "").strip()
-        ut = (summary.get("source_utility_type") or "").strip()
-        if sid and ut:
-            key = f"{ut}|{sid}"
-            staged_by_key.setdefault(key, []).append(summary)
+    for client in clients:
+        for row in list_activity_records(db, client_id=client.id, limit=200):
+            staged_all.append(row)
+            summary = activity_record_to_summary(row)
+            sid = (summary.get("site_id") or "").strip()
+            ut = (summary.get("source_utility_type") or "").strip()
+            if sid and ut:
+                key = f"{ut}|{sid}"
+                staged_by_key.setdefault(key, []).append(summary)
+
+    primary_loa_record_id = loa_record_ids[0] if loa_record_ids else None
 
     utility_bundles: list[dict[str, Any]] = []
     for site in sites:
@@ -274,8 +341,8 @@ def build_entity_activity_sources(
         etl_block = (
             _etl_preview(
                 slug,
-                client.id,
-                loa_record_id,
+                primary_client.id,
+                primary_loa_record_id,
                 ut,
                 ident,
                 fetch_rows,
@@ -288,6 +355,8 @@ def build_entity_activity_sources(
         utility_bundles.append(
             {
                 **site,
+                "aces_client_id": primary_client.id,
+                "loa_record_id": primary_loa_record_id,
                 "airtable_invoices": inv,
                 "etl_preview": etl_block,
                 "staged_activity_records": staged_by_key.get(key, []),
@@ -303,9 +372,11 @@ def build_entity_activity_sources(
         "found": True,
         "entity_id": slug,
         "period": period_label,
-        "aces_client_id": client.id,
-        "business_name": client.business_name,
-        "loa_record_id": loa_record_id,
+        "aces_client_id": primary_client.id,
+        "aces_client_ids": [c.id for c in clients],
+        "business_name": primary_client.business_name,
+        "loa_record_id": primary_loa_record_id,
+        "loa_record_ids": loa_record_ids,
         "airtable_configured": airtable_configured,
         "site_count": len(utility_bundles),
         "staged_activity_record_count": len(staged_all),

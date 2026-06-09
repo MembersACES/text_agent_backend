@@ -145,11 +145,13 @@ from models import (
     ClientStatusNote,
     Client,
     ClientReferral,
+    EntityGroup,
     Offer,
     OfferActivity,
     ClientManualActivity,
     StrategyItem,
     Testimonial,
+    AutonomousSequenceEvent,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
@@ -170,6 +172,9 @@ from schemas import (
     ClientCreate,
     ClientUpdate,
     ClientResponse,
+    EntityGroupCreate,
+    EntityGroupDetailResponse,
+    EntityGroupResponse,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -221,6 +226,7 @@ from services.crm import (
     resolve_offer_for_member_upload,
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
+    enrich_client_response,
 )
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
@@ -1072,6 +1078,7 @@ def get_business_info(
 @app.get("/api/utility-extra")
 def get_utility_extra(
     business_name: str = Query(..., description="Business name to fetch Airtable utility details for"),
+    external_business_id: Optional[str] = Query(None, description="Airtable LOA record id (rec…) — preferred when known"),
     user_info: dict = Depends(verify_google_token),
 ):
     """
@@ -1080,15 +1087,43 @@ def get_utility_extra(
     Returns empty dicts if Airtable is not configured or business not found.
     """
     out = {"linked_utilities": {}, "utility_retailers": {}, "linked_utility_extra": {}}
-    logging.info("[utility-extra] request business_name=%r", business_name)
+    logging.info(
+        "[utility-extra] request business_name=%r external_business_id=%r",
+        business_name,
+        external_business_id,
+    )
     if not getattr(airtable_client, "USE_AIRTABLE_DIRECT", False) or not airtable_client.AIRTABLE_API_KEY:
         logging.info("[utility-extra] skipped: USE_AIRTABLE_DIRECT or AIRTABLE_API_KEY not set")
         return out
     name = (business_name or "").strip()
-    if not name:
+    loa_id = (external_business_id or "").strip()
+    if not name and not loa_id:
         return out
     try:
-        loa_record = airtable_client.get_loa_record_by_business_name(name)
+        loa_record = None
+        if loa_id:
+            loa_record = airtable_client.get_loa_record_by_id(loa_id)
+        else:
+            records = airtable_client.get_loa_records_by_business_name(name)
+            if len(records) == 0:
+                logging.info("[utility-extra] no LOA record found for business_name=%r", name)
+                return out
+            if len(records) > 1:
+                logging.warning(
+                    "[utility-extra] ambiguous LOA lookup for business_name=%r: %s matches",
+                    name,
+                    len(records),
+                )
+                return {
+                    "ambiguous": True,
+                    "candidates": [
+                        airtable_client.loa_record_candidate_summary(rec) for rec in records
+                    ],
+                    "linked_utilities": {},
+                    "utility_retailers": {},
+                    "linked_utility_extra": {},
+                }
+            loa_record = records[0]
         if not loa_record:
             logging.info("[utility-extra] no LOA record found for business_name=%r", name)
             return out
@@ -7232,6 +7267,83 @@ async def check_due_tasks_cron(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
+# ---- CRM: Entity groups (commercial multisite) ----
+
+
+def _entity_group_member_counts(db: Session, group_ids: list[int]) -> dict[int, int]:
+    if not group_ids:
+        return {}
+    rows = (
+        db.query(Client.entity_group_id, func.count(Client.id))
+        .filter(Client.entity_group_id.in_(group_ids))
+        .group_by(Client.entity_group_id)
+        .all()
+    )
+    return {int(gid): int(count) for gid, count in rows}
+
+
+@app.get("/api/entity-groups", response_model=List[EntityGroupResponse])
+def list_entity_groups(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List commercial entity groups with member counts."""
+    groups = db.query(EntityGroup).order_by(EntityGroup.display_name.asc()).all()
+    counts = _entity_group_member_counts(db, [g.id for g in groups])
+    out: List[EntityGroupResponse] = []
+    for group in groups:
+        resp = EntityGroupResponse.model_validate(group)
+        out.append(resp.model_copy(update={"member_count": counts.get(group.id, 0)}))
+    return out
+
+
+@app.post("/api/entity-groups", response_model=EntityGroupResponse)
+def create_entity_group(
+    body: EntityGroupCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create a commercial entity group (explicit assignment only)."""
+    existing = db.query(EntityGroup).filter(EntityGroup.slug == body.slug).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Entity group with this slug already exists")
+    group = EntityGroup(
+        slug=body.slug,
+        display_name=body.display_name.strip(),
+        primary_abn=(body.primary_abn or "").strip() or None,
+        notes=(body.notes or "").strip() or None,
+    )
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    resp = EntityGroupResponse.model_validate(group)
+    return resp.model_copy(update={"member_count": 0})
+
+
+@app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)
+def get_entity_group(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Entity group detail with linked CRM clients."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    members = (
+        db.query(Client)
+        .filter(Client.entity_group_id == group.id)
+        .order_by(Client.business_name.asc())
+        .all()
+    )
+    resp = EntityGroupResponse.model_validate(group)
+    return EntityGroupDetailResponse(
+        **resp.model_copy(update={"member_count": len(members)}).model_dump(),
+        members=[enrich_client_response(db, m) for m in members],
+    )
+
+
 # ---- CRM: Clients, Offers, and Pipeline ----
 
 
@@ -7255,6 +7367,11 @@ def create_client(
             detail="Client with this business name already exists",
         )
 
+    if client.entity_group_id is not None:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+        if not group:
+            raise HTTPException(status_code=400, detail="Entity group not found")
+
     db_client = Client(
         business_name=client.business_name,
         external_business_id=client.external_business_id,
@@ -7263,13 +7380,14 @@ def create_client(
         stage=client.stage or "lead",
         owner_email=client.owner_email or (user_data.get("idinfo") or {}).get("email"),
         reporting_entity=client.reporting_entity,
+        entity_group_id=client.entity_group_id,
     )
     db.add(db_client)
     db.commit()
     db.refresh(db_client)
 
     logging.info(f"Client created with id {db_client.id}")
-    return db_client
+    return enrich_client_response(db, db_client)
 
 
 @app.get("/api/clients")
@@ -7280,6 +7398,7 @@ def list_clients(
     created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
     reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
+    entity_group: Optional[str] = Query(None, description="Filter by commercial entity group slug (exact match)"),
     signed_not_promoted: Optional[bool] = Query(
         None,
         description="If true, only clients with has_signed_contract and stage lead or qualified",
@@ -7308,9 +7427,14 @@ def list_clients(
         user_email = (user_data.get("idinfo") or {}).get("email")
         if user_email:
             base_query = base_query.filter(Client.owner_email == user_email)
-    if reporting_entity is not None and reporting_entity.strip():
+    if isinstance(reporting_entity, str) and reporting_entity.strip():
         base_query = base_query.filter(Client.reporting_entity == reporting_entity.strip().lower())
-    if signed_not_promoted:
+    if isinstance(entity_group, str) and entity_group.strip():
+        normalized_group = entity_group.strip().lower()
+        base_query = base_query.join(EntityGroup, Client.entity_group_id == EntityGroup.id).filter(
+            EntityGroup.slug == normalized_group
+        )
+    if signed_not_promoted is True:
         base_query = base_query.filter(
             Client.has_signed_contract == 1,
             Client.stage.in_(["lead", "qualified"]),
@@ -7335,10 +7459,10 @@ def list_clients(
         off = offset or 0
         lim = limit or 20
         clients = ordered.offset(off).limit(lim).all()
-        items = [ClientResponse.model_validate(c).model_dump(mode="json") for c in clients]
+        items = [enrich_client_response(db, c).model_dump(mode="json") for c in clients]
         return JSONResponse(content={"items": items, "total": total})
     clients = ordered.all()
-    return [ClientResponse.model_validate(c) for c in clients]
+    return [enrich_client_response(db, c) for c in clients]
 
 
 @app.get("/api/clients/export")
@@ -7411,12 +7535,7 @@ def get_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    resp = ClientResponse.model_validate(client)
-    if getattr(client, "referred_by_client_id", None):
-        advocate = db.query(Client).filter(Client.id == client.referred_by_client_id).first()
-        if advocate:
-            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
-    return resp
+    return enrich_client_response(db, client)
 
 
 @app.patch("/api/clients/{client_id}", response_model=ClientResponse)
@@ -7464,6 +7583,12 @@ def update_client(
         db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
     if "reporting_entity" in update_payload:
         db_client.reporting_entity = client_update.reporting_entity
+    if "entity_group_id" in update_payload:
+        if client_update.entity_group_id is not None:
+            group = db.query(EntityGroup).filter(EntityGroup.id == client_update.entity_group_id).first()
+            if not group:
+                raise HTTPException(status_code=400, detail="Entity group not found")
+        db_client.entity_group_id = client_update.entity_group_id
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
@@ -7471,12 +7596,7 @@ def update_client(
     db.commit()
     db.refresh(db_client)
     logging.info(f"Client {client_id} updated")
-    resp = ClientResponse.model_validate(db_client)
-    if getattr(db_client, "referred_by_client_id", None):
-        advocate = db.query(Client).filter(Client.id == db_client.referred_by_client_id).first()
-        if advocate:
-            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
-    return resp
+    return enrich_client_response(db, db_client)
 
 
 @app.get("/api/clients/{client_id}/referrals", response_model=List[ClientReferralResponse])
@@ -7594,7 +7714,7 @@ def delete_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # 1) Offers and offer activities
+    # 1) Offers and dependent rows (mirror delete_offer + strategy/automation links)
     offer_ids = [
         o.id
         for o in db.query(Offer.id)
@@ -7602,9 +7722,41 @@ def delete_client(
         .all()
     ]
     if offer_ids:
+        activity_ids = [
+            a.id
+            for a in db.query(OfferActivity)
+            .filter(OfferActivity.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if activity_ids:
+            db.query(StrategyItem).filter(
+                StrategyItem.offer_activity_id.in_(activity_ids)
+            ).delete(synchronize_session=False)
+        db.query(StrategyItem).filter(StrategyItem.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+        run_ids = [
+            r.id
+            for r in db.query(AutonomousSequenceRun)
+            .filter(AutonomousSequenceRun.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if run_ids:
+            db.query(AutonomousSequenceEvent).filter(
+                AutonomousSequenceEvent.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceStep).filter(
+                AutonomousSequenceStep.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceRun).filter(
+                AutonomousSequenceRun.id.in_(run_ids)
+            ).delete(synchronize_session=False)
         db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
             synchronize_session=False
         )
+        db.query(ClientStatusNote).filter(
+            ClientStatusNote.related_offer_id.in_(offer_ids)
+        ).delete(synchronize_session=False)
     # Also remove any activities that reference this client directly
     db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
         synchronize_session=False
@@ -7612,6 +7764,25 @@ def delete_client(
     db.query(Offer).filter(Offer.client_id == client_id).delete(
         synchronize_session=False
     )
+    db.query(StrategyItem).filter(StrategyItem.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    client_run_ids = [
+        r.id
+        for r in db.query(AutonomousSequenceRun)
+        .filter(AutonomousSequenceRun.client_id == client_id)
+        .all()
+    ]
+    if client_run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceRun).filter(
+            AutonomousSequenceRun.id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
 
     # 2) Tasks and task history
     task_ids = [
@@ -9736,23 +9907,32 @@ def signed_contract_dry_run(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
+class SyncSignedContractsRequest(BaseModel):
+    promote_signed: bool = Field(
+        False,
+        description="If true, promote signed lead/qualified members to existing_client after flag sync",
+    )
+
+
 @app.post("/api/admin/sync-signed-contracts")
 def sync_signed_contracts(
+    body: SyncSignedContractsRequest = SyncSignedContractsRequest(),
     db: Session = Depends(get_db),
     user_data: dict = Depends(_require_aces_staff),
 ):
     """
     Sync has_signed_contract from FILE_IDS sheet for all CRM clients.
-    Updates flags only — never changes client stage.
+    By default updates flags only; optional promote_signed promotes signed lead/qualified rows.
     """
     from services.signed_contract_dry_run import recompute_signed_contracts
 
     logging.info(
-        "sync-signed-contracts requested by %s",
+        "sync-signed-contracts requested by %s promote_signed=%s",
         (user_data.get("idinfo") or {}).get("email"),
+        body.promote_signed,
     )
     try:
-        return recompute_signed_contracts(db)
+        return recompute_signed_contracts(db, promote_signed=body.promote_signed)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 

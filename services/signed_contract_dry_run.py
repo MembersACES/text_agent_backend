@@ -396,10 +396,13 @@ def match_clients_to_sheet(
     return matches
 
 
-def recompute_signed_contracts(db: Session) -> dict[str, Any]:
+def recompute_signed_contracts(
+    db: Session, *, promote_signed: bool = False
+) -> dict[str, Any]:
     """
     Bulk-read FILE_IDS sheet once; update has_signed_contract on all clients.
-    Never changes client stage. Idempotent.
+    By default never changes client stage. When promote_signed=True, members who are
+    signed via ACES and still lead/qualified are promoted to existing_client.
     """
     sheet_rows, sheet_meta = read_data_from_airtable_tab()
     client_dicts = load_clients(db)
@@ -416,6 +419,7 @@ def recompute_signed_contracts(db: Session) -> dict[str, Any]:
     newly_signed_lead_or_qualified = 0
     flagged_matched_by_id = 0
     flagged_matched_by_name = 0
+    promoted_to_existing = 0
 
     for client in clients:
         m = match_by_client_id.get(client.id)
@@ -440,7 +444,12 @@ def recompute_signed_contracts(db: Session) -> dict[str, Any]:
                 flagged_matched_by_name += 1
             stage = (client.stage or "lead").strip()
             if stage in ("lead", "qualified"):
-                signed_lead_or_qualified += 1
+                if promote_signed:
+                    client.stage = "existing_client"
+                    client.stage_changed_at = now
+                    promoted_to_existing += 1
+                else:
+                    signed_lead_or_qualified += 1
             if not prev_flags.get(client.id):
                 newly_flagged += 1
                 if stage in ("lead", "qualified"):
@@ -458,6 +467,7 @@ def recompute_signed_contracts(db: Session) -> dict[str, Any]:
         "signed_but_lead_or_qualified": signed_lead_or_qualified,
         "newly_flagged": newly_flagged,
         "newly_signed_but_lead_or_qualified": newly_signed_lead_or_qualified,
+        "promoted_to_existing": promoted_to_existing,
         "flagged_matched_by_id": flagged_matched_by_id,
         "flagged_matched_by_name": flagged_matched_by_name,
         "join_stats": {

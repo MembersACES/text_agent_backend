@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 from database import Base
-from models import Client, Offer
+from models import Client, Offer, StrategyItem
 from schemas import ClientCreate, ClientUpdate, OfferCreate
 from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request, list_clients, update_client
 from services.crm import (
@@ -168,6 +168,29 @@ def test_get_business_info_upsert_respects_external_business_id():
     assert second.external_business_id == "airtable-123"
     assert second.primary_contact_email == "second@example.com"
     assert second.gdrive_folder_url == "https://drive.example/folder"
+
+
+def test_upsert_auto_resolves_external_business_id_on_single_loa_match():
+    from unittest.mock import patch
+    from services import airtable_client
+
+    db = _make_test_session()
+    with patch.object(airtable_client, "USE_AIRTABLE_DIRECT", True):
+        with patch.object(airtable_client, "AIRTABLE_API_KEY", "test-key"):
+            with patch.object(
+                airtable_client,
+                "resolve_loa_record_id",
+                return_value="recSolo123",
+            ):
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name="Solo Site",
+                    external_business_id=None,
+                    primary_contact_email=None,
+                    gdrive_folder_url=None,
+                )
+    assert client is not None
+    assert client.external_business_id == "recSolo123"
 
 
 def test_bulk_update_clients_assign_owner_only():
@@ -496,3 +519,36 @@ def test_list_clients_filters_by_reporting_entity():
     )
     names = {c.business_name for c in matches}
     assert names == {"Member One", "Member Two"}
+
+
+def test_delete_client_removes_offers_and_strategy_items():
+    from main import delete_client
+
+    db = _make_test_session()
+    client = _make_client(db, business_name="Delete Me Co")
+    offer = Offer(
+        client_id=client.id,
+        business_name=client.business_name,
+        status=OfferStatus.REQUESTED.value,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(offer)
+    db.commit()
+    db.refresh(offer)
+    db.add(
+        StrategyItem(
+            client_id=client.id,
+            year=2026,
+            section="in_progress",
+            row_index=0,
+            offer_id=offer.id,
+        )
+    )
+    db.commit()
+
+    delete_client(client_id=client.id, db=db, user_data={"idinfo": {"email": "test@acesolutions.com.au"}})
+
+    assert db.query(Client).filter(Client.id == client.id).first() is None
+    assert db.query(Offer).filter(Offer.client_id == client.id).count() == 0
+    assert db.query(StrategyItem).filter(StrategyItem.client_id == client.id).count() == 0
