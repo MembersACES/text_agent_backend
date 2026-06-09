@@ -7,8 +7,8 @@ from sqlalchemy.orm import sessionmaker
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 from database import Base
 from models import Client, Offer
-from schemas import ClientCreate, OfferCreate
-from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request
+from schemas import ClientCreate, ClientUpdate, OfferCreate
+from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request, list_clients, update_client
 from services.crm import (
     update_offer_status_and_propagate_client_stage,
     upsert_client_from_business_info,
@@ -414,3 +414,85 @@ def test_create_offer_activity_signed_engagement_accepts_offer_and_updates_clien
 
     assert offer.status == OfferStatus.ACCEPTED.value
     assert client.stage == ClientStage.WON.value
+
+
+def test_reporting_entity_normalizes_on_create():
+    client = ClientCreate(business_name="Group Co", reporting_entity="  Reddrop-Group  ")
+    assert client.reporting_entity == "reddrop-group"
+
+    cleared = ClientCreate(business_name="Solo Co", reporting_entity="   ")
+    assert cleared.reporting_entity is None
+
+
+def test_reporting_entity_rejects_invalid_slug():
+    from pydantic import ValidationError
+
+    for bad in ("bad slug", "bad_slug", "-leading", "trailing-", "double--hyphen", "a" * 129):
+        try:
+            ClientCreate(business_name="X", reporting_entity=bad)
+            assert False, f"Expected ValidationError for {bad!r}"
+        except ValidationError:
+            pass
+
+
+def test_update_client_sets_and_clears_reporting_entity():
+    db = _make_test_session()
+    client = _make_client(db, business_name="Member A")
+    user = {"idinfo": {"email": "admin@example.com"}}
+
+    updated = update_client(
+        client_id=client.id,
+        client_update=ClientUpdate(reporting_entity="Reddrop-Group"),
+        db=db,
+        user_data=user,
+    )
+    assert updated.reporting_entity == "reddrop-group"
+
+    db.refresh(client)
+    assert client.reporting_entity == "reddrop-group"
+
+    cleared = update_client(
+        client_id=client.id,
+        client_update=ClientUpdate(reporting_entity=None),
+        db=db,
+        user_data=user,
+    )
+    assert cleared.reporting_entity is None
+    db.refresh(client)
+    assert client.reporting_entity is None
+
+
+def test_list_clients_filters_by_reporting_entity():
+    db = _make_test_session()
+    c1 = _make_client(db, business_name="Member One")
+    c2 = _make_client(db, business_name="Member Two")
+    c3 = _make_client(db, business_name="Unlinked")
+
+    user = {"idinfo": {"email": "admin@example.com"}}
+    update_client(
+        client_id=c1.id,
+        client_update=ClientUpdate(reporting_entity="reddrop-group"),
+        db=db,
+        user_data=user,
+    )
+    update_client(
+        client_id=c2.id,
+        client_update=ClientUpdate(reporting_entity="reddrop-group"),
+        db=db,
+        user_data=user,
+    )
+
+    matches = list_clients(
+        query=None,
+        stage=None,
+        created_after=None,
+        created_before=None,
+        mine=None,
+        reporting_entity="Reddrop-Group",
+        limit=None,
+        offset=None,
+        db=db,
+        user_data=user,
+    )
+    names = {c.business_name for c in matches}
+    assert names == {"Member One", "Member Two"}

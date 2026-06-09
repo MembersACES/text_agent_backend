@@ -35,6 +35,14 @@ class Client(Base):
     advocacy_meeting_time = Column(String(20), nullable=True)  # e.g. "11:03 AM"
     advocacy_meeting_completed = Column(Integer, nullable=False, default=0)  # 0=no, 1=yes
 
+    # Sustainability reporting: A1 entity_id slug (many CRM clients may share one value)
+    reporting_entity = Column(String(128), nullable=True, index=True)
+
+    # Signed-via-ACES contract flag (synced from FILE_IDS sheet; does not drive stage)
+    has_signed_contract = Column(Integer, nullable=False, default=0)  # 0=no, 1=yes
+    signed_contract_utilities = Column(JSON_COLUMN_TYPE, nullable=True)  # JSON array of utility labels
+    signed_contract_checked_at = Column(DateTime, nullable=True)
+
 
 class ClientReferral(Base):
     """
@@ -436,3 +444,69 @@ class AutonomousSequenceTemplateStep(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     template = relationship("AutonomousSequenceTemplate", back_populates="steps")
+
+
+# --- Climate / sustainability (Prograde integration) — separate tables, no CRM schema changes ---
+
+
+class ClimateDriftEvent(Base):
+    """Persisted Prograde DRIFT_EVENT v1 webhooks (G1 badges, PC4 audit trail)."""
+
+    __tablename__ = "climate_drift_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(String(128), nullable=False, unique=True, index=True)
+    event_type = Column(String(64), nullable=True, index=True)
+    severity = Column(String(32), nullable=True, index=True)
+    emitted_at = Column(DateTime, nullable=True)
+    affected_scope = Column(String(32), nullable=True)
+    affected_entity_ids_json = Column(Text, nullable=True)
+    payload_json = Column(Text, nullable=False)
+    received_at = Column(DateTime, server_default=func.now(), nullable=False)
+    acknowledged_at = Column(DateTime, nullable=True)
+    acknowledged_by = Column(String(255), nullable=True)
+
+
+class ClimateActivityRecord(Base):
+    """B4-boundary ActivityRecord v1 rows staged before Prograde ingest (post-Tuesday)."""
+
+    __tablename__ = "climate_activity_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    record_id = Column(String(128), nullable=False, unique=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=True, index=True)
+    entity_id = Column(String(128), nullable=False, index=True)
+    site_id = Column(String(128), nullable=True, index=True)
+    loa_client_id = Column(String(64), nullable=True, index=True)
+    activity_type = Column(String(64), nullable=False, index=True)
+    scope = Column(Integer, nullable=False)
+    reporting_period_start = Column(Date, nullable=False)
+    reporting_period_end = Column(Date, nullable=False)
+    quantity = Column(Float, nullable=True)
+    unit = Column(String(32), nullable=True)
+    status = Column(String(32), nullable=False, default="draft")
+    source_system = Column(String(64), nullable=False, default="airtable_invoice")
+    source_utility_type = Column(String(64), nullable=True)
+    source_row_id = Column(String(64), nullable=True, index=True)
+    body_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ClimateIngestRun(Base):
+    """ETL batch log: Airtable invoice rows → climate_activity_records."""
+
+    __tablename__ = "climate_ingest_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
+    utility_type = Column(String(64), nullable=False)
+    identifier = Column(String(128), nullable=False)
+    reporting_period_start = Column(Date, nullable=False)
+    reporting_period_end = Column(Date, nullable=False)
+    records_created = Column(Integer, nullable=False, default=0)
+    records_updated = Column(Integer, nullable=False, default=0)
+    records_skipped = Column(Integer, nullable=False, default=0)
+    status = Column(String(32), nullable=False, default="completed")
+    diagnostics_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)

@@ -8,7 +8,7 @@ _backend_env = Path(__file__).resolve().parent / ".env"
 if _backend_env.is_file():
     load_dotenv(_backend_env, override=True)
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status, Request
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
@@ -21,7 +21,6 @@ import tempfile
 import requests
 import re
 import copy
-from google.auth.transport.requests import Request
 from urllib.parse import urlparse, parse_qs
 import os
 import sys
@@ -52,6 +51,19 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_keys,
 )
 from services import airtable_client
+from services.prograde_drift_webhook import get_nonce_cache, verify_signature
+from services.climate_store import (
+    activity_record_to_summary,
+    create_ingest_run,
+    drift_event_to_dict,
+    list_activity_records,
+    list_climate_roster,
+    list_drift_events,
+    save_drift_event,
+    upsert_activity_record,
+)
+from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
+from services.climate_entity_sources import build_entity_activity_sources
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -324,8 +336,14 @@ CORS_ORIGINS = [
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
+    "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
 
@@ -665,6 +683,326 @@ async def utility_linked_webhook(
         "ok": True,
         "message": "utility-linked placeholder accepted",
         "utility_type": request_body.utility_type,
+    }
+
+
+@app.post("/api/webhooks/prograde-drift")
+async def prograde_drift_webhook(
+    request: StarletteRequest,
+    db: Session = Depends(get_db),
+    x_prograde_signature: Annotated[Optional[str], Header(alias="X-Prograde-Signature")] = None,
+    x_prograde_event: Annotated[Optional[str], Header(alias="X-Prograde-Event")] = None,
+    x_prograde_delivery: Annotated[Optional[str], Header(alias="X-Prograde-Delivery")] = None,
+):
+    """
+    Inbound Prograde DRIFT_EVENT v1 (DRIFT_EVENT_v1.md §4.2).
+    Verifies HMAC, dedupes on event_id, persists to climate_drift_events (plus in-memory cache for dev).
+    """
+    secret = os.getenv("PROGRADE_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PROGRADE_WEBHOOK_SECRET not configured")
+
+    raw_body = await request.body()
+    if not x_prograde_signature:
+        raise HTTPException(status_code=400, detail="missing signature")
+
+    verified = verify_signature(raw_body, x_prograde_signature, secret)
+    if not verified.ok:
+        logging.warning("[prograde-drift] signature rejected: %s", verified.reason)
+        raise HTTPException(status_code=401, detail=verified.reason)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="schema mismatch: body must be object")
+
+    event_id = str(payload.get("event_id") or x_prograde_delivery or "").strip()
+    if event_id and not get_nonce_cache().check_and_store(event_id):
+        logging.info("[prograde-drift] duplicate event_id=%s", event_id[:24])
+        raise HTTPException(status_code=409, detail="duplicate event_id")
+
+    entry = {
+        "received_at": time.time(),
+        "event_id": event_id,
+        "event_type": payload.get("event_type") or x_prograde_event,
+        "severity": payload.get("severity"),
+        "standard": payload.get("standard"),
+        "payload": payload,
+    }
+    _prograde_drift_events.append(entry)
+    if len(_prograde_drift_events) > 500:
+        del _prograde_drift_events[: len(_prograde_drift_events) - 500]
+
+    try:
+        save_drift_event(db, payload)
+    except Exception:
+        logging.exception("[prograde-drift] failed to persist to climate_drift_events")
+
+    logging.info(
+        "[prograde-drift] accepted event_id=%s type=%s",
+        event_id[:24] if event_id else "?",
+        entry.get("event_type"),
+    )
+    return {"ok": True, "event_id": event_id}
+
+
+_prograde_drift_events: list[dict] = []
+
+
+def verify_roster_access(
+    authorization: Optional[str] = Header(None),
+    x_aces_service_key: Optional[str] = Header(None, alias="X-ACES-Service-Key"),
+):
+    """Google JWT or shared service key (Prograde server proxy)."""
+    roster_key = (os.environ.get("CLIMATE_ROSTER_SERVICE_KEY") or "").strip()
+    if roster_key and x_aces_service_key and secrets.compare_digest(x_aces_service_key, roster_key):
+        return {"auth": "service_key", "email": "roster@prograde.internal"}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        return idinfo
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/api/climate/roster")
+def get_climate_roster(
+    period: str = Query("FY26", description="Reporting period label for deep links"),
+    q: Optional[str] = Query(None, description="Filter by business name"),
+    limit: int = Query(200, ge=1, le=500),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Clients with reporting_entity — for Prograde launcher (ACES live roster)."""
+    rows = list_climate_roster(db, query=q, limit=limit)
+    clients = [
+        {
+            **row,
+            "period": period,
+            "deep_link": f"/?entity={row['reporting_entity']}&period={period}",
+        }
+        for row in rows
+    ]
+    return {
+        "period": period,
+        "count": len(clients),
+        "clients": clients,
+        "source": "database",
+    }
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources")
+def get_climate_entity_activity_sources(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label for ETL preview"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """
+    LOA linked utilities + Airtable invoice samples + ETL preview + staged SQL activity
+  for a reporting_entity. Prograde Scope 1/2 integration review (Marcus raw dump).
+    """
+    payload = build_entity_activity_sources(
+        db,
+        entity_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/drift-events")
+def list_prograde_drift_events(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    reporting_entity: Optional[str] = Query(None),
+    unacknowledged_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Consultant-facing drift event list for G1 badges."""
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=limit,
+    )
+    if not rows and _prograde_drift_events:
+        events = list(_prograde_drift_events)
+        if unacknowledged_only:
+            events = [e for e in events if not e.get("acknowledged")]
+        return {"events": events, "count": len(events), "source": "memory"}
+    return {
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+        "source": "database",
+    }
+
+
+class ClimateEtlSyncRequest(BaseModel):
+    utility_type: str = Field(..., description="e.g. C&I Electricity, C&I Gas")
+    identifier: str = Field(..., description="NMI, MRIN, or account identifier")
+    reporting_period_label: str = Field("FY26", description="FY label e.g. FY26")
+    max_records: int = Field(100, ge=1, le=500)
+    dry_run: bool = Field(False, description="If true, transform only — do not write climate_activity_records")
+
+
+@app.get("/api/clients/{client_id}/climate/drift-events")
+def list_client_climate_drift_events(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    unacknowledged_only: bool = Query(True),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    reporting_entity = (client.reporting_entity or "").strip() or None
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=50,
+    )
+    return {
+        "client_id": client_id,
+        "reporting_entity": reporting_entity,
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.get("/api/clients/{client_id}/climate/activity-records")
+def list_client_climate_activity_records(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    rows = list_activity_records(db, client_id=client_id, limit=limit)
+    return {
+        "client_id": client_id,
+        "records": [activity_record_to_summary(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.post("/api/clients/{client_id}/climate/etl/sync")
+def sync_client_climate_activity_records(
+    client_id: int,
+    request: ClimateEtlSyncRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Pull Airtable invoice rows for a utility identifier and stage ActivityRecord v1 rows
+    in climate_activity_records (separate from CRM tables). Post-Tuesday: forward to B4/Prograde.
+    """
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    entity_id = (client.reporting_entity or "").strip()
+    if not entity_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Client has no reporting_entity — set on Strategy & WIP tab first",
+        )
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+
+    period_start, period_end = default_fy_period(request.reporting_period_label)
+    payload = airtable_client.get_utility_invoice_rows_by_identifier(
+        request.utility_type,
+        request.identifier,
+        max_records=request.max_records,
+    )
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    ctx = EtlContext(
+        entity_id=entity_id,
+        client_id=client_id,
+        loa_client_id=client.external_business_id,
+        site_id=str(request.identifier).strip(),
+        utility_type=request.utility_type,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    results, diagnostics = transform_invoice_rows(rows, ctx)
+    diagnostics["airtable"] = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+
+    created = 0
+    updated = 0
+    skipped = 0
+    preview: list[dict] = []
+
+    for res in results:
+        if res.skipped:
+            skipped += 1
+            preview.append(
+                {"source_row_id": res.source_row_id, "skipped": True, "reason": res.skip_reason}
+            )
+            continue
+        preview.append(
+            {
+                "record_id": res.record_id,
+                "activity_type": res.body.get("activity_type"),
+                "quantity": res.body.get("quantity"),
+            }
+        )
+        if request.dry_run:
+            continue
+        _, was_created = upsert_activity_record(
+            db,
+            record_id=res.record_id,
+            client_id=client_id,
+            body=res.body,
+            source_utility_type=request.utility_type,
+            source_row_id=res.source_row_id,
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    status = "dry_run" if request.dry_run else "completed"
+    if not request.dry_run:
+        create_ingest_run(
+            db,
+            client_id=client_id,
+            utility_type=request.utility_type,
+            identifier=request.identifier,
+            period_start=period_start,
+            period_end=period_end,
+            records_created=created,
+            records_updated=updated,
+            records_skipped=skipped,
+            status=status,
+            diagnostics=diagnostics,
+        )
+
+    return {
+        "client_id": client_id,
+        "entity_id": entity_id,
+        "dry_run": request.dry_run,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "diagnostics": diagnostics,
+        "preview": preview[:20],
     }
 
 
@@ -6924,6 +7262,7 @@ def create_client(
         gdrive_folder_url=client.gdrive_folder_url,
         stage=client.stage or "lead",
         owner_email=client.owner_email or (user_data.get("idinfo") or {}).get("email"),
+        reporting_entity=client.reporting_entity,
     )
     db.add(db_client)
     db.commit()
@@ -6940,13 +7279,18 @@ def list_clients(
     created_after: Optional[str] = Query(None, description="Filter clients created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
+    reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
+    signed_not_promoted: Optional[bool] = Query(
+        None,
+        description="If true, only clients with has_signed_contract and stage lead or qualified",
+    ),
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
     """
-    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients).
+    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients), reporting_entity.
     When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
     """
     from datetime import datetime as dt
@@ -6964,6 +7308,13 @@ def list_clients(
         user_email = (user_data.get("idinfo") or {}).get("email")
         if user_email:
             base_query = base_query.filter(Client.owner_email == user_email)
+    if reporting_entity is not None and reporting_entity.strip():
+        base_query = base_query.filter(Client.reporting_entity == reporting_entity.strip().lower())
+    if signed_not_promoted:
+        base_query = base_query.filter(
+            Client.has_signed_contract == 1,
+            Client.stage.in_(["lead", "qualified"]),
+        )
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -7111,6 +7462,8 @@ def update_client(
         db_client.advocacy_meeting_time = (client_update.advocacy_meeting_time or "").strip() or None
     if "advocacy_meeting_completed" in update_payload:
         db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
+    if "reporting_entity" in update_payload:
+        db_client.reporting_entity = client_update.reporting_entity
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
@@ -9207,6 +9560,17 @@ def _client_manual_activity_offer_display(
     return " · ".join(parts) if parts else (n or "—")
 
 
+def _report_actor_email(user_data: dict) -> str:
+    """Email of the authenticated user for activity report filters."""
+    idinfo = user_data.get("idinfo") or {}
+    email = (idinfo.get("email") or "").strip()
+    if not email:
+        user = user_data.get("user")
+        if user is not None:
+            email = (getattr(user, "email", None) or "").strip()
+    return email.lower()
+
+
 def _client_manual_row_to_report_item(
     row: ClientManualActivity,
     business_name: Optional[str],
@@ -9284,6 +9648,7 @@ def activities_report_client_manual(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9296,6 +9661,12 @@ def activities_report_client_manual(
     q = db.query(ClientManualActivity, Client).join(Client, ClientManualActivity.client_id == Client.id)
     if client_id is not None:
         q = q.filter(ClientManualActivity.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            q = q.filter(func.lower(ClientManualActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9334,6 +9705,56 @@ def clients_offer_counts(
         .all()
     )
     return {str(client_id): count for client_id, count in rows}
+
+
+def _require_aces_staff(user_data: dict = Depends(get_current_user_with_db)) -> dict:
+    """Internal diagnostics: same Google auth as CRM, restricted to ACES staff domain."""
+    email = ((user_data.get("idinfo") or {}).get("email") or "").strip().lower()
+    if not email.endswith("@acesolutions.com.au"):
+        raise HTTPException(status_code=403, detail="ACES staff access required")
+    return user_data
+
+
+@app.get("/api/admin/signed-contract-dry-run")
+def signed_contract_dry_run(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Read-only diagnostic: Signed via ACES contract status vs CRM client stage.
+    Bulk-reads FILE_IDS sheet once; no DB or sheet writes.
+    """
+    from services.signed_contract_dry_run import run_signed_contract_dry_run
+
+    logging.info(
+        "signed-contract-dry-run requested by %s",
+        (user_data.get("idinfo") or {}).get("email"),
+    )
+    try:
+        return run_signed_contract_dry_run(db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/api/admin/sync-signed-contracts")
+def sync_signed_contracts(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Sync has_signed_contract from FILE_IDS sheet for all CRM clients.
+    Updates flags only — never changes client stage.
+    """
+    from services.signed_contract_dry_run import recompute_signed_contracts
+
+    logging.info(
+        "sync-signed-contracts requested by %s",
+        (user_data.get("idinfo") or {}).get("email"),
+    )
+    try:
+        return recompute_signed_contracts(db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.get("/api/reports/pipeline/summary")
@@ -9459,6 +9880,7 @@ def activities_report_list(
     activity_type: Optional[str] = Query(None, description="Filter by activity type"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9476,6 +9898,12 @@ def activities_report_list(
         query = query.filter(Offer.client_id == client_id)
     if activity_type is not None and activity_type.strip():
         query = query.filter(OfferActivity.activity_type == activity_type.strip())
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(OfferActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9594,6 +10022,7 @@ def activities_report_tasks(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only task events performed by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9610,6 +10039,12 @@ def activities_report_tasks(
     )
     if client_id is not None:
         query = query.filter(Task.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(TaskHistory.user_email) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
