@@ -43,6 +43,21 @@ class Client(Base):
     signed_contract_utilities = Column(JSON_COLUMN_TYPE, nullable=True)  # JSON array of utility labels
     signed_contract_checked_at = Column(DateTime, nullable=True)
 
+    # Commercial multisite grouping (explicit assignment; separate from reporting_entity)
+    entity_group_id = Column(Integer, ForeignKey("entity_groups.id"), nullable=True, index=True)
+
+
+class EntityGroup(Base):
+    __tablename__ = "entity_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(128), unique=True, nullable=False, index=True)
+    display_name = Column(String(255), nullable=False)
+    primary_abn = Column(String(20), nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
 
 class ClientReferral(Base):
     """

@@ -202,6 +202,19 @@ def init_db():
     except Exception as e:
         logging.warning("Could not ensure clients.reporting_entity column: %s", e)
 
+    # Clients: commercial entity group (multisite; separate from reporting_entity)
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("clients")]
+            if "entity_group_id" not in cols:
+                logging.info("Adding missing clients.entity_group_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE clients ADD COLUMN entity_group_id INTEGER"))
+                logging.info("✅ Added clients.entity_group_id column")
+    except Exception as e:
+        logging.warning("Could not ensure clients.entity_group_id column: %s", e)
+
     # Clients: signed-via-ACES contract flag (sheet sync; does not change stage)
     try:
         insp = inspect(engine)

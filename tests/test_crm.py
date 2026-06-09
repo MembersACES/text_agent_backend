@@ -170,6 +170,29 @@ def test_get_business_info_upsert_respects_external_business_id():
     assert second.gdrive_folder_url == "https://drive.example/folder"
 
 
+def test_upsert_auto_resolves_external_business_id_on_single_loa_match():
+    from unittest.mock import patch
+    from services import airtable_client
+
+    db = _make_test_session()
+    with patch.object(airtable_client, "USE_AIRTABLE_DIRECT", True):
+        with patch.object(airtable_client, "AIRTABLE_API_KEY", "test-key"):
+            with patch.object(
+                airtable_client,
+                "resolve_loa_record_id",
+                return_value="recSolo123",
+            ):
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name="Solo Site",
+                    external_business_id=None,
+                    primary_contact_email=None,
+                    gdrive_folder_url=None,
+                )
+    assert client is not None
+    assert client.external_business_id == "recSolo123"
+
+
 def test_bulk_update_clients_assign_owner_only():
     db = _make_test_session()
 

@@ -146,6 +146,8 @@ class ClientCreate(BaseModel):
     def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
         return _normalize_reporting_entity(v)
 
+    entity_group_id: Optional[int] = None
+
     @field_validator("stage", mode="before")
     @classmethod
     def _normalize_stage(cls, v: Optional[str]) -> Optional[ClientStage]:
@@ -194,6 +196,8 @@ class ClientUpdate(BaseModel):
     def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
         return _normalize_reporting_entity(v)
 
+    entity_group_id: Optional[int] = None
+
     @field_validator("stage", mode="before")
     @classmethod
     def _normalize_stage(cls, v: Optional[str]) -> Optional[ClientStage]:
@@ -235,6 +239,9 @@ class ClientResponse(BaseModel):
     advocacy_meeting_time: Optional[str] = None  # e.g. "11:03 AM"
     advocacy_meeting_completed: Optional[bool] = False
     reporting_entity: Optional[str] = None  # A1 entity_id slug for sustainability disclosures
+    entity_group_id: Optional[int] = None
+    entity_group_slug: Optional[str] = None
+    entity_group_display_name: Optional[str] = None
     has_signed_contract: bool = False
     signed_contract_utilities: Optional[list[str]] = None
     signed_contract_checked_at: Optional[datetime] = None
@@ -333,6 +340,42 @@ class ClientResponse(BaseModel):
         except ValueError:
             # Fallback for truly unexpected historic values.
             return ClientStage.LEAD
+
+
+class EntityGroupCreate(BaseModel):
+    slug: str
+    display_name: str
+    primary_abn: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("slug", mode="before")
+    @classmethod
+    def _validate_slug(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+
+class EntityGroupResponse(BaseModel):
+    id: int
+    slug: str
+    display_name: str
+    primary_abn: Optional[str] = None
+    notes: Optional[str] = None
+    member_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class EntityGroupDetailResponse(EntityGroupResponse):
+    members: List["ClientResponse"] = []
 
 
 class ClientReferralCreate(BaseModel):
