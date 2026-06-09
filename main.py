@@ -151,6 +151,7 @@ from models import (
     ClientManualActivity,
     StrategyItem,
     Testimonial,
+    AutonomousSequenceEvent,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
@@ -7713,7 +7714,7 @@ def delete_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # 1) Offers and offer activities
+    # 1) Offers and dependent rows (mirror delete_offer + strategy/automation links)
     offer_ids = [
         o.id
         for o in db.query(Offer.id)
@@ -7721,9 +7722,41 @@ def delete_client(
         .all()
     ]
     if offer_ids:
+        activity_ids = [
+            a.id
+            for a in db.query(OfferActivity)
+            .filter(OfferActivity.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if activity_ids:
+            db.query(StrategyItem).filter(
+                StrategyItem.offer_activity_id.in_(activity_ids)
+            ).delete(synchronize_session=False)
+        db.query(StrategyItem).filter(StrategyItem.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+        run_ids = [
+            r.id
+            for r in db.query(AutonomousSequenceRun)
+            .filter(AutonomousSequenceRun.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if run_ids:
+            db.query(AutonomousSequenceEvent).filter(
+                AutonomousSequenceEvent.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceStep).filter(
+                AutonomousSequenceStep.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceRun).filter(
+                AutonomousSequenceRun.id.in_(run_ids)
+            ).delete(synchronize_session=False)
         db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
             synchronize_session=False
         )
+        db.query(ClientStatusNote).filter(
+            ClientStatusNote.related_offer_id.in_(offer_ids)
+        ).delete(synchronize_session=False)
     # Also remove any activities that reference this client directly
     db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
         synchronize_session=False
@@ -7731,6 +7764,25 @@ def delete_client(
     db.query(Offer).filter(Offer.client_id == client_id).delete(
         synchronize_session=False
     )
+    db.query(StrategyItem).filter(StrategyItem.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    client_run_ids = [
+        r.id
+        for r in db.query(AutonomousSequenceRun)
+        .filter(AutonomousSequenceRun.client_id == client_id)
+        .all()
+    ]
+    if client_run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceRun).filter(
+            AutonomousSequenceRun.id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
 
     # 2) Tasks and task history
     task_ids = [
@@ -9855,23 +9907,32 @@ def signed_contract_dry_run(
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
+class SyncSignedContractsRequest(BaseModel):
+    promote_signed: bool = Field(
+        False,
+        description="If true, promote signed lead/qualified members to existing_client after flag sync",
+    )
+
+
 @app.post("/api/admin/sync-signed-contracts")
 def sync_signed_contracts(
+    body: SyncSignedContractsRequest = SyncSignedContractsRequest(),
     db: Session = Depends(get_db),
     user_data: dict = Depends(_require_aces_staff),
 ):
     """
     Sync has_signed_contract from FILE_IDS sheet for all CRM clients.
-    Updates flags only — never changes client stage.
+    By default updates flags only; optional promote_signed promotes signed lead/qualified rows.
     """
     from services.signed_contract_dry_run import recompute_signed_contracts
 
     logging.info(
-        "sync-signed-contracts requested by %s",
+        "sync-signed-contracts requested by %s promote_signed=%s",
         (user_data.get("idinfo") or {}).get("email"),
+        body.promote_signed,
     )
     try:
-        return recompute_signed_contracts(db)
+        return recompute_signed_contracts(db, promote_signed=body.promote_signed)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 

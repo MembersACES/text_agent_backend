@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 from database import Base
-from models import Client, Offer
+from models import Client, Offer, StrategyItem
 from schemas import ClientCreate, ClientUpdate, OfferCreate
 from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request, list_clients, update_client
 from services.crm import (
@@ -519,3 +519,36 @@ def test_list_clients_filters_by_reporting_entity():
     )
     names = {c.business_name for c in matches}
     assert names == {"Member One", "Member Two"}
+
+
+def test_delete_client_removes_offers_and_strategy_items():
+    from main import delete_client
+
+    db = _make_test_session()
+    client = _make_client(db, business_name="Delete Me Co")
+    offer = Offer(
+        client_id=client.id,
+        business_name=client.business_name,
+        status=OfferStatus.REQUESTED.value,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(offer)
+    db.commit()
+    db.refresh(offer)
+    db.add(
+        StrategyItem(
+            client_id=client.id,
+            year=2026,
+            section="in_progress",
+            row_index=0,
+            offer_id=offer.id,
+        )
+    )
+    db.commit()
+
+    delete_client(client_id=client.id, db=db, user_data={"idinfo": {"email": "test@acesolutions.com.au"}})
+
+    assert db.query(Client).filter(Client.id == client.id).first() is None
+    assert db.query(Offer).filter(Offer.client_id == client.id).count() == 0
+    assert db.query(StrategyItem).filter(StrategyItem.client_id == client.id).count() == 0
