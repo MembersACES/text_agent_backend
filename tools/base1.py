@@ -1,6 +1,11 @@
 """
 Base 1 Review - Quick Win Tool
 Handles document upload, stub extraction, and output generation
+
+DEPRECATED for comparison / savings figures: live Base 1 reviews use
+text_agent_template-1 (DeterministicSavingsService + base1ComparisonBuckets.ts).
+Do not extend MARKET_BENCHMARKS here — edit comparison buckets via the /base-1 hub
+or lib/config/base1ComparisonBuckets.ts in the template repo.
 """
 import os
 import json
