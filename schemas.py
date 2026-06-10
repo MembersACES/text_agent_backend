@@ -2,7 +2,7 @@
 Pydantic schemas for API requests and responses
 """
 from pydantic import BaseModel, Field, field_serializer, field_validator
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 import json
 from utils.timezone import to_melbourne_iso
@@ -218,6 +218,29 @@ class ClientUpdate(BaseModel):
         return ClientStage(raw)
 
 
+class CrmLinkCandidate(BaseModel):
+    client_id: int
+    business_name: str
+    external_business_id: Optional[str] = None
+    stage: str
+
+
+class CrmLinkResponse(BaseModel):
+    status: Literal["matched", "no_match", "ambiguous", "conflict"]
+    client_id: Optional[int] = None
+    record_id: Optional[str] = None
+    reason: str
+    candidates: List[CrmLinkCandidate] = []
+
+
+class ClientLinkFromLoaRequest(BaseModel):
+    record_id: str
+    business_name: str
+    primary_contact_email: Optional[str] = None
+    gdrive_folder_url: Optional[str] = None
+    client_id: Optional[int] = None
+
+
 class ClientResponse(BaseModel):
     id: int
     business_name: str
@@ -376,6 +399,41 @@ class EntityGroupResponse(BaseModel):
 
 class EntityGroupDetailResponse(EntityGroupResponse):
     members: List["ClientResponse"] = []
+
+
+class EntityGroupReportingEntitySummary(BaseModel):
+    aligned: bool = True
+    distinct_values: List[str] = []
+
+
+class EntityGroupSummaryResponse(BaseModel):
+    member_count: int = 0
+    total_offers: int = 0
+    any_signed: bool = False
+    stage_breakdown: dict[str, int] = {}
+    reporting_entity: EntityGroupReportingEntitySummary = Field(
+        default_factory=EntityGroupReportingEntitySummary
+    )
+
+
+class EntityGroupSuggestionMemberPreview(BaseModel):
+    id: int
+    business_name: str
+    external_business_id: Optional[str] = None
+    stage: str
+
+
+class EntityGroupSuggestionCluster(BaseModel):
+    suggested_display_name: str
+    suggested_slug: str
+    member_ids: List[int]
+    members: List[EntityGroupSuggestionMemberPreview]
+    reason: str
+    confidence: Literal["high", "medium", "low"]
+
+
+class EntityGroupSuggestionsResponse(BaseModel):
+    clusters: List[EntityGroupSuggestionCluster] = []
 
 
 class ClientReferralCreate(BaseModel):

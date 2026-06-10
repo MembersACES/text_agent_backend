@@ -171,10 +171,13 @@ from schemas import (
     ClientStatusNoteResponse,
     ClientCreate,
     ClientUpdate,
+    ClientLinkFromLoaRequest,
     ClientResponse,
     EntityGroupCreate,
     EntityGroupDetailResponse,
     EntityGroupResponse,
+    EntityGroupSummaryResponse,
+    EntityGroupSuggestionsResponse,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -217,6 +220,10 @@ from crm_enums import (
     OfferPipelineStage,
     POST_WIN_STAGES,
 )
+from services.crm_loa_link import (
+    link_or_create_client_from_loa,
+    resolve_crm_client_for_loa,
+)
 from services.crm import (
     upsert_client_from_business_info,
     update_client_stage_with_history,
@@ -228,6 +235,7 @@ from services.crm import (
     sync_strategy_items_from_crm,
     enrich_client_response,
 )
+from services.entity_groups import build_entity_group_summary, compute_entity_group_suggestions
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
@@ -1048,28 +1056,16 @@ def get_business_info(
         result["user_email"] = user_info.get("email")
         # Airtable utility data (Contract End Date, Data Requested, Data Recieved) is loaded
         # lazily via GET /api/utility-extra to keep this endpoint fast.
-        business_details = result.get("business_details", {}) or {}
-        if business_details.get("name"):
-            try:
-                contact_info = result.get("contact_information", {}) or {}
-                gdrive_info = result.get("gdrive", {}) or {}
-
-                business_name = business_details.get("name") or request.business_name
-                external_business_id = result.get("record_ID")
-                primary_contact_email = contact_info.get("email")
-                gdrive_folder_url = gdrive_info.get("folder_url")
-
-                client = upsert_client_from_business_info(
-                    db=db,
-                    business_name=business_name,
-                    external_business_id=external_business_id,
-                    primary_contact_email=primary_contact_email,
-                    gdrive_folder_url=gdrive_folder_url,
-                )
-                if client:
-                    result["client_id"] = client.id
-            except Exception as e:
-                logging.error(f"Error upserting Client from business info: {str(e)}")
+        try:
+            crm_link = resolve_crm_client_for_loa(
+                db=db,
+                record_id=result.get("record_ID"),
+            )
+            result["crm_link"] = crm_link
+            if crm_link.get("status") == "matched" and crm_link.get("client_id"):
+                result["client_id"] = crm_link["client_id"]
+        except Exception as e:
+            logging.error(f"Error resolving CRM link from business info: {str(e)}")
 
     logging.info(f"Returning response to frontend: {result}")
     return result
@@ -7320,6 +7316,30 @@ def create_entity_group(
     return resp.model_copy(update={"member_count": 0})
 
 
+@app.get("/api/entity-groups/suggestions", response_model=EntityGroupSuggestionsResponse)
+def get_entity_group_suggestions(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Read-only candidate clusters for ungrouped CRM members (no auto-assign)."""
+    clusters = compute_entity_group_suggestions(db)
+    return EntityGroupSuggestionsResponse(clusters=clusters)
+
+
+@app.get("/api/entity-groups/{slug}/summary", response_model=EntityGroupSummaryResponse)
+def get_entity_group_summary(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Aggregate summary for a commercial entity group hub."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    return EntityGroupSummaryResponse(**build_entity_group_summary(db, group))
+
+
 @app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)
 def get_entity_group(
     slug: str,
@@ -7388,6 +7408,25 @@ def create_client(
 
     logging.info(f"Client created with id {db_client.id}")
     return enrich_client_response(db, db_client)
+
+
+@app.post("/api/clients/link-from-loa", response_model=ClientResponse)
+def link_client_from_loa(
+    body: ClientLinkFromLoaRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Explicitly link an LOA record to an existing CRM member or create a new one."""
+    owner_email = (user_data.get("idinfo") or {}).get("email")
+    return link_or_create_client_from_loa(
+        db=db,
+        record_id=body.record_id,
+        business_name=body.business_name,
+        primary_contact_email=body.primary_contact_email,
+        gdrive_folder_url=body.gdrive_folder_url,
+        client_id=body.client_id,
+        owner_email=owner_email,
+    )
 
 
 @app.get("/api/clients")
