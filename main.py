@@ -174,6 +174,7 @@ from schemas import (
     ClientLinkFromLoaRequest,
     ClientResponse,
     EntityGroupCreate,
+    EntityGroupDeleteResponse,
     EntityGroupDetailResponse,
     EntityGroupResponse,
     EntityGroupSummaryResponse,
@@ -235,7 +236,11 @@ from services.crm import (
     sync_strategy_items_from_crm,
     enrich_client_response,
 )
-from services.entity_groups import build_entity_group_summary, compute_entity_group_suggestions
+from services.entity_groups import (
+    build_entity_group_summary,
+    compute_entity_group_suggestions,
+    delete_entity_group,
+)
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
@@ -7364,6 +7369,27 @@ def get_entity_group(
     )
 
 
+@app.delete("/api/entity-groups/{slug}", response_model=EntityGroupDeleteResponse)
+def delete_entity_group_endpoint(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Delete a commercial entity group and unlink all assigned CRM members."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    group_slug = group.slug
+    unlinked_count = delete_entity_group(db, group)
+    logging.info(
+        "Entity group %s deleted; unlinked %s member(s)",
+        group_slug,
+        unlinked_count,
+    )
+    return EntityGroupDeleteResponse(slug=group_slug, unlinked_member_count=unlinked_count)
+
+
 # ---- CRM: Clients, Offers, and Pipeline ----
 
 
@@ -7438,6 +7464,10 @@ def list_clients(
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
     reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
     entity_group: Optional[str] = Query(None, description="Filter by commercial entity group slug (exact match)"),
+    ungrouped_only: Optional[bool] = Query(
+        None,
+        description="If true, only clients with no commercial entity group assigned",
+    ),
     signed_not_promoted: Optional[bool] = Query(
         None,
         description="If true, only clients with has_signed_contract and stage lead or qualified",
@@ -7473,6 +7503,8 @@ def list_clients(
         base_query = base_query.join(EntityGroup, Client.entity_group_id == EntityGroup.id).filter(
             EntityGroup.slug == normalized_group
         )
+    if ungrouped_only is True:
+        base_query = base_query.filter(Client.entity_group_id.is_(None))
     if signed_not_promoted is True:
         base_query = base_query.filter(
             Client.has_signed_contract == 1,

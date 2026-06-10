@@ -9,6 +9,15 @@ storage/
 runs.json
 data/testimonial_content_overrides.json
 
+# Local SQLite database (dev runtime — not for repo)
+aces-task-db.sqlite3
+*.sqlite3
+
+# Local integration / audit notes (not for repo)
+docs/frankston-rsl-integration-audit.md
+docs/morgan-integration.md
+docs/N8N_DEPRECATION_PLAN.md
+
 # Virtual env
 .venv/
 venv/

@@ -258,3 +258,18 @@ def compute_entity_group_suggestions(db: Session) -> list[dict]:
 
     out.sort(key=lambda c: (-len(c["member_ids"]), c["suggested_display_name"].lower()))
     return out
+
+
+def delete_entity_group(db: Session, group: EntityGroup) -> int:
+    """
+    Unlink all CRM members from the group, then delete the group row.
+    Returns the number of members that were unlinked.
+    """
+    unlinked_count = (
+        db.query(Client)
+        .filter(Client.entity_group_id == group.id)
+        .update({Client.entity_group_id: None}, synchronize_session="fetch")
+    )
+    db.delete(group)
+    db.commit()
+    return unlinked_count
