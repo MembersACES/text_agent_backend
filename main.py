@@ -175,6 +175,8 @@ from schemas import (
     EntityGroupCreate,
     EntityGroupDetailResponse,
     EntityGroupResponse,
+    EntityGroupSummaryResponse,
+    EntityGroupSuggestionsResponse,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -228,6 +230,7 @@ from services.crm import (
     sync_strategy_items_from_crm,
     enrich_client_response,
 )
+from services.entity_groups import build_entity_group_summary, compute_entity_group_suggestions
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
@@ -7318,6 +7321,30 @@ def create_entity_group(
     db.refresh(group)
     resp = EntityGroupResponse.model_validate(group)
     return resp.model_copy(update={"member_count": 0})
+
+
+@app.get("/api/entity-groups/suggestions", response_model=EntityGroupSuggestionsResponse)
+def get_entity_group_suggestions(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Read-only candidate clusters for ungrouped CRM members (no auto-assign)."""
+    clusters = compute_entity_group_suggestions(db)
+    return EntityGroupSuggestionsResponse(clusters=clusters)
+
+
+@app.get("/api/entity-groups/{slug}/summary", response_model=EntityGroupSummaryResponse)
+def get_entity_group_summary(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Aggregate summary for a commercial entity group hub."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    return EntityGroupSummaryResponse(**build_entity_group_summary(db, group))
 
 
 @app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)
