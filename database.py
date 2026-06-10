@@ -18,14 +18,27 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if DB_TYPE == "postgresql":
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL must be set when DB_TYPE=postgresql")
-    
-    logging.info("🐘 Using PostgreSQL (Cloud SQL)")
-    
-    # Cloud SQL Configuration
+
+    pool_size = int(os.getenv("DB_POOL_SIZE", "1"))
+    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "1"))
+    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+    pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+
+    logging.info(
+        "🐘 Using PostgreSQL (Cloud SQL) pool_size=%s max_overflow=%s pool_timeout=%s",
+        pool_size,
+        max_overflow,
+        pool_timeout,
+    )
+
+    # Bounded pool for Cloud Run — pair with containerConcurrency in deploy config.
     engine = create_engine(
         DATABASE_URL,
-        pool_pre_ping=True,  # Verify connections before using
-        pool_recycle=3600,   # Recycle connections after 1 hour
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=pool_timeout,
+        pool_pre_ping=True,
+        pool_recycle=pool_recycle,
         echo=False,
     )
 else:
