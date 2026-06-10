@@ -11,6 +11,7 @@ from services.crm import enrich_client_response
 from services.entity_groups import (
     build_entity_group_summary,
     compute_entity_group_suggestions,
+    delete_entity_group,
     normalize_business_name,
 )
 
@@ -273,3 +274,43 @@ def test_normalize_business_name_strips_legal_suffixes():
         == "centurion sa investments"
     )
     assert normalize_business_name("Foo Trust as trustee for Bar") == "foo bar"
+
+
+def test_delete_entity_group_unlinks_members_and_removes_group():
+    db = _make_test_session()
+    group = EntityGroup(slug="frankston-rsl", display_name="Frankston RSL")
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+
+    a = _add_client(db, business_name="Site A", entity_group_id=group.id)
+    b = _add_client(db, business_name="Site B", entity_group_id=group.id)
+    other_group = EntityGroup(slug="other", display_name="Other")
+    db.add(other_group)
+    db.commit()
+    db.refresh(other_group)
+    c = _add_client(db, business_name="Other Site", entity_group_id=other_group.id)
+
+    unlinked = delete_entity_group(db, group)
+    assert unlinked == 2
+    assert db.query(EntityGroup).filter(EntityGroup.slug == "frankston-rsl").first() is None
+    assert db.query(EntityGroup).filter(EntityGroup.slug == "other").count() == 1
+
+    db.refresh(a)
+    db.refresh(b)
+    db.refresh(c)
+    assert a.entity_group_id is None
+    assert b.entity_group_id is None
+    assert c.entity_group_id == other_group.id
+
+
+def test_delete_entity_group_with_no_members():
+    db = _make_test_session()
+    group = EntityGroup(slug="empty-group", display_name="Empty Group")
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+
+    unlinked = delete_entity_group(db, group)
+    assert unlinked == 0
+    assert db.query(EntityGroup).filter(EntityGroup.slug == "empty-group").first() is None
