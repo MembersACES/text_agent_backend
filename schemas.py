@@ -218,6 +218,29 @@ class ClientUpdate(BaseModel):
         return ClientStage(raw)
 
 
+class CrmLinkCandidate(BaseModel):
+    client_id: int
+    business_name: str
+    external_business_id: Optional[str] = None
+    stage: str
+
+
+class CrmLinkResponse(BaseModel):
+    status: Literal["matched", "no_match", "ambiguous", "conflict"]
+    client_id: Optional[int] = None
+    record_id: Optional[str] = None
+    reason: str
+    candidates: List[CrmLinkCandidate] = []
+
+
+class ClientLinkFromLoaRequest(BaseModel):
+    record_id: str
+    business_name: str
+    primary_contact_email: Optional[str] = None
+    gdrive_folder_url: Optional[str] = None
+    client_id: Optional[int] = None
+
+
 class ClientResponse(BaseModel):
     id: int
     business_name: str

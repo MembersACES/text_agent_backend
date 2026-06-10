@@ -171,6 +171,7 @@ from schemas import (
     ClientStatusNoteResponse,
     ClientCreate,
     ClientUpdate,
+    ClientLinkFromLoaRequest,
     ClientResponse,
     EntityGroupCreate,
     EntityGroupDetailResponse,
@@ -218,6 +219,10 @@ from crm_enums import (
     OfferActivityType,
     OfferPipelineStage,
     POST_WIN_STAGES,
+)
+from services.crm_loa_link import (
+    link_or_create_client_from_loa,
+    resolve_crm_client_for_loa,
 )
 from services.crm import (
     upsert_client_from_business_info,
@@ -1051,28 +1056,16 @@ def get_business_info(
         result["user_email"] = user_info.get("email")
         # Airtable utility data (Contract End Date, Data Requested, Data Recieved) is loaded
         # lazily via GET /api/utility-extra to keep this endpoint fast.
-        business_details = result.get("business_details", {}) or {}
-        if business_details.get("name"):
-            try:
-                contact_info = result.get("contact_information", {}) or {}
-                gdrive_info = result.get("gdrive", {}) or {}
-
-                business_name = business_details.get("name") or request.business_name
-                external_business_id = result.get("record_ID")
-                primary_contact_email = contact_info.get("email")
-                gdrive_folder_url = gdrive_info.get("folder_url")
-
-                client = upsert_client_from_business_info(
-                    db=db,
-                    business_name=business_name,
-                    external_business_id=external_business_id,
-                    primary_contact_email=primary_contact_email,
-                    gdrive_folder_url=gdrive_folder_url,
-                )
-                if client:
-                    result["client_id"] = client.id
-            except Exception as e:
-                logging.error(f"Error upserting Client from business info: {str(e)}")
+        try:
+            crm_link = resolve_crm_client_for_loa(
+                db=db,
+                record_id=result.get("record_ID"),
+            )
+            result["crm_link"] = crm_link
+            if crm_link.get("status") == "matched" and crm_link.get("client_id"):
+                result["client_id"] = crm_link["client_id"]
+        except Exception as e:
+            logging.error(f"Error resolving CRM link from business info: {str(e)}")
 
     logging.info(f"Returning response to frontend: {result}")
     return result
@@ -7415,6 +7408,25 @@ def create_client(
 
     logging.info(f"Client created with id {db_client.id}")
     return enrich_client_response(db, db_client)
+
+
+@app.post("/api/clients/link-from-loa", response_model=ClientResponse)
+def link_client_from_loa(
+    body: ClientLinkFromLoaRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Explicitly link an LOA record to an existing CRM member or create a new one."""
+    owner_email = (user_data.get("idinfo") or {}).get("email")
+    return link_or_create_client_from_loa(
+        db=db,
+        record_id=body.record_id,
+        business_name=body.business_name,
+        primary_contact_email=body.primary_contact_email,
+        gdrive_folder_url=body.gdrive_folder_url,
+        client_id=body.client_id,
+        owner_email=owner_email,
+    )
 
 
 @app.get("/api/clients")
