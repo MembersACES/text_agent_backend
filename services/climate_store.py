@@ -180,43 +180,103 @@ def list_climate_roster(
     query: Optional[str] = None,
     limit: int = 200,
 ) -> list[dict]:
-    """CRM clients with reporting_entity set — for Prograde launcher."""
+    """Deduped disclosure entities for Prograde launcher (v2 — one row per reporting_entity slug)."""
+    from collections import defaultdict
+
     from sqlalchemy import func
 
-    from models import Client
+    from models import Client, EntityGroup
+    from services.entity_groups import clients_in_disclosure_rollup
 
-    q = (
-        db.query(Client)
+    slug_candidates: dict[str, set[str]] = defaultdict(set)
+
+    direct_slugs = (
+        db.query(Client.reporting_entity)
         .filter(Client.reporting_entity.isnot(None))
         .filter(Client.reporting_entity != "")
+        .distinct()
+        .all()
     )
-    if query and query.strip():
-        pattern = f"%{query.strip()}%"
-        q = q.filter(Client.business_name.ilike(pattern))
+    for (slug_val,) in direct_slugs:
+        if slug_val:
+            slug_candidates[slug_val.strip().lower()].add("direct")
 
-    clients = q.order_by(Client.business_name.asc()).limit(max(1, min(limit, 500))).all()
+    group_slugs = (
+        db.query(EntityGroup.reporting_entity)
+        .filter(EntityGroup.reporting_entity.isnot(None))
+        .filter(EntityGroup.reporting_entity != "")
+        .distinct()
+        .all()
+    )
+    for (slug_val,) in group_slugs:
+        if slug_val:
+            slug_candidates[slug_val.strip().lower()].add("group")
+
+    slugs = sorted(slug_candidates.keys())
+    if query and query.strip():
+        pattern = query.strip().lower()
+        slugs = [s for s in slugs if pattern in s]
+
     out: list[dict] = []
-    for client in clients:
-        entity_id = (client.reporting_entity or "").strip().lower()
-        if not entity_id:
+    for entity_id in slugs[: max(1, min(limit, 500))]:
+        members = clients_in_disclosure_rollup(db, entity_id)
+        if not members:
             continue
+
+        if query and query.strip():
+            pattern = query.strip().lower()
+            if not any(pattern in (m.business_name or "").lower() for m in members):
+                if pattern not in entity_id:
+                    continue
+
+        member_ids = [m.id for m in members]
         activity_count = (
             db.query(func.count(ClimateActivityRecord.id))
-            .filter(ClimateActivityRecord.client_id == client.id)
+            .filter(ClimateActivityRecord.client_id.in_(member_ids))
             .scalar()
             or 0
         )
+
+        entity_group_slug: str | None = None
+        primary_abn: str | None = None
+        display_name = members[0].business_name
+        for member in members:
+            if not member.entity_group_id:
+                continue
+            group = db.query(EntityGroup).filter(EntityGroup.id == member.entity_group_id).first()
+            if not group:
+                continue
+            if (group.reporting_entity or "").strip().lower() == entity_id:
+                entity_group_slug = group.slug
+                primary_abn = group.primary_abn
+                display_name = group.display_name
+                break
+
+        loa_record_ids = [
+            (m.external_business_id or "").strip()
+            for m in members
+            if (m.external_business_id or "").strip()
+        ]
+
         out.append(
             {
-                "aces_client_id": client.id,
-                "business_name": client.business_name,
                 "reporting_entity": entity_id,
-                "stage": client.stage,
-                "owner_email": client.owner_email,
-                "loa_record_id": client.external_business_id,
+                "display_name": display_name,
+                "entity_group_slug": entity_group_slug,
+                "member_count": len(members),
+                "aces_client_ids": member_ids,
+                "aces_client_id": member_ids[0],
+                "business_name": display_name,
+                "loa_record_ids": loa_record_ids,
+                "loa_record_id": loa_record_ids[0] if loa_record_ids else None,
+                "stage": members[0].stage,
+                "owner_email": members[0].owner_email,
                 "activity_record_count": int(activity_count),
+                "primary_abn": primary_abn,
             }
         )
+
+    out.sort(key=lambda row: (row.get("display_name") or "").lower())
     return out
 
 

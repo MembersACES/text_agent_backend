@@ -63,7 +63,10 @@ from services.climate_store import (
     upsert_activity_record,
 )
 from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
-from services.climate_entity_sources import build_entity_activity_sources
+from services.climate_entity_sources import (
+    build_client_linked_utilities,
+    build_entity_activity_sources,
+)
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -179,6 +182,7 @@ from schemas import (
     EntityGroupResponse,
     EntityGroupSummaryResponse,
     EntityGroupSuggestionsResponse,
+    EntityGroupUpdate,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -240,6 +244,7 @@ from services.entity_groups import (
     build_entity_group_summary,
     compute_entity_group_suggestions,
     delete_entity_group,
+    effective_reporting_entity,
 )
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
@@ -887,7 +892,10 @@ def list_client_climate_drift_events(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    reporting_entity = (client.reporting_entity or "").strip() or None
+    group = None
+    if client.entity_group_id:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+    reporting_entity = effective_reporting_entity(client, group)
     rows = list_drift_events(
         db,
         reporting_entity=reporting_entity,
@@ -900,6 +908,19 @@ def list_client_climate_drift_events(
         "events": [drift_event_to_dict(r) for r in rows],
         "count": len(rows),
     }
+
+
+@app.get("/api/clients/{client_id}/climate/linked-utilities")
+def get_client_climate_linked_utilities(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """LOA linked utilities for CRM Climate tab (same resolver as Prograde activity-sources)."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return build_client_linked_utilities(db, client)
 
 
 @app.get("/api/clients/{client_id}/climate/activity-records")
@@ -935,11 +956,14 @@ def sync_client_climate_activity_records(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    entity_id = (client.reporting_entity or "").strip()
+    group = None
+    if client.entity_group_id:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+    entity_id = effective_reporting_entity(client, group)
     if not entity_id:
         raise HTTPException(
             status_code=400,
-            detail="Client has no reporting_entity — set on Strategy & WIP tab first",
+            detail="No effective reporting_entity — set on member Climate tab or group disclosure slug",
         )
     if not airtable_client.AIRTABLE_API_KEY:
         raise HTTPException(status_code=503, detail="Airtable integration is not configured")
@@ -7312,6 +7336,7 @@ def create_entity_group(
         slug=body.slug,
         display_name=body.display_name.strip(),
         primary_abn=(body.primary_abn or "").strip() or None,
+        reporting_entity=body.reporting_entity,
         notes=(body.notes or "").strip() or None,
     )
     db.add(group)
@@ -7343,6 +7368,71 @@ def get_entity_group_summary(
     if not group:
         raise HTTPException(status_code=404, detail="Entity group not found")
     return EntityGroupSummaryResponse(**build_entity_group_summary(db, group))
+
+
+@app.patch("/api/entity-groups/{slug}", response_model=EntityGroupResponse)
+def update_entity_group(
+    slug: str,
+    body: EntityGroupUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update commercial entity group metadata (including climate disclosure slug)."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    update_data = body.model_dump(exclude_unset=True)
+    if "display_name" in update_data and update_data["display_name"] is not None:
+        group.display_name = update_data["display_name"].strip()
+    if "primary_abn" in update_data:
+        group.primary_abn = (update_data["primary_abn"] or "").strip() or None
+    if "reporting_entity" in update_data:
+        group.reporting_entity = update_data["reporting_entity"]
+    if "notes" in update_data:
+        group.notes = (update_data["notes"] or "").strip() or None
+    db.commit()
+    db.refresh(group)
+    member_count = (
+        db.query(func.count(Client.id))
+        .filter(Client.entity_group_id == group.id)
+        .scalar()
+        or 0
+    )
+    resp = EntityGroupResponse.model_validate(group)
+    return resp.model_copy(update={"member_count": int(member_count)})
+
+
+@app.post("/api/entity-groups/{slug}/apply-reporting-entity")
+def apply_entity_group_reporting_entity(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Copy group reporting_entity to all members that do not have a site-level override."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    group_slug = (group.reporting_entity or "").strip().lower()
+    if not group_slug:
+        raise HTTPException(status_code=400, detail="Group has no reporting_entity set")
+    members = db.query(Client).filter(Client.entity_group_id == group.id).all()
+    updated = 0
+    skipped = 0
+    for member in members:
+        if member.reporting_entity and str(member.reporting_entity).strip():
+            skipped += 1
+            continue
+        member.reporting_entity = group_slug
+        updated += 1
+    db.commit()
+    return {
+        "slug": group.slug,
+        "reporting_entity": group_slug,
+        "updated_member_count": updated,
+        "skipped_member_count": skipped,
+    }
 
 
 @app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)

@@ -369,11 +369,29 @@ class EntityGroupCreate(BaseModel):
     slug: str
     display_name: str
     primary_abn: Optional[str] = None
+    reporting_entity: Optional[str] = None
     notes: Optional[str] = None
 
     @field_validator("slug", mode="before")
     @classmethod
     def _validate_slug(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+
+class EntityGroupUpdate(BaseModel):
+    display_name: Optional[str] = None
+    primary_abn: Optional[str] = None
+    reporting_entity: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
         return _normalize_reporting_entity(v)
 
 
@@ -382,6 +400,7 @@ class EntityGroupResponse(BaseModel):
     slug: str
     display_name: str
     primary_abn: Optional[str] = None
+    reporting_entity: Optional[str] = None
     notes: Optional[str] = None
     member_count: int = 0
     created_at: datetime
@@ -411,6 +430,9 @@ class EntityGroupSummaryResponse(BaseModel):
     total_offers: int = 0
     any_signed: bool = False
     stage_breakdown: dict[str, int] = {}
+    group_reporting_entity: Optional[str] = None
+    members_in_climate_rollup: int = 0
+    staged_activity_total: int = 0
     reporting_entity: EntityGroupReportingEntitySummary = Field(
         default_factory=EntityGroupReportingEntitySummary
     )

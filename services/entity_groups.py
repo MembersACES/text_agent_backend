@@ -8,7 +8,7 @@ from typing import Literal, Optional
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from models import Client, EntityGroup, Offer
+from models import Client, ClimateActivityRecord, EntityGroup, Offer
 
 Confidence = Literal["high", "medium", "low"]
 
@@ -137,6 +137,63 @@ def _cluster_confidence(members: list[Client], pair_confidences: list[Confidence
     return "low"
 
 
+def effective_reporting_entity(
+    client: Client,
+    group: EntityGroup | None = None,
+) -> str | None:
+    """Site override wins; else inherit group disclosure slug."""
+    if client.reporting_entity and str(client.reporting_entity).strip():
+        return str(client.reporting_entity).strip().lower()
+    if group and group.reporting_entity and str(group.reporting_entity).strip():
+        return str(group.reporting_entity).strip().lower()
+    if client.entity_group_id and group is None:
+        return None
+    return None
+
+
+def clients_in_disclosure_rollup(db: Session, slug: str) -> list[Client]:
+    """
+    CRM clients whose LOA/staged activity roll up to a disclosure slug.
+    Includes direct member slug match and group-inheriting members (null member slug).
+    """
+    normalized = (slug or "").strip().lower()
+    if not normalized:
+        return []
+
+    direct = (
+        db.query(Client)
+        .filter(Client.reporting_entity == normalized)
+        .order_by(Client.id.asc())
+        .all()
+    )
+    direct_ids = {c.id for c in direct}
+
+    inherit = (
+        db.query(Client)
+        .join(EntityGroup, Client.entity_group_id == EntityGroup.id)
+        .filter(Client.reporting_entity.is_(None))
+        .filter(EntityGroup.reporting_entity == normalized)
+        .order_by(Client.id.asc())
+        .all()
+    )
+
+    out = list(direct)
+    for client in inherit:
+        if client.id not in direct_ids:
+            out.append(client)
+    return out
+
+
+def disclosure_source_for_client(client: Client, slug: str, group: EntityGroup | None) -> str:
+    normalized = (slug or "").strip().lower()
+    member_slug = (client.reporting_entity or "").strip().lower()
+    if member_slug == normalized:
+        return "member"
+    if not member_slug and group and (group.reporting_entity or "").strip().lower() == normalized:
+        return "group_inherit"
+    return "member"
+
+
 def build_entity_group_summary(db: Session, group: EntityGroup) -> dict:
     members = (
         db.query(Client)
@@ -166,11 +223,35 @@ def build_entity_group_summary(db: Session, group: EntityGroup) -> dict:
     )
     aligned = len(distinct_values) <= 1
 
+    group_slug = (group.reporting_entity or "").strip().lower() or None
+    rollup_members: list[Client] = []
+    if group_slug:
+        rollup_members = clients_in_disclosure_rollup(db, group_slug)
+        rollup_members = [m for m in rollup_members if m.entity_group_id == group.id]
+    elif distinct_values:
+        for val in distinct_values:
+            rollup_members.extend(
+                m for m in members if (m.reporting_entity or "").strip().lower() == val
+            )
+
+    rollup_ids = {m.id for m in rollup_members}
+    staged_activity_total = 0
+    if rollup_ids:
+        staged_activity_total = (
+            db.query(func.count(ClimateActivityRecord.id))
+            .filter(ClimateActivityRecord.client_id.in_(list(rollup_ids)))
+            .scalar()
+            or 0
+        )
+
     return {
         "member_count": member_count,
         "total_offers": int(total_offers),
         "any_signed": any_signed,
         "stage_breakdown": stage_breakdown,
+        "group_reporting_entity": group_slug,
+        "members_in_climate_rollup": len(rollup_members),
+        "staged_activity_total": int(staged_activity_total),
         "reporting_entity": {
             "aligned": aligned,
             "distinct_values": distinct_values,

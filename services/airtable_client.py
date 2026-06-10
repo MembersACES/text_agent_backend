@@ -42,6 +42,7 @@ UTILITY_CONFIG = [
         "table_name": "C&I Electricity Records",
         "identifier_field": "NMI",
         "retailer_field": "Retailer (from Link to C&I Electricity Records)",  # or primary field name if lookup
+        "loa_retailer_fields": ["Retailer (from Link to C&I Electricity Records)"],
     },
     {
         "app_key": "SME Electricity",
@@ -53,9 +54,11 @@ UTILITY_CONFIG = [
     {
         "app_key": "C&I Gas",
         "loa_link_field": "4th Sheet - Large Gas",
+        "loa_link_field_fallbacks": ["Link to C&I Gas Client"],
         "table_name": "C&I Gas Clients",
         "identifier_field": "MRIN",
         "retailer_field": "Retailer C&I Gas",
+        "loa_retailer_fields": ["Retailer C&I Gas"],
     },
     {
         "app_key": "SME Gas",
@@ -66,17 +69,20 @@ UTILITY_CONFIG = [
     },
     {
         "app_key": "Waste",
-        "loa_link_field": "7th Sheet - Waste",  # may be singleLineText; handle both
-        "table_name": "Waste",  # adjust if different table name
-        "identifier_field": "Account Number",
-        "retailer_field": "Retailer",
+        "loa_link_field": "Link to Waste Clients",
+        "loa_link_field_fallbacks": ["7th Sheet - Waste"],
+        "table_name": "Waste Clients",
+        "identifier_field": "Account Number or Customer Number",
+        "retailer_field": "Provider",
+        "loa_retailer_fields": ["Retailers Waste Clients"],
     },
     {
         "app_key": "Oil",
         "loa_link_field": "8th Sheet - Oil",
-        "table_name": "Oil",  # adjust if different
-        "identifier_field": "Account Name",
+        "table_name": "Oil Clients",
+        "identifier_field": "Client Name",
         "retailer_field": "Retailer",
+        "loa_retailer_fields": ["Retailers Oil Clients"],
     },
 ]
 
@@ -320,6 +326,33 @@ def _loa_field_to_record_ids(loa_record: dict, link_field: str) -> list:
     return []
 
 
+def _loa_link_record_ids(loa_record: dict, cfg: dict) -> list:
+    """Resolve linked utility record IDs from LOA, trying primary and fallback link fields."""
+    fields = [cfg.get("loa_link_field")] + list(cfg.get("loa_link_field_fallbacks") or [])
+    for link_field in fields:
+        if not link_field:
+            continue
+        record_ids = _loa_field_to_record_ids(loa_record, link_field)
+        if record_ids:
+            return record_ids
+    return []
+
+
+def _loa_retailer_at_index(loa_record: dict, cfg: dict, idx: int) -> str:
+    """Fallback retailer from LOA rollup fields when utility row retailer is empty."""
+    loa_fields = loa_record.get("fields") or {}
+    for field_name in cfg.get("loa_retailer_fields") or []:
+        val = loa_fields.get(field_name)
+        if val is None:
+            continue
+        if isinstance(val, list):
+            if idx < len(val) and val[idx]:
+                return str(val[idx]).strip()
+        elif val:
+            return str(val).strip()
+    return ""
+
+
 def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
     """
     From an LOA record, resolve linked utility records and build:
@@ -332,17 +365,16 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
     linked_utility_extra = {}
     for cfg in UTILITY_CONFIG:
         app_key = cfg["app_key"]
-        link_field = cfg["loa_link_field"]
         table_name = cfg["table_name"]
         id_field = cfg["identifier_field"]
         retailer_field = cfg.get("retailer_field") or "Retailer"
-        record_ids = _loa_field_to_record_ids(loa_record, link_field)
+        record_ids = _loa_link_record_ids(loa_record, cfg)
         if not record_ids:
             continue
         identifiers = []
         retailers = []
         extras = []
-        for rec_id in record_ids:
+        for rec_idx, rec_id in enumerate(record_ids):
             rec = _fetch_record(table_name, rec_id)
             if not rec:
                 continue
@@ -362,7 +394,10 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
             ret = f.get(retailer_field)
             if isinstance(ret, list):
                 ret = ret[0] if ret else ""
-            retailers.append(str(ret).strip() if ret else "")
+            retailer = str(ret).strip() if ret else ""
+            if not retailer:
+                retailer = _loa_retailer_at_index(loa_record, cfg, rec_idx)
+            retailers.append(retailer)
             # New tracking fields (exact names as in Airtable - note "Data Recieved" is typo in some bases)
             data_req = f.get("Data Requested")
             data_rec = f.get("Data Recieved") or f.get("Data Received")  # support both spellings
