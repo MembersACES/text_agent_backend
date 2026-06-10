@@ -8,7 +8,7 @@ _backend_env = Path(__file__).resolve().parent / ".env"
 if _backend_env.is_file():
     load_dotenv(_backend_env, override=True)
 
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Body, status, Request
 from fastapi import Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form
@@ -21,7 +21,6 @@ import tempfile
 import requests
 import re
 import copy
-from google.auth.transport.requests import Request
 from urllib.parse import urlparse, parse_qs
 import os
 import sys
@@ -52,6 +51,19 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_keys,
 )
 from services import airtable_client
+from services.prograde_drift_webhook import get_nonce_cache, verify_signature
+from services.climate_store import (
+    activity_record_to_summary,
+    create_ingest_run,
+    drift_event_to_dict,
+    list_activity_records,
+    list_climate_roster,
+    list_drift_events,
+    save_drift_event,
+    upsert_activity_record,
+)
+from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
+from services.climate_entity_sources import build_entity_activity_sources
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -133,11 +145,13 @@ from models import (
     ClientStatusNote,
     Client,
     ClientReferral,
+    EntityGroup,
     Offer,
     OfferActivity,
     ClientManualActivity,
     StrategyItem,
     Testimonial,
+    AutonomousSequenceEvent,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
@@ -157,7 +171,13 @@ from schemas import (
     ClientStatusNoteResponse,
     ClientCreate,
     ClientUpdate,
+    ClientLinkFromLoaRequest,
     ClientResponse,
+    EntityGroupCreate,
+    EntityGroupDetailResponse,
+    EntityGroupResponse,
+    EntityGroupSummaryResponse,
+    EntityGroupSuggestionsResponse,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -200,6 +220,10 @@ from crm_enums import (
     OfferPipelineStage,
     POST_WIN_STAGES,
 )
+from services.crm_loa_link import (
+    link_or_create_client_from_loa,
+    resolve_crm_client_for_loa,
+)
 from services.crm import (
     upsert_client_from_business_info,
     update_client_stage_with_history,
@@ -209,7 +233,9 @@ from services.crm import (
     resolve_offer_for_member_upload,
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
+    enrich_client_response,
 )
+from services.entity_groups import build_entity_group_summary, compute_entity_group_suggestions
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
 from utils.task_history import (
@@ -324,8 +350,14 @@ CORS_ORIGINS = [
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
+    "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:8080",
+    "http://localhost:8081",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
 
@@ -668,6 +700,326 @@ async def utility_linked_webhook(
     }
 
 
+@app.post("/api/webhooks/prograde-drift")
+async def prograde_drift_webhook(
+    request: StarletteRequest,
+    db: Session = Depends(get_db),
+    x_prograde_signature: Annotated[Optional[str], Header(alias="X-Prograde-Signature")] = None,
+    x_prograde_event: Annotated[Optional[str], Header(alias="X-Prograde-Event")] = None,
+    x_prograde_delivery: Annotated[Optional[str], Header(alias="X-Prograde-Delivery")] = None,
+):
+    """
+    Inbound Prograde DRIFT_EVENT v1 (DRIFT_EVENT_v1.md §4.2).
+    Verifies HMAC, dedupes on event_id, persists to climate_drift_events (plus in-memory cache for dev).
+    """
+    secret = os.getenv("PROGRADE_WEBHOOK_SECRET", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="PROGRADE_WEBHOOK_SECRET not configured")
+
+    raw_body = await request.body()
+    if not x_prograde_signature:
+        raise HTTPException(status_code=400, detail="missing signature")
+
+    verified = verify_signature(raw_body, x_prograde_signature, secret)
+    if not verified.ok:
+        logging.warning("[prograde-drift] signature rejected: %s", verified.reason)
+        raise HTTPException(status_code=401, detail=verified.reason)
+
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="schema mismatch: body must be object")
+
+    event_id = str(payload.get("event_id") or x_prograde_delivery or "").strip()
+    if event_id and not get_nonce_cache().check_and_store(event_id):
+        logging.info("[prograde-drift] duplicate event_id=%s", event_id[:24])
+        raise HTTPException(status_code=409, detail="duplicate event_id")
+
+    entry = {
+        "received_at": time.time(),
+        "event_id": event_id,
+        "event_type": payload.get("event_type") or x_prograde_event,
+        "severity": payload.get("severity"),
+        "standard": payload.get("standard"),
+        "payload": payload,
+    }
+    _prograde_drift_events.append(entry)
+    if len(_prograde_drift_events) > 500:
+        del _prograde_drift_events[: len(_prograde_drift_events) - 500]
+
+    try:
+        save_drift_event(db, payload)
+    except Exception:
+        logging.exception("[prograde-drift] failed to persist to climate_drift_events")
+
+    logging.info(
+        "[prograde-drift] accepted event_id=%s type=%s",
+        event_id[:24] if event_id else "?",
+        entry.get("event_type"),
+    )
+    return {"ok": True, "event_id": event_id}
+
+
+_prograde_drift_events: list[dict] = []
+
+
+def verify_roster_access(
+    authorization: Optional[str] = Header(None),
+    x_aces_service_key: Optional[str] = Header(None, alias="X-ACES-Service-Key"),
+):
+    """Google JWT or shared service key (Prograde server proxy)."""
+    roster_key = (os.environ.get("CLIMATE_ROSTER_SERVICE_KEY") or "").strip()
+    if roster_key and x_aces_service_key and secrets.compare_digest(x_aces_service_key, roster_key):
+        return {"auth": "service_key", "email": "roster@prograde.internal"}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization required")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        return idinfo
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+@app.get("/api/climate/roster")
+def get_climate_roster(
+    period: str = Query("FY26", description="Reporting period label for deep links"),
+    q: Optional[str] = Query(None, description="Filter by business name"),
+    limit: int = Query(200, ge=1, le=500),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Clients with reporting_entity — for Prograde launcher (ACES live roster)."""
+    rows = list_climate_roster(db, query=q, limit=limit)
+    clients = [
+        {
+            **row,
+            "period": period,
+            "deep_link": f"/?entity={row['reporting_entity']}&period={period}",
+        }
+        for row in rows
+    ]
+    return {
+        "period": period,
+        "count": len(clients),
+        "clients": clients,
+        "source": "database",
+    }
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources")
+def get_climate_entity_activity_sources(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label for ETL preview"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """
+    LOA linked utilities + Airtable invoice samples + ETL preview + staged SQL activity
+  for a reporting_entity. Prograde Scope 1/2 integration review (Marcus raw dump).
+    """
+    payload = build_entity_activity_sources(
+        db,
+        entity_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/drift-events")
+def list_prograde_drift_events(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    reporting_entity: Optional[str] = Query(None),
+    unacknowledged_only: bool = Query(False),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """Consultant-facing drift event list for G1 badges."""
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=limit,
+    )
+    if not rows and _prograde_drift_events:
+        events = list(_prograde_drift_events)
+        if unacknowledged_only:
+            events = [e for e in events if not e.get("acknowledged")]
+        return {"events": events, "count": len(events), "source": "memory"}
+    return {
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+        "source": "database",
+    }
+
+
+class ClimateEtlSyncRequest(BaseModel):
+    utility_type: str = Field(..., description="e.g. C&I Electricity, C&I Gas")
+    identifier: str = Field(..., description="NMI, MRIN, or account identifier")
+    reporting_period_label: str = Field("FY26", description="FY label e.g. FY26")
+    max_records: int = Field(100, ge=1, le=500)
+    dry_run: bool = Field(False, description="If true, transform only — do not write climate_activity_records")
+
+
+@app.get("/api/clients/{client_id}/climate/drift-events")
+def list_client_climate_drift_events(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    unacknowledged_only: bool = Query(True),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    reporting_entity = (client.reporting_entity or "").strip() or None
+    rows = list_drift_events(
+        db,
+        reporting_entity=reporting_entity,
+        unacknowledged_only=unacknowledged_only,
+        limit=50,
+    )
+    return {
+        "client_id": client_id,
+        "reporting_entity": reporting_entity,
+        "events": [drift_event_to_dict(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.get("/api/clients/{client_id}/climate/activity-records")
+def list_client_climate_activity_records(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=200),
+):
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    rows = list_activity_records(db, client_id=client_id, limit=limit)
+    return {
+        "client_id": client_id,
+        "records": [activity_record_to_summary(r) for r in rows],
+        "count": len(rows),
+    }
+
+
+@app.post("/api/clients/{client_id}/climate/etl/sync")
+def sync_client_climate_activity_records(
+    client_id: int,
+    request: ClimateEtlSyncRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """
+    Pull Airtable invoice rows for a utility identifier and stage ActivityRecord v1 rows
+    in climate_activity_records (separate from CRM tables). Post-Tuesday: forward to B4/Prograde.
+    """
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    entity_id = (client.reporting_entity or "").strip()
+    if not entity_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Client has no reporting_entity — set on Strategy & WIP tab first",
+        )
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+
+    period_start, period_end = default_fy_period(request.reporting_period_label)
+    payload = airtable_client.get_utility_invoice_rows_by_identifier(
+        request.utility_type,
+        request.identifier,
+        max_records=request.max_records,
+    )
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    ctx = EtlContext(
+        entity_id=entity_id,
+        client_id=client_id,
+        loa_client_id=client.external_business_id,
+        site_id=str(request.identifier).strip(),
+        utility_type=request.utility_type,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    results, diagnostics = transform_invoice_rows(rows, ctx)
+    diagnostics["airtable"] = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+
+    created = 0
+    updated = 0
+    skipped = 0
+    preview: list[dict] = []
+
+    for res in results:
+        if res.skipped:
+            skipped += 1
+            preview.append(
+                {"source_row_id": res.source_row_id, "skipped": True, "reason": res.skip_reason}
+            )
+            continue
+        preview.append(
+            {
+                "record_id": res.record_id,
+                "activity_type": res.body.get("activity_type"),
+                "quantity": res.body.get("quantity"),
+            }
+        )
+        if request.dry_run:
+            continue
+        _, was_created = upsert_activity_record(
+            db,
+            record_id=res.record_id,
+            client_id=client_id,
+            body=res.body,
+            source_utility_type=request.utility_type,
+            source_row_id=res.source_row_id,
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    status = "dry_run" if request.dry_run else "completed"
+    if not request.dry_run:
+        create_ingest_run(
+            db,
+            client_id=client_id,
+            utility_type=request.utility_type,
+            identifier=request.identifier,
+            period_start=period_start,
+            period_end=period_end,
+            records_created=created,
+            records_updated=updated,
+            records_skipped=skipped,
+            status=status,
+            diagnostics=diagnostics,
+        )
+
+    return {
+        "client_id": client_id,
+        "entity_id": entity_id,
+        "dry_run": request.dry_run,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "diagnostics": diagnostics,
+        "preview": preview[:20],
+    }
+
+
 class ClientSearchRequest(BaseModel):
     query: str
 
@@ -704,28 +1056,16 @@ def get_business_info(
         result["user_email"] = user_info.get("email")
         # Airtable utility data (Contract End Date, Data Requested, Data Recieved) is loaded
         # lazily via GET /api/utility-extra to keep this endpoint fast.
-        business_details = result.get("business_details", {}) or {}
-        if business_details.get("name"):
-            try:
-                contact_info = result.get("contact_information", {}) or {}
-                gdrive_info = result.get("gdrive", {}) or {}
-
-                business_name = business_details.get("name") or request.business_name
-                external_business_id = result.get("record_ID")
-                primary_contact_email = contact_info.get("email")
-                gdrive_folder_url = gdrive_info.get("folder_url")
-
-                client = upsert_client_from_business_info(
-                    db=db,
-                    business_name=business_name,
-                    external_business_id=external_business_id,
-                    primary_contact_email=primary_contact_email,
-                    gdrive_folder_url=gdrive_folder_url,
-                )
-                if client:
-                    result["client_id"] = client.id
-            except Exception as e:
-                logging.error(f"Error upserting Client from business info: {str(e)}")
+        try:
+            crm_link = resolve_crm_client_for_loa(
+                db=db,
+                record_id=result.get("record_ID"),
+            )
+            result["crm_link"] = crm_link
+            if crm_link.get("status") == "matched" and crm_link.get("client_id"):
+                result["client_id"] = crm_link["client_id"]
+        except Exception as e:
+            logging.error(f"Error resolving CRM link from business info: {str(e)}")
 
     logging.info(f"Returning response to frontend: {result}")
     return result
@@ -734,6 +1074,7 @@ def get_business_info(
 @app.get("/api/utility-extra")
 def get_utility_extra(
     business_name: str = Query(..., description="Business name to fetch Airtable utility details for"),
+    external_business_id: Optional[str] = Query(None, description="Airtable LOA record id (rec…) — preferred when known"),
     user_info: dict = Depends(verify_google_token),
 ):
     """
@@ -742,15 +1083,43 @@ def get_utility_extra(
     Returns empty dicts if Airtable is not configured or business not found.
     """
     out = {"linked_utilities": {}, "utility_retailers": {}, "linked_utility_extra": {}}
-    logging.info("[utility-extra] request business_name=%r", business_name)
+    logging.info(
+        "[utility-extra] request business_name=%r external_business_id=%r",
+        business_name,
+        external_business_id,
+    )
     if not getattr(airtable_client, "USE_AIRTABLE_DIRECT", False) or not airtable_client.AIRTABLE_API_KEY:
         logging.info("[utility-extra] skipped: USE_AIRTABLE_DIRECT or AIRTABLE_API_KEY not set")
         return out
     name = (business_name or "").strip()
-    if not name:
+    loa_id = (external_business_id or "").strip()
+    if not name and not loa_id:
         return out
     try:
-        loa_record = airtable_client.get_loa_record_by_business_name(name)
+        loa_record = None
+        if loa_id:
+            loa_record = airtable_client.get_loa_record_by_id(loa_id)
+        else:
+            records = airtable_client.get_loa_records_by_business_name(name)
+            if len(records) == 0:
+                logging.info("[utility-extra] no LOA record found for business_name=%r", name)
+                return out
+            if len(records) > 1:
+                logging.warning(
+                    "[utility-extra] ambiguous LOA lookup for business_name=%r: %s matches",
+                    name,
+                    len(records),
+                )
+                return {
+                    "ambiguous": True,
+                    "candidates": [
+                        airtable_client.loa_record_candidate_summary(rec) for rec in records
+                    ],
+                    "linked_utilities": {},
+                    "utility_retailers": {},
+                    "linked_utility_extra": {},
+                }
+            loa_record = records[0]
         if not loa_record:
             logging.info("[utility-extra] no LOA record found for business_name=%r", name)
             return out
@@ -6894,6 +7263,107 @@ async def check_due_tasks_cron(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
+# ---- CRM: Entity groups (commercial multisite) ----
+
+
+def _entity_group_member_counts(db: Session, group_ids: list[int]) -> dict[int, int]:
+    if not group_ids:
+        return {}
+    rows = (
+        db.query(Client.entity_group_id, func.count(Client.id))
+        .filter(Client.entity_group_id.in_(group_ids))
+        .group_by(Client.entity_group_id)
+        .all()
+    )
+    return {int(gid): int(count) for gid, count in rows}
+
+
+@app.get("/api/entity-groups", response_model=List[EntityGroupResponse])
+def list_entity_groups(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List commercial entity groups with member counts."""
+    groups = db.query(EntityGroup).order_by(EntityGroup.display_name.asc()).all()
+    counts = _entity_group_member_counts(db, [g.id for g in groups])
+    out: List[EntityGroupResponse] = []
+    for group in groups:
+        resp = EntityGroupResponse.model_validate(group)
+        out.append(resp.model_copy(update={"member_count": counts.get(group.id, 0)}))
+    return out
+
+
+@app.post("/api/entity-groups", response_model=EntityGroupResponse)
+def create_entity_group(
+    body: EntityGroupCreate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Create a commercial entity group (explicit assignment only)."""
+    existing = db.query(EntityGroup).filter(EntityGroup.slug == body.slug).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Entity group with this slug already exists")
+    group = EntityGroup(
+        slug=body.slug,
+        display_name=body.display_name.strip(),
+        primary_abn=(body.primary_abn or "").strip() or None,
+        notes=(body.notes or "").strip() or None,
+    )
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+    resp = EntityGroupResponse.model_validate(group)
+    return resp.model_copy(update={"member_count": 0})
+
+
+@app.get("/api/entity-groups/suggestions", response_model=EntityGroupSuggestionsResponse)
+def get_entity_group_suggestions(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Read-only candidate clusters for ungrouped CRM members (no auto-assign)."""
+    clusters = compute_entity_group_suggestions(db)
+    return EntityGroupSuggestionsResponse(clusters=clusters)
+
+
+@app.get("/api/entity-groups/{slug}/summary", response_model=EntityGroupSummaryResponse)
+def get_entity_group_summary(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Aggregate summary for a commercial entity group hub."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    return EntityGroupSummaryResponse(**build_entity_group_summary(db, group))
+
+
+@app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)
+def get_entity_group(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Entity group detail with linked CRM clients."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    members = (
+        db.query(Client)
+        .filter(Client.entity_group_id == group.id)
+        .order_by(Client.business_name.asc())
+        .all()
+    )
+    resp = EntityGroupResponse.model_validate(group)
+    return EntityGroupDetailResponse(
+        **resp.model_copy(update={"member_count": len(members)}).model_dump(),
+        members=[enrich_client_response(db, m) for m in members],
+    )
+
+
 # ---- CRM: Clients, Offers, and Pipeline ----
 
 
@@ -6917,6 +7387,11 @@ def create_client(
             detail="Client with this business name already exists",
         )
 
+    if client.entity_group_id is not None:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+        if not group:
+            raise HTTPException(status_code=400, detail="Entity group not found")
+
     db_client = Client(
         business_name=client.business_name,
         external_business_id=client.external_business_id,
@@ -6924,13 +7399,34 @@ def create_client(
         gdrive_folder_url=client.gdrive_folder_url,
         stage=client.stage or "lead",
         owner_email=client.owner_email or (user_data.get("idinfo") or {}).get("email"),
+        reporting_entity=client.reporting_entity,
+        entity_group_id=client.entity_group_id,
     )
     db.add(db_client)
     db.commit()
     db.refresh(db_client)
 
     logging.info(f"Client created with id {db_client.id}")
-    return db_client
+    return enrich_client_response(db, db_client)
+
+
+@app.post("/api/clients/link-from-loa", response_model=ClientResponse)
+def link_client_from_loa(
+    body: ClientLinkFromLoaRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Explicitly link an LOA record to an existing CRM member or create a new one."""
+    owner_email = (user_data.get("idinfo") or {}).get("email")
+    return link_or_create_client_from_loa(
+        db=db,
+        record_id=body.record_id,
+        business_name=body.business_name,
+        primary_contact_email=body.primary_contact_email,
+        gdrive_folder_url=body.gdrive_folder_url,
+        client_id=body.client_id,
+        owner_email=owner_email,
+    )
 
 
 @app.get("/api/clients")
@@ -6940,13 +7436,19 @@ def list_clients(
     created_after: Optional[str] = Query(None, description="Filter clients created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter clients created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only clients where owner_email matches current user"),
+    reporting_entity: Optional[str] = Query(None, description="Filter by sustainability reporting entity slug (exact match)"),
+    entity_group: Optional[str] = Query(None, description="Filter by commercial entity group slug (exact match)"),
+    signed_not_promoted: Optional[bool] = Query(
+        None,
+        description="If true, only clients with has_signed_contract and stage lead or qualified",
+    ),
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
     """
-    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients).
+    List clients. Optional filters: query, stage, created_after, created_before, mine (My clients), reporting_entity.
     When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
     """
     from datetime import datetime as dt
@@ -6964,6 +7466,18 @@ def list_clients(
         user_email = (user_data.get("idinfo") or {}).get("email")
         if user_email:
             base_query = base_query.filter(Client.owner_email == user_email)
+    if isinstance(reporting_entity, str) and reporting_entity.strip():
+        base_query = base_query.filter(Client.reporting_entity == reporting_entity.strip().lower())
+    if isinstance(entity_group, str) and entity_group.strip():
+        normalized_group = entity_group.strip().lower()
+        base_query = base_query.join(EntityGroup, Client.entity_group_id == EntityGroup.id).filter(
+            EntityGroup.slug == normalized_group
+        )
+    if signed_not_promoted is True:
+        base_query = base_query.filter(
+            Client.has_signed_contract == 1,
+            Client.stage.in_(["lead", "qualified"]),
+        )
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -6984,10 +7498,10 @@ def list_clients(
         off = offset or 0
         lim = limit or 20
         clients = ordered.offset(off).limit(lim).all()
-        items = [ClientResponse.model_validate(c).model_dump(mode="json") for c in clients]
+        items = [enrich_client_response(db, c).model_dump(mode="json") for c in clients]
         return JSONResponse(content={"items": items, "total": total})
     clients = ordered.all()
-    return [ClientResponse.model_validate(c) for c in clients]
+    return [enrich_client_response(db, c) for c in clients]
 
 
 @app.get("/api/clients/export")
@@ -7060,12 +7574,7 @@ def get_client(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    resp = ClientResponse.model_validate(client)
-    if getattr(client, "referred_by_client_id", None):
-        advocate = db.query(Client).filter(Client.id == client.referred_by_client_id).first()
-        if advocate:
-            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
-    return resp
+    return enrich_client_response(db, client)
 
 
 @app.patch("/api/clients/{client_id}", response_model=ClientResponse)
@@ -7111,6 +7620,14 @@ def update_client(
         db_client.advocacy_meeting_time = (client_update.advocacy_meeting_time or "").strip() or None
     if "advocacy_meeting_completed" in update_payload:
         db_client.advocacy_meeting_completed = 1 if client_update.advocacy_meeting_completed else 0
+    if "reporting_entity" in update_payload:
+        db_client.reporting_entity = client_update.reporting_entity
+    if "entity_group_id" in update_payload:
+        if client_update.entity_group_id is not None:
+            group = db.query(EntityGroup).filter(EntityGroup.id == client_update.entity_group_id).first()
+            if not group:
+                raise HTTPException(status_code=400, detail="Entity group not found")
+        db_client.entity_group_id = client_update.entity_group_id
     if client_update.stage is not None and client_update.stage != db_client.stage:
         db_client.stage = client_update.stage
         db_client.stage_changed_at = datetime.utcnow()
@@ -7118,12 +7635,7 @@ def update_client(
     db.commit()
     db.refresh(db_client)
     logging.info(f"Client {client_id} updated")
-    resp = ClientResponse.model_validate(db_client)
-    if getattr(db_client, "referred_by_client_id", None):
-        advocate = db.query(Client).filter(Client.id == db_client.referred_by_client_id).first()
-        if advocate:
-            resp = resp.model_copy(update={"referred_by_advocate_name": advocate.business_name})
-    return resp
+    return enrich_client_response(db, db_client)
 
 
 @app.get("/api/clients/{client_id}/referrals", response_model=List[ClientReferralResponse])
@@ -7241,7 +7753,7 @@ def delete_client(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    # 1) Offers and offer activities
+    # 1) Offers and dependent rows (mirror delete_offer + strategy/automation links)
     offer_ids = [
         o.id
         for o in db.query(Offer.id)
@@ -7249,9 +7761,41 @@ def delete_client(
         .all()
     ]
     if offer_ids:
+        activity_ids = [
+            a.id
+            for a in db.query(OfferActivity)
+            .filter(OfferActivity.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if activity_ids:
+            db.query(StrategyItem).filter(
+                StrategyItem.offer_activity_id.in_(activity_ids)
+            ).delete(synchronize_session=False)
+        db.query(StrategyItem).filter(StrategyItem.offer_id.in_(offer_ids)).delete(
+            synchronize_session=False
+        )
+        run_ids = [
+            r.id
+            for r in db.query(AutonomousSequenceRun)
+            .filter(AutonomousSequenceRun.offer_id.in_(offer_ids))
+            .all()
+        ]
+        if run_ids:
+            db.query(AutonomousSequenceEvent).filter(
+                AutonomousSequenceEvent.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceStep).filter(
+                AutonomousSequenceStep.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            db.query(AutonomousSequenceRun).filter(
+                AutonomousSequenceRun.id.in_(run_ids)
+            ).delete(synchronize_session=False)
         db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(
             synchronize_session=False
         )
+        db.query(ClientStatusNote).filter(
+            ClientStatusNote.related_offer_id.in_(offer_ids)
+        ).delete(synchronize_session=False)
     # Also remove any activities that reference this client directly
     db.query(OfferActivity).filter(OfferActivity.client_id == client_id).delete(
         synchronize_session=False
@@ -7259,6 +7803,25 @@ def delete_client(
     db.query(Offer).filter(Offer.client_id == client_id).delete(
         synchronize_session=False
     )
+    db.query(StrategyItem).filter(StrategyItem.client_id == client_id).delete(
+        synchronize_session=False
+    )
+    client_run_ids = [
+        r.id
+        for r in db.query(AutonomousSequenceRun)
+        .filter(AutonomousSequenceRun.client_id == client_id)
+        .all()
+    ]
+    if client_run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceRun).filter(
+            AutonomousSequenceRun.id.in_(client_run_ids)
+        ).delete(synchronize_session=False)
 
     # 2) Tasks and task history
     task_ids = [
@@ -9207,6 +9770,17 @@ def _client_manual_activity_offer_display(
     return " · ".join(parts) if parts else (n or "—")
 
 
+def _report_actor_email(user_data: dict) -> str:
+    """Email of the authenticated user for activity report filters."""
+    idinfo = user_data.get("idinfo") or {}
+    email = (idinfo.get("email") or "").strip()
+    if not email:
+        user = user_data.get("user")
+        if user is not None:
+            email = (getattr(user, "email", None) or "").strip()
+    return email.lower()
+
+
 def _client_manual_row_to_report_item(
     row: ClientManualActivity,
     business_name: Optional[str],
@@ -9284,6 +9858,7 @@ def activities_report_client_manual(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9296,6 +9871,12 @@ def activities_report_client_manual(
     q = db.query(ClientManualActivity, Client).join(Client, ClientManualActivity.client_id == Client.id)
     if client_id is not None:
         q = q.filter(ClientManualActivity.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            q = q.filter(func.lower(ClientManualActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9334,6 +9915,65 @@ def clients_offer_counts(
         .all()
     )
     return {str(client_id): count for client_id, count in rows}
+
+
+def _require_aces_staff(user_data: dict = Depends(get_current_user_with_db)) -> dict:
+    """Internal diagnostics: same Google auth as CRM, restricted to ACES staff domain."""
+    email = ((user_data.get("idinfo") or {}).get("email") or "").strip().lower()
+    if not email.endswith("@acesolutions.com.au"):
+        raise HTTPException(status_code=403, detail="ACES staff access required")
+    return user_data
+
+
+@app.get("/api/admin/signed-contract-dry-run")
+def signed_contract_dry_run(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Read-only diagnostic: Signed via ACES contract status vs CRM client stage.
+    Bulk-reads FILE_IDS sheet once; no DB or sheet writes.
+    """
+    from services.signed_contract_dry_run import run_signed_contract_dry_run
+
+    logging.info(
+        "signed-contract-dry-run requested by %s",
+        (user_data.get("idinfo") or {}).get("email"),
+    )
+    try:
+        return run_signed_contract_dry_run(db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+class SyncSignedContractsRequest(BaseModel):
+    promote_signed: bool = Field(
+        False,
+        description="If true, promote signed lead/qualified members to existing_client after flag sync",
+    )
+
+
+@app.post("/api/admin/sync-signed-contracts")
+def sync_signed_contracts(
+    body: SyncSignedContractsRequest = SyncSignedContractsRequest(),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(_require_aces_staff),
+):
+    """
+    Sync has_signed_contract from FILE_IDS sheet for all CRM clients.
+    By default updates flags only; optional promote_signed promotes signed lead/qualified rows.
+    """
+    from services.signed_contract_dry_run import recompute_signed_contracts
+
+    logging.info(
+        "sync-signed-contracts requested by %s promote_signed=%s",
+        (user_data.get("idinfo") or {}).get("email"),
+        body.promote_signed,
+    )
+    try:
+        return recompute_signed_contracts(db, promote_signed=body.promote_signed)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.get("/api/reports/pipeline/summary")
@@ -9459,6 +10099,7 @@ def activities_report_list(
     activity_type: Optional[str] = Query(None, description="Filter by activity type"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only activities created by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9476,6 +10117,12 @@ def activities_report_list(
         query = query.filter(Offer.client_id == client_id)
     if activity_type is not None and activity_type.strip():
         query = query.filter(OfferActivity.activity_type == activity_type.strip())
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(OfferActivity.created_by) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")
@@ -9594,6 +10241,7 @@ def activities_report_tasks(
     client_id: Optional[int] = Query(None, description="Filter by client id"),
     created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    mine: bool = Query(False, description="Only task events performed by the current user"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
@@ -9610,6 +10258,12 @@ def activities_report_tasks(
     )
     if client_id is not None:
         query = query.filter(Task.client_id == client_id)
+    if mine:
+        actor = _report_actor_email(user_data)
+        if actor:
+            query = query.filter(func.lower(TaskHistory.user_email) == actor)
+        else:
+            return []
     if created_after:
         try:
             start = dt.strptime(created_after, "%Y-%m-%d")

@@ -12,7 +12,8 @@ from crm_enums import (
     OfferPipelineStage,
     POST_WIN_STAGES,
 )
-from models import Client, Offer, ClientStatusNote, OfferActivity, StrategyItem
+from models import Client, Offer, ClientStatusNote, OfferActivity, StrategyItem, EntityGroup
+from services import airtable_client
 
 
 def upsert_client_from_business_info(
@@ -30,6 +31,17 @@ def upsert_client_from_business_info(
     """
     if not business_name:
         return None
+
+    if not external_business_id and business_name:
+        try:
+            if airtable_client.AIRTABLE_API_KEY and getattr(
+                airtable_client, "USE_AIRTABLE_DIRECT", False
+            ):
+                resolved = airtable_client.resolve_loa_record_id(business_name)
+                if resolved:
+                    external_business_id = resolved
+        except Exception:
+            pass
 
     client: Optional[Client] = None
 
@@ -64,6 +76,26 @@ def upsert_client_from_business_info(
     db.commit()
     db.refresh(client)
     return client
+
+
+def enrich_client_response(db: Session, client: Client):
+    """Build ClientResponse with advocate and entity-group display fields."""
+    from schemas import ClientResponse
+
+    resp = ClientResponse.model_validate(client)
+    updates: dict = {}
+    if getattr(client, "referred_by_client_id", None):
+        advocate = db.query(Client).filter(Client.id == client.referred_by_client_id).first()
+        if advocate:
+            updates["referred_by_advocate_name"] = advocate.business_name
+    if getattr(client, "entity_group_id", None):
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+        if group:
+            updates["entity_group_slug"] = group.slug
+            updates["entity_group_display_name"] = group.display_name
+    if updates:
+        resp = resp.model_copy(update=updates)
+    return resp
 
 
 def update_client_stage_with_history(

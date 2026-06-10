@@ -185,38 +185,90 @@ def _escape_formula_value(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "''")
 
 
-def get_loa_record_by_business_name(business_name: str) -> Optional[dict]:
+def get_loa_record_by_id(record_id: str) -> Optional[dict]:
+    """Fetch LOA Business Details record by Airtable record id (rec…)."""
+    rid = (record_id or "").strip()
+    if not rid:
+        return None
+    return _fetch_record(LOA_TABLE_ID, rid)
+
+
+def get_loa_records_by_business_name(
+    business_name: str, *, max_records: int = 10
+) -> list[dict]:
     """
-    Find LOA Business Details record: first by Business Name, then by Trading As.
-    Returns the first matching record or None.
+    Find LOA Business Details records by Business Name or Trading As.
+    Returns all matches up to max_records (empty list on no key / failure).
     """
     if not business_name or not AIRTABLE_API_KEY:
-        return None
+        return []
     search = (business_name or "").strip()
     if not search:
-        return None
+        return []
     escaped = _escape_formula_value(search)
-    # OR({Business Name}='X',{Trading As}='X') - try both so we match either reference
     formula = f"OR({{Business Name}}='{escaped}',{{Trading As}}='{escaped}')"
     try:
         logger.info("[utility-extra] Airtable LOA lookup: business_name=%r", search)
         r = requests.get(
             _url(LOA_TABLE_ID),
             headers=_headers(),
-            params={"filterByFormula": formula, "maxRecords": 1},
+            params={"filterByFormula": formula, "maxRecords": max(1, max_records)},
             timeout=30,
         )
         r.raise_for_status()
         data = r.json()
         records = data.get("records", [])
-        if records:
-            logger.info("[utility-extra] Airtable LOA found: record id=%s", records[0].get("id", "")[:12])
-            return records[0]
-        logger.info("[utility-extra] Airtable LOA: no record matched business_name=%r", search)
-        return None
+        if not isinstance(records, list):
+            return []
+        return records
     except requests.RequestException as e:
-        logger.warning("Airtable get_loa_record request failed: %s", e)
+        logger.warning("Airtable get_loa_records request failed: %s", e)
+        return []
+
+
+def loa_record_candidate_summary(loa_record: dict) -> dict:
+    """Minimal disambiguation payload for ambiguous LOA name lookups."""
+    fields = loa_record.get("fields") or {}
+    return {
+        "record_id": loa_record.get("id") or "",
+        "trading_name": (fields.get("Trading As") or "").strip() or None,
+        "site_address": (fields.get("Site Address") or "").strip() or None,
+        "abn": (fields.get("Business ABN") or "").strip() or None,
+    }
+
+
+def resolve_loa_record_id(business_name: str) -> Optional[str]:
+    """Return LOA record id only when business_name matches exactly one LOA row."""
+    records = get_loa_records_by_business_name(business_name, max_records=10)
+    if len(records) != 1:
         return None
+    return records[0].get("id") or None
+
+
+def get_loa_record_by_business_name(business_name: str) -> Optional[dict]:
+    """
+    Find LOA Business Details record: first by Business Name, then by Trading As.
+    Returns the first matching record or None.
+    """
+    records = get_loa_records_by_business_name(business_name, max_records=10)
+    if not records:
+        logger.info("[utility-extra] Airtable LOA: no record matched business_name=%r", (business_name or "").strip())
+        return None
+    if len(records) > 1:
+        logger.warning(
+            "[utility-extra] Ambiguous LOA lookup for business_name=%r: %s matches",
+            (business_name or "").strip(),
+            len(records),
+        )
+        for rec in records:
+            summary = loa_record_candidate_summary(rec)
+            logger.warning(
+                "[utility-extra] LOA candidate id=%s site_address=%r",
+                (summary.get("record_id") or "")[:12],
+                summary.get("site_address"),
+            )
+    logger.info("[utility-extra] Airtable LOA found: record id=%s", (records[0].get("id") or "")[:12])
+    return records[0]
 
 
 def _fetch_record(table_name: str, record_id: str) -> Optional[dict]:
@@ -451,6 +503,81 @@ def _normalize_contract_end_date(value: Any) -> Optional[str]:
     if len(s) >= 10:
         return s[:10]
     return None
+
+
+def _normalize_drive_folder_id(raw: Any) -> str:
+    """Normalize a Drive folder cell (raw ID or URL) to a canonical folder ID string."""
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if s.startswith("http://") or s.startswith("https://"):
+        m = re.search(r"/folders/([a-zA-Z0-9_-]+)", s)
+        if m:
+            return m.group(1)
+        m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", s)
+        if m:
+            return m.group(1)
+        return ""
+    # Raw folder ID (may include trailing path fragments)
+    return s.split("/", 1)[0].strip()
+
+
+def list_all_loa_records() -> list[dict]:
+    """
+    List all LOA Business Details records with fields needed for sheet reconciliation.
+    Returns dicts: record_id, business_name, trading_as, abn, drive_folder_id.
+    Uses pagination (offset) on LOA_TABLE_ID.
+    """
+    if not AIRTABLE_API_KEY:
+        logger.warning("[list_all_loa_records] AIRTABLE_API_KEY not set")
+        return []
+    out: list[dict] = []
+    try:
+        print("[airtable] list_all_loa_records: fetching LOA Business Details...", flush=True)
+        offset: Optional[str] = None
+        page = 0
+        max_pages = 100
+        while page < max_pages:
+            page += 1
+            params: dict[str, Any] = {"pageSize": 100}
+            if offset:
+                params["offset"] = offset
+            r = requests.get(
+                _url(LOA_TABLE_ID),
+                headers=_headers(),
+                params=params,
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+            records = data.get("records", [])
+            for rec in records:
+                rid = (rec.get("id") or "").strip()
+                fields = rec.get("fields") or {}
+                folder_raw = fields.get("File ID Google Drive Client Folder")
+                out.append({
+                    "record_id": rid,
+                    "business_name": (fields.get("Business Name") or "").strip(),
+                    "trading_as": (fields.get("Trading As") or "").strip(),
+                    "abn": (fields.get("Business ABN") or "").strip(),
+                    "drive_folder_id": _normalize_drive_folder_id(folder_raw),
+                })
+            next_offset = data.get("offset")
+            print(
+                f"[airtable] list_all_loa_records: page {page} -> {len(records)} records "
+                f"(total so far: {len(out)}), next_offset={bool(next_offset)}",
+                flush=True,
+            )
+            if not next_offset:
+                break
+            offset = next_offset
+        logger.info("[list_all_loa_records] fetched %s records in %s page(s)", len(out), page)
+    except requests.RequestException as e:
+        logger.warning("[list_all_loa_records] Airtable request failed: %s", e)
+    print(f"[airtable] list_all_loa_records -> {len(out)} records", flush=True)
+    return out
 
 
 def list_all_utility_records(utility_type: str) -> list[dict]:

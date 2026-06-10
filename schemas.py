@@ -2,11 +2,28 @@
 Pydantic schemas for API requests and responses
 """
 from pydantic import BaseModel, Field, field_serializer, field_validator
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 import json
 from utils.timezone import to_melbourne_iso
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
+
+
+def _normalize_reporting_entity(v: Optional[str]) -> Optional[str]:
+    """A1 entity_id slug: lowercase kebab-case, e.g. agn-holdings."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+    if len(s) > 128:
+        raise ValueError("reporting_entity must be 128 characters or fewer")
+    allowed = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+    if not all(c in allowed for c in s) or s.startswith("-") or s.endswith("-") or "--" in s:
+        raise ValueError(
+            "reporting_entity must be a lowercase slug (letters, numbers, single hyphens), e.g. agn-holdings"
+        )
+    return s
 
 
 class TaskCreate(BaseModel):
@@ -122,6 +139,14 @@ class ClientCreate(BaseModel):
     gdrive_folder_url: Optional[str] = None
     stage: Optional[ClientStage] = ClientStage.LEAD
     owner_email: Optional[str] = None
+    reporting_entity: Optional[str] = None
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+    entity_group_id: Optional[int] = None
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -164,6 +189,14 @@ class ClientUpdate(BaseModel):
     advocacy_meeting_date: Optional[str] = None
     advocacy_meeting_time: Optional[str] = None
     advocacy_meeting_completed: Optional[bool] = None
+    reporting_entity: Optional[str] = None
+
+    @field_validator("reporting_entity", mode="before")
+    @classmethod
+    def _validate_reporting_entity(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+    entity_group_id: Optional[int] = None
 
     @field_validator("stage", mode="before")
     @classmethod
@@ -183,6 +216,29 @@ class ClientUpdate(BaseModel):
         }:
             return ClientStage.QUALIFIED
         return ClientStage(raw)
+
+
+class CrmLinkCandidate(BaseModel):
+    client_id: int
+    business_name: str
+    external_business_id: Optional[str] = None
+    stage: str
+
+
+class CrmLinkResponse(BaseModel):
+    status: Literal["matched", "no_match", "ambiguous", "conflict"]
+    client_id: Optional[int] = None
+    record_id: Optional[str] = None
+    reason: str
+    candidates: List[CrmLinkCandidate] = []
+
+
+class ClientLinkFromLoaRequest(BaseModel):
+    record_id: str
+    business_name: str
+    primary_contact_email: Optional[str] = None
+    gdrive_folder_url: Optional[str] = None
+    client_id: Optional[int] = None
 
 
 class ClientResponse(BaseModel):
@@ -205,8 +261,15 @@ class ClientResponse(BaseModel):
     advocacy_meeting_date: Optional[str] = None  # ISO date YYYY-MM-DD
     advocacy_meeting_time: Optional[str] = None  # e.g. "11:03 AM"
     advocacy_meeting_completed: Optional[bool] = False
+    reporting_entity: Optional[str] = None  # A1 entity_id slug for sustainability disclosures
+    entity_group_id: Optional[int] = None
+    entity_group_slug: Optional[str] = None
+    entity_group_display_name: Optional[str] = None
+    has_signed_contract: bool = False
+    signed_contract_utilities: Optional[list[str]] = None
+    signed_contract_checked_at: Optional[datetime] = None
 
-    @field_serializer("created_at", "updated_at", "stage_changed_at")
+    @field_serializer("created_at", "updated_at", "stage_changed_at", "signed_contract_checked_at")
     def serialize_datetime(self, dt: Optional[datetime], _info):
         if dt is None:
             return None
@@ -245,6 +308,35 @@ class ClientResponse(BaseModel):
             return bool(v)
         return False
 
+    @field_validator("has_signed_contract", mode="before")
+    @classmethod
+    def _has_signed_contract_bool(cls, v: Optional[object]) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, int):
+            return bool(v)
+        return False
+
+    @field_validator("signed_contract_utilities", mode="before")
+    @classmethod
+    def _signed_contract_utilities_list(cls, v: Optional[object]) -> Optional[list[str]]:
+        if v is None or v == "":
+            return None
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            try:
+                import json
+
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed]
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return None
+
     class Config:
         from_attributes = True
 
@@ -271,6 +363,77 @@ class ClientResponse(BaseModel):
         except ValueError:
             # Fallback for truly unexpected historic values.
             return ClientStage.LEAD
+
+
+class EntityGroupCreate(BaseModel):
+    slug: str
+    display_name: str
+    primary_abn: Optional[str] = None
+    notes: Optional[str] = None
+
+    @field_validator("slug", mode="before")
+    @classmethod
+    def _validate_slug(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_reporting_entity(v)
+
+
+class EntityGroupResponse(BaseModel):
+    id: int
+    slug: str
+    display_name: str
+    primary_abn: Optional[str] = None
+    notes: Optional[str] = None
+    member_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class EntityGroupDetailResponse(EntityGroupResponse):
+    members: List["ClientResponse"] = []
+
+
+class EntityGroupReportingEntitySummary(BaseModel):
+    aligned: bool = True
+    distinct_values: List[str] = []
+
+
+class EntityGroupSummaryResponse(BaseModel):
+    member_count: int = 0
+    total_offers: int = 0
+    any_signed: bool = False
+    stage_breakdown: dict[str, int] = {}
+    reporting_entity: EntityGroupReportingEntitySummary = Field(
+        default_factory=EntityGroupReportingEntitySummary
+    )
+
+
+class EntityGroupSuggestionMemberPreview(BaseModel):
+    id: int
+    business_name: str
+    external_business_id: Optional[str] = None
+    stage: str
+
+
+class EntityGroupSuggestionCluster(BaseModel):
+    suggested_display_name: str
+    suggested_slug: str
+    member_ids: List[int]
+    members: List[EntityGroupSuggestionMemberPreview]
+    reason: str
+    confidence: Literal["high", "medium", "low"]
+
+
+class EntityGroupSuggestionsResponse(BaseModel):
+    clusters: List[EntityGroupSuggestionCluster] = []
 
 
 class ClientReferralCreate(BaseModel):

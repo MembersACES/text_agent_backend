@@ -6,9 +6,9 @@ from sqlalchemy.orm import sessionmaker
 
 from crm_enums import ClientStage, OfferStatus, OfferActivityType, OfferPipelineStage
 from database import Base
-from models import Client, Offer
-from schemas import ClientCreate, OfferCreate
-from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request
+from models import Client, Offer, StrategyItem
+from schemas import ClientCreate, ClientUpdate, OfferCreate
+from main import ClientBulkUpdateRequest, bulk_update_clients, DataRequest, data_request, list_clients, update_client
 from services.crm import (
     update_offer_status_and_propagate_client_stage,
     upsert_client_from_business_info,
@@ -168,6 +168,29 @@ def test_get_business_info_upsert_respects_external_business_id():
     assert second.external_business_id == "airtable-123"
     assert second.primary_contact_email == "second@example.com"
     assert second.gdrive_folder_url == "https://drive.example/folder"
+
+
+def test_upsert_auto_resolves_external_business_id_on_single_loa_match():
+    from unittest.mock import patch
+    from services import airtable_client
+
+    db = _make_test_session()
+    with patch.object(airtable_client, "USE_AIRTABLE_DIRECT", True):
+        with patch.object(airtable_client, "AIRTABLE_API_KEY", "test-key"):
+            with patch.object(
+                airtable_client,
+                "resolve_loa_record_id",
+                return_value="recSolo123",
+            ):
+                client = upsert_client_from_business_info(
+                    db=db,
+                    business_name="Solo Site",
+                    external_business_id=None,
+                    primary_contact_email=None,
+                    gdrive_folder_url=None,
+                )
+    assert client is not None
+    assert client.external_business_id == "recSolo123"
 
 
 def test_bulk_update_clients_assign_owner_only():
@@ -414,3 +437,118 @@ def test_create_offer_activity_signed_engagement_accepts_offer_and_updates_clien
 
     assert offer.status == OfferStatus.ACCEPTED.value
     assert client.stage == ClientStage.WON.value
+
+
+def test_reporting_entity_normalizes_on_create():
+    client = ClientCreate(business_name="Group Co", reporting_entity="  Reddrop-Group  ")
+    assert client.reporting_entity == "reddrop-group"
+
+    cleared = ClientCreate(business_name="Solo Co", reporting_entity="   ")
+    assert cleared.reporting_entity is None
+
+
+def test_reporting_entity_rejects_invalid_slug():
+    from pydantic import ValidationError
+
+    for bad in ("bad slug", "bad_slug", "-leading", "trailing-", "double--hyphen", "a" * 129):
+        try:
+            ClientCreate(business_name="X", reporting_entity=bad)
+            assert False, f"Expected ValidationError for {bad!r}"
+        except ValidationError:
+            pass
+
+
+def test_update_client_sets_and_clears_reporting_entity():
+    db = _make_test_session()
+    client = _make_client(db, business_name="Member A")
+    user = {"idinfo": {"email": "admin@example.com"}}
+
+    updated = update_client(
+        client_id=client.id,
+        client_update=ClientUpdate(reporting_entity="Reddrop-Group"),
+        db=db,
+        user_data=user,
+    )
+    assert updated.reporting_entity == "reddrop-group"
+
+    db.refresh(client)
+    assert client.reporting_entity == "reddrop-group"
+
+    cleared = update_client(
+        client_id=client.id,
+        client_update=ClientUpdate(reporting_entity=None),
+        db=db,
+        user_data=user,
+    )
+    assert cleared.reporting_entity is None
+    db.refresh(client)
+    assert client.reporting_entity is None
+
+
+def test_list_clients_filters_by_reporting_entity():
+    db = _make_test_session()
+    c1 = _make_client(db, business_name="Member One")
+    c2 = _make_client(db, business_name="Member Two")
+    c3 = _make_client(db, business_name="Unlinked")
+
+    user = {"idinfo": {"email": "admin@example.com"}}
+    update_client(
+        client_id=c1.id,
+        client_update=ClientUpdate(reporting_entity="reddrop-group"),
+        db=db,
+        user_data=user,
+    )
+    update_client(
+        client_id=c2.id,
+        client_update=ClientUpdate(reporting_entity="reddrop-group"),
+        db=db,
+        user_data=user,
+    )
+
+    matches = list_clients(
+        query=None,
+        stage=None,
+        created_after=None,
+        created_before=None,
+        mine=None,
+        reporting_entity="Reddrop-Group",
+        limit=None,
+        offset=None,
+        db=db,
+        user_data=user,
+    )
+    names = {c.business_name for c in matches}
+    assert names == {"Member One", "Member Two"}
+
+
+def test_delete_client_removes_offers_and_strategy_items():
+    from main import delete_client
+
+    db = _make_test_session()
+    client = _make_client(db, business_name="Delete Me Co")
+    offer = Offer(
+        client_id=client.id,
+        business_name=client.business_name,
+        status=OfferStatus.REQUESTED.value,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(offer)
+    db.commit()
+    db.refresh(offer)
+    db.add(
+        StrategyItem(
+            client_id=client.id,
+            year=2026,
+            section="in_progress",
+            row_index=0,
+            offer_id=offer.id,
+        )
+    )
+    db.commit()
+
+    delete_client(client_id=client.id, db=db, user_data={"idinfo": {"email": "test@acesolutions.com.au"}})
+
+    assert db.query(Client).filter(Client.id == client.id).first() is None
+    assert db.query(Offer).filter(Offer.client_id == client.id).count() == 0
+    assert db.query(StrategyItem).filter(StrategyItem.client_id == client.id).count() == 0
