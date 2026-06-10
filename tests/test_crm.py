@@ -485,6 +485,45 @@ def test_update_client_sets_and_clears_reporting_entity():
     assert client.reporting_entity is None
 
 
+def test_list_clients_filters_ungrouped_only():
+    db = _make_test_session()
+    from models import EntityGroup
+
+    group = EntityGroup(slug="test-grp", display_name="Test Grp")
+    db.add(group)
+    db.commit()
+    db.refresh(group)
+
+    _make_client(db, business_name="Grouped")
+    c_ungrouped = _make_client(db, business_name="Ungrouped One")
+    user = {"idinfo": {"email": "admin@example.com"}}
+    update_client(
+        client_id=db.query(Client).filter(Client.business_name == "Grouped").first().id,
+        client_update=ClientUpdate(entity_group_id=group.id),
+        db=db,
+        user_data=user,
+    )
+
+    matches = list_clients(
+        query=None,
+        stage=None,
+        created_after=None,
+        created_before=None,
+        mine=None,
+        reporting_entity=None,
+        entity_group=None,
+        ungrouped_only=True,
+        signed_not_promoted=None,
+        limit=None,
+        offset=None,
+        db=db,
+        user_data=user,
+    )
+    names = {c.business_name for c in matches}
+    assert names == {"Ungrouped One"}
+    assert c_ungrouped.id in {c.id for c in matches}
+
+
 def test_list_clients_filters_by_reporting_entity():
     db = _make_test_session()
     c1 = _make_client(db, business_name="Member One")

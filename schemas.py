@@ -436,6 +436,12 @@ class EntityGroupSuggestionsResponse(BaseModel):
     clusters: List[EntityGroupSuggestionCluster] = []
 
 
+class EntityGroupDeleteResponse(BaseModel):
+    deleted: bool = True
+    slug: str
+    unlinked_member_count: int = 0
+
+
 class ClientReferralCreate(BaseModel):
     advocate_client_id: Optional[int] = None
     advocate_business_name: Optional[str] = None
