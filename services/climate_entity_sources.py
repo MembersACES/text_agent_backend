@@ -9,8 +9,13 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from models import Client
+from models import Client, EntityGroup
 from services import airtable_client
+from services.entity_groups import (
+    clients_in_disclosure_rollup,
+    disclosure_source_for_client,
+    effective_reporting_entity,
+)
 from services.climate_activity_etl import (
     EtlContext,
     UTILITY_ACTIVITY_MAP,
@@ -259,18 +264,13 @@ def build_entity_activity_sources(
     if not slug:
         raise ValueError("entity_id required")
 
-    clients = (
-        db.query(Client)
-        .filter(Client.reporting_entity == slug)
-        .order_by(Client.id.asc())
-        .all()
-    )
+    clients = clients_in_disclosure_rollup(db, slug)
     if not clients:
         return {
             "found": False,
             "entity_id": slug,
             "period": period_label,
-            "message": "No CRM client with this reporting_entity",
+            "message": "No CRM client in disclosure rollup for this reporting_entity",
         }
 
     primary_client = clients[0]
@@ -278,10 +278,24 @@ def build_entity_activity_sources(
         airtable_client.AIRTABLE_API_KEY and getattr(airtable_client, "USE_AIRTABLE_DIRECT", False)
     )
 
+    group_by_id: dict[int, EntityGroup] = {}
+    for client in clients:
+        if client.entity_group_id and client.entity_group_id not in group_by_id:
+            group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+            if group:
+                group_by_id[group.id] = group
+
+    entity_group_slug: str | None = None
+    for group in group_by_id.values():
+        if (group.reporting_entity or "").strip().lower() == slug:
+            entity_group_slug = group.slug
+            break
+
     linked_utilities: dict = {}
     utility_retailers: dict = {}
     linked_utility_extra: dict = {}
     loa_record_ids: list[str] = []
+    site_by_key: dict[str, dict[str, Any]] = {}
 
     if airtable_configured:
         for client in clients:
@@ -302,8 +316,20 @@ def build_entity_activity_sources(
                     new_retailers,
                     new_extra,
                 )
+                for site in _sites_from_loa(new_linked, new_retailers, new_extra):
+                    key = f"{site['utility_type']}|{site['identifier']}"
+                    if key in site_by_key:
+                        continue
+                    site_by_key[key] = {
+                        **site,
+                        "member_aces_client_id": client.id,
+                        "member_business_name": client.business_name,
+                        "member_loa_record_id": loa_record_id,
+                    }
 
-    sites = _sites_from_loa(linked_utilities, utility_retailers, linked_utility_extra)
+    sites = list(site_by_key.values()) if site_by_key else _sites_from_loa(
+        linked_utilities, utility_retailers, linked_utility_extra
+    )
     staged_all: list = []
     staged_by_key: dict[str, list[dict]] = {}
     for client in clients:
@@ -318,10 +344,25 @@ def build_entity_activity_sources(
 
     primary_loa_record_id = loa_record_ids[0] if loa_record_ids else None
 
+    members_payload: list[dict[str, Any]] = []
+    for client in clients:
+        group = group_by_id.get(client.entity_group_id) if client.entity_group_id else None
+        members_payload.append(
+            {
+                "aces_client_id": client.id,
+                "business_name": client.business_name,
+                "loa_record_id": (client.external_business_id or "").strip() or None,
+                "disclosure_source": disclosure_source_for_client(client, slug, group),
+            }
+        )
+
     utility_bundles: list[dict[str, Any]] = []
+    matched_staged_keys: set[str] = set()
     for site in sites:
         ut = site["utility_type"]
         ident = site["identifier"]
+        member_client_id = site.get("member_aces_client_id") or primary_client.id
+        member_loa_id = site.get("member_loa_record_id") or primary_loa_record_id
         inv = _invoice_payload(ut, ident, sample_limit=invoice_sample_limit)
         fetch_rows: list[dict] = []
         if inv.get("configured") and not inv.get("error"):
@@ -341,8 +382,8 @@ def build_entity_activity_sources(
         etl_block = (
             _etl_preview(
                 slug,
-                primary_client.id,
-                primary_loa_record_id,
+                member_client_id,
+                member_loa_id,
                 ut,
                 ident,
                 fetch_rows,
@@ -352,16 +393,26 @@ def build_entity_activity_sources(
             else {"supported": ut in ETL_SUPPORTED_UTILITIES, "preview": []}
         )
         key = f"{ut}|{ident}"
+        staged_for_site = staged_by_key.get(key, [])
+        if staged_for_site:
+            matched_staged_keys.add(key)
         utility_bundles.append(
             {
                 **site,
-                "aces_client_id": primary_client.id,
-                "loa_record_id": primary_loa_record_id,
+                "aces_client_id": member_client_id,
+                "member_aces_client_id": member_client_id,
+                "member_business_name": site.get("member_business_name"),
+                "loa_record_id": member_loa_id,
                 "airtable_invoices": inv,
                 "etl_preview": etl_block,
-                "staged_activity_records": staged_by_key.get(key, []),
+                "staged_activity_records": staged_for_site,
             }
         )
+
+    orphaned_staged_records: list[dict] = []
+    for key, summaries in staged_by_key.items():
+        if key not in matched_staged_keys:
+            orphaned_staged_records.extend(summaries)
 
     by_type: dict[str, list[dict]] = {}
     for bundle in utility_bundles:
@@ -372,6 +423,8 @@ def build_entity_activity_sources(
         "found": True,
         "entity_id": slug,
         "period": period_label,
+        "entity_group_slug": entity_group_slug,
+        "members": members_payload,
         "aces_client_id": primary_client.id,
         "aces_client_ids": [c.id for c in clients],
         "business_name": primary_client.business_name,
@@ -380,6 +433,8 @@ def build_entity_activity_sources(
         "airtable_configured": airtable_configured,
         "site_count": len(utility_bundles),
         "staged_activity_record_count": len(staged_all),
+        "orphaned_staged_record_count": len(orphaned_staged_records),
+        "orphaned_staged_records": orphaned_staged_records,
         "raw_loa": {
             "linked_utilities": linked_utilities,
             "utility_retailers": utility_retailers,
@@ -399,4 +454,54 @@ def build_entity_activity_sources(
             ],
             "b4_boundary": "activity_record.v1 staged in climate_activity_records; Prograde ingest post-Tuesday",
         },
+    }
+
+
+def build_client_linked_utilities(db: Session, client: Client) -> dict[str, Any]:
+    """Per-client LOA linked utilities — same resolver as activity-sources (CRM Climate tab)."""
+    group: EntityGroup | None = None
+    if client.entity_group_id:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+
+    effective_slug = effective_reporting_entity(client, group)
+    airtable_configured = bool(
+        airtable_client.AIRTABLE_API_KEY and getattr(airtable_client, "USE_AIRTABLE_DIRECT", False)
+    )
+
+    linked_utilities: dict = {}
+    utility_retailers: dict = {}
+    linked_utility_extra: dict = {}
+    loa_record_id: str | None = None
+
+    if airtable_configured:
+        loa_record, loa_record_id = _resolve_loa_for_client(
+            client, airtable_configured=airtable_configured
+        )
+        if loa_record:
+            linked_utilities, utility_retailers, linked_utility_extra = (
+                airtable_client.get_linked_utility_records(loa_record)
+            )
+    else:
+        loa_record_id = (client.external_business_id or "").strip() or None
+
+    sites = _sites_from_loa(linked_utilities, utility_retailers, linked_utility_extra)
+    disclosure_source = "none"
+    if effective_slug:
+        disclosure_source = disclosure_source_for_client(client, effective_slug, group)
+
+    return {
+        "client_id": client.id,
+        "business_name": client.business_name,
+        "loa_record_id": loa_record_id,
+        "reporting_entity": (client.reporting_entity or "").strip().lower() or None,
+        "effective_reporting_entity": effective_slug,
+        "disclosure_source": disclosure_source,
+        "entity_group_slug": group.slug if group else None,
+        "group_reporting_entity": (group.reporting_entity or "").strip().lower() if group else None,
+        "airtable_configured": airtable_configured,
+        "linked_utilities": linked_utilities,
+        "utility_retailers": utility_retailers,
+        "linked_utility_extra": linked_utility_extra,
+        "sites": sites,
+        "site_count": len(sites),
     }

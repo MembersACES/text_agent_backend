@@ -54,6 +54,7 @@ class EntityGroup(Base):
     slug = Column(String(128), unique=True, nullable=False, index=True)
     display_name = Column(String(255), nullable=False)
     primary_abn = Column(String(20), nullable=True)
+    reporting_entity = Column(String(128), nullable=True, index=True)
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

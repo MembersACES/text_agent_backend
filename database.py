@@ -228,6 +228,32 @@ def init_db():
     except Exception as e:
         logging.warning("Could not ensure clients.entity_group_id column: %s", e)
 
+    # Entity groups: climate disclosure slug (members may inherit when client.reporting_entity is null)
+    try:
+        insp = inspect(engine)
+        if "entity_groups" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("entity_groups")]
+            if "reporting_entity" not in cols:
+                logging.info("Adding missing entity_groups.reporting_entity column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE entity_groups ADD COLUMN reporting_entity VARCHAR(128)"))
+                logging.info("✅ Added entity_groups.reporting_entity column")
+            # Idempotent Frankston seed for dev/staging verification
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE entity_groups
+                        SET reporting_entity = 'frankston-rsl',
+                            primary_abn = COALESCE(primary_abn, '12 643 054 953')
+                        WHERE slug = 'frankston-rsl'
+                          AND (reporting_entity IS NULL OR reporting_entity = '')
+                        """
+                    )
+                )
+    except Exception as e:
+        logging.warning("Could not ensure entity_groups.reporting_entity column: %s", e)
+
     # Clients: signed-via-ACES contract flag (sheet sync; does not change stage)
     try:
         insp = inspect(engine)
