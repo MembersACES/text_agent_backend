@@ -38,6 +38,89 @@ USE_N8N_FALLBACK = os.getenv("USE_N8N_FALLBACK", "false").lower() == "true"
 N8N_LOG_WEBHOOK = "https://membersaces.app.n8n.cloud/webhook/one-month-savings-log"
 N8N_HISTORY_WEBHOOK = "https://membersaces.app.n8n.cloud/webhook/one-month-savings-history"
 
+OMS_UPLOAD_LOG_PREFIX = "[OMS_UPLOAD]"
+
+
+def oms_upload_debug_enabled() -> bool:
+    """Verbose Drive probe logs when true (default off in production)."""
+    return os.getenv("OMS_UPLOAD_DEBUG", "false").lower() in ("1", "true", "yes")
+
+
+def oms_upload_log(
+    level: int,
+    message: str,
+    *,
+    request_id: Optional[str] = None,
+    invoice_number: Optional[str] = None,
+    stage: Optional[str] = None,
+    **fields: Any,
+) -> None:
+    """Structured one-line upload log for Cloud Logging (`textPayload:\"[OMS_UPLOAD]\"`)."""
+    parts: List[str] = [OMS_UPLOAD_LOG_PREFIX]
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    if invoice_number:
+        parts.append(f"invoice={invoice_number}")
+    if stage:
+        parts.append(f"stage={stage}")
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = str(value).replace("\n", " ")
+        if len(text) > 500:
+            text = text[:497] + "..."
+        parts.append(f"{key}={text}")
+    parts.append(message)
+    logger.log(level, " | ".join(parts))
+
+
+def oms_upload_fail(
+    *,
+    request_id: Optional[str],
+    invoice_number: Optional[str],
+    path: str,
+    error_code: str,
+    message: str,
+    remediation: Optional[str] = None,
+    http_status: Optional[int] = None,
+    **extra: Any,
+) -> None:
+    """Single grep-friendly failure line."""
+    oms_upload_log(
+        logging.ERROR,
+        "FAIL",
+        request_id=request_id,
+        invoice_number=invoice_number,
+        stage="upload",
+        path=path,
+        error_code=error_code,
+        http=http_status,
+        remediation=remediation,
+        message=message,
+        **extra,
+    )
+
+
+def oms_upload_http_detail(
+    *,
+    error_code: str,
+    message: str,
+    request_id: Optional[str] = None,
+    remediation: Optional[str] = None,
+    **extra: Any,
+) -> Dict[str, Any]:
+    """JSON body for FastAPI HTTPException(detail=...)."""
+    body: Dict[str, Any] = {
+        "error_code": error_code,
+        "message": message,
+    }
+    if request_id:
+        body["request_id"] = request_id
+    if remediation:
+        body["remediation"] = remediation
+    body.update(extra)
+    return body
+
 
 def get_sheets_service():
     """Get Google Sheets service using service account credentials"""
@@ -444,7 +527,16 @@ def probe_drive_folder_access(
         "errors": [],
     }
 
-    logger.info("%s === Drive access probe start === | folder_id=%s | portal_user_hint=%s", tag, folder_id, user_email_hint)
+    if not oms_upload_debug_enabled():
+        logger.info(
+            "%s probe start | folder_id=%s | credential=%s | user_hint=%s",
+            tag,
+            folder_id,
+            credential_label,
+            user_email_hint,
+        )
+    else:
+        logger.info("%s === Drive access probe start === | folder_id=%s | portal_user_hint=%s", tag, folder_id, user_email_hint)
 
     # Who is this credential acting as?
     try:
@@ -674,15 +766,25 @@ def probe_drive_folder_access(
             summary["errors"].append(f"drives().get(): {e!s}")
             logger.warning("%s drives().get() EXCEPTION | %s", tag, e, exc_info=True)
 
-    logger.info(
-        "%s === Probe complete === | folder_visible=%s | can_add_children=%s | "
-        "authenticated_as=%s | errors=%s",
-        tag,
-        summary["folder_visible"],
-        summary["can_add_children"],
-        summary.get("authenticated_as"),
-        summary["errors"] or "(none)",
-    )
+    if oms_upload_debug_enabled():
+        logger.info(
+            "%s === Probe complete === | folder_visible=%s | can_add_children=%s | "
+            "authenticated_as=%s | errors=%s",
+            tag,
+            summary["folder_visible"],
+            summary["can_add_children"],
+            summary.get("authenticated_as"),
+            summary["errors"] or "(none)",
+        )
+    else:
+        logger.info(
+            "%s probe complete | folder_visible=%s | can_add_children=%s | authenticated_as=%s | error_count=%s",
+            tag,
+            summary["folder_visible"],
+            summary["can_add_children"],
+            summary.get("authenticated_as"),
+            len(summary["errors"]),
+        )
     return summary
 
 
@@ -936,9 +1038,10 @@ def log_invoice_to_sheets(invoice_data: Dict) -> Dict:
         rows_data = []
         for item in line_items:
             solution_label = item.get('solution_label', '').strip()
-            savings_amount = item.get('savings_amount', 0)
-            gst = savings_amount * 0.1 / 1.1  # Calculate GST (10% of total, so GST = total * 0.1 / 1.1)
-            total = savings_amount + gst
+            savings_amount = float(item.get('savings_amount', 0) or 0)
+            # Savings amount is ex-GST (matches invoice UI and testimonial sheet)
+            gst = float(item.get('gst', savings_amount * 0.1) or 0)
+            total = float(item.get('total', savings_amount + gst) or 0)
             
             row_data = [
                 invoice_data.get("business_name", ""),      # Column A: Member
@@ -1405,6 +1508,57 @@ def get_invoice_history(business_name: str) -> Dict:
             "invoices": [],
             "error": f"Failed to fetch history: {str(e)}"
         }
+
+
+def update_invoice_file_id(business_name: str, invoice_number: str, file_id: str) -> Dict:
+    """
+    Update column H (Invoice ID / Drive file_id) for all rows matching this invoice.
+    """
+    file_id_clean = (file_id or "").strip()
+    if not file_id_clean:
+        return {"success": False, "error": "file_id is required"}
+    if not business_name or not invoice_number:
+        return {"success": False, "error": "business_name and invoice_number are required"}
+    try:
+        service = get_sheets_service()
+        if not service:
+            return {"success": False, "error": "Could not connect to Google Sheets"}
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SHEET_ID,
+            range=f"{SHEET_NAME}!A2:I",
+            valueRenderOption="UNFORMATTED_VALUE",
+        ).execute()
+        values = result.get("values", [])
+        business_name_clean = business_name.strip().lower()
+        invoice_number_clean = invoice_number.strip()
+        sheet_rows_to_update = []
+        for idx, row in enumerate(values):
+            while len(row) < 9:
+                row.append("")
+            row_business = (str(row[0]).strip() if row[0] is not None else "").lower()
+            row_invoice = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
+            if row_business == business_name_clean and row_invoice == invoice_number_clean:
+                sheet_rows_to_update.append(idx + 2)
+        if not sheet_rows_to_update:
+            return {"success": False, "error": "No matching rows found for this invoice"}
+        data = [
+            {"range": f"{SHEET_NAME}!H{r}:H{r}", "values": [[file_id_clean]]}
+            for r in sheet_rows_to_update
+        ]
+        service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": data},
+        ).execute()
+        logger.info(
+            f"Updated file_id to '{file_id_clean}' for invoice {invoice_number} ({len(sheet_rows_to_update)} rows)"
+        )
+        return {"success": True, "updated_rows": len(sheet_rows_to_update), "file_id": file_id_clean}
+    except HttpError as e:
+        logger.error(f"Google Sheets API error updating file_id: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.exception(e)
+        return {"success": False, "error": str(e)}
 
 
 def update_invoice_status(business_name: str, invoice_number: str, new_status: str) -> Dict:
