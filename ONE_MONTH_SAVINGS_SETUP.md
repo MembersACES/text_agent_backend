@@ -92,6 +92,24 @@ Once configured, the system will:
 
 If `USE_N8N_FALLBACK=true` and the Google Sheets API fails, it will automatically fallback to the n8n webhook.
 
+## Upload logging
+
+Drive upload logs use the prefix `[OMS_UPLOAD]` in Cloud Run (backend + frontend proxy).
+
+```
+textPayload:"[OMS_UPLOAD]"
+textPayload:"[OMS_UPLOAD]" AND textPayload:"FAIL"
+textPayload:"[OMS_UPLOAD]" AND textPayload:"invoice=RA5711"
+```
+
+Set `OMS_UPLOAD_DEBUG=true` on the backend for verbose Drive probe logs (off by default).
+
+## n8n Drive upload
+
+Invoice PDFs upload via the **shared** n8n `file-upload` webhook (`upload_type=one_month_savings_invoice`). See `docs/FILE_UPLOAD_N8N.md`.
+
+Set `N8N_FILE_UPLOAD_WEBHOOK` on Cloud Run (test URL for dev, production URL when workflow is active).
+
 ## Troubleshooting
 
 - **"Could not connect to Google Sheets"**: Check that your service account JSON is valid and the sheet is shared with the service account email

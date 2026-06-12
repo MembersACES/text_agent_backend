@@ -805,11 +805,13 @@ class TestimonialResponse(BaseModel):
     business_name: str
     file_name: str
     file_id: str
+    file_link: Optional[str] = None  # Full Drive/Docs URL when sourced from sheet
     invoice_number: Optional[str] = None
     status: str
     testimonial_type: Optional[str] = None
     testimonial_solution_type_id: Optional[str] = None
     testimonial_savings: Optional[str] = None
+    source: Optional[str] = "crm"  # crm | sheet
     created_at: datetime
     updated_at: datetime
 
