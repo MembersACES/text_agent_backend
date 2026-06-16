@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 N8N_FILE_UPLOAD_WEBHOOK = os.getenv(
     "N8N_FILE_UPLOAD_WEBHOOK",
-    "https://membersaces.app.n8n.cloud/webhook/file-upload",
+    "https://membersaces.app.n8n.cloud/webhook-test/file-upload",
 )
 
 UPLOAD_TYPE_TESTIMONIAL = "testimonial"

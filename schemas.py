@@ -811,6 +811,8 @@ class TestimonialResponse(BaseModel):
     testimonial_type: Optional[str] = None
     testimonial_solution_type_id: Optional[str] = None
     testimonial_savings: Optional[str] = None
+    video_long_file_id: Optional[str] = None
+    video_short_file_id: Optional[str] = None
     source: Optional[str] = "crm"  # crm | sheet
     created_at: datetime
     updated_at: datetime
@@ -830,6 +832,78 @@ class TestimonialUpdate(BaseModel):
     invoice_number: Optional[str] = None
     file_id: Optional[str] = None
     file_name: Optional[str] = None
+    video_long_file_id: Optional[str] = None
+    video_short_file_id: Optional[str] = None
+
+
+# --- Marketing videos (CZA video library) ---
+
+MARKETING_VIDEO_STATUSES = ("draft", "qa_pending", "approved", "published")
+
+
+class MarketingVideoResponse(BaseModel):
+    id: int
+    slug: str
+    kind: str
+    variant: str
+    file_id: str
+    file_name: str
+    preview_url: Optional[str] = None
+    web_view_link: Optional[str] = None
+    crm_solution_type_id: Optional[str] = None
+    testimonial_id: Optional[int] = None
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    status: str
+    source_doc_file_id: Optional[str] = None
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class MarketingVideoUpdate(BaseModel):
+    status: Optional[str] = None
+    crm_solution_type_id: Optional[str] = None
+    testimonial_id: Optional[int] = None
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    notes: Optional[str] = None
+    source_doc_file_id: Optional[str] = None
+
+
+class MarketingVideoPublishPackRequest(BaseModel):
+    slug: str
+    kind: str = "marketing"
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    testimonial_id: Optional[int] = None
+    crm_solution_type_id: Optional[str] = None
+    status: str = "qa_pending"
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    variants: Optional[List[str]] = None  # default long + 30s
+
+
+class VideoRegistryResponse(BaseModel):
+    version: str
+    source: Optional[str] = None
+    entries: List[Dict[str, Any]] = []
 
 
 class TestimonialCheckApprovedResponse(BaseModel):

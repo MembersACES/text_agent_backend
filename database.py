@@ -147,6 +147,8 @@ def init_db():
                 ("testimonial_type", "VARCHAR(255)"),
                 ("testimonial_solution_type_id", "VARCHAR(100)"),
                 ("testimonial_savings", "VARCHAR(255)"),
+                ("video_long_file_id", "VARCHAR(255)"),
+                ("video_short_file_id", "VARCHAR(255)"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing testimonials.%s column", col_name)
@@ -155,6 +157,23 @@ def init_db():
                     logging.info("✅ Added testimonials.%s column", col_name)
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
+
+    # marketing_videos table is created via Base.metadata.create_all; ensure columns if table pre-exists.
+    try:
+        insp = inspect(engine)
+        if "marketing_videos" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("marketing_videos")]
+            for col_name, col_type in [
+                ("notes", "TEXT"),
+                ("render_job_id", "VARCHAR(128)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing marketing_videos.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE marketing_videos ADD COLUMN {col_name} {col_type}"))
+                    logging.info("Added marketing_videos.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure marketing_videos columns: %s", e)
 
     # Clients: advocate / referral fields (referred by another member or business name + active flag)
     try:
