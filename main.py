@@ -67,6 +67,8 @@ from services.climate_activity_etl import EtlContext, default_fy_period, transfo
 from services.climate_entity_sources import (
     build_client_linked_utilities,
     build_entity_activity_sources,
+    build_entity_activity_manifest,
+    build_entity_site_detail,
 )
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
@@ -856,6 +858,48 @@ def get_climate_entity_activity_sources(
     if not payload.get("found"):
         raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
     return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/manifest")
+def get_climate_entity_activity_manifest(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label"),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Fast manifest (entity + members + site list, no per-site Airtable detail)
+    for progressive loading. Pair with .../activity-sources/site."""
+    payload = build_entity_activity_manifest(db, entity_id, period_label=period)
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/site")
+def get_climate_entity_site_detail(
+    entity_id: str,
+    utility_type: str = Query(..., description="e.g. C&I Electricity"),
+    identifier: str = Query(..., description="NMI / MRIN / account identifier"),
+    member_aces_client_id: Optional[int] = Query(None),
+    member_loa_record_id: Optional[str] = Query(None),
+    period: str = Query("FY26"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Per-site Airtable invoice + ETL preview + staged activity for ONE site.
+    Inputs come from the manifest's site entries (utility_type, identifier,
+    member_aces_client_id, member_loa_record_id)."""
+    return build_entity_site_detail(
+        db,
+        entity_id,
+        utility_type,
+        identifier,
+        member_aces_client_id=member_aces_client_id,
+        member_loa_record_id=member_loa_record_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
 
 
 @app.get("/api/climate/drift-events")
