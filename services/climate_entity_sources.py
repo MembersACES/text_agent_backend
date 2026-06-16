@@ -259,7 +259,14 @@ def build_entity_activity_sources(
 ) -> dict[str, Any]:
     """
     Full activity-source bundle for a reporting_entity slug (A1 kebab-case).
-  """
+
+    NOTE: every database read is performed up front, then the DB session is
+    released (db.close()) BEFORE the slow live-Airtable fan-out. A single
+    request here can run for minutes; holding a pooled connection that long
+    exhausted the (small) connection pool and made unrelated endpoints fail
+    with QueuePool timeouts. Code after db.close() only reads already-loaded
+    scalar columns on detached ORM objects (no lazy loads) and calls Airtable.
+    """
     slug = (entity_id or "").strip().lower()
     if not slug:
         raise ValueError("entity_id required")
@@ -291,6 +298,40 @@ def build_entity_activity_sources(
             entity_group_slug = group.slug
             break
 
+    # ------------------------------------------------------------------
+    # DB reads — performed while the pooled connection is still checked out.
+    # ------------------------------------------------------------------
+    staged_all: list = []
+    staged_by_key: dict[str, list[dict]] = {}
+    for client in clients:
+        for row in list_activity_records(db, client_id=client.id, limit=200):
+            staged_all.append(row)
+            summary = activity_record_to_summary(row)
+            sid = (summary.get("site_id") or "").strip()
+            ut = (summary.get("source_utility_type") or "").strip()
+            if sid and ut:
+                key = f"{ut}|{sid}"
+                staged_by_key.setdefault(key, []).append(summary)
+
+    members_payload: list[dict[str, Any]] = []
+    for client in clients:
+        group = group_by_id.get(client.entity_group_id) if client.entity_group_id else None
+        members_payload.append(
+            {
+                "aces_client_id": client.id,
+                "business_name": client.business_name,
+                "loa_record_id": (client.external_business_id or "").strip() or None,
+                "disclosure_source": disclosure_source_for_client(client, slug, group),
+            }
+        )
+
+    # Release the pooled DB connection BEFORE the slow Airtable work. Only
+    # already-loaded scalar attributes are read on the detached objects below.
+    db.close()
+
+    # ------------------------------------------------------------------
+    # Live Airtable fan-out — NO DB connection held below this line.
+    # ------------------------------------------------------------------
     linked_utilities: dict = {}
     utility_retailers: dict = {}
     linked_utility_extra: dict = {}
@@ -330,31 +371,7 @@ def build_entity_activity_sources(
     sites = list(site_by_key.values()) if site_by_key else _sites_from_loa(
         linked_utilities, utility_retailers, linked_utility_extra
     )
-    staged_all: list = []
-    staged_by_key: dict[str, list[dict]] = {}
-    for client in clients:
-        for row in list_activity_records(db, client_id=client.id, limit=200):
-            staged_all.append(row)
-            summary = activity_record_to_summary(row)
-            sid = (summary.get("site_id") or "").strip()
-            ut = (summary.get("source_utility_type") or "").strip()
-            if sid and ut:
-                key = f"{ut}|{sid}"
-                staged_by_key.setdefault(key, []).append(summary)
-
     primary_loa_record_id = loa_record_ids[0] if loa_record_ids else None
-
-    members_payload: list[dict[str, Any]] = []
-    for client in clients:
-        group = group_by_id.get(client.entity_group_id) if client.entity_group_id else None
-        members_payload.append(
-            {
-                "aces_client_id": client.id,
-                "business_name": client.business_name,
-                "loa_record_id": (client.external_business_id or "").strip() or None,
-                "disclosure_source": disclosure_source_for_client(client, slug, group),
-            }
-        )
 
     utility_bundles: list[dict[str, Any]] = []
     matched_staged_keys: set[str] = set()
