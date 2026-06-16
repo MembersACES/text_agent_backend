@@ -63,7 +63,10 @@ from services.climate_store import (
     upsert_activity_record,
 )
 from services.climate_activity_etl import EtlContext, default_fy_period, transform_invoice_rows
-from services.climate_entity_sources import build_entity_activity_sources
+from services.climate_entity_sources import (
+    build_client_linked_utilities,
+    build_entity_activity_sources,
+)
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -108,6 +111,7 @@ from tools.one_month_savings import (
     log_invoice_to_sheets,
     get_invoice_history,
     update_invoice_status,
+    update_invoice_file_id,
     get_next_sequential_invoice_number,
     get_or_create_subfolder,
     upload_pdf_to_drive,
@@ -179,6 +183,7 @@ from schemas import (
     EntityGroupResponse,
     EntityGroupSummaryResponse,
     EntityGroupSuggestionsResponse,
+    EntityGroupUpdate,
     ClientReferralCreate,
     ClientReferralUpdate,
     ClientReferralResponse,
@@ -240,6 +245,7 @@ from services.entity_groups import (
     build_entity_group_summary,
     compute_entity_group_suggestions,
     delete_entity_group,
+    effective_reporting_entity,
 )
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import func, or_, inspect, text
@@ -887,7 +893,10 @@ def list_client_climate_drift_events(
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    reporting_entity = (client.reporting_entity or "").strip() or None
+    group = None
+    if client.entity_group_id:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+    reporting_entity = effective_reporting_entity(client, group)
     rows = list_drift_events(
         db,
         reporting_entity=reporting_entity,
@@ -900,6 +909,19 @@ def list_client_climate_drift_events(
         "events": [drift_event_to_dict(r) for r in rows],
         "count": len(rows),
     }
+
+
+@app.get("/api/clients/{client_id}/climate/linked-utilities")
+def get_client_climate_linked_utilities(
+    client_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """LOA linked utilities for CRM Climate tab (same resolver as Prograde activity-sources)."""
+    client = db.query(Client).filter(Client.id == client_id).first()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return build_client_linked_utilities(db, client)
 
 
 @app.get("/api/clients/{client_id}/climate/activity-records")
@@ -935,11 +957,14 @@ def sync_client_climate_activity_records(
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
 
-    entity_id = (client.reporting_entity or "").strip()
+    group = None
+    if client.entity_group_id:
+        group = db.query(EntityGroup).filter(EntityGroup.id == client.entity_group_id).first()
+    entity_id = effective_reporting_entity(client, group)
     if not entity_id:
         raise HTTPException(
             status_code=400,
-            detail="Client has no reporting_entity — set on Strategy & WIP tab first",
+            detail="No effective reporting_entity — set on member Climate tab or group disclosure slug",
         )
     if not airtable_client.AIRTABLE_API_KEY:
         raise HTTPException(status_code=503, detail="Airtable integration is not configured")
@@ -5417,6 +5442,43 @@ async def update_invoice_status_endpoint(
     return result
 
 
+@app.patch("/api/one-month-savings/file-id")
+async def update_invoice_file_id_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    user_info: dict = None
+):
+    """Update Drive file_id (sheet column H) for an existing 1st Month Savings invoice."""
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    file_id = request_data.get("file_id") or request_data.get("invoice_file_id")
+    if not business_name or not invoice_number or not file_id:
+        raise HTTPException(
+            status_code=400,
+            detail="business_name, invoice_number and file_id are required",
+        )
+    result = update_invoice_file_id(business_name, invoice_number, file_id)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400 if "No matching" in str(result.get("error", "")) else 500,
+            detail=result.get("error", "Failed to update file_id"),
+        )
+    return result
+
+
 @app.post("/api/one-month-savings/next-invoice-number")
 async def get_next_invoice_number_endpoint(
     request: Request,
@@ -5484,12 +5546,27 @@ async def upload_invoice_pdf_endpoint(
     authorization: str = Header(...),
     user_info: dict = None
 ):
-    """Upload invoice PDF to Google Drive folder"""
-    logging.info("=== One Month Savings Upload PDF Endpoint Called ===")
-    
+    """Upload invoice PDF to Google Drive via unified n8n file-upload webhook."""
+    import uuid
+    from tools.n8n_file_upload import UPLOAD_TYPE_ONE_MONTH_SAVINGS, upload_file_via_n8n
+    from tools.one_month_savings import (
+        oms_upload_fail,
+        oms_upload_http_detail,
+        oms_upload_log,
+    )
+
     # Get the request body
     request_data = await request.json()
-    logging.info(f"Request data keys: {list(request_data.keys())}")
+    request_id = (request_data.get("request_id") or "").strip() or str(uuid.uuid4())
+    invoice_number_early = request_data.get("invoice_number")
+    oms_upload_log(
+        logging.INFO,
+        "endpoint called",
+        request_id=request_id,
+        invoice_number=invoice_number_early,
+        stage="start",
+        body_keys=",".join(sorted(request_data.keys())),
+    )
     
     # For Drive upload, we accept either API key or Google access token
     # Access tokens are different from ID tokens - we don't verify them as ID tokens
@@ -5522,233 +5599,153 @@ async def upload_invoice_pdf_endpoint(
         business_name = request_data.get("business_name")
         
         if not pdf_base64 or not filename:
+            oms_upload_fail(
+                request_id=request_id,
+                invoice_number=invoice_number_early,
+                path="validation",
+                error_code="MISSING_FIELDS",
+                message="Missing required fields: pdf_base64 and filename",
+                http_status=400,
+            )
             raise HTTPException(
                 status_code=400,
-                detail="Missing required fields: pdf_base64 and filename"
+                detail=oms_upload_http_detail(
+                    error_code="MISSING_FIELDS",
+                    message="Missing required fields: pdf_base64 and filename",
+                    request_id=request_id,
+                ),
             )
-        
+
         user_email = request_data.get("user_email", "unknown@example.com")
-        
+
         # Decode base64 PDF
         pdf_bytes = base64.b64decode(pdf_base64)
-        logging.info(f"Decoded PDF, size: {len(pdf_bytes)} bytes")
-        
-        # Use fixed folder ID from environment variable or default
-        from tools.one_month_savings import (
-            INVOICE_STORAGE_FOLDER_ID,
-            log_invoice_upload_environment,
-        )
-        folder_id = INVOICE_STORAGE_FOLDER_ID
-        
-        if not folder_id:
-            raise HTTPException(
-                status_code=500,
-                detail="Invoice storage folder ID not configured"
-            )
-        
-        # Try user's OAuth token first (works for My Drive folders)
-        # If that fails, fall back to service account (works for Shared Drives)
-        file_id = None
-        access_token = None
-        refresh_token = request_data.get("refresh_token")
-        auth_via_api_key = False
-        
-        if authorization.startswith("Bearer "):
-            token = authorization.split("Bearer ")[1]
-            if token != os.getenv("BACKEND_API_KEY", "test-key"):
-                access_token = token
-            else:
-                auth_via_api_key = True
-        else:
-            logging.warning("Authorization header does not start with 'Bearer '")
-
-        log_invoice_upload_environment(
+        oms_upload_log(
+            logging.INFO,
+            "pdf decoded",
+            request_id=request_id,
             invoice_number=invoice_number,
-            business_name=business_name,
+            stage="decode",
+            pdf_bytes=len(pdf_bytes),
             user_email=user_email,
+            business=business_name,
             filename=filename,
-            pdf_byte_count=len(pdf_bytes),
-            folder_id=folder_id,
-            has_user_access_token=bool(access_token),
-            has_refresh_token=bool(refresh_token),
-            auth_via_api_key=auth_via_api_key,
         )
 
-        logging.info(
-            "INVOICE_UPLOAD_START | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
-            "has_user_access_token=%s | has_refresh_token=%s | access_token_len=%s | auth_via_api_key=%s",
-            invoice_number,
-            business_name,
-            user_email,
-            folder_id,
-            bool(access_token),
-            bool(refresh_token),
-            len(access_token) if access_token else 0,
-            auth_via_api_key,
-        )
-        
-        # First, try with user's OAuth token (for My Drive folders)
-        if access_token:
-            try:
-                logging.info("Attempting upload with user's OAuth token (for My Drive folders)")
-                from google.oauth2.credentials import Credentials as UserCredentials
-                
-                client_id = os.getenv("GOOGLE_CLIENT_ID")
-                client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
-                token_uri = "https://oauth2.googleapis.com/token"
-                
-                if not client_id or not client_secret:
-                    logging.warning("Google OAuth credentials not configured, skipping user token attempt")
-                else:
-                    user_creds = UserCredentials(
-                        token=access_token,
-                        refresh_token=refresh_token,
-                        token_uri=token_uri,
-                        client_id=client_id,
-                        client_secret=client_secret
-                    )
-                    user_drive_service = build('drive', 'v3', credentials=user_creds)
-                    logging.info(
-                        "INVOICE_UPLOAD_USER_OAUTH_ATTEMPT | invoice=%s | user_email=%s | folder_id=%s",
-                        invoice_number,
-                        user_email,
-                        folder_id,
-                    )
-                    file_id = upload_pdf_to_drive(
-                        pdf_bytes,
-                        filename,
-                        folder_id,
-                        user_drive_service,
-                        credential_label="user_oauth",
-                        user_email_hint=user_email,
-                    )
-                    if file_id:
-                        logging.info(
-                            "INVOICE_UPLOAD_SUCCESS | via=user_oauth | invoice=%s | user_email=%s | file_id=%s",
-                            invoice_number,
-                            user_email,
-                            file_id,
-                        )
-                    else:
-                        logging.warning(
-                            "INVOICE_UPLOAD_USER_OAUTH_FAILED | invoice=%s | user_email=%s | folder_id=%s | "
-                            "See preceding [INVOICE_UPLOAD][user_oauth] lines. "
-                            "Typical fix: sign out/in so Google grants Drive scope, or grant this user Editor on the folder. "
-                            "Attempting service_account fallback next.",
-                            invoice_number,
-                            user_email,
-                            folder_id,
-                        )
-            except Exception as e:
-                logging.warning(
-                    "INVOICE_UPLOAD_USER_OAUTH_EXCEPTION | invoice=%s | user_email=%s | error=%s | "
-                    "Will try service_account fallback.",
-                    invoice_number,
-                    user_email,
-                    str(e),
-                )
-                logging.exception(e)
-        else:
-            logging.info(
-                "INVOICE_UPLOAD_SKIP_USER_OAUTH | invoice=%s | reason=no_google_access_token_in_authorization",
-                invoice_number,
-            )
+        from tools.one_month_savings import INVOICE_STORAGE_FOLDER_ID
 
-        file_id_after_user_oauth = file_id
-        
-        # If user token failed or wasn't available, try service account (for Shared Drives)
-        if not file_id:
-            logging.info(
-                "INVOICE_UPLOAD_FALLBACK_SERVICE_ACCOUNT | invoice=%s | user_email=%s | folder_id=%s",
-                invoice_number,
-                user_email,
-                folder_id,
-            )
-            from tools.one_month_savings import get_configured_service_account_email
+        folder_id = INVOICE_STORAGE_FOLDER_ID
 
-            drive_service = get_drive_service()
-            
-            if not drive_service:
-                error_msg = (
-                    "Failed to create Google Drive service. "
-                    "Service account not configured properly. "
-                    "Please check your service account credentials."
-                )
-                logging.error(error_msg)
-                raise HTTPException(status_code=500, detail=error_msg)
-
-            sa_email = get_configured_service_account_email()
-            logging.info(
-                "INVOICE_UPLOAD_SERVICE_ACCOUNT_ATTEMPT | invoice=%s | portal_user=%s | "
-                "folder_id=%s | service_account_email=%s",
-                invoice_number,
-                user_email,
-                folder_id,
-                sa_email or "(unknown)",
+        if not folder_id:
+            oms_upload_fail(
+                request_id=request_id,
+                invoice_number=invoice_number,
+                path="config",
+                error_code="FOLDER_NOT_CONFIGURED",
+                message="Invoice storage folder ID not configured",
+                http_status=500,
             )
-            
-            file_id = upload_pdf_to_drive(
-                pdf_bytes,
-                filename,
-                folder_id,
-                drive_service,
-                credential_label="service_account",
-                user_email_hint=user_email,
-            )
-            
-            if not file_id:
-                # Provide helpful error message based on the error type
-                error_msg = (
-                    f"Failed to upload PDF to Google Drive. "
-                    f"The invoice storage folder (ID: {folder_id}) is not accessible. "
-                    f"To fix: Open the folder in Google Drive and share it with '{user_email}' with 'Editor' permissions. "
-                    f"Alternatively, if using a Shared Drive, add the service account to the Shared Drive with 'Content Manager' role."
-                )
-                logging.error(
-                    "INVOICE_UPLOAD_COMPLETE_FAILURE | invoice=%s | business=%s | user_email=%s | folder_id=%s | "
-                    "had_user_access_token=%s | user_oauth_returned_file_id=%s | service_account_returned_file_id=false | "
-                    "REMEDIATION_USER=Sign out and sign in with Google in the app (Drive scope); confirm token is not expired. | "
-                    "REMEDIATION_OPS=Move folder into a Google Shared Drive; add backend service account as Content manager "
-                    "(service accounts cannot use My Drive quota). Search logs for DIAGNOSIS= lines above.",
-                    invoice_number,
-                    business_name,
-                    user_email,
-                    folder_id,
-                    bool(access_token),
-                    bool(file_id_after_user_oauth),
-                )
-                logging.error(error_msg)
-                raise HTTPException(status_code=403, detail=error_msg)
-            logging.info(
-                "INVOICE_UPLOAD_SUCCESS | via=service_account | invoice=%s | user_email=%s | file_id=%s | "
-                "note=user_oauth_did_not_produce_file_id",
-                invoice_number,
-                user_email,
-                file_id,
-            )
-        
-        file_url = f"https://drive.google.com/file/d/{file_id}/view"
-        
-        logging.info(f"PDF uploaded successfully. File ID: {file_id}")
-        logging.info(f"File ID type: {type(file_id)}")
-        logging.info(f"File ID length: {len(file_id) if file_id else 0}")
-        
-        if not file_id:
-            logging.error("❌ CRITICAL: Upload succeeded but file_id is None or empty!")
             raise HTTPException(
                 status_code=500,
-                detail="Upload succeeded but file_id was not returned"
+                detail=oms_upload_http_detail(
+                    error_code="FOLDER_NOT_CONFIGURED",
+                    message="Invoice storage folder ID not configured",
+                    request_id=request_id,
+                ),
             )
-        
+
+        oms_upload_log(
+            logging.INFO,
+            "n8n upload start",
+            request_id=request_id,
+            invoice_number=invoice_number,
+            stage="n8n",
+            business=business_name,
+            user_email=user_email,
+            folder_id=folder_id,
+        )
+
+        extra_form: Dict[str, str] = {}
+        if invoice_number:
+            extra_form["invoice_number"] = str(invoice_number).strip()
+        for key in (
+            "due_date",
+            "invoice_date",
+            "status",
+            "subtotal",
+            "total_gst",
+            "total_amount",
+            "solution",
+            "savings_amount",
+            "gst",
+            "total_invoice",
+            "line_items",
+        ):
+            val = request_data.get(key)
+            if val is not None and str(val).strip() != "":
+                extra_form[key] = str(val).strip()
+
+        n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
+            file_bytes=pdf_bytes,
+            filename=filename,
+            upload_type=UPLOAD_TYPE_ONE_MONTH_SAVINGS,
+            business_name=business_name or "",
+            drive_folder=folder_id,
+            content_type="application/pdf",
+            request_id=request_id,
+            requested_by=user_email,
+            extra_form=extra_form,
+        )
+
+        if not n8n_ok:
+            error_code = n8n_result.get("error_code") or "N8N_UPLOAD_FAILED"
+            error_msg = n8n_result.get("message") or "Invoice upload workflow failed."
+            remediation = (
+                "Check n8n workflow 'file-upload' (upload_type=one_month_savings_invoice) "
+                "and Cloud Run env N8N_FILE_UPLOAD_WEBHOOK."
+            )
+            oms_upload_fail(
+                request_id=request_id,
+                invoice_number=invoice_number,
+                path="n8n",
+                error_code=error_code,
+                message=error_msg,
+                remediation=remediation,
+                http_status=n8n_status,
+                folder_id=folder_id,
+            )
+            raise HTTPException(
+                status_code=502 if n8n_status >= 500 else 403,
+                detail=oms_upload_http_detail(
+                    error_code=error_code,
+                    message=error_msg,
+                    request_id=request_id,
+                    remediation=remediation,
+                    folder_id=folder_id,
+                ),
+            )
+
+        file_id = n8n_result.get("file_id")
+        file_url = n8n_result.get("file_url") or f"https://drive.google.com/file/d/{file_id}/view"
+
         response_data = {
             "success": True,
             "file_id": file_id,
             "file_url": file_url,
-            "message": f"Invoice PDF uploaded successfully to {business_name}'s Google Drive"
+            "request_id": request_id,
+            "message": f"Invoice PDF uploaded successfully for {business_name}",
         }
-        
-        logging.info(f"Returning upload response: {json.dumps({k: v for k, v in response_data.items() if k != 'message'}, indent=2)}")
-        
+
+        oms_upload_log(
+            logging.INFO,
+            "SUCCESS",
+            request_id=request_id,
+            invoice_number=invoice_number,
+            stage="complete",
+            path="n8n",
+            file_id=file_id,
+        )
+
         return response_data
         
     except HTTPException:
@@ -5889,10 +5886,20 @@ async def list_testimonials(
             raise HTTPException(status_code=401, detail="Invalid Google token")
     if not business_name or not business_name.strip():
         raise HTTPException(status_code=400, detail="business_name is required")
-    items = db.query(Testimonial).filter(
-        func.lower(Testimonial.business_name) == business_name.strip().lower()
-    ).order_by(Testimonial.created_at.desc()).all()
-    return [TestimonialResponse.model_validate(t) for t in items]
+    from tools.testimonial_sheet import (
+        get_testimonials_from_sheet_for_business,
+        merge_db_and_sheet_testimonials,
+    )
+
+    db_items = (
+        db.query(Testimonial)
+        .filter(func.lower(Testimonial.business_name) == business_name.strip().lower())
+        .order_by(Testimonial.created_at.desc())
+        .all()
+    )
+    sheet_items = get_testimonials_from_sheet_for_business(business_name)
+    merged = merge_db_and_sheet_testimonials(db_items, sheet_items)
+    return [TestimonialResponse.model_validate(item) for item in merged]
 
 
 @app.get("/api/testimonials/check-approved", response_model=TestimonialCheckApprovedResponse)
@@ -5912,11 +5919,15 @@ async def check_testimonial_approved(
             raise HTTPException(status_code=401, detail="Invalid Google token")
     if not business_name or not business_name.strip():
         raise HTTPException(status_code=400, detail="business_name is required")
-    approved = db.query(Testimonial).filter(
+    from tools.testimonial_sheet import count_sheet_testimonials_for_business
+
+    db_approved = db.query(Testimonial).filter(
         func.lower(Testimonial.business_name) == business_name.strip().lower(),
         Testimonial.status == "Approved",
     ).count()
-    return TestimonialCheckApprovedResponse(has_approved=approved > 0, count=approved)
+    sheet_count = count_sheet_testimonials_for_business(business_name)
+    total = db_approved + sheet_count
+    return TestimonialCheckApprovedResponse(has_approved=total > 0, count=total)
 
 
 @app.post("/api/testimonials/upload", response_model=TestimonialResponse)
@@ -5933,12 +5944,8 @@ async def upload_testimonial(
     db: Session = Depends(get_db),
 ):
     """
-    Upload a testimonial document via n8n.
-
-    Instead of uploading directly with the service account (which has no storage quota),
-    this endpoint forwards the file + metadata to an n8n webhook, which handles the
-    actual Drive upload and returns the created file ID. We then log that file as a
-    Testimonial row in the CRM.
+    Upload a testimonial document via the unified n8n file-upload webhook
+    (upload_type=testimonial). Returns file_id from n8n and logs a CRM Testimonial row.
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
@@ -5963,55 +5970,45 @@ async def upload_testimonial(
     # Prefer the explicit client folder URL; fall back to TESTIMONIAL_STORAGE_FOLDER_ID if set.
     drive_folder = (gdrive_folder_url or "").strip() or TESTIMONIAL_STORAGE_FOLDER_ID
 
-    # Forward to n8n webhook which handles the actual Drive upload.
+    from tools.n8n_file_upload import UPLOAD_TYPE_TESTIMONIAL, upload_file_via_n8n
+
+    norm_testimonial_type = (testimonial_type or "").strip()
+    norm_solution_type_id = (testimonial_solution_type_id or "").strip()
+    norm_savings = (testimonial_savings or "").strip()
+
+    extra_form = {
+        "testimonial_type": norm_testimonial_type,
+        "testimonial_solution_type_id": norm_solution_type_id,
+        "testimonial_savings": norm_savings,
+    }
+    if invoice_number and invoice_number.strip():
+        extra_form["invoice_number"] = invoice_number.strip()
+
     try:
         contents = await file.read()
-        files = {
-            "file": (filename, contents, file.content_type or "application/octet-stream"),
-        }
-        norm_testimonial_type = (testimonial_type or "").strip()
-        norm_solution_type_id = (testimonial_solution_type_id or "").strip()
-        norm_savings = (testimonial_savings or "").strip()
-        data = {
-            "business_name": business_name.strip(),
-            "drive_folder": drive_folder,
-            "upload_type": "testimonial",
-            # Always include these keys so they are visible in n8n even if blank
-            "testimonial_type": norm_testimonial_type,
-            "testimonial_solution_type_id": norm_solution_type_id,
-            "testimonial_savings": norm_savings,
-        }
-        if invoice_number and invoice_number.strip():
-            data["invoice_number"] = invoice_number.strip()
-
-        logging.info(f"Calling testimonial-upload webhook with data: {data}")
-
-        resp = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook/testimonial-upload",
-            data=data,
-            files=files,
-            timeout=60,
+        n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
+            file_bytes=contents,
+            filename=filename,
+            upload_type=UPLOAD_TYPE_TESTIMONIAL,
+            business_name=business_name.strip(),
+            drive_folder=drive_folder,
+            content_type=file.content_type or "application/octet-stream",
+            extra_form=extra_form,
         )
     except Exception as e:
-        logging.error(f"Error calling testimonial-upload webhook: {e}")
+        logging.error(f"Error calling file-upload n8n webhook: {e}")
         raise HTTPException(status_code=500, detail="Failed to call testimonial upload workflow.")
 
-    if resp.status_code != 200:
-        logging.error(f"testimonial-upload webhook failed: {resp.status_code} - {resp.text}")
+    if not n8n_ok:
+        error_msg = n8n_result.get("message") or "Testimonial upload workflow failed."
         raise HTTPException(
-            status_code=500,
-            detail="Testimonial upload workflow failed.",
+            status_code=502 if n8n_status >= 500 else 500,
+            detail=error_msg,
         )
 
-    try:
-        result_json = resp.json()
-    except Exception:
-        logging.error("testimonial-upload webhook did not return JSON.")
-        raise HTTPException(status_code=500, detail="Testimonial upload workflow returned invalid response.")
-
-    file_id = result_json.get("file_id")
+    file_id = n8n_result.get("file_id")
     if not file_id:
-        logging.error(f"testimonial-upload webhook missing file_id in response: {result_json}")
+        logging.error(f"file-upload webhook missing file_id in response: {n8n_result}")
         raise HTTPException(status_code=500, detail="Testimonial upload workflow did not return file_id.")
 
     type_label_for_name = norm_testimonial_type
@@ -7312,6 +7309,7 @@ def create_entity_group(
         slug=body.slug,
         display_name=body.display_name.strip(),
         primary_abn=(body.primary_abn or "").strip() or None,
+        reporting_entity=body.reporting_entity,
         notes=(body.notes or "").strip() or None,
     )
     db.add(group)
@@ -7343,6 +7341,71 @@ def get_entity_group_summary(
     if not group:
         raise HTTPException(status_code=404, detail="Entity group not found")
     return EntityGroupSummaryResponse(**build_entity_group_summary(db, group))
+
+
+@app.patch("/api/entity-groups/{slug}", response_model=EntityGroupResponse)
+def update_entity_group(
+    slug: str,
+    body: EntityGroupUpdate,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Update commercial entity group metadata (including climate disclosure slug)."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    update_data = body.model_dump(exclude_unset=True)
+    if "display_name" in update_data and update_data["display_name"] is not None:
+        group.display_name = update_data["display_name"].strip()
+    if "primary_abn" in update_data:
+        group.primary_abn = (update_data["primary_abn"] or "").strip() or None
+    if "reporting_entity" in update_data:
+        group.reporting_entity = update_data["reporting_entity"]
+    if "notes" in update_data:
+        group.notes = (update_data["notes"] or "").strip() or None
+    db.commit()
+    db.refresh(group)
+    member_count = (
+        db.query(func.count(Client.id))
+        .filter(Client.entity_group_id == group.id)
+        .scalar()
+        or 0
+    )
+    resp = EntityGroupResponse.model_validate(group)
+    return resp.model_copy(update={"member_count": int(member_count)})
+
+
+@app.post("/api/entity-groups/{slug}/apply-reporting-entity")
+def apply_entity_group_reporting_entity(
+    slug: str,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Copy group reporting_entity to all members that do not have a site-level override."""
+    normalized = (slug or "").strip().lower()
+    group = db.query(EntityGroup).filter(EntityGroup.slug == normalized).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Entity group not found")
+    group_slug = (group.reporting_entity or "").strip().lower()
+    if not group_slug:
+        raise HTTPException(status_code=400, detail="Group has no reporting_entity set")
+    members = db.query(Client).filter(Client.entity_group_id == group.id).all()
+    updated = 0
+    skipped = 0
+    for member in members:
+        if member.reporting_entity and str(member.reporting_entity).strip():
+            skipped += 1
+            continue
+        member.reporting_entity = group_slug
+        updated += 1
+    db.commit()
+    return {
+        "slug": group.slug,
+        "reporting_entity": group_slug,
+        "updated_member_count": updated,
+        "skipped_member_count": skipped,
+    }
 
 
 @app.get("/api/entity-groups/{slug}", response_model=EntityGroupDetailResponse)
