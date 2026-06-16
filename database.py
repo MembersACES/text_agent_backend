@@ -15,14 +15,28 @@ load_dotenv()
 DB_TYPE = os.getenv("DB_TYPE", "sqlite")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+def _int_env(name: str, default: int) -> int:
+    """Parse an int env var; fall back to default on missing/garbage rather than
+    crashing the whole app at import (a malformed value previously took the
+    service down on startup)."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        logging.warning("Invalid %s=%r; falling back to %d", name, raw, default)
+        return default
+
+
 if DB_TYPE == "postgresql":
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL must be set when DB_TYPE=postgresql")
 
-    pool_size = int(os.getenv("DB_POOL_SIZE", "1"))
-    max_overflow = int(os.getenv("DB_MAX_OVERFLOW", "1"))
-    pool_timeout = int(os.getenv("DB_POOL_TIMEOUT", "30"))
-    pool_recycle = int(os.getenv("DB_POOL_RECYCLE", "3600"))
+    pool_size = _int_env("DB_POOL_SIZE", 1)
+    max_overflow = _int_env("DB_MAX_OVERFLOW", 1)
+    pool_timeout = _int_env("DB_POOL_TIMEOUT", 30)
+    pool_recycle = _int_env("DB_POOL_RECYCLE", 3600)
 
     logging.info(
         "🐘 Using PostgreSQL (Cloud SQL) pool_size=%s max_overflow=%s pool_timeout=%s",
@@ -147,6 +161,8 @@ def init_db():
                 ("testimonial_type", "VARCHAR(255)"),
                 ("testimonial_solution_type_id", "VARCHAR(100)"),
                 ("testimonial_savings", "VARCHAR(255)"),
+                ("video_long_file_id", "VARCHAR(255)"),
+                ("video_short_file_id", "VARCHAR(255)"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing testimonials.%s column", col_name)
@@ -155,6 +171,23 @@ def init_db():
                     logging.info("✅ Added testimonials.%s column", col_name)
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
+
+    # marketing_videos table is created via Base.metadata.create_all; ensure columns if table pre-exists.
+    try:
+        insp = inspect(engine)
+        if "marketing_videos" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("marketing_videos")]
+            for col_name, col_type in [
+                ("notes", "TEXT"),
+                ("render_job_id", "VARCHAR(128)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing marketing_videos.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE marketing_videos ADD COLUMN {col_name} {col_type}"))
+                    logging.info("Added marketing_videos.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure marketing_videos columns: %s", e)
 
     # Clients: advocate / referral fields (referred by another member or business name + active flag)
     try:

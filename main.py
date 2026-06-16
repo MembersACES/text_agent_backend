@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 import os
 import sys
 import logging
+import subprocess
 import time
 import tempfile
 import os
@@ -32,7 +33,7 @@ import httpx
 from typing import Annotated, Any, Dict, List, Optional, Union
 import json
 from fastapi import HTTPException, Depends
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -66,6 +67,8 @@ from services.climate_activity_etl import EtlContext, default_fy_period, transfo
 from services.climate_entity_sources import (
     build_client_linked_utilities,
     build_entity_activity_sources,
+    build_entity_activity_manifest,
+    build_entity_site_detail,
 )
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
@@ -155,6 +158,7 @@ from models import (
     ClientManualActivity,
     StrategyItem,
     Testimonial,
+    MarketingVideo,
     AutonomousSequenceEvent,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
@@ -203,6 +207,11 @@ from schemas import (
     TestimonialResponse,
     TestimonialUpdate,
     TestimonialCheckApprovedResponse,
+    MarketingVideoResponse,
+    MarketingVideoUpdate,
+    MarketingVideoPublishPackRequest,
+    VideoRegistryResponse,
+    MARKETING_VIDEO_STATUSES,
     TestimonialSolutionContentItem,
     TestimonialSolutionContentUpdate,
     AutonomousSequenceStartRequest,
@@ -406,9 +415,12 @@ async def global_exception_handler(request: StarletteRequest, exc: Exception):
             headers=headers,
         )
     logging.exception("Unhandled exception: %s", exc)
+    detail = "Internal server error"
+    if os.getenv("ENVIRONMENT", "development").lower() not in ("production", "prod"):
+        detail = f"Internal server error: {exc}"
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": detail},
         headers=headers,
     )
 
@@ -846,6 +858,48 @@ def get_climate_entity_activity_sources(
     if not payload.get("found"):
         raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
     return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/manifest")
+def get_climate_entity_activity_manifest(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label"),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Fast manifest (entity + members + site list, no per-site Airtable detail)
+    for progressive loading. Pair with .../activity-sources/site."""
+    payload = build_entity_activity_manifest(db, entity_id, period_label=period)
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/site")
+def get_climate_entity_site_detail(
+    entity_id: str,
+    utility_type: str = Query(..., description="e.g. C&I Electricity"),
+    identifier: str = Query(..., description="NMI / MRIN / account identifier"),
+    member_aces_client_id: Optional[int] = Query(None),
+    member_loa_record_id: Optional[str] = Query(None),
+    period: str = Query("FY26"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Per-site Airtable invoice + ETL preview + staged activity for ONE site.
+    Inputs come from the manifest's site entries (utility_type, identifier,
+    member_aces_client_id, member_loa_record_id)."""
+    return build_entity_site_detail(
+        db,
+        entity_id,
+        utility_type,
+        identifier,
+        member_aces_client_id=member_aces_client_id,
+        member_loa_record_id=member_loa_record_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
 
 
 @app.get("/api/climate/drift-events")
@@ -3546,6 +3600,8 @@ def get_discrepancy_check(
 @app.get("/api/resources/drive-videos")
 def get_resources_drive_videos(
     user_info: dict = Depends(verify_google_token),
+    kind: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
 ):
     """
     List video files in the configured Google Drive folder (service account).
@@ -3553,13 +3609,1434 @@ def get_resources_drive_videos(
     """
     _ = user_info  # require authenticated ACES session
     folder_id = get_resources_videos_folder_id()
-    videos, err = list_resources_folder_videos()
+    db_ids = {row.file_id for row in db.query(MarketingVideo.file_id).all() if row.file_id}
+    videos, err = list_resources_folder_videos(kind_filter=kind, db_file_ids=db_ids)
     if err:
         raise HTTPException(status_code=503, detail=err)
     return {
         "folder_id": folder_id,
         "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "videos": videos,
+    }
+
+
+def _verify_video_write_auth(authorization: str) -> None:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid authorization")
+
+
+def _require_video_dev_tools() -> None:
+    """Block destructive dev-only video tooling in production unless explicitly enabled."""
+    env = (os.getenv("ENVIRONMENT") or "development").strip().lower()
+    flag = (os.getenv("VIDEO_DEV_TOOLS") or "").strip().lower()
+    if env in ("production", "prod") and flag not in ("1", "true", "yes", "on"):
+        raise HTTPException(
+            status_code=403,
+            detail="Video dev tools are disabled in production (set VIDEO_DEV_TOOLS=1 to override)",
+        )
+
+
+@app.get("/api/videos/registry", response_model=VideoRegistryResponse)
+def get_video_registry(user_info: dict = Depends(verify_google_token)):
+    _ = user_info
+    from tools.video_registry_loader import load_video_registry
+
+    data = load_video_registry()
+    return VideoRegistryResponse(
+        version=str(data.get("version") or "0"),
+        source=data.get("source"),
+        entries=data.get("entries") or [],
+    )
+
+
+@app.get("/api/videos", response_model=List[MarketingVideoResponse])
+def list_marketing_videos(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    kind: Optional[str] = Query(None),
+    solution_type_id: Optional[str] = Query(None, alias="solution_type_id"),
+    business_name: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+):
+    _ = user_info
+    q = db.query(MarketingVideo)
+    if kind:
+        q = q.filter(MarketingVideo.kind == kind.strip().lower())
+    if solution_type_id:
+        q = q.filter(MarketingVideo.crm_solution_type_id == solution_type_id.strip())
+    if business_name:
+        q = q.filter(func.lower(MarketingVideo.business_name) == business_name.strip().lower())
+    if status:
+        q = q.filter(MarketingVideo.status == status.strip().lower())
+    if slug:
+        q = q.filter(MarketingVideo.slug == slug.strip().lower())
+    rows = q.order_by(MarketingVideo.updated_at.desc()).all()
+    return [MarketingVideoResponse.model_validate(r) for r in rows]
+
+
+@app.get("/api/videos/suggest-slug")
+def suggest_video_slug(
+    user_info: dict = Depends(verify_google_token),
+    business_name: str = Query(...),
+    solution_type_id: Optional[str] = Query(None),
+):
+    _ = user_info
+    from tools.video_upload import suggest_testimonial_slug
+
+    slug = suggest_testimonial_slug(business_name.strip(), (solution_type_id or "").strip() or None)
+    return {"slug": slug, "business_name": business_name.strip()}
+
+
+@app.get("/api/videos/render-job")
+def get_video_render_job_status(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: Optional[str] = Query(None),
+    job_id: Optional[str] = Query(None),
+):
+    """Proxy CZA Videos job status, read local progress file, or infer from CRM rows."""
+    _verify_video_write_auth(authorization)
+    slug_val = (slug or "").strip().lower()
+    job_id_val = (job_id or "").strip()
+
+    from tools.video_pipeline_progress import (
+        build_running_progress_from_sources,
+        message_from_progress,
+        merge_progress,
+        progress_failure,
+        progress_is_complete,
+        read_pipeline_progress_file,
+    )
+
+    file_progress = read_pipeline_progress_file(slug_val) if slug_val else None
+
+    api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/")
+    if api_url and (job_id_val or slug_val):
+        try:
+            import httpx
+
+            key = (os.getenv("CZA_VIDEOS_API_KEY") or "").strip()
+            headers: Dict[str, str] = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            path = (
+                f"/jobs/{job_id_val}"
+                if job_id_val
+                else f"/jobs/by-slug/{slug_val}"
+            )
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(f"{api_url}{path}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                live = merge_progress(data.get("progress"), file_progress)
+                if live.get("steps"):
+                    data["progress"] = live
+                fail = progress_failure(live)
+                if fail:
+                    data["status"] = "failed"
+                    data["error"] = data.get("error") or fail[1]
+                msg = message_from_progress(live)
+                if msg:
+                    data["message"] = msg
+                return data
+            if resp.status_code != 404:
+                logging.warning("[video] render-job proxy %s: %s", resp.status_code, resp.text[:300])
+        except Exception as exc:
+            logging.warning("[video] render-job proxy error: %s", exc)
+
+    if file_progress and slug_val:
+        running = build_running_progress_from_sources(slug_val, job_progress=file_progress)
+        fail = progress_failure(running)
+        return {
+            "status": "failed" if fail else ("completed" if progress_is_complete(running) else "running"),
+            "slug": slug_val,
+            "message": message_from_progress(running) or "Render pipeline in progress",
+            "error": fail[1] if fail else None,
+            "progress": running,
+        }
+
+    if slug_val:
+        rows = (
+            db.query(MarketingVideo)
+            .filter(MarketingVideo.slug == slug_val)
+            .order_by(MarketingVideo.variant.asc())
+            .all()
+        )
+        if rows:
+            rendered = [r for r in rows if r.file_id and r.file_id != "pending"]
+            has_qa = any((r.qa_review_path or "").strip() for r in rows)
+            if len(rendered) >= 1 and has_qa:
+                return {
+                    "status": "completed",
+                    "slug": slug_val,
+                    "message": "MP4s and QA uploaded — ready to review",
+                }
+            pack_url = next((r.tool_output_zip_path for r in rows if r.tool_output_zip_path), None)
+            if pack_url or rendered:
+                skeleton = build_running_progress_from_sources(slug_val)
+                fail = progress_failure(skeleton)
+                return {
+                    "status": "failed" if fail else "running",
+                    "slug": slug_val,
+                    "message": message_from_progress(skeleton)
+                    or "Waiting for render pipeline to start…",
+                    "error": fail[1] if fail else None,
+                    "progress": skeleton,
+                }
+
+    raise HTTPException(status_code=404, detail="No render job found for this slug")
+
+
+@app.get("/api/videos/local-stream")
+def stream_local_rendered_video(
+    request: Request,
+    authorization: str = Header(...),
+    slug: str = Query(...),
+    variant: str = Query("long"),
+    kind: str = Query("testimonial"),
+):
+    """Stream freshly rendered MP4 from claude-videos disk (before / during Drive upload)."""
+    _verify_video_write_auth(authorization)
+    from tools.local_video_render import find_local_mp4
+
+    path, err = find_local_mp4(slug.strip().lower(), variant, kind)
+    if err or not path:
+        raise HTTPException(status_code=404, detail=err or "Local render not found")
+
+    from tools.video_creation_pack import _parse_range_header
+
+    total = path.stat().st_size
+    range_header = request.headers.get("range")
+    start, end = _parse_range_header(range_header, total)
+    content_length = end - start + 1
+    filename = path.name.replace('"', "")
+
+    def iter_file():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = f.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(content_length)
+        status_code = 206
+    else:
+        headers["Content-Length"] = str(total)
+        status_code = 200
+
+    return StreamingResponse(iter_file(), status_code=status_code, headers=headers, media_type="video/mp4")
+
+
+@app.get("/api/videos/{video_id}", response_model=MarketingVideoResponse)
+def get_marketing_video(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return MarketingVideoResponse.model_validate(row)
+
+
+@app.get("/api/videos/{video_id}/creation-pack")
+def get_video_creation_pack_links(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Direct Drive URLs for pack root and qa/renders/scripts/slides subfolders."""
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    pack_url = (row.tool_output_zip_path or "").strip()
+    if not pack_url or "drive.google.com" not in pack_url:
+        raise HTTPException(status_code=404, detail="No creation pack folder linked")
+
+    from tools.video_creation_pack import list_pack_subfolder_urls
+
+    result = list_pack_subfolder_urls(pack_url)
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+    result["pack_folder_name"] = row.render_job_id
+    result["slug"] = row.slug
+    # Where publish actually stored assets (may differ from empty pack subfolders)
+    result["linked_assets"] = {
+        "qa_review_url": (row.qa_review_path or "").strip() or None,
+        "cuts": [],
+    }
+    siblings = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == row.slug, MarketingVideo.kind == row.kind)
+        .all()
+    )
+    for s in siblings:
+        if s.file_id and s.file_id != "pending":
+            result["linked_assets"]["cuts"].append(
+                {
+                    "variant": s.variant,
+                    "file_id": s.file_id,
+                    "file_name": s.file_name,
+                    "preview_url": s.preview_url,
+                    "web_view_link": s.web_view_link,
+                }
+            )
+    subfolder_file_count = sum(
+        (v.get("file_count") or 0) for v in (result.get("subfolders") or {}).values()
+    )
+    result["pack_subfolders_empty"] = subfolder_file_count == 0
+    result["linked_assets_outside_pack"] = bool(
+        result["linked_assets"]["cuts"] or result["linked_assets"]["qa_review_url"]
+    ) and result["pack_subfolders_empty"]
+    return result
+
+
+@app.get("/api/videos/{video_id}/qa-html")
+def get_video_qa_html(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Serve QA-Review.html for in-app iframe preview (Drive download, not Drive embed)."""
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    from tools.video_creation_pack import load_qa_review_html
+    from fastapi.responses import HTMLResponse
+
+    html, err = load_qa_review_html(qa_review_path=row.qa_review_path)
+    if err or not html:
+        raise HTTPException(status_code=404, detail=err or "QA review not available")
+    return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
+
+
+@app.get("/api/videos/{video_id}/stream")
+def stream_marketing_video(
+    video_id: int,
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Stream MP4 from Drive via service account (HTML5 video; supports Range)."""
+    _verify_video_write_auth(authorization)
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row or not row.file_id or row.file_id == "pending":
+        raise HTTPException(status_code=404, detail="Video not found or not uploaded")
+
+    from tools.video_creation_pack import (
+        _parse_range_header,
+        get_drive_file_meta,
+        iter_drive_file_chunks,
+    )
+
+    meta = get_drive_file_meta(row.file_id)
+    if not meta:
+        raise HTTPException(status_code=502, detail="Could not read video from Drive")
+
+    total = int(meta.get("size") or 0)
+    if total <= 0:
+        raise HTTPException(status_code=502, detail="Video file has no size on Drive")
+
+    range_header = request.headers.get("range")
+    start, end = _parse_range_header(range_header, total)
+    content_length = end - start + 1
+    filename = (row.file_name or meta.get("name") or f"{row.slug}.mp4").replace('"', "")
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": meta.get("mimeType") or "video/mp4",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(content_length)
+        status_code = 206
+    else:
+        headers["Content-Length"] = str(total)
+        status_code = 200
+
+    return StreamingResponse(
+        iter_drive_file_chunks(
+            row.file_id,
+            start=start,
+            end=end,
+            partial=bool(range_header),
+        ),
+        status_code=status_code,
+        headers=headers,
+        media_type=headers["Content-Type"],
+    )
+
+
+@app.post("/api/videos/upload", response_model=MarketingVideoResponse)
+async def upload_marketing_video(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    slug: str = Form(...),
+    kind: str = Form("marketing"),
+    variant: str = Form("long"),
+    status: Optional[str] = Form("draft"),
+    business_name: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    testimonial_id: Optional[int] = Form(None),
+    crm_solution_type_id: Optional[str] = Form(None),
+    source_doc_file_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Upload MP4 to Interface Videos folder and register metadata."""
+    _verify_video_write_auth(authorization)
+    slug_val = slug.strip().lower()
+    kind_val = (kind or "marketing").strip().lower()
+    variant_val = (variant or "long").strip().lower()
+    if kind_val not in ("marketing", "testimonial"):
+        raise HTTPException(status_code=400, detail="kind must be marketing or testimonial")
+    if variant_val not in ("long", "30s"):
+        raise HTTPException(status_code=400, detail="variant must be long or 30s")
+    status_val = (status or "draft").strip().lower()
+    if status_val not in MARKETING_VIDEO_STATUSES:
+        status_val = "draft"
+
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".mp4"):
+        raise HTTPException(status_code=400, detail="File must be .mp4")
+
+    from tools.video_upload import (
+        drive_links_for_file,
+        resolve_crm_solution_type_id,
+        upload_video_to_library,
+    )
+
+    contents = await file.read()
+    file_id, stored_name, err = upload_video_to_library(
+        file_bytes=contents,
+        slug=slug_val,
+        variant=variant_val,  # type: ignore[arg-type]
+        kind=kind_val,  # type: ignore[arg-type]
+        filename=filename,
+    )
+    if err or not file_id:
+        raise HTTPException(status_code=502, detail=err or "Upload failed")
+
+    links = drive_links_for_file(file_id)
+    crm_id = resolve_crm_solution_type_id(slug_val, kind_val, crm_solution_type_id)  # type: ignore[arg-type]
+
+    existing = (
+        db.query(MarketingVideo)
+        .filter(
+            MarketingVideo.slug == slug_val,
+            MarketingVideo.kind == kind_val,
+            MarketingVideo.variant == variant_val,
+        )
+        .first()
+    )
+    if existing:
+        existing.file_id = file_id
+        existing.file_name = stored_name
+        existing.preview_url = links["preview_url"]
+        existing.web_view_link = links["web_view_link"]
+        existing.status = status_val
+        existing.crm_solution_type_id = crm_id
+        existing.business_name = (business_name or "").strip() or existing.business_name
+        existing.client_id = client_id if client_id is not None else existing.client_id
+        existing.testimonial_id = testimonial_id if testimonial_id is not None else existing.testimonial_id
+        if source_doc_file_id:
+            existing.source_doc_file_id = source_doc_file_id.strip()
+        db.commit()
+        db.refresh(existing)
+        _sync_testimonial_video_ids(db, existing)
+        return MarketingVideoResponse.model_validate(existing)
+
+    row = MarketingVideo(
+        slug=slug_val,
+        kind=kind_val,
+        variant=variant_val,
+        file_id=file_id,
+        file_name=stored_name,
+        preview_url=links["preview_url"],
+        web_view_link=links["web_view_link"],
+        crm_solution_type_id=crm_id,
+        business_name=(business_name or "").strip() or None,
+        client_id=client_id,
+        testimonial_id=testimonial_id,
+        status=status_val,
+        source_doc_file_id=(source_doc_file_id or "").strip() or None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    _sync_testimonial_video_ids(db, row)
+    return MarketingVideoResponse.model_validate(row)
+
+
+def _sync_testimonial_video_ids(db: Session, video: MarketingVideo) -> None:
+    if not video.testimonial_id:
+        return
+    testimonial = db.query(Testimonial).filter(Testimonial.id == video.testimonial_id).first()
+    if not testimonial:
+        return
+    if video.variant == "long":
+        testimonial.video_long_file_id = video.file_id
+    elif video.variant == "30s":
+        testimonial.video_short_file_id = video.file_id
+    db.commit()
+
+
+def _log_video_published_activity(db: Session, video: MarketingVideo) -> None:
+    """CRM timeline entry when a video is published (optional client_id)."""
+    if video.status != "published" or not video.client_id or video.file_id == "pending":
+        return
+    client = db.query(Client).filter(Client.id == video.client_id).first()
+    if not client:
+        return
+    offer = resolve_offer_for_member_upload(
+        db,
+        client=client,
+        business_name=(client.business_name or "").strip(),
+        created_by="video-pipeline@system",
+        offer_id=None,
+        filing_type=None,
+        utility_key=None,
+    )
+    create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.MEMBER_DOCUMENT_UPLOAD,
+        document_link=video.web_view_link or f"https://drive.google.com/file/d/{video.file_id}/view",
+        metadata={
+            "upload_kind": "marketing_video",
+            "filename": video.file_name,
+            "video_slug": video.slug,
+            "video_variant": video.variant,
+        },
+        created_by="video-pipeline@system",
+    )
+
+
+@app.patch("/api/videos/{video_id}", response_model=MarketingVideoResponse)
+def patch_marketing_video(
+    video_id: int,
+    body: MarketingVideoUpdate,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    _verify_video_write_auth(authorization)
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if body.status is not None:
+        st = body.status.strip().lower()
+        if st in MARKETING_VIDEO_STATUSES:
+            row.status = st
+    for field in (
+        "crm_solution_type_id",
+        "business_name",
+        "qa_review_path",
+        "tool_output_zip_path",
+        "render_job_id",
+        "notes",
+        "source_doc_file_id",
+    ):
+        val = getattr(body, field)
+        if val is not None:
+            setattr(row, field, val.strip() if isinstance(val, str) else val)
+    if body.testimonial_id is not None:
+        row.testimonial_id = body.testimonial_id
+    if body.client_id is not None:
+        row.client_id = body.client_id
+    db.commit()
+    db.refresh(row)
+    _sync_testimonial_video_ids(db, row)
+    if row.status == "published":
+        _log_video_published_activity(db, row)
+    return MarketingVideoResponse.model_validate(row)
+
+
+@app.post("/api/videos/publish-pack")
+async def publish_video_pack(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: str = Form(...),
+    kind: str = Form("marketing"),
+    status: Optional[str] = Form("qa_pending"),
+    business_name: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    testimonial_id: Optional[int] = Form(None),
+    crm_solution_type_id: Optional[str] = Form(None),
+    qa_review_path: Optional[str] = Form(None),
+    tool_output_zip_path: Optional[str] = Form(None),
+    render_job_id: Optional[str] = Form(None),
+    long_file: Optional[UploadFile] = File(None),
+    short_file: Optional[UploadFile] = File(None),
+    qa_review_file: Optional[UploadFile] = File(None),
+    pack_script_files: List[UploadFile] = File(default=[]),
+    pack_slide_files: List[UploadFile] = File(default=[]),
+):
+    """
+    Register long + 30s cuts after local render. Requires BACKEND_API_KEY or Google token.
+    Upload one or both MP4 files; metadata-only update if files omitted.
+    When draft rows link a creation pack folder, QA + MP4 copies upload into pack subfolders.
+    """
+    _verify_video_write_auth(authorization)
+    slug_val = slug.strip().lower()
+    kind_val = (kind or "marketing").strip().lower()
+    status_val = (status or "qa_pending").strip().lower()
+    if status_val not in MARKETING_VIDEO_STATUSES:
+        status_val = "qa_pending"
+
+    from tools.video_upload import drive_links_for_file, resolve_crm_solution_type_id, upload_video_to_library
+    from tools.video_creation_pack import upload_pack_artifacts
+    from tools.video_naming import build_drive_filename
+
+    crm_id = resolve_crm_solution_type_id(slug_val, kind_val, crm_solution_type_id)  # type: ignore[arg-type]
+    results: List[MarketingVideoResponse] = []
+
+    long_bytes: Optional[bytes] = await long_file.read() if long_file else None
+    short_bytes: Optional[bytes] = await short_file.read() if short_file else None
+    qa_bytes: Optional[bytes] = await qa_review_file.read() if qa_review_file else None
+    if not qa_bytes and qa_review_path and os.path.isfile(qa_review_path.strip()):
+        try:
+            qa_bytes = open(qa_review_path.strip(), "rb").read()
+        except OSError:
+            pass
+
+    script_files: Dict[str, bytes] = {}
+    for uf in pack_script_files or []:
+        if not uf.filename:
+            continue
+        script_files[uf.filename] = await uf.read()
+    slide_files: Dict[str, bytes] = {}
+    for uf in pack_slide_files or []:
+        if not uf.filename:
+            continue
+        slide_files[uf.filename] = await uf.read()
+
+    draft_row = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == slug_val, MarketingVideo.kind == kind_val)
+        .first()
+    )
+    pack_folder_url = ""
+    if draft_row and draft_row.tool_output_zip_path and "drive.google.com" in draft_row.tool_output_zip_path:
+        pack_folder_url = draft_row.tool_output_zip_path.strip()
+    elif tool_output_zip_path and "drive.google.com" in (tool_output_zip_path or ""):
+        pack_folder_url = tool_output_zip_path.strip()
+
+    resolved_qa_url = (qa_review_path or "").strip()
+    pack_upload: Dict[str, Any] = {}
+    if pack_folder_url and (qa_bytes or long_bytes or short_bytes or script_files or slide_files):
+        long_name = (long_file.filename if long_file else None) or f"testimonial-{slug_val}-long.mp4"
+        short_name = (short_file.filename if short_file else None) or f"testimonial-{slug_val}-30s.mp4"
+        pack_upload = upload_pack_artifacts(
+            pack_folder_url=pack_folder_url,
+            qa_html_bytes=qa_bytes,
+            long_mp4_bytes=long_bytes,
+            short_mp4_bytes=short_bytes,
+            long_filename=long_name,
+            short_filename=short_name,
+            script_files=script_files or None,
+            slide_files=slide_files or None,
+        )
+        if pack_upload.get("qa_review_url"):
+            resolved_qa_url = pack_upload["qa_review_url"]
+        if pack_upload.get("error"):
+            logging.warning("[publish-pack] pack upload: %s", pack_upload["error"])
+
+    async def _upsert_variant(variant: str, upload: Optional[UploadFile], contents: Optional[bytes]) -> None:
+        nonlocal results
+        if contents is None:
+            existing = (
+                db.query(MarketingVideo)
+                .filter(
+                    MarketingVideo.slug == slug_val,
+                    MarketingVideo.kind == kind_val,
+                    MarketingVideo.variant == variant,
+                )
+                .first()
+            )
+            if existing:
+                if resolved_qa_url:
+                    existing.qa_review_path = resolved_qa_url
+                if pack_folder_url:
+                    existing.tool_output_zip_path = pack_folder_url
+                elif tool_output_zip_path:
+                    existing.tool_output_zip_path = tool_output_zip_path.strip()
+                if render_job_id:
+                    existing.render_job_id = render_job_id.strip()
+                existing.status = status_val
+                db.commit()
+                db.refresh(existing)
+                results.append(MarketingVideoResponse.model_validate(existing))
+            return
+
+        stored_name = (upload.filename if upload else None) or build_drive_filename(
+            slug_val, variant, kind_val  # type: ignore[arg-type]
+        )
+        file_id, _, err = upload_video_to_library(
+            file_bytes=contents,
+            slug=slug_val,
+            variant=variant,  # type: ignore[arg-type]
+            kind=kind_val,  # type: ignore[arg-type]
+            filename=stored_name,
+        )
+        pack_key = "long_mp4_file_id" if variant == "long" else "short_mp4_file_id"
+        pack_preview = "long_mp4_preview_url" if variant == "long" else "short_mp4_preview_url"
+        pack_view = "long_mp4_web_view_link" if variant == "long" else "short_mp4_web_view_link"
+        if (err or not file_id) and pack_upload.get(pack_key):
+            file_id = pack_upload[pack_key]
+            err = None
+        if err or not file_id:
+            raise HTTPException(status_code=502, detail=err or f"Upload failed for {variant}")
+        links = drive_links_for_file(file_id)
+        if pack_upload.get(pack_preview):
+            links["preview_url"] = pack_upload[pack_preview]
+        if pack_upload.get(pack_view):
+            links["web_view_link"] = pack_upload[pack_view]
+        existing = (
+            db.query(MarketingVideo)
+            .filter(
+                MarketingVideo.slug == slug_val,
+                MarketingVideo.kind == kind_val,
+                MarketingVideo.variant == variant,
+            )
+            .first()
+        )
+        if existing:
+            existing.file_id = file_id
+            existing.file_name = stored_name
+            existing.preview_url = links["preview_url"]
+            existing.web_view_link = links["web_view_link"]
+            existing.status = status_val
+            existing.crm_solution_type_id = crm_id
+            existing.business_name = (business_name or "").strip() or existing.business_name
+            existing.client_id = client_id if client_id is not None else existing.client_id
+            existing.testimonial_id = testimonial_id if testimonial_id is not None else existing.testimonial_id
+            if resolved_qa_url:
+                existing.qa_review_path = resolved_qa_url
+            if pack_folder_url:
+                existing.tool_output_zip_path = pack_folder_url
+            elif tool_output_zip_path:
+                existing.tool_output_zip_path = tool_output_zip_path.strip()
+            if render_job_id:
+                existing.render_job_id = render_job_id.strip()
+            db.commit()
+            db.refresh(existing)
+            _sync_testimonial_video_ids(db, existing)
+            if existing.status == "published":
+                _log_video_published_activity(db, existing)
+            results.append(MarketingVideoResponse.model_validate(existing))
+            return
+        row = MarketingVideo(
+            slug=slug_val,
+            kind=kind_val,
+            variant=variant,
+            file_id=file_id,
+            file_name=stored_name,
+            preview_url=links["preview_url"],
+            web_view_link=links["web_view_link"],
+            crm_solution_type_id=crm_id,
+            business_name=(business_name or "").strip() or None,
+            client_id=client_id,
+            testimonial_id=testimonial_id,
+            status=status_val,
+            qa_review_path=resolved_qa_url or None,
+            tool_output_zip_path=pack_folder_url or ((tool_output_zip_path or "").strip() or None),
+            render_job_id=(render_job_id or "").strip() or None,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        _sync_testimonial_video_ids(db, row)
+        if row.status == "published":
+            _log_video_published_activity(db, row)
+        results.append(MarketingVideoResponse.model_validate(row))
+
+    await _upsert_variant("long", long_file, long_bytes)
+    await _upsert_variant("30s", short_file, short_bytes)
+
+    return {"slug": slug_val, "kind": kind_val, "videos": results, "pack_upload": pack_upload or None}
+
+
+def _create_video_draft_placeholders(
+    db: Session,
+    *,
+    slug: str,
+    kind: str,
+    business_name: str,
+    testimonial_id: Optional[int] = None,
+    client_id: Optional[int] = None,
+    crm_solution_type_id: Optional[str] = None,
+    source_doc_file_id: Optional[str] = None,
+) -> List[MarketingVideo]:
+    slug_val = slug.strip().lower()
+    kind_val = kind.strip().lower()
+    rows: List[MarketingVideo] = []
+    for variant in ("long", "30s"):
+        existing = (
+            db.query(MarketingVideo)
+            .filter(
+                MarketingVideo.slug == slug_val,
+                MarketingVideo.kind == kind_val,
+                MarketingVideo.variant == variant,
+            )
+            .first()
+        )
+        if existing:
+            if testimonial_id:
+                existing.testimonial_id = testimonial_id
+            if client_id:
+                existing.client_id = client_id
+            if source_doc_file_id:
+                existing.source_doc_file_id = source_doc_file_id
+            if crm_solution_type_id:
+                existing.crm_solution_type_id = crm_solution_type_id
+            rows.append(existing)
+            continue
+        row = MarketingVideo(
+            slug=slug_val,
+            kind=kind_val,
+            variant=variant,
+            file_id="pending",
+            file_name=f"{'testimonial-' if kind_val == 'testimonial' else ''}{'custom-' if kind_val == 'custom' else ''}{slug_val}-{variant}.mp4",
+            status="draft",
+            testimonial_id=testimonial_id,
+            business_name=business_name.strip() or None,
+            client_id=client_id,
+            crm_solution_type_id=(crm_solution_type_id or "").strip() or None,
+            source_doc_file_id=source_doc_file_id,
+        )
+        db.add(row)
+        rows.append(row)
+    db.commit()
+    for r in rows:
+        db.refresh(r)
+    return rows
+
+
+def _attach_creation_pack_to_videos(
+    db: Session,
+    rows: List[MarketingVideo],
+    pack: Dict[str, Any],
+) -> None:
+    folder_url = (pack.get("folder_url") or "").strip()
+    if not folder_url:
+        return
+    folder_name = (pack.get("folder_name") or "").strip()
+    for row in rows:
+        row.tool_output_zip_path = folder_url
+        if folder_name:
+            row.render_job_id = folder_name
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+
+def _reset_rows_for_new_video_session(db: Session, rows: List[MarketingVideo]) -> None:
+    """Clear prior publish artifacts so the UI waits for this session's render + publish."""
+    for row in rows:
+        row.file_id = "pending"
+        row.preview_url = None
+        row.web_view_link = None
+        row.qa_review_path = None
+        row.status = "draft"
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+
+def _create_new_creation_pack(
+    db: Session,
+    rows: List[MarketingVideo],
+    *,
+    slug: str,
+    kind: str,
+    business_name: Optional[str] = None,
+    testimonial_id: Optional[int] = None,
+    client_id: Optional[int] = None,
+    source_doc_file_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Always create a fresh pack folder for this create-session (never reuse an old one)."""
+    from tools.video_creation_pack import create_video_creation_pack
+
+    _reset_rows_for_new_video_session(db, rows)
+    pack = create_video_creation_pack(
+        slug=slug,
+        kind=kind,
+        business_name=business_name,
+        testimonial_id=testimonial_id,
+        client_id=client_id,
+        source_doc_file_id=source_doc_file_id,
+    )
+    if pack.get("folder_url"):
+        _attach_creation_pack_to_videos(db, rows, pack)
+    return pack
+
+
+def _video_cli_steps(
+    slug: str,
+    kind: str,
+    testimonial_id: Optional[int],
+    filename: Optional[str] = None,
+    source_doc_file_id: Optional[str] = None,
+    pack_folder_url: Optional[str] = None,
+) -> List[str]:
+    steps: List[str] = ["# Run from claude-videos repo root (see docs/LOCAL_DEV.md)"]
+    if kind == "custom":
+        steps.extend([
+            f"# Custom project '{slug}' — refine slides in the Interface review HTML, then:",
+            f"python -m engine videos/{slug}/script.yaml --prepare  # after exporting script.yaml",
+            "cd remotion",
+            f"npm run render:only -- {slug}",
+            "npm run postrender",
+            f"npm run publish:local -- --slug {slug} --kind custom",
+        ])
+        if pack_folder_url:
+            steps.append(f"# Upload QA + MP4s into pack folder: {pack_folder_url}")
+        return steps
+    if kind == "testimonial":
+        if source_doc_file_id:
+            steps.append(
+                f"# 1. Download CRM source: https://drive.google.com/file/d/{source_doc_file_id}/view"
+            )
+        fn = (filename or "document.docx").strip()
+        src_arg = f'downloads/{fn}'
+        if fn.lower().endswith(".pdf"):
+            steps.append(f'python tools/build_one_testimonial.py --slug {slug} --source "{src_arg}"')
+        elif fn.lower().endswith((".docx", ".doc")):
+            steps.append(f'python tools/build_one_testimonial.py --slug {slug} --source "{src_arg}"')
+        else:
+            steps.append(f'# 2. Prepare source ({fn}) then run build_one_testimonial.py --source …')
+        steps.append("python tools/gen_render_manifest.py")
+    elif filename:
+        steps.append(f'python tools/understand_testimonial.py --docx "{filename}"')
+    steps.extend([
+        "cd remotion",
+        f"npm run render:only -- {slug}",
+        "npm run postrender",
+        f"npm run publish:local -- --slug {slug} --kind {kind}"
+        + (f" --testimonial-id {testimonial_id}" if testimonial_id else ""),
+    ])
+    if pack_folder_url:
+        steps.append(f"# Pack folder (QA + renders upload automatically on publish): {pack_folder_url}")
+    return steps
+
+
+def _default_claude_videos_root() -> str:
+    sibling = Path(__file__).resolve().parent.parent / "claude-videos"
+    return str(sibling) if sibling.is_dir() else ""
+
+
+def _trigger_testimonial_render_job(
+    slug: str,
+    source_doc_file_id: Optional[str],
+    testimonial_id: int,
+    client_id: Optional[int] = None,
+    business_name: Optional[str] = None,
+    source_file_name: Optional[str] = None,
+    *,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Enqueue Step 2 (render + publish) via CZA Videos API or local subprocess."""
+    if not (source_doc_file_id or "").strip():
+        logging.warning("[video] auto-render skipped — testimonial has no Drive file_id")
+        return None
+
+    slug_val = slug.strip().lower()
+    publish_env = (os.getenv("VIDEO_PUBLISH_ENV") or "local").strip() or "local"
+    payload: Dict[str, Any] = {
+        "slug": slug_val,
+        "source_doc_file_id": source_doc_file_id.strip(),
+        "testimonial_id": testimonial_id,
+        "client_id": client_id,
+        "business_name": business_name,
+        "source_file_name": source_file_name,
+        "publish_env": publish_env,
+        "force": force,
+    }
+
+    api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/")
+    if api_url:
+        try:
+            import httpx
+
+            key = (os.getenv("CZA_VIDEOS_API_KEY") or "").strip()
+            headers: Dict[str, str] = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{api_url}/jobs/testimonial", json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logging.error(
+                    "[video] CZA job enqueue failed %s: %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+                return {
+                    "status": "enqueue_failed",
+                    "error": resp.text[:500],
+                    "api_url": api_url,
+                }
+            data = resp.json()
+            return {
+                "id": data.get("id"),
+                "status": data.get("status"),
+                "type": "testimonial",
+                "api_url": api_url,
+                "error": data.get("error"),
+                "message": data.get("message"),
+                "progress": data.get("progress"),
+            }
+        except Exception as exc:
+            logging.exception("[video] CZA job enqueue error")
+            return {"status": "enqueue_failed", "error": str(exc), "api_url": api_url}
+
+    videos_root = (os.getenv("CLAUDE_VIDEOS_ROOT") or _default_claude_videos_root()).strip()
+    script = os.path.join(videos_root, "tools", "run_testimonial_pipeline.py")
+    if videos_root and os.path.isdir(videos_root) and os.path.isfile(script):
+        argv = [
+            sys.executable,
+            script,
+            "--slug",
+            slug_val,
+            "--source-doc-file-id",
+            payload["source_doc_file_id"],
+            "--testimonial-id",
+            str(testimonial_id),
+            "--publish-env",
+            publish_env,
+        ]
+        if client_id is not None:
+            argv.extend(["--client-id", str(client_id)])
+        if business_name:
+            argv.extend(["--business-name", business_name])
+        if source_file_name:
+            argv.extend(["--source-file-name", source_file_name])
+        try:
+            subprocess.Popen(argv, cwd=videos_root)
+            return {
+                "id": None,
+                "status": "started_local",
+                "type": "testimonial",
+                "message": "Pipeline started as local subprocess",
+            }
+        except Exception as exc:
+            logging.exception("[video] local pipeline spawn failed")
+            return {"status": "spawn_failed", "error": str(exc)}
+
+    logging.warning(
+        "[video] auto-render not configured — set CZA_VIDEOS_API_URL or CLAUDE_VIDEOS_ROOT"
+    )
+    return None
+
+
+@app.post("/api/videos/restart-pipeline")
+def restart_video_pipeline(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: str = Form(...),
+):
+    """Re-enqueue a stalled testimonial render job (force=true on CZA API)."""
+    _verify_video_write_auth(authorization)
+    slug_val = (slug or "").strip().lower()
+    if not slug_val:
+        raise HTTPException(status_code=400, detail="slug is required")
+
+    row = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == slug_val)
+        .order_by(MarketingVideo.id.asc())
+        .first()
+    )
+    if not row or not row.testimonial_id:
+        raise HTTPException(status_code=404, detail="No testimonial video draft found for slug")
+
+    testimonial = db.query(Testimonial).filter(Testimonial.id == row.testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+
+    source_doc_file_id = (row.source_doc_file_id or testimonial.file_id or "").strip()
+    if not source_doc_file_id:
+        raise HTTPException(status_code=400, detail="Testimonial has no Drive source document")
+
+    render_job = _trigger_testimonial_render_job(
+        slug=slug_val,
+        source_doc_file_id=source_doc_file_id,
+        testimonial_id=testimonial.id,
+        client_id=row.client_id,
+        business_name=row.business_name or testimonial.business_name,
+        source_file_name=testimonial.file_name,
+        force=True,
+    )
+    if not render_job:
+        raise HTTPException(status_code=503, detail="Render service not configured")
+
+    from tools.video_pipeline_progress import build_running_progress_from_sources
+
+    progress = build_running_progress_from_sources(slug_val, job_progress=render_job.get("progress"))
+    return {
+        "slug": slug_val,
+        "render_job": render_job,
+        "progress": progress,
+        "message": render_job.get("message") or "Render pipeline restarted",
+    }
+
+
+@app.post("/api/videos/ingest-testimonial")
+async def ingest_testimonial_for_video(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    business_name: str = Form(...),
+    testimonial_solution_type_id: Optional[str] = Form(None),
+    testimonial_type: Optional[str] = Form(None),
+    slug_hint: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    gdrive_folder_url: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload testimonial .docx for video pipeline — n8n with Drive fallback for local dev.
+    """
+    _verify_video_write_auth(authorization)
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    filename = (file.filename or "document").strip()
+    if not filename.lower().endswith((".docx", ".doc")):
+        raise HTTPException(status_code=400, detail="File must be Word (.docx, .doc)")
+
+    client_gdrive: Optional[str] = None
+    if client_id:
+        client = db.query(Client).filter(Client.id == client_id).first()
+        if client:
+            client_gdrive = client.gdrive_folder_url
+
+    from tools.video_upload import (
+        resolve_testimonial_drive_folder,
+        suggest_testimonial_slug,
+        upload_testimonial_document,
+    )
+
+    folder_id, folder_err = resolve_testimonial_drive_folder(
+        drive_folder_url=gdrive_folder_url,
+        client_gdrive_url=client_gdrive,
+    )
+    if not folder_id:
+        raise HTTPException(status_code=503, detail=folder_err or "Drive folder not configured")
+
+    contents = await file.read()
+    file_id, upload_err = upload_testimonial_document(
+        file_bytes=contents,
+        filename=filename,
+        business_name=business_name.strip(),
+        drive_folder_id=folder_id,
+        content_type=file.content_type or None,
+        testimonial_type=(testimonial_type or "").strip() or None,
+        testimonial_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+    )
+    if not file_id:
+        raise HTTPException(status_code=502, detail=upload_err or "Upload failed")
+
+    testimonial = Testimonial(
+        business_name=business_name.strip(),
+        file_name=filename,
+        file_id=file_id,
+        status="Draft",
+        testimonial_type=(testimonial_type or "").strip() or None,
+        testimonial_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+    )
+    db.add(testimonial)
+    db.commit()
+    db.refresh(testimonial)
+
+    slug = (slug_hint or "").strip().lower() or suggest_testimonial_slug(
+        business_name.strip(),
+        (testimonial_solution_type_id or "").strip() or None,
+    )
+
+    _create_video_draft_placeholders(
+        db,
+        slug=slug,
+        kind="testimonial",
+        business_name=business_name.strip(),
+        testimonial_id=testimonial.id,
+        client_id=client_id,
+        crm_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+        source_doc_file_id=file_id,
+    )
+
+    return {
+        "testimonial": TestimonialResponse.model_validate(testimonial),
+        "slug": slug,
+        "cli": _video_cli_steps(
+            slug, "testimonial", testimonial.id, filename, file_id
+        ),
+    }
+
+
+@app.post("/api/videos/start-from-testimonial")
+async def start_video_from_testimonial(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    testimonial_id: int = Form(...),
+    slug_hint: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+):
+    """Create draft video rows from an existing CRM testimonial (no re-upload)."""
+    _verify_video_write_auth(authorization)
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    if testimonial.id < 0:
+        raise HTTPException(status_code=400, detail="Sheet-sourced testimonials cannot start video pipeline")
+
+    from tools.video_upload import suggest_testimonial_slug
+
+    slug = (slug_hint or "").strip().lower() or suggest_testimonial_slug(
+        testimonial.business_name,
+        testimonial.testimonial_solution_type_id,
+    )
+
+    resolved_client_id = client_id
+    if not resolved_client_id:
+        client = (
+            db.query(Client)
+            .filter(func.lower(Client.business_name) == testimonial.business_name.strip().lower())
+            .first()
+        )
+        if client:
+            resolved_client_id = client.id
+
+    rows = _create_video_draft_placeholders(
+        db,
+        slug=slug,
+        kind="testimonial",
+        business_name=testimonial.business_name,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        crm_solution_type_id=testimonial.testimonial_solution_type_id,
+        source_doc_file_id=testimonial.file_id,
+    )
+
+    pack = _create_new_creation_pack(
+        db,
+        rows,
+        slug=slug,
+        kind="testimonial",
+        business_name=testimonial.business_name,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        source_doc_file_id=testimonial.file_id,
+    )
+    pack_error = pack.get("error")
+
+    render_job = _trigger_testimonial_render_job(
+        slug=slug,
+        source_doc_file_id=testimonial.file_id,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        business_name=testimonial.business_name,
+        source_file_name=testimonial.file_name,
+    )
+    cza_api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/") or None
+
+    from tools.video_pipeline_progress import build_pack_progress_steps
+
+    progress = build_pack_progress_steps(pack, render_job=render_job, slug=slug)
+
+    return {
+        "testimonial": TestimonialResponse.model_validate(testimonial),
+        "slug": slug,
+        "videos": [MarketingVideoResponse.model_validate(r) for r in rows],
+        "pack_folder_id": pack.get("folder_id"),
+        "pack_folder_name": pack.get("folder_name"),
+        "pack_folder_url": pack.get("folder_url"),
+        "pack_parent_folder_url": pack.get("parent_folder_url"),
+        "pack_reused": False,
+        "pack_error": pack_error,
+        "pack_warnings": pack.get("warnings") or [],
+        "render_job": render_job,
+        "cza_videos_api_url": cza_api_url,
+        "progress": progress,
+        "cli": _video_cli_steps(
+            slug,
+            "testimonial",
+            testimonial.id,
+            testimonial.file_name,
+            testimonial.file_id,
+            pack.get("folder_url"),
+        ),
+    }
+
+
+@app.post("/api/videos/custom/extract-text")
+async def extract_custom_video_text(
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+):
+    _ = user_info
+    from tools.video_brief import extract_upload_text
+
+    content = await file.read()
+    filename = file.filename or "upload"
+    text = extract_upload_text(content, filename)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from this file")
+    return {"text": text, "filename": filename}
+
+
+@app.post("/api/videos/custom/start")
+async def start_custom_video_project(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    slug: str = Form(...),
+    brief_json: str = Form("{}"),
+    client_id: Optional[int] = Form(None),
+):
+    """Upload source material and create draft custom video rows."""
+    _verify_video_write_auth(authorization)
+    from tools.video_brief import slugify_title
+    from tools.video_upload import resolve_testimonial_drive_folder, upload_custom_source_document
+
+    filename = file.filename or "source.docx"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    slug_val = slugify_title(slug or title, "custom-video")
+    folder_id, folder_err = resolve_testimonial_drive_folder()
+    if not folder_id:
+        raise HTTPException(status_code=502, detail=folder_err or "No Drive folder configured")
+
+    file_id, upload_err = upload_custom_source_document(
+        file_bytes=content,
+        filename=filename,
+        drive_folder_id=folder_id,
+    )
+    if not file_id:
+        raise HTTPException(status_code=502, detail=upload_err or "Upload failed")
+
+    rows = _create_video_draft_placeholders(
+        db,
+        slug=slug_val,
+        kind="custom",
+        business_name=title.strip(),
+        client_id=client_id,
+        source_doc_file_id=file_id,
+    )
+    for row in rows:
+        row.notes = (brief_json or "").strip() or None
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+    pack = _create_new_creation_pack(
+        db,
+        rows,
+        slug=slug_val,
+        kind="custom",
+        business_name=title.strip(),
+        client_id=client_id,
+        source_doc_file_id=file_id,
+    )
+
+    return {
+        "slug": slug_val,
+        "title": title.strip(),
+        "source_doc_file_id": file_id,
+        "videos": [MarketingVideoResponse.model_validate(r) for r in rows],
+        "pack_folder_id": pack.get("folder_id"),
+        "pack_folder_name": pack.get("folder_name"),
+        "pack_folder_url": pack.get("folder_url"),
+        "pack_parent_folder_url": pack.get("parent_folder_url"),
+        "pack_reused": False,
+        "pack_error": pack.get("error"),
+        "pack_warnings": pack.get("warnings") or [],
+        "cli": _video_cli_steps(
+            slug_val,
+            "custom",
+            None,
+            filename,
+            file_id,
+            pack.get("folder_url"),
+        ),
+    }
+
+
+@app.post("/api/videos/dev/regenerate-all")
+def dev_regenerate_all_videos(
+    authorization: str = Header(...),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Dev-only: return the full local regenerate-all CLI workflow.
+    Does NOT run renders on the server — operator runs commands on claude-videos machine.
+    """
+    _ = user_info
+    _require_video_dev_tools()
+    _verify_video_write_auth(authorization)
+
+    from tools.video_registry_loader import load_video_registry
+
+    reg = load_video_registry()
+    entries = reg.get("entries") or []
+    marketing = [e for e in entries if e.get("kind") == "marketing"]
+    testimonials = [e for e in entries if e.get("kind") == "testimonial"]
+
+    publish_lines = [
+        f"npm run publish:local -- --slug {e.get('slug')} --kind marketing"
+        for e in marketing
+        if e.get("slug")
+    ]
+    publish_lines.extend(
+        f"npm run publish:local -- --slug {e.get('slug')} --kind testimonial"
+        for e in testimonials
+        if e.get("slug")
+    )
+
+    cli = [
+        "# TESTING & DEVELOPMENT ONLY — full library regenerate on claude-videos machine",
+        "cd \"C:\\My Projects\\claude-videos\"",
+        "npm run export:registry",
+        "cd remotion",
+        "npm run make:all",
+        "npm run postrender",
+        "cd ..",
+        "# Publish rendered MP4s back to local interface (one per slug):",
+        *publish_lines[:5],
+    ]
+    if len(publish_lines) > 5:
+        cli.append(f"# … plus {len(publish_lines) - 5} more publish:local commands (see publish_commands)")
+
+    return {
+        "warning": "TESTING & DEVELOPMENT ONLY — Do not run in production unless you intend a full re-render.",
+        "registry_version": reg.get("version"),
+        "registry_count": len(entries),
+        "marketing_count": len(marketing),
+        "testimonial_count": len(testimonials),
+        "cli": cli,
+        "publish_commands": publish_lines,
     }
 
 
@@ -6084,6 +7561,10 @@ async def update_testimonial(
         if len(fn) > 512:
             raise HTTPException(status_code=400, detail="file_name is too long")
         testimonial.file_name = fn
+    if body.video_long_file_id is not None:
+        testimonial.video_long_file_id = body.video_long_file_id.strip() or None
+    if body.video_short_file_id is not None:
+        testimonial.video_short_file_id = body.video_short_file_id.strip() or None
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)

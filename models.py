@@ -282,6 +282,37 @@ class Testimonial(Base):
     testimonial_type = Column(String(255), nullable=True)  # e.g. C&I Electricity Reviews
     testimonial_solution_type_id = Column(String(100), nullable=True)  # e.g. ci_electricity
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
+    video_long_file_id = Column(String(255), nullable=True)  # Drive ID for long-cut MP4
+    video_short_file_id = Column(String(255), nullable=True)  # Drive ID for 30s-cut MP4
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MarketingVideo(Base):
+    """
+    CZA marketing or testimonial video registered in the Interface Videos library.
+    MP4s live in RESOURCES_VIDEOS_FOLDER_ID on Google Drive.
+    """
+    __tablename__ = "marketing_videos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(128), nullable=False, index=True)
+    kind = Column(String(32), nullable=False, index=True)  # marketing | testimonial
+    variant = Column(String(16), nullable=False, index=True)  # long | 30s
+    file_id = Column(String(255), nullable=False)
+    file_name = Column(String(512), nullable=False)
+    preview_url = Column(String(512), nullable=True)
+    web_view_link = Column(String(512), nullable=True)
+    crm_solution_type_id = Column(String(100), nullable=True, index=True)
+    testimonial_id = Column(Integer, nullable=True, index=True)
+    business_name = Column(String(255), nullable=True, index=True)
+    client_id = Column(Integer, nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="draft", index=True)
+    source_doc_file_id = Column(String(255), nullable=True)
+    qa_review_path = Column(String(1024), nullable=True)
+    tool_output_zip_path = Column(String(1024), nullable=True)
+    render_job_id = Column(String(128), nullable=True)
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
