@@ -926,7 +926,7 @@ def get_utility_invoice_rows_by_identifier(
         if not rec:
             continue
         fields = rec.get("fields") or {}
-        out.append({"record_id": rec.get("id", ""), **fields})
+        out.append({"record_id": rec.get("id", ""), **fields, "airtable_created_time": rec.get("createdTime")})
     out = _sort_invoice_rows(out, sort_by, sort_dir)
     return {
         "rows": out,

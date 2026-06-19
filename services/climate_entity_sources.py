@@ -6,6 +6,7 @@ Used by Prograde dashboard (Scope 1 & 2 activity integration) and Marcus integra
 from __future__ import annotations
 
 from typing import Any, Optional
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
@@ -684,6 +685,7 @@ def build_entity_activity_manifest(
         "site_count": len(sites),
         "staged_activity_record_count": staged_total,
         "sites": sites,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -757,6 +759,7 @@ def build_entity_site_detail(
 
     return {
         "site_key": f"{ut}|{ident}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "utility_type": ut,
         "identifier": ident,
         "aces_client_id": member_aces_client_id,

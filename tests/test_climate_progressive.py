@@ -9,6 +9,7 @@ Airtable call, same as build_entity_activity_sources.
 import types
 
 import services.climate_entity_sources as ces
+from datetime import datetime
 
 
 class _FakeDB:
@@ -60,6 +61,7 @@ def test_manifest_lists_sites_and_closes_before_airtable(monkeypatch):
     monkeypatch.setattr(ces.airtable_client, "get_linked_utility_records", _linked)
 
     out = ces.build_entity_activity_manifest(db, "aligned-leisure")
+    assert "generated_at" in out and datetime.fromisoformat(out["generated_at"])
 
     assert db.closed is True
     assert out["found"] is True
@@ -112,6 +114,7 @@ def test_site_detail_closes_before_airtable_and_returns_bundle(monkeypatch):
 
     assert db.closed is True
     assert out["site_key"] == "C&I Electricity|NMI123"
+    assert "generated_at" in out and datetime.fromisoformat(out["generated_at"])
     assert out["airtable_invoices"]["configured"] is True
     assert out["airtable_invoices"]["total_count"] == 1
     assert len(out["staged_activity_records"]) == 1
