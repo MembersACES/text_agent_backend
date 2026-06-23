@@ -374,8 +374,19 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
         identifiers = []
         retailers = []
         extras = []
+        # PERF: fetch this utility type's linked records CONCURRENTLY (independent Airtable GETs) rather
+        # than one-at-a-time. Sequential fetching here was the main driver of the slow manifest /
+        # get-business-info call (the ~2-min "frozen" load). Order is preserved (map keeps input order);
+        # all processing below stays sequential and unchanged.
+        if len(record_ids) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(6, len(record_ids))) as _ex:
+                _fetched = list(_ex.map(lambda rid: _fetch_record(table_name, rid), record_ids))
+        else:
+            _fetched = [_fetch_record(table_name, record_ids[0])]
         for rec_idx, rec_id in enumerate(record_ids):
-            rec = _fetch_record(table_name, rec_id)
+            rec = _fetched[rec_idx]
             if not rec:
                 continue
             f = rec.get("fields") or {}

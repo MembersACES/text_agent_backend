@@ -837,6 +837,39 @@ def get_climate_roster(
     }
 
 
+@app.get("/api/waste-invoice-rows")
+def get_waste_invoice_rows(
+    account: str = Query(..., description="Account / customer number to match in the raw waste dump sheet"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Raw waste invoice rows (per-bin schedule + Invoice Total Amount + Webview Link / Drive PDF)
+    from 'Member ACES Data' -> '7th Sheet - Waste', matched by account number. Uncleaned source —
+    the caller computes expected cost from the bins and flags blank Webview Links as missing invoices."""
+    from services.waste_invoice_dump import read_waste_invoice_rows
+    try:
+        return read_waste_invoice_rows(account)
+    except Exception as e:
+        logging.error("[waste-invoice-rows] %s", e)
+        raise HTTPException(status_code=502, detail=f"Waste invoice lookup failed: {e}")
+
+
+@app.get("/api/utility-invoice-links")
+def get_utility_invoice_links(
+    utility_type: str = Query(..., description="Utility type, e.g. 'C&I Electricity', 'Waste', 'Oil'"),
+    identifier: str = Query(..., description="The meter/account identifier (NMI / MRIN / account number)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Invoice PDF links for one (utility_type, identifier) from that utility's tab of the
+    'Member ACES Data' workbook. Matches identifier against the tab's key column (NMI/MRIN/account).
+    Read-only; used by the Disc Engine evidence panel to show invoice files across all utilities."""
+    from services.waste_invoice_dump import read_utility_invoice_links
+    try:
+        return read_utility_invoice_links(utility_type, identifier)
+    except Exception as e:
+        logging.error("[utility-invoice-links] %s", e)
+        raise HTTPException(status_code=502, detail=f"Utility invoice links lookup failed: {e}")
+
+
 @app.get("/api/climate/config")
 def get_climate_config(
     period: str = Query("FY26"),
