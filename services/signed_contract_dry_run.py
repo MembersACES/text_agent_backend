@@ -573,3 +573,34 @@ def run_signed_contract_dry_run(db: Session) -> dict[str, Any]:
         ],
         "sheet_rows_no_client_total": len(orphans),
     }
+
+
+def get_contracts_for_business(business_name: str) -> dict:
+    """Signed-contract file IDs + status per utility for one business, matched by name
+    against the FILE_IDS 'Data from Airtable' tab. Read-only; reuses read_data_from_airtable_tab.
+    Returns {business_name, matched, record_id, contracts:{<utility>:{file_id,status,link}}, sheet_id}."""
+    rows, meta = read_data_from_airtable_tab()
+    target = normalize_business_name(business_name)
+    matched = None
+    for r in rows:
+        if normalize_business_name(r.get("business_name", "")) == target:
+            matched = r
+            break
+    contracts: dict[str, dict] = {}
+    if matched:
+        for status_key, file_key, label in STATUS_FILE_PAIRS:
+            fid = (matched.get(file_key) or "").strip()
+            status = (matched.get(status_key) or "").strip()
+            if fid or status:
+                contracts[label] = {
+                    "file_id": fid or None,
+                    "status": status or None,
+                    "link": f"https://drive.google.com/file/d/{fid}/view" if fid else None,
+                }
+    return {
+        "business_name": business_name,
+        "matched": matched is not None,
+        "record_id": (matched.get("record_id") if matched else None),
+        "contracts": contracts,
+        "sheet_id": meta.get("sheet_id"),
+    }

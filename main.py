@@ -837,6 +837,37 @@ def get_climate_roster(
     }
 
 
+@app.get("/api/climate/config")
+def get_climate_config(
+    period: str = Query("FY26"),
+    user_info: dict = Depends(verify_roster_access),
+):
+    """Env/config block for the Prograde Disc Engine embed. Returns fast so the embed's
+    getConfig() stops 404-storming this route (it calls it ~8x per render)."""
+    from datetime import datetime, timezone
+    return {
+        "aces_data_env": os.environ.get("ACES_DATA_ENV", "prod"),
+        "aces_api_host": "",
+        "period": period,
+        "today": datetime.now(timezone.utc).strftime("%Y-%m"),
+    }
+
+
+@app.get("/api/contracts/by-business")
+def get_contracts_by_business(
+    business_name: str = Query(..., description="Business name to match in the FILE_IDS 'Data from Airtable' tab"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Signed-contract file IDs + status per utility for a business (from the FILE_IDS sheet).
+    Read-only; reuses services.signed_contract_dry_run. Surfaces 'is there a signed contract'."""
+    from services.signed_contract_dry_run import get_contracts_for_business
+    try:
+        return get_contracts_for_business(business_name)
+    except Exception as e:
+        logging.error("[contracts/by-business] %s", e)
+        raise HTTPException(status_code=502, detail=f"Contract lookup failed: {e}")
+
+
 @app.get("/api/climate/entities/{entity_id}/activity-sources")
 def get_climate_entity_activity_sources(
     entity_id: str,
