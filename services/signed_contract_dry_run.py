@@ -8,7 +8,9 @@ No database or sheet writes.
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -572,4 +574,96 @@ def run_signed_contract_dry_run(db: Session) -> dict[str, Any]:
             for o in orphans[:50]
         ],
         "sheet_rows_no_client_total": len(orphans),
+    }
+
+
+# ── Cached contract index ────────────────────────────────────────────────────
+# build_entity_activity_manifest / build_entity_site_detail enrich EVERY site with
+# its signed-contract status. Reading the FILE_IDS sheet once per site would add N
+# sheet reads to the (already slow) manifest call, so we read the whole sheet ONCE,
+# build a {normalized_business_name: {utility_label: {file_id,status,link}}} index,
+# and cache it for a short TTL. Lookups are then in-memory dict gets.
+_CONTRACT_INDEX_CACHE: dict[str, Any] = {"ts": 0.0, "index": None, "sheet_id": None}
+_CONTRACT_INDEX_TTL = 300.0  # seconds
+
+
+def _contract_block(row: dict[str, str]) -> dict[str, dict]:
+    """{utility_label: {file_id,status,link}} for one FILE_IDS row (only utilities present)."""
+    out: dict[str, dict] = {}
+    for status_key, file_key, label in STATUS_FILE_PAIRS:
+        fid = (row.get(file_key) or "").strip()
+        status = (row.get(status_key) or "").strip()
+        if fid or status:
+            out[label] = {
+                "file_id": fid or None,
+                "status": status or None,
+                "link": f"https://drive.google.com/file/d/{fid}/view" if fid else None,
+            }
+    return out
+
+
+def load_contract_index(force: bool = False) -> dict:
+    """Read the FILE_IDS sheet ONCE and return a cached index keyed by normalized
+    business name. Shape: {"index": {norm_name: {utility_label: {...}}}, "sheet_id", "cached"}.
+    Cached for _CONTRACT_INDEX_TTL. Caller should treat exceptions as 'no contracts'."""
+    now = time.time()
+    cached = _CONTRACT_INDEX_CACHE["index"]
+    if (not force) and cached is not None and (now - float(_CONTRACT_INDEX_CACHE["ts"])) < _CONTRACT_INDEX_TTL:
+        return {"index": cached, "sheet_id": _CONTRACT_INDEX_CACHE["sheet_id"], "cached": True}
+    rows, meta = read_data_from_airtable_tab()
+    index: dict[str, dict] = {}
+    for r in rows:
+        key = normalize_business_name(r.get("business_name", ""))
+        if not key:
+            continue
+        block = _contract_block(r)
+        if block:
+            index[key] = block
+    _CONTRACT_INDEX_CACHE.update({"ts": now, "index": index, "sheet_id": meta.get("sheet_id")})
+    logging.info("[contract-index] built: %d businesses with contracts (sheet=%s)", len(index), meta.get("sheet_id"))
+    return {"index": index, "sheet_id": meta.get("sheet_id"), "cached": False}
+
+
+def contracts_for(business_name: str, index: dict | None = None) -> dict:
+    """One business's {utility_label: {file_id,status,link}} from a prebuilt index (or load it).
+    Returns {} on any failure — enrichment must never break the caller."""
+    try:
+        idx = index if index is not None else load_contract_index()["index"]
+        return idx.get(normalize_business_name(business_name), {}) or {}
+    except Exception as e:  # pragma: no cover - defensive
+        logging.info("[contracts_for] lookup failed for %r: %s", business_name, e)
+        return {}
+
+
+def get_contracts_for_business(business_name: str) -> dict:
+    """Signed-contract file IDs + status per utility for one business, matched by name
+    against the FILE_IDS 'Data from Airtable' tab. Read-only; reuses read_data_from_airtable_tab.
+    Returns {business_name, matched, record_id, contracts:{<utility>:{file_id,status,link}}, sheet_id}."""
+    rows, meta = read_data_from_airtable_tab()
+    target = normalize_business_name(business_name)
+    logging.info("[contracts/by-business] search=%r normalized=%r rows_in_sheet=%d", business_name, target, len(rows))
+    matched = None
+    for r in rows:
+        if normalize_business_name(r.get("business_name", "")) == target:
+            matched = r
+            break
+    contracts: dict[str, dict] = {}
+    if matched:
+        for status_key, file_key, label in STATUS_FILE_PAIRS:
+            fid = (matched.get(file_key) or "").strip()
+            status = (matched.get(status_key) or "").strip()
+            if fid or status:
+                contracts[label] = {
+                    "file_id": fid or None,
+                    "status": status or None,
+                    "link": f"https://drive.google.com/file/d/{fid}/view" if fid else None,
+                }
+    logging.info("[contracts/by-business] matched=%s record_id=%s utilities=%s",
+                 matched is not None, (matched.get("record_id") if matched else None), list(contracts.keys()))
+    return {
+        "business_name": business_name,
+        "matched": matched is not None,
+        "record_id": (matched.get("record_id") if matched else None),
+        "contracts": contracts,
+        "sheet_id": meta.get("sheet_id"),
     }

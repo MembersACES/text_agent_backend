@@ -837,6 +837,70 @@ def get_climate_roster(
     }
 
 
+@app.get("/api/waste-invoice-rows")
+def get_waste_invoice_rows(
+    account: str = Query(..., description="Account / customer number to match in the raw waste dump sheet"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Raw waste invoice rows (per-bin schedule + Invoice Total Amount + Webview Link / Drive PDF)
+    from 'Member ACES Data' -> '7th Sheet - Waste', matched by account number. Uncleaned source —
+    the caller computes expected cost from the bins and flags blank Webview Links as missing invoices."""
+    from services.waste_invoice_dump import read_waste_invoice_rows
+    try:
+        return read_waste_invoice_rows(account)
+    except Exception as e:
+        logging.error("[waste-invoice-rows] %s", e)
+        raise HTTPException(status_code=502, detail=f"Waste invoice lookup failed: {e}")
+
+
+@app.get("/api/utility-invoice-links")
+def get_utility_invoice_links(
+    utility_type: str = Query(..., description="Utility type, e.g. 'C&I Electricity', 'Waste', 'Oil'"),
+    identifier: str = Query(..., description="The meter/account identifier (NMI / MRIN / account number)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Invoice PDF links for one (utility_type, identifier) from that utility's tab of the
+    'Member ACES Data' workbook. Matches identifier against the tab's key column (NMI/MRIN/account).
+    Read-only; used by the Disc Engine evidence panel to show invoice files across all utilities."""
+    from services.waste_invoice_dump import read_utility_invoice_links
+    try:
+        return read_utility_invoice_links(utility_type, identifier)
+    except Exception as e:
+        logging.error("[utility-invoice-links] %s", e)
+        raise HTTPException(status_code=502, detail=f"Utility invoice links lookup failed: {e}")
+
+
+@app.get("/api/climate/config")
+def get_climate_config(
+    period: str = Query("FY26"),
+    user_info: dict = Depends(verify_roster_access),
+):
+    """Env/config block for the Prograde Disc Engine embed. Returns fast so the embed's
+    getConfig() stops 404-storming this route (it calls it ~8x per render)."""
+    from datetime import datetime, timezone
+    return {
+        "aces_data_env": os.environ.get("ACES_DATA_ENV", "prod"),
+        "aces_api_host": "",
+        "period": period,
+        "today": datetime.now(timezone.utc).strftime("%Y-%m"),
+    }
+
+
+@app.get("/api/contracts/by-business")
+def get_contracts_by_business(
+    business_name: str = Query(..., description="Business name to match in the FILE_IDS 'Data from Airtable' tab"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Signed-contract file IDs + status per utility for a business (from the FILE_IDS sheet).
+    Read-only; reuses services.signed_contract_dry_run. Surfaces 'is there a signed contract'."""
+    from services.signed_contract_dry_run import get_contracts_for_business
+    try:
+        return get_contracts_for_business(business_name)
+    except Exception as e:
+        logging.error("[contracts/by-business] %s", e)
+        raise HTTPException(status_code=502, detail=f"Contract lookup failed: {e}")
+
+
 @app.get("/api/climate/entities/{entity_id}/activity-sources")
 def get_climate_entity_activity_sources(
     entity_id: str,
@@ -11946,3 +12010,113 @@ def offers_summary(
         "lost": lost,
         "win_rate": win_rate,
     }
+
+
+# === Base 2 comparison defaults (editable offer/benchmark rates for /base-2) ===
+# Single JSON config stored in the app_config table (same DB as everything else).
+# Auth: request header X-Base2-Admin-Key must equal env BASE2_DEFAULTS_WRITE_SECRET.
+
+BASE2_DEFAULTS_KEY = "base2_comparison_defaults"
+BASE2_DEFAULTS_SEED = {
+    "version": 1,
+    "updatedAt": "1970-01-01T00:00:00.000Z",
+    "electricity": {
+        "ci": {"nsw": {"peak": 10, "shoulder": 10, "offPeak": 12},
+               "other": {"peak": 9, "offPeak": 7, "shoulderDefault": 9,
+                         "shoulderWhenSameAsOffPeak": 7, "shoulderSameAsOffPeakTolerance": 0.01},
+               "meterAnnual": 600, "vasAnnual": 300, "dailySupply": 0, "demandCharge": 0},
+        "sme": {"discountFactor": 0.95, "peakRateDefault": 24.5, "offPeakRateDefault": 18.0,
+                "shoulderRateDefault": 20.0, "meteringAnnual": 700.0,
+                "dailySupplyDefault": 1.5, "demandChargeDefault": 12.0},
+    },
+    "gas": {"tiers": [{"minGj": 1000, "benchmarkPerGj": 17.1},
+                      {"minGj": 10000, "benchmarkPerGj": 15},
+                      {"minGj": 30000, "benchmarkPerGj": 13.9}],
+            "ciComparisonPerGj": 17.8, "commissionPerGj": 3.0, "dailySupplyDefault": 1.2,
+            "smeEnergyShare": 0.75, "discountFactor": 0.95},
+    "oil": {"comparisonPerL": 3},
+    "waste": {"discountFactor": 0.95},
+    "cleaning": {"discountFactor": 0.95},
+}
+
+
+def _base2_ensure_table(conn):
+    from sqlalchemy import text as _t
+    conn.execute(_t(
+        "CREATE TABLE IF NOT EXISTS app_config "
+        "(key TEXT PRIMARY KEY, value TEXT, generation TEXT, updated_at TEXT)"
+    ))
+
+
+def _base2_check_key(x_base2_admin_key):
+    secret = (os.getenv("BASE2_DEFAULTS_WRITE_SECRET") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="BASE2_DEFAULTS_WRITE_SECRET not configured")
+    if (x_base2_admin_key or "").strip() != secret:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+
+class Base2DefaultsPut(BaseModel):
+    defaults: dict
+    generation: Optional[str] = None
+    updatedBy: Optional[str] = None
+
+
+@app.get("/api/base2-comparison-defaults")
+def get_base2_comparison_defaults(
+    x_base2_admin_key: Optional[str] = Header(None, alias="X-Base2-Admin-Key"),
+):
+    _base2_check_key(x_base2_admin_key)
+    from sqlalchemy import text as _t
+    from database import engine
+    with engine.begin() as conn:
+        _base2_ensure_table(conn)
+        row = conn.execute(
+            _t("SELECT value, generation FROM app_config WHERE key = :k"),
+            {"k": BASE2_DEFAULTS_KEY},
+        ).fetchone()
+    if not row:
+        return {"defaults": BASE2_DEFAULTS_SEED, "generation": None}
+    return {"defaults": json.loads(row[0]), "generation": row[1]}
+
+
+@app.put("/api/base2-comparison-defaults")
+def put_base2_comparison_defaults(
+    body: Base2DefaultsPut,
+    x_base2_admin_key: Optional[str] = Header(None, alias="X-Base2-Admin-Key"),
+):
+    _base2_check_key(x_base2_admin_key)
+    from sqlalchemy import text as _t
+    from database import engine
+    from datetime import datetime, timezone
+    with engine.begin() as conn:
+        _base2_ensure_table(conn)
+        row = conn.execute(
+            _t("SELECT value, generation FROM app_config WHERE key = :k"),
+            {"k": BASE2_DEFAULTS_KEY},
+        ).fetchone()
+        current_gen = row[1] if row else None
+        if (body.generation or None) != (current_gen or None):
+            raise HTTPException(status_code=409, detail="stale generation - reload and retry")
+        new_gen = str(int(current_gen) + 1) if (current_gen and str(current_gen).isdigit()) else "1"
+        defaults = dict(body.defaults or {})
+        try:
+            defaults["version"] = int(defaults.get("version", 0)) + 1
+        except Exception:
+            defaults["version"] = 1
+        defaults["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if body.updatedBy:
+            defaults["updatedBy"] = body.updatedBy
+        value = json.dumps(defaults)
+        if row:
+            conn.execute(
+                _t("UPDATE app_config SET value=:v, generation=:g, updated_at=:u WHERE key=:k"),
+                {"v": value, "g": new_gen, "u": defaults["updatedAt"], "k": BASE2_DEFAULTS_KEY},
+            )
+        else:
+            conn.execute(
+                _t("INSERT INTO app_config (key, value, generation, updated_at) "
+                   "VALUES (:k, :v, :g, :u)"),
+                {"k": BASE2_DEFAULTS_KEY, "v": value, "g": new_gen, "u": defaults["updatedAt"]},
+            )
+    return {"defaults": defaults, "generation": new_gen}
