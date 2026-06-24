@@ -154,8 +154,17 @@ class Offer(Base):
     # Additional Base 2 / comparison offer metrics (e.g. C&I gas/electricity)
     annual_usage_gj = Column(Float, nullable=True)
     energy_charge_pct = Column(Float, nullable=True)
+    # Blended single rates — used for utilities priced as one rate (e.g. C&I gas).
     contracted_rate = Column(Float, nullable=True)
     offer_rate = Column(Float, nullable=True)
+    # Time-of-use (TOU) rates for C&I electricity (c/kWh). 'current_*' = invoiced/contracted now,
+    # 'new_*' = offered. shoulder is null for peak/off-peak-only sites; all null for non-electricity.
+    current_peak_rate = Column(Float, nullable=True)
+    current_shoulder_rate = Column(Float, nullable=True)
+    current_offpeak_rate = Column(Float, nullable=True)
+    new_peak_rate = Column(Float, nullable=True)
+    new_shoulder_rate = Column(Float, nullable=True)
+    new_offpeak_rate = Column(Float, nullable=True)
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
     document_link = Column(Text, nullable=True)

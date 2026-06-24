@@ -517,6 +517,13 @@ class OfferCreate(BaseModel):
     # Optional explicit pipeline stage when creating offers manually.
     pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
+    # C&I electricity time-of-use rates (c/kWh) — optional at creation, also settable via PATCH.
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -537,6 +544,13 @@ class OfferUpdate(BaseModel):
     energy_charge_pct: Optional[float] = None
     contracted_rate: Optional[float] = None
     offer_rate: Optional[float] = None
+    # C&I electricity time-of-use rates (c/kWh)
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -560,6 +574,13 @@ class OfferResponse(BaseModel):
     energy_charge_pct: Optional[float] = None
     contracted_rate: Optional[float] = None
     offer_rate: Optional[float] = None
+    # C&I electricity time-of-use rates (c/kWh)
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None

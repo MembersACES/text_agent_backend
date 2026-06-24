@@ -115,6 +115,13 @@ def init_db():
                 ("energy_charge_pct", "REAL"),
                 ("contracted_rate", "REAL"),
                 ("offer_rate", "REAL"),
+                # C&I electricity time-of-use rates (c/kWh)
+                ("current_peak_rate", "REAL"),
+                ("current_shoulder_rate", "REAL"),
+                ("current_offpeak_rate", "REAL"),
+                ("new_peak_rate", "REAL"),
+                ("new_shoulder_rate", "REAL"),
+                ("new_offpeak_rate", "REAL"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing offers.%s column", col_name)
