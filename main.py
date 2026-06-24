@@ -9957,6 +9957,12 @@ def create_offer(
         if isinstance(getattr(offer, "pipeline_stage", None), OfferPipelineStageSchema)
         else getattr(offer, "pipeline_stage", None),
         estimated_value=offer.estimated_value,
+        current_peak_rate=getattr(offer, "current_peak_rate", None),
+        current_shoulder_rate=getattr(offer, "current_shoulder_rate", None),
+        current_offpeak_rate=getattr(offer, "current_offpeak_rate", None),
+        new_peak_rate=getattr(offer, "new_peak_rate", None),
+        new_shoulder_rate=getattr(offer, "new_shoulder_rate", None),
+        new_offpeak_rate=getattr(offer, "new_offpeak_rate", None),
         created_by=user_email,
         external_record_id=offer.external_record_id,
         document_link=offer.document_link,
@@ -11219,6 +11225,19 @@ def update_offer(
         db_offer.contracted_rate = offer_update.contracted_rate
     if offer_update.offer_rate is not None:
         db_offer.offer_rate = offer_update.offer_rate
+    # C&I electricity time-of-use rates
+    if offer_update.current_peak_rate is not None:
+        db_offer.current_peak_rate = offer_update.current_peak_rate
+    if offer_update.current_shoulder_rate is not None:
+        db_offer.current_shoulder_rate = offer_update.current_shoulder_rate
+    if offer_update.current_offpeak_rate is not None:
+        db_offer.current_offpeak_rate = offer_update.current_offpeak_rate
+    if offer_update.new_peak_rate is not None:
+        db_offer.new_peak_rate = offer_update.new_peak_rate
+    if offer_update.new_shoulder_rate is not None:
+        db_offer.new_shoulder_rate = offer_update.new_shoulder_rate
+    if offer_update.new_offpeak_rate is not None:
+        db_offer.new_offpeak_rate = offer_update.new_offpeak_rate
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
