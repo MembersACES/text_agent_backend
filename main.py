@@ -46,6 +46,9 @@ import io
 
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
+from tools.member_documents import get_eoi_ids, get_member_wip
+from tools.loa_business_details import get_return_business_details
+from tools.return_utility_info import get_return_utility_info
 from tools.invoicing_retailer_sheets import (
     get_commission_figures_client_count,
     get_trojan_oil_unique_client_count,
@@ -629,6 +632,11 @@ class UtilityInfoRequest(BaseModel):
     business_name: str
     service_type: str
     identifier: Optional[str]
+
+
+class ReturnUtilityInfoRequest(BaseModel):
+    utility_type: str
+    business_name: str = ""
 
 
 class UtilityLinkedDetailItem(BaseModel):
@@ -1217,6 +1225,44 @@ def get_business_info(
 
     logging.info(f"Returning response to frontend: {result}")
     return result
+
+
+@app.post("/api/member-eoi-ids")
+def member_eoi_ids(
+    request: BusinessInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-eoi-ids request business_name=%r user=%s", request.business_name, user_info.get("email"))
+    return get_eoi_ids(request.business_name)
+
+
+@app.post("/api/member-wip")
+def member_wip(
+    request: BusinessInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-wip request business_name=%r user=%s", request.business_name, user_info.get("email"))
+    return get_member_wip(request.business_name)
+
+
+@app.post("/api/loa-business-details")
+def loa_business_details(user_info: dict = Depends(verify_google_token)):
+    logging.info("loa-business-details request user=%s", user_info.get("email"))
+    return get_return_business_details()
+
+
+@app.post("/api/return-utility-info")
+def return_utility_info(
+    request: ReturnUtilityInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "return-utility-info request utility_type=%s business_name=%r user=%s",
+        request.utility_type,
+        request.business_name,
+        user_info.get("email"),
+    )
+    return get_return_utility_info(request.utility_type, request.business_name)
 
 
 @app.get("/api/utility-extra")
