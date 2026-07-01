@@ -1,8 +1,9 @@
+import re
 import requests
 import logging
 import os
 import json
-from typing import Optional, Dict
+from typing import Any, Optional, Dict
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -19,6 +20,21 @@ logger = logging.getLogger(__name__)
 FILE_IDS_SHEET_ID = os.getenv("FILE_IDS_SHEET_ID", "1l_ShkAcpS1HBqX8EdXLEVmn3pkliVGwsskkkI0GlLho")
 FILE_IDS_SHEET_NAME = os.getenv("FILE_IDS_SHEET_NAME", "Data from Airtable")  # Sheet name or can use GID
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "service-account-key.json")
+
+N8N_SEARCH_BUSINESS_INFO_URL = os.getenv(
+    "N8N_SEARCH_BUSINESS_INFO_URL",
+    "https://membersaces.app.n8n.cloud/webhook/search-business-info-test",
+)
+N8N_RETURN_FILE_IDS_URL = os.getenv(
+    "N8N_RETURN_FILE_IDS_URL",
+    "https://membersaces.app.n8n.cloud/webhook/return_fileIDs",
+)
+# When true, fall back to n8n if direct Airtable/Sheets paths fail (default on during migration).
+USE_N8N_BUSINESS_INFO_FALLBACK = os.getenv("USE_N8N_BUSINESS_INFO_FALLBACK", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 def _normalize_drive_cell_value(raw_value: object) -> str:
     """Normalize comma-separated Google Drive IDs/URLs into comma-separated URLs."""
@@ -111,15 +127,79 @@ def get_sheets_service():
         logger.error(f"Error creating Google Sheets service: {str(e)}")
         return None
 
-def get_file_ids(business_name: str) -> dict:
+def _normalize_business_name_for_match(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+
+def _find_sheet_header_row(values: list[list[Any]]) -> int:
+    """Return index of header row containing 'Business Name'."""
+    for i in range(min(5, len(values))):
+        for cell in values[i]:
+            if _normalize_business_name_for_match(str(cell)) == "business name":
+                return i
+    return 0
+
+
+def get_file_ids_from_sheets(business_name: str) -> dict:
     """
-    Get file IDs from n8n webhook (return_fileIDs). Used by get_business_information.
+    Read file IDs for a business from the FILE_IDS Google Sheet.
+    Returns a dict keyed by sheet column headers (n8n-compatible shape).
     """
+    if not business_name or not FILE_IDS_SHEET_ID:
+        return {}
+    service = get_sheets_service()
+    if not service:
+        return {}
+    tab = FILE_IDS_SHEET_NAME or "Data from Airtable"
+    try:
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=FILE_IDS_SHEET_ID,
+                range=f"'{tab}'!A1:AZ5000",
+                valueRenderOption="FORMATTED_VALUE",
+            )
+            .execute()
+        )
+        rows = result.get("values", [])
+        if not rows:
+            return {}
+        header_idx = _find_sheet_header_row(rows)
+        headers = [str(h).strip() for h in rows[header_idx]]
+        target = _normalize_business_name_for_match(business_name)
+        for row in rows[header_idx + 1 :]:
+            row_dict: dict[str, Any] = {}
+            for i, header in enumerate(headers):
+                if not header:
+                    continue
+                val = row[i] if i < len(row) else ""
+                row_dict[header] = val if val is not None else ""
+            bn = row_dict.get("Business Name") or row_dict.get("business name") or ""
+            if _normalize_business_name_for_match(str(bn)) == target:
+                logger.info("File IDs loaded from Google Sheets for business_name=%r", business_name)
+                return row_dict
+        logger.info("No FILE_IDS sheet row matched business_name=%r", business_name)
+        return {}
+    except HttpError as e:
+        logger.warning(
+            "Google Sheets API error reading file IDs: %s - %s",
+            getattr(e.resp, "status", "?"),
+            getattr(e, "reason", e),
+        )
+        return {}
+    except Exception as e:
+        logger.warning("Failed to read file IDs from Google Sheets: %s", e)
+        return {}
+
+
+def get_file_ids_from_n8n(business_name: str) -> dict:
+    """Get file IDs via n8n return_fileIDs webhook."""
     if not business_name:
         return {}
     try:
         response = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook/return_fileIDs",
+            N8N_RETURN_FILE_IDS_URL,
             json={"business_name": business_name.strip()},
             timeout=30,
         )
@@ -131,6 +211,22 @@ def get_file_ids(business_name: str) -> dict:
     except Exception as e:
         logger.warning("Failed to get file IDs from n8n webhook: %s", e)
         return {}
+
+
+def get_file_ids(business_name: str) -> dict:
+    """
+    Get file IDs for a business: Google Sheets direct first, n8n fallback.
+    Used by get_business_information and other tools.
+    """
+    if not business_name:
+        return {}
+    sheet_data = get_file_ids_from_sheets(business_name)
+    if sheet_data:
+        return sheet_data
+    if USE_N8N_BUSINESS_INFO_FALLBACK:
+        logger.info("Falling back to n8n return_fileIDs for business_name=%r", business_name)
+        return get_file_ids_from_n8n(business_name)
+    return {}
 
 
 # Base 1 Landing Page Responses sheet (interface form submissions)
@@ -177,120 +273,115 @@ def get_base1_landing_responses() -> list:
         return []
 
 
-def get_business_information(business_name: str) -> dict:
-    """
-    Get the business information including:
-    - record_ID
-    - Business Details: Name, Trading Name, ABN
-    - Contact Information: Postal Address, Site Address, Telephone, Email
-    - Representative Details: Contact Name, Position, LOA Sign Date
-    - Business Documents: List of available documents
-    - Linked Utilities and their retailers
-    - Google Drive folder URL
+def _search_business_info_from_airtable(business_name: str) -> Optional[dict]:
+    """Build business-info payload from Airtable LOA + linked utilities (no n8n)."""
+    from services import airtable_client
 
-    Args:
-        business_name (str): The name of the business to search for
+    if not airtable_client.USE_AIRTABLE_DIRECT or not airtable_client.AIRTABLE_API_KEY:
+        return None
+    loa_record = airtable_client.get_loa_record_by_business_name(business_name)
+    if not loa_record:
+        return None
+    data = airtable_client.build_business_info_from_loa(loa_record)
+    linked_utilities, utility_retailers, linked_utility_extra = (
+        airtable_client.get_linked_utility_records(loa_record)
+    )
+    n8n_linked: dict[str, Any] = {}
+    for key, identifiers in linked_utilities.items():
+        cleaned = [str(x).strip() for x in identifiers if str(x).strip()]
+        if not cleaned:
+            continue
+        n8n_linked[key] = ", ".join(cleaned) if len(cleaned) > 1 else cleaned[0]
+    data["Linked_Details"] = {
+        "linked_utilities": n8n_linked,
+        "utility_retailers": utility_retailers,
+        "linked_utility_extra": linked_utility_extra,
+    }
+    logger.info(
+        "Business info loaded from Airtable for business_name=%r record_id=%s",
+        business_name,
+        (data.get("record_ID") or "")[:12],
+    )
+    return data
 
-    Returns:
-        Dict containing business information including record_ID and formatted_output
-    """
-    logger = logging.getLogger(__name__)
 
-    processed_file_ids = {}
-    # Send API request to n8n
+def _search_business_info_from_n8n(business_name: str) -> Optional[dict]:
+    """Fetch raw business-info JSON from n8n search-business-info-test webhook."""
     payload = {"business_name": business_name}
-    logger.info(f"Making API call to n8n with payload: {payload}")
-    
+    logger.info("Making n8n API call for business info with payload: %s", payload)
+    response = requests.post(N8N_SEARCH_BUSINESS_INFO_URL, json=payload, timeout=60)
+    logger.info("n8n business info response status: %s", response.status_code)
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    if not response.text:
+        logger.error("Empty response received from n8n business info webhook")
+        return None
     try:
-        response = requests.post(
-            "https://membersaces.app.n8n.cloud/webhook/search-business-info-test", json=payload
-        )
-        logger.info(f"API response status code: {response.status_code}")
-        logger.info(f"API response content: {response.text}")
+        data = response.json()
+    except requests.exceptions.JSONDecodeError as e:
+        logger.error("Failed to parse n8n business info JSON: %s", e)
+        return None
+    logger.info("Business info loaded from n8n for business_name=%r", business_name)
+    return data
 
-        if response.status_code == 404:
-            return {"_formatted_output": "Sorry but couldn't find that business name"}
 
-        if not response.text:
-            logger.error("Empty response received from API")
-            return {"_formatted_output": "Error: Received empty response from the server"}
+def _build_business_info_response(data: dict, business_name: str, file_ids_data: dict) -> dict:
+    """Format business info + file IDs into the API response shape."""
+    official_business_name = data.get("business_details", {}).get("name", business_name)
 
-        try:
-            data = response.json()
-        except requests.exceptions.JSONDecodeError as e:
-            logger.error(f"Failed to parse JSON response: {str(e)}")
-            logger.error(f"Raw response content: {response.text}")
-            return {"_formatted_output": "Error: Invalid response format from the server"}
+    file_ids_dict: dict = {}
+    if isinstance(file_ids_data, list) and file_ids_data:
+        file_ids_dict = file_ids_data[0] if isinstance(file_ids_data[0], dict) else {}
+    elif isinstance(file_ids_data, dict):
+        file_ids_dict = file_ids_data
 
-        logger.info(f"Parsed API response data: {data}")
+    processed_file_ids: dict[str, str] = {}
+    file_mapping = {
+        "LOA File ID": "business_LOA",
+        "WIP": "business_WIP",
+        "Floor Plan": "business_Floor Plan (Exit Map)",
+        "Site Profling": "business_Site Profiling",
+        "Site Profiling": "business_Site Profiling",
+        "Service Fee Agreement": "business_Service Fee Agreement",
+        "Initial Strategy": "business_Initial Strategy",
+        "Cleaning Invoice": "invoice_Cleaning",
+        "Telecommunication:": "invoice_Telecommunication",
+        "Oil Invoice": "invoice_Oil",
+        "Water Invoice": "invoice_Water",
+        "SC C&I E": "contract_C&I Electricity",
+        "SC SME E": "contract_SME Electricity",
+        "SC C&I G": "contract_C&I Gas",
+        "SC SME G": "contract_SME Gas",
+        "SC Waste": "contract_Waste",
+        "SC Oil": "contract_Oil",
+        "SC DMA": "contract_DMA",
+        "Amortisation Excel": "business_amortisation_excel",
+        "Amortisation PDF": "business_amortisation_pdf",
+    }
+    status_mapping = {
+        "SC C&I E Status:": "contract_C&I Electricity_status",
+        "SC SME E Status:": "contract_SME Electricity_status",
+        "SC C&I G Status:": "contract_C&I Gas_status",
+        "SC SME G Status:": "contract_SME Gas_status",
+        "SC Waste Status:": "contract_Waste_status",
+        "SC Oil Status:": "contract_Oil_status",
+        "SC DMA Status:": "contract_DMA_status",
+    }
 
-        # Get the official business name to use for file ID lookup
-        official_business_name = data.get('business_details', {}).get('name', business_name)
+    for n8n_key, mapped_key in file_mapping.items():
+        normalized_value = _normalize_drive_cell_value(file_ids_dict.get(n8n_key))
+        if normalized_value:
+            processed_file_ids[mapped_key] = normalized_value
 
-        # Get file IDs from n8n webhook (return_fileIDs)
-        file_ids_data = get_file_ids(official_business_name)
+    for n8n_key, mapped_key in status_mapping.items():
+        status_value = file_ids_dict.get(n8n_key)
+        if status_value and str(status_value).strip():
+            processed_file_ids[mapped_key] = str(status_value).strip()
 
-        # Webhook may return a list with one dictionary or a single dict
-        file_ids_dict = {}
-        if isinstance(file_ids_data, list) and file_ids_data:
-            file_ids_dict = file_ids_data[0]
-        elif isinstance(file_ids_data, dict):
-            file_ids_dict = file_ids_data
+    loa_file_link = _normalize_drive_cell_value(file_ids_dict.get("LOA File ID"))
 
-        # Process file IDs for easy access by other functions
-        # Map N8N keys to expected keys (support both "Site Profling" and "Site Profiling" from n8n)
-        file_mapping = {
-            'LOA File ID': 'business_LOA',
-            'WIP': 'business_WIP',
-            'Floor Plan': 'business_Floor Plan (Exit Map)',
-            'Site Profling': 'business_Site Profiling',
-            'Site Profiling': 'business_Site Profiling',
-            'Service Fee Agreement': 'business_Service Fee Agreement',
-            'Initial Strategy': 'business_Initial Strategy',
-            'Cleaning Invoice': 'invoice_Cleaning',
-            'Telecommunication:': 'invoice_Telecommunication',
-            'Oil Invoice': 'invoice_Oil',
-            'Water Invoice': 'invoice_Water',
-            'SC C&I E': 'contract_C&I Electricity',
-            'SC SME E': 'contract_SME Electricity',
-            'SC C&I G': 'contract_C&I Gas',
-            'SC SME G': 'contract_SME Gas',
-            'SC Waste': 'contract_Waste',
-            'SC Oil': 'contract_Oil',
-            'SC DMA': 'contract_DMA',
-            'Amortisation Excel': 'business_amortisation_excel',
-            'Amortisation PDF': 'business_amortisation_pdf',
-        }
-        
-        # NEW: Status field mapping
-        status_mapping = {
-            'SC C&I E Status:': 'contract_C&I Electricity_status',
-            'SC SME E Status:': 'contract_SME Electricity_status',
-            'SC C&I G Status:': 'contract_C&I Gas_status',
-            'SC SME G Status:': 'contract_SME Gas_status',
-            'SC Waste Status:': 'contract_Waste_status',
-            'SC Oil Status:': 'contract_Oil_status',
-            'SC DMA Status:': 'contract_DMA_status',
-        }
-        
-        # Process all file IDs from N8N data
-        for n8n_key, mapped_key in file_mapping.items():
-            normalized_value = _normalize_drive_cell_value(file_ids_dict.get(n8n_key))
-            if normalized_value:
-                processed_file_ids[mapped_key] = normalized_value
-        
-        # NEW: Process all status fields from N8N data
-        for n8n_key, mapped_key in status_mapping.items():
-            status_value = file_ids_dict.get(n8n_key)
-            if status_value and status_value.strip():  # Check if status exists and is not empty
-                processed_file_ids[mapped_key] = status_value
-
-        # Prepare LOA file link for Representative Details
-        loa_file_id = file_ids_dict.get('LOA File ID')
-        loa_file_link = _normalize_drive_cell_value(loa_file_id)
-
-        # Format the response message in a clear and organized way
-        formatted_response = f"""Here is the information for {business_name}:
+    formatted_response = f"""Here is the information for {business_name}:
 
 ### Business Details:
 - **Business Name:** {data.get('business_details', {}).get('name', 'N/A')}
@@ -308,156 +399,148 @@ def get_business_information(business_name: str) -> dict:
 - **Position:** {data.get('representative_details', {}).get('position', 'N/A')}
 - **LOA Sign Date:** {data.get('representative_details', {}).get('signed_date', 'N/A')}
 """
-        # Add LOA file link if available (constructed from ID only)
-        if loa_file_link:
-            formatted_response += f"- **LOA:** [In File]({loa_file_link})\n"
-        else:
-            formatted_response += f"- **LOA:** Not Available\n"
+    if loa_file_link:
+        formatted_response += f"- **LOA:** [In File]({loa_file_link})\n"
+    else:
+        formatted_response += "- **LOA:** Not Available\n"
 
-        formatted_response += "\n### Business Documents:\n"
-        
-        # Create business documents dict from available files
-        business_documents = {}
-        
-        # Check each document type based on N8N data (use correct "Site Profiling" as key)
-        doc_checks = [
-            ('Initial Strategy', 'Initial Strategy'),
-            ('Site Profiling', 'Site Profiling'),  # try both spellings for file_id below
-            ('Service Fee Agreement', 'Service Fee Agreement'),
-            ('Floor Plan (Exit Map)', 'Floor Plan'),
-        ]
+    formatted_response += "\n### Business Documents:\n"
+    business_documents: dict[str, bool] = {}
+    doc_checks = [
+        ("Initial Strategy", "Initial Strategy"),
+        ("Site Profiling", "Site Profiling"),
+        ("Service Fee Agreement", "Service Fee Agreement"),
+        ("Floor Plan (Exit Map)", "Floor Plan"),
+    ]
+    for doc_name, n8n_key in doc_checks:
+        file_id = file_ids_dict.get(n8n_key) or (
+            file_ids_dict.get("Site Profling") if n8n_key == "Site Profiling" else None
+        )
+        business_documents[doc_name] = bool(file_id and str(file_id).strip())
 
-        for doc_name, n8n_key in doc_checks:
-            file_id = file_ids_dict.get(n8n_key) or (file_ids_dict.get('Site Profling') if n8n_key == 'Site Profiling' else None)
-            business_documents[doc_name] = bool(file_id and file_id.strip())
-        
-        # Always show Initial Strategy as available (as per original logic)
-        if 'Initial Strategy' not in business_documents:
-            business_documents['Initial Strategy'] = True
-            
-        if business_documents:
-            for doc_name, status in business_documents.items():
-                if status:
-                    # Map document name to file ID key
-                    doc_key = f"business_{doc_name}"
-                    file_link = processed_file_ids.get(doc_key)
+    if "Initial Strategy" not in business_documents:
+        business_documents["Initial Strategy"] = True
 
-                    if file_link:
-                        formatted_response += f"- **{doc_name}:** [In File]({file_link})\n"
-                    else:
-                        formatted_response += f"- **{doc_name}:** In File (Link not found)\n"
+    if business_documents:
+        for doc_name, status in business_documents.items():
+            if status:
+                doc_key = f"business_{doc_name}"
+                file_link = processed_file_ids.get(doc_key)
+                if file_link:
+                    formatted_response += f"- **{doc_name}:** [In File]({file_link})\n"
                 else:
-                    formatted_response += f"- **{doc_name}:** Not Available\n"
-        else:
-            formatted_response += "- No business documents available\n"
-
-        # Add Signed Contracts section WITH STATUS
-        sc_fields = [
-            ("SC C&I E", "C&I Electricity", "SC C&I E Status:"),
-            ("SC SME E", "SME Electricity", "SC SME E Status:"),
-            ("SC C&I G", "C&I Gas", "SC C&I G Status:"),
-            ("SC SME G", "SME Gas", "SC SME G Status:"),
-            ("SC Waste", "Waste", "SC Waste Status:"),
-            ("SC Oil", "Oil", "SC Oil Status:"),
-            ("SC DMA", "DMA", "SC DMA Status:"),
-        ]
-        formatted_response += "\n### Signed Contracts:\n"
-        for sc_key, sc_label, status_key in sc_fields:
-            sc_file_id = file_ids_dict.get(sc_key)
-            sc_status = file_ids_dict.get(status_key, "")
-
-            normalized_sc_value = _normalize_drive_cell_value(sc_file_id)
-            if normalized_sc_value:
-                sc_links = [v.strip() for v in normalized_sc_value.split(",") if v.strip()]
-                status_values = [v.strip() for v in str(sc_status).split(",") if v.strip()] if sc_status else []
-                if len(sc_links) == 1:
-                    status_text = f" ({status_values[0]})" if status_values else ""
-                    formatted_response += f"- **{sc_label}:** [In File]({sc_links[0]}){status_text}\n"
-                else:
-                    formatted_response += f"- **{sc_label}:**\n"
-                    for idx, link in enumerate(sc_links):
-                        status_text = ""
-                        if status_values:
-                            status_text = f" ({status_values[idx] if idx < len(status_values) else status_values[0]})"
-                        formatted_response += f"  - [In File #{idx + 1}]({link}){status_text}\n"
+                    formatted_response += f"- **{doc_name}:** In File (Link not found)\n"
             else:
-                formatted_response += f"- **{sc_label}:** Not Available\n"
+                formatted_response += f"- **{doc_name}:** Not Available\n"
+    else:
+        formatted_response += "- No business documents available\n"
 
-        wip_file_id = file_ids_dict.get('WIP')
-        wip_file_link = _normalize_drive_cell_value(wip_file_id)
-        if wip_file_link:
-            processed_file_ids["business_WIP"] = wip_file_link
+    sc_fields = [
+        ("SC C&I E", "C&I Electricity", "SC C&I E Status:"),
+        ("SC SME E", "SME Electricity", "SC SME E Status:"),
+        ("SC C&I G", "C&I Gas", "SC C&I G Status:"),
+        ("SC SME G", "SME Gas", "SC SME G Status:"),
+        ("SC Waste", "Waste", "SC Waste Status:"),
+        ("SC Oil", "Oil", "SC Oil Status:"),
+        ("SC DMA", "DMA", "SC DMA Status:"),
+    ]
+    formatted_response += "\n### Signed Contracts:\n"
+    for sc_key, sc_label, status_key in sc_fields:
+        sc_file_id = file_ids_dict.get(sc_key)
+        sc_status = file_ids_dict.get(status_key, "")
+        normalized_sc_value = _normalize_drive_cell_value(sc_file_id)
+        if normalized_sc_value:
+            sc_links = [v.strip() for v in normalized_sc_value.split(",") if v.strip()]
+            status_values = (
+                [v.strip() for v in str(sc_status).split(",") if v.strip()] if sc_status else []
+            )
+            if len(sc_links) == 1:
+                status_text = f" ({status_values[0]})" if status_values else ""
+                formatted_response += f"- **{sc_label}:** [In File]({sc_links[0]}){status_text}\n"
+            else:
+                formatted_response += f"- **{sc_label}:**\n"
+                for idx, link in enumerate(sc_links):
+                    status_text = ""
+                    if status_values:
+                        status_text = (
+                            f" ({status_values[idx] if idx < len(status_values) else status_values[0]})"
+                        )
+                    formatted_response += f"  - [In File #{idx + 1}]({link}){status_text}\n"
+        else:
+            formatted_response += f"- **{sc_label}:** Not Available\n"
 
-        formatted_response += "\n### Linked Utilities and Retailers:"
+    wip_file_link = _normalize_drive_cell_value(file_ids_dict.get("WIP"))
+    if wip_file_link:
+        processed_file_ids["business_WIP"] = wip_file_link
 
-        # Add linked utilities and their details
-        linked_utilities = data.get('Linked_Details', {}).get('linked_utilities', {})
-        utility_retailers = data.get('Linked_Details', {}).get('utility_retailers', {})
+    formatted_response += "\n### Linked Utilities and Retailers:"
+    linked_utilities = data.get("Linked_Details", {}).get("linked_utilities", {})
+    utility_retailers = data.get("Linked_Details", {}).get("utility_retailers", {})
 
-        if "Robot Number" in linked_utilities:
-            linked_utilities["Robot"] = linked_utilities["Robot Number"]
-        
-        # Handle all utility types (keeping the original logic)
-        utility_types = [
-            ('C&I Electricity', 'NMI'),
-            ('SME Electricity', 'NMI'),
-            ('C&I Gas', 'MRIN'),
-            ('SME Gas', 'MRIN'),
-            ('Small Gas', 'MRIN'),
-            ('Waste', 'Account Number'),
-            ('Oil', 'Account Name'),
-        ]
+    if "Robot Number" in linked_utilities:
+        linked_utilities["Robot"] = linked_utilities["Robot Number"]
 
-        for utility_type, identifier_type in utility_types:
-            if utility_type in linked_utilities:
-                formatted_response += f"\n\n**{utility_type}:**"
-                details = linked_utilities[utility_type]
-                if isinstance(details, str):
-                    formatted_response += f"\n- {identifier_type}: {details}"
-                elif isinstance(details, bool) and details:
-                    formatted_response += "\n- Status: In File"
-                if utility_type in utility_retailers:
-                    retailers = utility_retailers[utility_type]
-                    if isinstance(retailers, list):
-                        formatted_response += f"\n- Retailer: {', '.join(retailers)}"
-                    else:
-                        formatted_response += f"\n- Retailer: {retailers}"
+    utility_types = [
+        ("C&I Electricity", "NMI"),
+        ("SME Electricity", "NMI"),
+        ("C&I Gas", "MRIN"),
+        ("SME Gas", "MRIN"),
+        ("Small Gas", "MRIN"),
+        ("Waste", "Account Number"),
+        ("Oil", "Account Name"),
+    ]
 
-        # Handle Robots section
-        robot_number = linked_utilities.get('Robot Number')
-        robot_supplier = utility_retailers.get('Robot Supplier')
-        if robot_number or robot_supplier:
-            formatted_response += "\n\n**Robots:**"
-            if robot_number:
-                if isinstance(robot_number, str) and ',' in robot_number:
-                    robot_numbers = [r.strip() for r in robot_number.split(',')]
-                    formatted_response += f"\n- Robot Number: {', '.join(robot_numbers)}"
-                elif isinstance(robot_number, list):
-                    formatted_response += f"\n- Robot Number: {', '.join(robot_number)}"
+    for utility_type, identifier_type in utility_types:
+        if utility_type in linked_utilities:
+            formatted_response += f"\n\n**{utility_type}:**"
+            details = linked_utilities[utility_type]
+            if isinstance(details, list):
+                ids = ", ".join(str(x) for x in details if x)
+                if ids:
+                    formatted_response += f"\n- {identifier_type}: {ids}"
+            elif isinstance(details, str):
+                formatted_response += f"\n- {identifier_type}: {details}"
+            elif isinstance(details, bool) and details:
+                formatted_response += "\n- Status: In File"
+            if utility_type in utility_retailers:
+                retailers = utility_retailers[utility_type]
+                if isinstance(retailers, list):
+                    formatted_response += f"\n- Retailer: {', '.join(str(r) for r in retailers if r)}"
                 else:
-                    formatted_response += f"\n- Robot Number: {robot_number}"
-            if robot_supplier:
-                formatted_response += f"\n- Supplier: {robot_supplier}"
+                    formatted_response += f"\n- Retailer: {retailers}"
 
-        # Handle Cleaning
-        if 'Cleaning' in linked_utilities:
-            formatted_response += "\n\n**Cleaning:**"
-            details = linked_utilities['Cleaning']
-            if isinstance(details, bool):
-                formatted_response += f"\n- Status: {'In File' if details else 'Not Available'}"
-        else:
-            formatted_response += "\n\n**Cleaning:**\n- Status: Not Available"
+    robot_number = linked_utilities.get("Robot Number")
+    robot_supplier = utility_retailers.get("Robot Supplier")
+    if robot_number or robot_supplier:
+        formatted_response += "\n\n**Robots:**"
+        if robot_number:
+            if isinstance(robot_number, str) and "," in robot_number:
+                robot_numbers = [r.strip() for r in robot_number.split(",")]
+                formatted_response += f"\n- Robot Number: {', '.join(robot_numbers)}"
+            elif isinstance(robot_number, list):
+                formatted_response += f"\n- Robot Number: {', '.join(str(r) for r in robot_number)}"
+            else:
+                formatted_response += f"\n- Robot Number: {robot_number}"
+        if robot_supplier:
+            formatted_response += f"\n- Supplier: {robot_supplier}"
 
-        # Handle Telecommunication
-        if 'Telecommunication' in linked_utilities:
-            formatted_response += "\n\n**Telecommunication:**"
-            details = linked_utilities['Telecommunication']
-            if isinstance(details, bool):
-                formatted_response += f"\n- Status: {'In File' if details else 'Not Available'}"
-        else:
-            formatted_response += "\n\n**Telecommunication:**\n- Status: Not Available"
+    if "Cleaning" in linked_utilities:
+        formatted_response += "\n\n**Cleaning:**"
+        details = linked_utilities["Cleaning"]
+        if isinstance(details, bool):
+            formatted_response += f"\n- Status: {'In File' if details else 'Not Available'}"
+    else:
+        formatted_response += "\n\n**Cleaning:**\n- Status: Not Available"
 
-        formatted_response += f"""
+    if "Telecommunication" in linked_utilities:
+        formatted_response += "\n\n**Telecommunication:**"
+        details = linked_utilities["Telecommunication"]
+        if isinstance(details, bool):
+            formatted_response += f"\n- Status: {'In File' if details else 'Not Available'}"
+    else:
+        formatted_response += "\n\n**Telecommunication:**\n- Status: Not Available"
+
+    formatted_response += f"""
 
 ### Google Drive:
 - **Folder URL:** {data.get('gdrive', {}).get('folder_url', 'N/A')}
@@ -465,20 +548,59 @@ def get_business_information(business_name: str) -> dict:
 ### Information Retrieval
 """
 
-        logger.info(f"Formatted response: {formatted_response}")
-        logger.info(f"Processed file IDs: {processed_file_ids}")
-        
-        # Return both the raw data and formatted output, plus processed file IDs
-        return {
-            **data,  # Include all raw data
-            "_formatted_output": formatted_response,  # Add formatted output
-            "_processed_file_ids": processed_file_ids,  # Add processed file IDs for other functions
-            "business_documents": business_documents  # Add the business_documents dict
-        }
+    logger.info("Formatted business info response for business_name=%r", official_business_name)
+    return {
+        **data,
+        "_formatted_output": formatted_response,
+        "_processed_file_ids": processed_file_ids,
+        "business_documents": business_documents,
+    }
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error in get_business_information: {str(e)}", exc_info=True)
-        return {"_formatted_output": "Error: Unable to connect to the server. Please try again later."}
+
+def get_business_information(business_name: str) -> dict:
+    """
+    Get the business information including:
+    - record_ID
+    - Business Details: Name, Trading Name, ABN
+    - Contact Information: Postal Address, Site Address, Telephone, Email
+    - Representative Details: Contact Name, Position, LOA Sign Date
+    - Business Documents: List of available documents
+    - Linked Utilities and their retailers
+    - Google Drive folder URL
+
+    Data sources (in order):
+    1. Airtable direct (when USE_AIRTABLE_DIRECT=true) with n8n fallback
+    2. Google Sheets direct for file IDs with n8n fallback
+    """
+    data: Optional[dict] = None
+
+    try:
+        data = _search_business_info_from_airtable(business_name)
     except Exception as e:
-        logger.error(f"Unexpected error in get_business_information: {str(e)}", exc_info=True)
+        logger.warning("Airtable business info lookup failed: %s", e, exc_info=True)
+
+    if not data and USE_N8N_BUSINESS_INFO_FALLBACK:
+        try:
+            data = _search_business_info_from_n8n(business_name)
+        except requests.exceptions.RequestException as e:
+            logger.error("n8n business info request failed: %s", e, exc_info=True)
+            return {
+                "_formatted_output": "Error: Unable to connect to the server. Please try again later."
+            }
+        except Exception as e:
+            logger.error("Unexpected n8n business info error: %s", e, exc_info=True)
+            return {
+                "_formatted_output": "Error: An unexpected error occurred. Please try again later."
+            }
+
+    if not data:
+        return {"_formatted_output": "Sorry but couldn't find that business name"}
+
+    official_business_name = data.get("business_details", {}).get("name", business_name)
+    file_ids_data = get_file_ids(official_business_name or business_name)
+
+    try:
+        return _build_business_info_response(data, business_name, file_ids_data)
+    except Exception as e:
+        logger.error("Unexpected error building business info response: %s", e, exc_info=True)
         return {"_formatted_output": "Error: An unexpected error occurred. Please try again later."}
