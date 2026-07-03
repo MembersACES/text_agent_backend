@@ -373,6 +373,9 @@ _CORS_ORIGINS_BASE = [
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    # czeroanz-ai Cloud Run frontends (CZA hosting)
+    "https://czagentinterface-522472397014.australia-southeast2.run.app",
+    "https://czagentinterfacedev-522472397014.australia-southeast2.run.app",
     "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
     "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
