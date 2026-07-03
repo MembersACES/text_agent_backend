@@ -368,7 +368,7 @@ def on_shutdown() -> None:
         _autonomous_scheduler = None
 
 # CORS: allow these origins so error responses (e.g. 500) can include CORS headers
-CORS_ORIGINS = [
+_CORS_ORIGINS_BASE = [
     "https://acesagentinterface-672026052958.australia-southeast2.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
@@ -383,6 +383,20 @@ CORS_ORIGINS = [
     "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
+
+
+def _build_cors_origins() -> list[str]:
+    """Static allowlist plus optional comma-separated CORS_EXTRA_ORIGINS (CZA Cloud Run URLs)."""
+    extra_raw = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
+    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    merged = list(_CORS_ORIGINS_BASE)
+    for origin in extra:
+        if origin not in merged:
+            merged.append(origin)
+    return merged
+
+
+CORS_ORIGINS = _build_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,
