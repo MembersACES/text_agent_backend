@@ -49,6 +49,7 @@ from tools.business_info import get_business_information, get_base1_landing_resp
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
+from tools.sheet_preview import get_sheet_preview
 from tools.invoicing_retailer_sheets import (
     get_commission_figures_client_count,
     get_trojan_oil_unique_client_count,
@@ -1280,6 +1281,21 @@ def return_utility_info(
         user_info.get("email"),
     )
     return get_return_utility_info(request.utility_type, request.business_name)
+
+
+@app.get("/api/sheet-preview")
+def sheet_preview(
+    utility_type: str = Query(..., description="Utility type key, e.g. LOA, WASTE, ELECTRICITY_CI"),
+    rows: int = Query(5, ge=1, le=10, description="Number of data rows to return (from row 2 downward)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "sheet-preview request utility_type=%s rows=%s user=%s",
+        utility_type,
+        rows,
+        user_info.get("email"),
+    )
+    return get_sheet_preview(utility_type, rows)
 
 
 @app.get("/api/utility-extra")
