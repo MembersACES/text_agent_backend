@@ -140,6 +140,7 @@ from tools.resources_drive_videos import (
     get_resources_videos_folder_id,
     list_resources_folder_videos,
 )
+from tools.plus_es_dma import get_plus_es_dma_folder_id, list_plus_es_dma_pdfs
 from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
@@ -3760,6 +3761,21 @@ def get_resources_drive_videos(
         "folder_id": folder_id,
         "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "videos": videos,
+    }
+
+
+@app.get("/api/base1/plus-es-dma")
+def get_plus_es_dma_pdfs(user_info: dict = Depends(verify_google_token)):
+    """List PDF DMA documents in the Plus ES Google Drive folder (service account)."""
+    _ = user_info
+    folder_id = get_plus_es_dma_folder_id()
+    pdfs, err = list_plus_es_dma_pdfs()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return {
+        "folder_id": folder_id,
+        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
+        "pdfs": pdfs,
     }
 
 
