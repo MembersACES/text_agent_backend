@@ -49,6 +49,7 @@ from tools.business_info import get_business_information, get_base1_landing_resp
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
+from tools.sheet_preview import get_sheet_preview
 from tools.invoicing_retailer_sheets import (
     get_commission_figures_client_count,
     get_trojan_oil_unique_client_count,
@@ -368,11 +369,14 @@ def on_shutdown() -> None:
         _autonomous_scheduler = None
 
 # CORS: allow these origins so error responses (e.g. 500) can include CORS headers
-CORS_ORIGINS = [
+_CORS_ORIGINS_BASE = [
     "https://acesagentinterface-672026052958.australia-southeast2.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    # czeroanz-ai Cloud Run frontends (CZA hosting)
+    "https://czagentinterface-522472397014.australia-southeast2.run.app",
+    "https://czagentinterfacedev-522472397014.australia-southeast2.run.app",
     "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
     "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
@@ -383,6 +387,20 @@ CORS_ORIGINS = [
     "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
+
+
+def _build_cors_origins() -> list[str]:
+    """Static allowlist plus optional comma-separated CORS_EXTRA_ORIGINS (CZA Cloud Run URLs)."""
+    extra_raw = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
+    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    merged = list(_CORS_ORIGINS_BASE)
+    for origin in extra:
+        if origin not in merged:
+            merged.append(origin)
+    return merged
+
+
+CORS_ORIGINS = _build_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,
@@ -1263,6 +1281,21 @@ def return_utility_info(
         user_info.get("email"),
     )
     return get_return_utility_info(request.utility_type, request.business_name)
+
+
+@app.get("/api/sheet-preview")
+def sheet_preview(
+    utility_type: str = Query(..., description="Utility type key, e.g. LOA, WASTE, ELECTRICITY_CI"),
+    rows: int = Query(5, ge=1, le=10, description="Number of data rows to return (from row 2 downward)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "sheet-preview request utility_type=%s rows=%s user=%s",
+        utility_type,
+        rows,
+        user_info.get("email"),
+    )
+    return get_sheet_preview(utility_type, rows)
 
 
 @app.get("/api/utility-extra")
