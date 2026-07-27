@@ -344,6 +344,7 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
     {
         "gas_base2_followup_v1",
         "ci_electricity_base2_followup_v1",
+        "ci_electricity_offer",
     }
 )
 
@@ -437,6 +438,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "sequence_type": "ci_electricity_base2_followup_v1",
             "display_name": "C&I Electricity Base 2 Follow-up v1",
             "description": "Default Base 2 cadence for C&I electricity offers.",
+            "is_restartable": 1,
+        },
+        {
+            "sequence_type": "ci_electricity_offer",
+            "display_name": "C&I Electricity Offer",
+            "description": "Utility Invoice Info C&I electricity offer comparison follow-up.",
             "is_restartable": 1,
         },
         {
