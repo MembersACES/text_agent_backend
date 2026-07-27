@@ -10716,6 +10716,22 @@ def autonomous_sequence_start(
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
     if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
         incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
+        if not incoming_validity:
+            # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
+            for key in ("offer_validity_label", "validity_date", "offer_validity"):
+                label = str(sequence_context.get(key) or "").strip()
+                if not label:
+                    continue
+                m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", label)
+                if m:
+                    dd, mm, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+                    incoming_validity = f"{yyyy}-{mm}-{dd}"
+                    break
+                m_iso = re.search(r"(\d{4})-(\d{2})-(\d{2})", label)
+                if m_iso:
+                    incoming_validity = f"{m_iso.group(1)}-{m_iso.group(2)}-{m_iso.group(3)}"
+                    break
+
         if incoming_validity:
             try:
                 valid_date = date.fromisoformat(incoming_validity[:10])
@@ -10726,11 +10742,13 @@ def autonomous_sequence_start(
                 )
                 valid_until_utc = valid_until_local.astimezone(timezone.utc)
                 sequence_context["offer_validity_date"] = valid_date.isoformat()
-                sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-                sequence_context.setdefault(
-                    "validity_date",
-                    valid_until_local.strftime("%d/%m/%Y") + " (12pm)",
+                sequence_context["offer_valid_until"] = valid_until_utc.isoformat()
+                sequence_context["validity_date"] = valid_until_local.strftime("%d/%m/%Y") + " (12pm)"
+                sequence_context["offer_validity_label"] = (
+                    str(sequence_context.get("offer_validity_label") or "").strip()
+                    or f"12pm on {valid_until_local.strftime('%d/%m/%Y')}"
                 )
+                sequence_context.pop("offer_validity_days", None)
             except ValueError:
                 logging.warning("Ignoring invalid offer_validity_date=%r", incoming_validity)
                 sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
