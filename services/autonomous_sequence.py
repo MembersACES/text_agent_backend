@@ -105,7 +105,7 @@ SOLAR_ENGAGEMENT_SIGNATURE_HTML = """<p style="margin-bottom:0;"><strong>Amelia 
 <span style="color:#666;">Customer Success Manager (CSM) – Implementation: Connects onboarding directly to future success.</span></p>
 <p style="margin-top:16px; margin-bottom:0;"><strong>Carbon Zero Australasia</strong><br>
 Australian Circular Economy Solutions Division<br>
-Direct: 1300 938 638<br>
+Direct: 0468 050 399<br>
 Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">business@acesolutions.com.au</a><br>
 470 St Kilda Road, Melbourne VIC 3004<br>
 Ph: 1300 849 908 | Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
