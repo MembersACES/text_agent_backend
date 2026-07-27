@@ -10701,7 +10701,8 @@ def autonomous_sequence_start(
         sequence_context.setdefault("email_id", incoming_email_id)
 
     # Provide consistent offer timing fields for prompts/workflows.
-    # The offer validity window defaults to exactly 7 days from generation.
+    # Prefer an explicit offer_validity_date from the client/UI when provided.
+    # Otherwise default the offer validity window to exactly 7 days from generation.
     anchor_dt = body.anchor_at
     if anchor_dt.tzinfo is None:
         anchor_utc = anchor_dt.replace(tzinfo=timezone.utc)
@@ -10714,9 +10715,35 @@ def autonomous_sequence_start(
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
     if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
-        sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-        sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-        sequence_context.setdefault("offer_validity_days", 7)
+        incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
+        if incoming_validity:
+            try:
+                valid_date = date.fromisoformat(incoming_validity[:10])
+                # Noon Australia/Brisbane on that calendar day.
+                valid_until_local = datetime(
+                    valid_date.year, valid_date.month, valid_date.day, 12, 0, 0,
+                    tzinfo=ZoneInfo("Australia/Brisbane"),
+                )
+                valid_until_utc = valid_until_local.astimezone(timezone.utc)
+                sequence_context["offer_validity_date"] = valid_date.isoformat()
+                sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+                sequence_context.setdefault(
+                    "validity_date",
+                    valid_until_local.strftime("%d/%m/%Y") + " (12pm)",
+                )
+            except ValueError:
+                logging.warning("Ignoring invalid offer_validity_date=%r", incoming_validity)
+                sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+                sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+                sequence_context.setdefault("offer_validity_days", 7)
+        else:
+            sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
+            sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
+            sequence_context.setdefault("offer_validity_days", 7)
+            sequence_context.setdefault(
+                "validity_date",
+                valid_until_local.strftime("%d/%m/%Y") + " (12pm)",
+            )
 
     template = get_sequence_template_by_type(db, sequence_type)
     if not template:
