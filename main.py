@@ -10683,7 +10683,15 @@ def autonomous_sequence_start(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    from services.autonomous_sequence import get_sequence_template_by_type, start_gas_base2_sequence
+    from services.autonomous_sequence import (
+        ensure_autonomous_sequence_type_row,
+        get_sequence_template_by_type,
+        start_gas_base2_sequence,
+    )
+
+    sequence_type = (body.sequence_type or "").strip()
+    if not sequence_type:
+        raise HTTPException(status_code=400, detail="sequence_type is required")
 
     sequence_context = dict(body.context or {})
     incoming_email_id = (body.email_id or body.email_ID or "").strip()
@@ -10705,30 +10713,49 @@ def autonomous_sequence_start(
     from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if body.sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
         sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
         sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
         sequence_context.setdefault("offer_validity_days", 7)
 
-    template = get_sequence_template_by_type(db, body.sequence_type)
+    template = get_sequence_template_by_type(db, sequence_type)
     if not template:
-        raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
+                "Create it under Autonomous Agent → Sequence templates, or check the mono key under the display name."
+            ),
+        )
     if not bool(template.is_active):
-        raise HTTPException(status_code=400, detail="Sequence template is inactive")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sequence template is inactive: {sequence_type!r}. Enable Active and Save template.",
+        )
     offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
 
-    run = start_gas_base2_sequence(
-        db,
-        sequence_type=body.sequence_type,
-        offer_id=body.offer_id,
-        client_id=body.client_id if body.client_id is not None else offer.client_id,
-        crm_activity_id=body.crm_activity_id,
-        anchor_at=body.anchor_at,
-        tz=body.timezone,
-        context=sequence_context,
-    )
+    # Ensure FK parent row exists (shared DB may enforce autonomous_sequence_type).
+    ensure_autonomous_sequence_type_row(db, sequence_type)
+
+    try:
+        run = start_gas_base2_sequence(
+            db,
+            sequence_type=sequence_type,
+            offer_id=body.offer_id,
+            client_id=body.client_id if body.client_id is not None else offer.client_id,
+            crm_activity_id=body.crm_activity_id,
+            anchor_at=body.anchor_at,
+            tz=body.timezone,
+            context=sequence_context,
+        )
+    except Exception as e:
+        logging.exception("autonomous sequence start failed type=%s offer_id=%s", sequence_type, body.offer_id)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to start sequence {sequence_type!r}: {e}",
+        ) from e
     steps_planned = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run.id).count()
     return {
         "run_id": run.id,
