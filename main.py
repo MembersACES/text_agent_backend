@@ -12306,3 +12306,27 @@ def put_base2_comparison_defaults(
                 {"k": BASE2_DEFAULTS_KEY, "v": value, "g": new_gen, "u": defaults["updatedAt"]},
             )
     return {"defaults": defaults, "generation": new_gen}
+
+
+# --- B4 climate report push (activity_record.v1 -> aces-climate-api) ---
+from services.prograde_b4_client import push_report_to_b4, B4PushError
+
+
+@app.post("/api/climate/entities/{entity_id}/commit-to-b4")
+def commit_entity_to_b4(
+    entity_id: str,
+    period: str = Query("FY26"),
+    commit: bool = Query(False, description="lock the report to defensible"),
+    jurisdiction: Optional[str] = Query(None, description="state for electricity factor, e.g. VIC"),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Forward this entity's staged activity to B4 and return the computed report."""
+    try:
+        return push_report_to_b4(
+            db, entity_id, period,
+            commit=commit, jurisdiction=jurisdiction,
+            user_email=user_info.get("email", "system@acesolutions.com.au"),
+        )
+    except B4PushError as e:
+        raise HTTPException(status_code=502, detail=str(e))
