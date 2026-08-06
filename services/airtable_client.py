@@ -505,6 +505,105 @@ def build_business_info_from_loa(loa_record: dict) -> dict:
     }
 
 
+# App field name → Airtable LOA Business Details column
+_LOA_EDITABLE_FIELDS: dict[str, str] = {
+    "trading_name": "Trading As",
+    "postal_address": "Postal Address",
+    "site_address": "Site Address",
+    "telephone": "Contact Number",
+    "email": "Contact Email",
+    "contact_name": "Contact Name",
+    "position": "Contact Position",
+}
+
+
+def update_loa_business_details(
+    *,
+    record_id: Optional[str] = None,
+    business_name: Optional[str] = None,
+    trading_name: Optional[str] = None,
+    postal_address: Optional[str] = None,
+    site_address: Optional[str] = None,
+    telephone: Optional[str] = None,
+    email: Optional[str] = None,
+    contact_name: Optional[str] = None,
+    position: Optional[str] = None,
+) -> dict:
+    """
+    PATCH editable LOA Business Details fields in Airtable.
+    Prefer record_id when available; otherwise resolve by business_name.
+
+    Returns {ok, record_id, updated_fields, business_info} where business_info is the
+    remapped payload shape used by get-business-info (without file IDs).
+    """
+    if not AIRTABLE_API_KEY:
+        raise RuntimeError("AIRTABLE_API_KEY is not set")
+
+    rid = (record_id or "").strip()
+    if not rid:
+        bn = (business_name or "").strip()
+        if not bn:
+            raise ValueError("record_id or business_name is required")
+        loa = get_loa_record_by_business_name(bn)
+        if not loa:
+            raise ValueError(f"No LOA record matched business_name={bn!r}")
+        rid = (loa.get("id") or "").strip()
+        if not rid:
+            raise ValueError(f"LOA match for {bn!r} has no record id")
+
+    raw_updates = {
+        "trading_name": trading_name,
+        "postal_address": postal_address,
+        "site_address": site_address,
+        "telephone": telephone,
+        "email": email,
+        "contact_name": contact_name,
+        "position": position,
+    }
+    fields: dict[str, str] = {}
+    for app_key, airtable_key in _LOA_EDITABLE_FIELDS.items():
+        if app_key not in raw_updates:
+            continue
+        val = raw_updates[app_key]
+        if val is None:
+            continue
+        fields[airtable_key] = str(val).strip()
+
+    if not fields:
+        raise ValueError("No editable fields provided")
+
+    url = _url(LOA_TABLE_ID, rid)
+    logger.info("[loa-update] PATCH %s fields=%s", url, list(fields.keys()))
+    try:
+        r = requests.patch(
+            url,
+            headers=_headers(),
+            json={"fields": fields},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Airtable LOA update request failed: {e}") from e
+
+    if not r.ok:
+        logger.warning(
+            "[loa-update] Airtable PATCH failed: status=%s body=%s",
+            r.status_code,
+            (r.text or "")[:500],
+        )
+        raise RuntimeError(f"Airtable LOA update failed ({r.status_code}): {(r.text or '')[:300]}")
+
+    # PATCH responses may only include changed fields — re-fetch full record for UI merge.
+    refreshed = get_loa_record_by_id(rid) or r.json()
+    return {
+        "ok": True,
+        "record_id": (refreshed.get("id") if isinstance(refreshed, dict) else None) or rid,
+        "updated_fields": list(fields.keys()),
+        "business_info": build_business_info_from_loa(
+            refreshed if isinstance(refreshed, dict) else {"id": rid, "fields": fields}
+        ),
+    }
+
+
 # Possible Airtable field names for contract end date (C&I Electricity may differ from C&I Gas)
 CONTRACT_END_DATE_KEYS = ("Contract End Date", "Contract end date", "ContractEndDate", "Contract End date")
 
