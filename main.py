@@ -928,6 +928,88 @@ def get_contracts_by_business(
         raise HTTPException(status_code=502, detail=f"Contract lookup failed: {e}")
 
 
+class ContractStatusUpdateRequest(BaseModel):
+    business_name: str
+    contract_key: str  # e.g. "DMA", "C&I Electricity"
+    status: str = ""  # "Signed via ACES" | "Existing Contract" | "Signed Externally" | ""
+    file_index: int = 0  # for comma-separated multi-file rows
+
+
+class BusinessInfoUpdateRequest(BaseModel):
+    """Patch editable LOA Business Details fields (Airtable). Prefer record_id when known."""
+    business_name: Optional[str] = None
+    record_id: Optional[str] = None
+    trading_name: Optional[str] = None
+    postal_address: Optional[str] = None
+    site_address: Optional[str] = None
+    telephone: Optional[str] = None
+    email: Optional[str] = None
+    contact_name: Optional[str] = None
+    position: Optional[str] = None
+
+
+@app.patch("/api/contracts/status")
+def patch_contract_status(
+    request: ContractStatusUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update one FILE_IDS signed-contract status cell (multi-file index-safe). No file upload required."""
+    from services.contract_status_update import update_contract_status
+
+    try:
+        result = update_contract_status(
+            request.business_name,
+            request.contract_key,
+            request.status,
+            file_index=request.file_index,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logging.error("[contracts/status] %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logging.exception("[contracts/status] unexpected error")
+        raise HTTPException(status_code=502, detail=f"Contract status update failed: {e}")
+
+    result["user_email"] = user_info.get("email")
+    return result
+
+
+@app.patch("/api/business-info")
+def patch_business_info(
+    request: BusinessInfoUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update LOA contact / business detail fields in Airtable (dashboard inline edit)."""
+    from services import airtable_client
+
+    payload = request.model_dump(exclude_unset=True)
+    try:
+        result = airtable_client.update_loa_business_details(
+            record_id=payload.get("record_id"),
+            business_name=payload.get("business_name"),
+            trading_name=payload.get("trading_name"),
+            postal_address=payload.get("postal_address"),
+            site_address=payload.get("site_address"),
+            telephone=payload.get("telephone"),
+            email=payload.get("email"),
+            contact_name=payload.get("contact_name"),
+            position=payload.get("position"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logging.error("[business-info PATCH] %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logging.exception("[business-info PATCH] unexpected error")
+        raise HTTPException(status_code=502, detail=f"Business info update failed: {e}")
+
+    result["user_email"] = user_info.get("email")
+    return result
+
+
 @app.get("/api/climate/entities/{entity_id}/activity-sources")
 def get_climate_entity_activity_sources(
     entity_id: str,
@@ -12322,11 +12404,17 @@ def commit_entity_to_b4(
     db: Session = Depends(get_db),
 ):
     """Forward this entity's staged activity to B4 and return the computed report."""
+    # B4 requires the audit actor to be a permitted (acesolutions.com.au) identity.
+    # Service-key / proxy calls arrive as a synthetic internal address, so stamp a real,
+    # identifiable platform service identity for those; keep a real user email if present.
+    actor = (user_info.get("email") or "").strip()
+    if not actor.endswith("@acesolutions.com.au"):
+        actor = "prograde-platform@acesolutions.com.au"
     try:
         return push_report_to_b4(
             db, entity_id, period,
             commit=commit, jurisdiction=jurisdiction,
-            user_email=user_info.get("email", "system@acesolutions.com.au"),
+            user_email=actor,
         )
     except B4PushError as e:
         raise HTTPException(status_code=502, detail=str(e))
