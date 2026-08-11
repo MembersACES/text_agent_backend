@@ -12472,3 +12472,61 @@ def commit_entity_to_b4(
         )
     except B4PushError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# --- MAINTENANCE: rebuild staged activity for ONE entity (purge + re-stage with fixed ETL) ---
+@app.post("/api/climate/entities/{entity_id}/rebuild-staged")
+def rebuild_staged_activity(
+    entity_id: str,
+    period: str = Query("FY26"),
+    confirm: bool = Query(False, description="true = purge + re-stage; false = dry-run"),
+    max_records: int = Query(1000),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """MAINTENANCE (entity-scoped): clear this entity's staged climate_activity_records and
+    re-stage from Airtable using the current ETL (which now filters to the reporting FY).
+    Dry-run unless confirm=true. Reuses the per-client sync's fetch/transform/upsert."""
+    from models import ClimateActivityRecord
+    manifest = build_entity_activity_manifest(db, entity_id, period_label=period)
+    sites = manifest.get("sites", []) if isinstance(manifest, dict) else []
+    period_start, period_end = default_fy_period(period)
+    existing = db.query(ClimateActivityRecord).filter(ClimateActivityRecord.entity_id == entity_id).count()
+    if not confirm:
+        return {"entity_id": entity_id, "period": period, "dry_run": True,
+                "existing_staged_rows": existing, "sites_to_restage": len(sites)}
+    deleted = (db.query(ClimateActivityRecord)
+               .filter(ClimateActivityRecord.entity_id == entity_id)
+               .delete(synchronize_session=False))
+    db.commit()
+    staged = 0
+    skipped = 0
+    per_site = []
+    for s in sites:
+        ut = s.get("utility_type")
+        ident = s.get("identifier")
+        member_client_id = s.get("member_aces_client_id")
+        loa_id = s.get("member_loa_record_id")
+        if not ut or not ident:
+            continue
+        payload = airtable_client.get_utility_invoice_rows_by_identifier(ut, ident, max_records=max_records)
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        ctx = EtlContext(entity_id=entity_id, client_id=member_client_id, loa_client_id=loa_id,
+                         site_id=str(ident).strip(), utility_type=ut,
+                         period_start=period_start, period_end=period_end)
+        results, _diag = transform_invoice_rows(rows, ctx)
+        s_staged = 0
+        s_skipped = 0
+        for res in results:
+            if res.skipped:
+                s_skipped += 1
+                continue
+            upsert_activity_record(db, record_id=res.record_id, client_id=member_client_id,
+                                   body=res.body, source_utility_type=ut, source_row_id=res.source_row_id)
+            s_staged += 1
+        staged += s_staged
+        skipped += s_skipped
+        per_site.append({"site": ident, "utility_type": ut, "invoices": len(rows),
+                         "staged": s_staged, "skipped": s_skipped})
+    return {"entity_id": entity_id, "period": period, "dry_run": False,
+            "deleted": int(deleted or 0), "staged": staged, "skipped": skipped, "per_site": per_site}
