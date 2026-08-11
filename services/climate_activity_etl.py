@@ -119,8 +119,11 @@ UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
         ],
     },
     "Oil": {
-        "activity_type": "diesel",
-        "scope": 1,
+        # Cooking oil (Trojan Oils fry oil + collected used oil) — NOT combustion fuel.
+        # Reclassified out of Scope 1: -> Scope 3 Cat 5 (waste generated in operations).
+        # Interim; confirm factor with Trojan Oils. See team_debrief.md.
+        "activity_type": "cooking_oil",
+        "scope": 3,
         "unit": "L",
         "quantity_fields": [
             "Litres",
