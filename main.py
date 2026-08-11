@@ -55,6 +55,10 @@ from tools.invoicing_retailer_sheets import (
     get_trojan_oil_unique_client_count,
     list_retailer_keys,
 )
+from tools.invoicing_access import require_invoicing_user
+from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
+from tools.invoicing_drive import list_documents as list_invoicing_drive_documents
+from tools.invoicing_drive import list_category_keys as list_invoicing_drive_category_keys
 from services import airtable_client
 from services.prograde_drift_webhook import get_nonce_cache, verify_signature
 from services.climate_store import (
@@ -5668,6 +5672,56 @@ def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verif
         "unique_client_count": count,
         "user_email": user_info.get("email"),
     }
+
+
+@app.get("/api/invoicing/drive/businesses")
+def invoicing_drive_businesses_endpoint(
+    category: str = Query(
+        ...,
+        description="automation_services | one_month_savings | equipment_rental | solar_cleaning | cleaning_scrubber",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List businesses for an invoicing Drive category (lazy discovery under configured parent).
+    document_count is always null — avoid N+1 Drive calls.
+    """
+    require_invoicing_user(user_info)
+    payload, err, status = list_invoicing_drive_businesses(category)
+    if err:
+        if status == 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid category. Use one of: {', '.join(list_invoicing_drive_category_keys())}",
+            )
+        raise HTTPException(status_code=status, detail=err)
+    return payload
+
+
+@app.get("/api/invoicing/drive/documents")
+def invoicing_drive_documents_endpoint(
+    category: str = Query(...),
+    businessId: str = Query(..., description="Business id from /businesses response"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List invoice files for one business. Folder categories validate the folder is a
+    direct child of the category parent before listing (no arbitrary folder ID access).
+    """
+    require_invoicing_user(user_info)
+    payload, err, status = list_invoicing_drive_documents(category, businessId)
+    if err:
+        if err == "unknown_category":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid category. Use one of: {', '.join(list_invoicing_drive_category_keys())}",
+            )
+        if err == "missing_business_id":
+            raise HTTPException(status_code=400, detail="businessId is required")
+        if err == "business_not_found":
+            raise HTTPException(status_code=404, detail="Business not found in this category")
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
 
 
 @app.get("/api/base1-leads")
