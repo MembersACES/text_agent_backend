@@ -260,6 +260,48 @@ def _resolve_quantity(row: dict, cfg: dict) -> Optional[float]:
     return None
 
 
+_OIL_COLLECTION_TOKENS = (
+    "used cooking oil", "used oil", "uco", "waste oil",
+    "collect", "collection", "collected", "pickup", "pick up", "pick-up",
+    "recover", "recovery", "recycle", "recycled", "recycling",
+)
+# Description-like fields most likely to name the product/service on an oil invoice.
+_OIL_DESC_FIELDS = (
+    "Description", "Product Description", "Charge Description",
+    "Line Item", "Line Items", "Product", "Products",
+    "Item", "Items", "Service", "Services", "Details", "Detail",
+    "Type", "Transaction Type", "Category", "Name",
+    "Notes", "Comment", "Comments",
+)
+
+
+def _classify_cooking_oil(row: dict) -> tuple[int, Optional[str], Optional[str]]:
+    """Split a cooking-oil invoice line into a Scope 3 category from its description text.
+
+      collection marker present -> Cat 5 (Waste generated in operations; used-oil recovery)
+      otherwise (default)       -> Cat 1 (Purchased goods & services; fresh-oil purchase)
+
+    Returns (scope3_category, matched_field, matched_token). Default is the purchase
+    case (majority + most-defensible). The match (or 'default-purchase') is stamped into
+    data_quality.flags so a mis-route is visible on the record, never silent. TUNE the
+    token / field lists once real Trojan Oils line-item wording is confirmed.
+    """
+    for fname in _OIL_DESC_FIELDS:
+        val = _first_field(row, [fname])
+        if isinstance(val, str):
+            low = val.lower()
+            for tok in _OIL_COLLECTION_TOKENS:
+                if tok in low:
+                    return 5, fname, tok
+    for k, v in (row or {}).items():
+        if isinstance(v, str):
+            low = v.lower()
+            for tok in _OIL_COLLECTION_TOKENS:
+                if tok in low:
+                    return 5, k, tok
+    return 1, None, None
+
+
 def _parse_iso_date(raw: Any) -> Optional[date]:
     if raw is None:
         return None
@@ -388,6 +430,19 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
     record_id = _make_record_id(ctx.entity_id, activity_type, source_row_id)
     evidence_uri = _evidence_uri(row)
 
+    # Scope 3 category routing. waste -> Cat 5; cooking oil -> SPLIT (purchase Cat 1 /
+    # collection Cat 5 via _classify_cooking_oil); everything else -> None.
+    _etl_flags = ["etl_from_airtable", f"utility:{ctx.utility_type}"]
+    if activity_type == "waste_generated_operations":
+        scope3_cat: Optional[int] = 5
+    elif activity_type == "cooking_oil":
+        scope3_cat, _oil_field, _oil_token = _classify_cooking_oil(row)
+        _etl_flags.append(
+            f"oil_class:cat{scope3_cat}:{_oil_token or 'default-purchase'}:field={_oil_field or '-'}"
+        )
+    else:
+        scope3_cat = None
+
     body: dict[str, Any] = {
         "schema_version": "1.0",
         "record_id": record_id,
@@ -400,7 +455,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         },
         "activity_type": activity_type,
         "scope": cfg["scope"],
-        "scope_3_category": 5 if activity_type == "waste_generated_operations" else None,
+        "scope_3_category": scope3_cat,
         "quantity": quantity,
         "unit": cfg["unit"],
         "evidence_refs": [],
@@ -415,7 +470,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
             "estimation_method": "calculated_invoice",
             "uncertainty_pct": 8,
             "completeness_pct": 85,
-            "flags": ["etl_from_airtable", f"utility:{ctx.utility_type}"],
+            "flags": _etl_flags,
             "quantity_source": "airtable_invoice_etl",
         },
         "notes": f"ETL from Airtable invoice row {source_row_id}",
