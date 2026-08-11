@@ -273,6 +273,12 @@ def _parse_iso_date(raw: Any) -> Optional[date]:
             return datetime.strptime(s[:10], fmt).date()
         except ValueError:
             continue
+    # human-readable dates on the oil invoices, e.g. "4 Apr 2025" / "23 July 2026"
+    for fmt in ("%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -325,12 +331,15 @@ def _row_period(
     )
     if rng:
         return rng[0], rng[1], True
-    # 3) single invoice date -> treat as a same-day period
-    single = _parse_iso_date(
-        _first_field(row, ["Invoice Date", "invoice_date", "Invoice Date Formatted"])
-    )
-    if single:
-        return single, single, True
+    # 3) single invoice date -> treat as a same-day period.
+    #    Try each candidate field and use the FIRST that actually PARSES. Oil invoices
+    #    carry a human "Invoice Date" ("4 Apr 2025") plus a clean "Invoice Date Formatted"
+    #    ("04/04/2025"); some rows have "#ERROR!" in one of them, so we cannot just take
+    #    the first non-empty field.
+    for _dfld in ("Invoice Date Formatted", "Invoice Date", "invoice_date"):
+        single = _parse_iso_date(_first_field(row, [_dfld]))
+        if single:
+            return single, single, True
     # 4) period unknown -> FY-window fallback (do NOT filter these out)
     return fallback_start, fallback_end, False
 
