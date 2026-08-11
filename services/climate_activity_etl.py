@@ -276,14 +276,60 @@ def _parse_iso_date(raw: Any) -> Optional[date]:
     return None
 
 
-def _row_period(row: dict, fallback_start: date, fallback_end: date) -> tuple[date, date]:
-    start_raw = _first_field(row, ["Period Start", "Billing Period Start", "Invoice Review Period Start"])
-    end_raw = _first_field(row, ["Period End", "Billing Period End", "Invoice Review Period End"])
-    start = _parse_iso_date(start_raw) or fallback_start
-    end = _parse_iso_date(end_raw) or fallback_end
-    if end < start:
-        start, end = end, start
-    return start, end
+def _parse_period_range(raw: Any) -> Optional[tuple[date, date]]:
+    """Parse a combined billing-period string into (start, end).
+
+    Handles the Airtable 'Invoice Review Period' shape, e.g.
+    '01/12/2025-31/12/2025' (Australian DD/MM/YYYY, '-' between the two dates),
+    as well as an ISO range such as '2025-12-01 to 2025-12-31'.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    tokens = re.findall(r"\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}", s)
+    if len(tokens) >= 2:
+        a = _parse_iso_date(tokens[0])
+        b = _parse_iso_date(tokens[1])
+        if a and b:
+            return (a, b) if a <= b else (b, a)
+    return None
+
+
+def _row_period(
+    row: dict, fallback_start: date, fallback_end: date
+) -> tuple[date, date, bool]:
+    """Return (start, end, period_known).
+
+    period_known is False only when no real billing period could be read and we
+    fell back to the FY window; callers must NOT reporting-period-filter those.
+    """
+    # 1) explicit separate start/end fields
+    start = _parse_iso_date(
+        _first_field(row, ["Period Start", "Billing Period Start", "Invoice Review Period Start"])
+    )
+    end = _parse_iso_date(
+        _first_field(row, ["Period End", "Billing Period End", "Invoice Review Period End"])
+    )
+    if start and end:
+        if end < start:
+            start, end = end, start
+        return start, end, True
+    # 2) combined 'Invoice Review Period' style field (the real Airtable shape)
+    rng = _parse_period_range(
+        _first_field(row, ["Invoice Review Period", "Review Period", "Billing Period"])
+    )
+    if rng:
+        return rng[0], rng[1], True
+    # 3) single invoice date -> treat as a same-day period
+    single = _parse_iso_date(
+        _first_field(row, ["Invoice Date", "invoice_date", "Invoice Date Formatted"])
+    )
+    if single:
+        return single, single, True
+    # 4) period unknown -> FY-window fallback (do NOT filter these out)
+    return fallback_start, fallback_end, False
 
 
 def _evidence_uri(row: dict) -> Optional[str]:
@@ -314,7 +360,18 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
     if quantity is None or quantity <= 0:
         return EtlRowResult(source_row_id, "", {}, True, "missing or zero quantity")
 
-    period_start, period_end = _row_period(row, ctx.period_start, ctx.period_end)
+    period_start, period_end, period_known = _row_period(row, ctx.period_start, ctx.period_end)
+    # Reporting-period filter: an invoice belongs to the FY its billing period ENDS in.
+    # Only filter rows whose period we actually parsed — never drop undated rows.
+    if period_known and not (ctx.period_start <= period_end <= ctx.period_end):
+        return EtlRowResult(
+            source_row_id,
+            "",
+            {},
+            True,
+            f"outside reporting window: invoice {period_start.isoformat()}..{period_end.isoformat()} "
+            f"not in {ctx.period_start.isoformat()}..{ctx.period_end.isoformat()}",
+        )
     activity_type = cfg["activity_type"]
     record_id = _make_record_id(ctx.entity_id, activity_type, source_row_id)
     evidence_uri = _evidence_uri(row)
