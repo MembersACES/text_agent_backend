@@ -12356,7 +12356,7 @@ BASE2_DEFAULTS_SEED = {
                       {"minGj": 30000, "benchmarkPerGj": 13.9}],
             "ciComparisonPerGj": 17.8, "commissionPerGj": 3.0, "dailySupplyDefault": 1.2,
             "smeEnergyShare": 0.75, "discountFactor": 0.95},
-    "oil": {"comparisonPerL": 3},
+    "oil": {"comparisonPerL": 3.30},
     "waste": {"discountFactor": 0.95},
     "cleaning": {"discountFactor": 0.95},
 }
