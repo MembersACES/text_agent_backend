@@ -22,7 +22,11 @@ logger = logging.getLogger(__name__)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-DiscoveryMode = Literal["child_folders", "flat_files_group_by_filename"]
+DiscoveryMode = Literal[
+    "child_folders",
+    "flat_files_group_by_filename",
+    "pdfs_in_parent",
+]
 
 # Best-effort invoice number from filenames like "Acme - INV-123.pdf"
 _INVOICE_AFTER_DASH = re.compile(
@@ -37,6 +41,7 @@ class CategoryConfig:
     key: str
     business_parent_folder_id: str
     discovery: DiscoveryMode
+    display_name: str = ""
 
 
 def _automation_parent() -> str:
@@ -73,6 +78,52 @@ def _oms_parent() -> str:
     ).strip()
 
 
+def _alinta_ci_elec_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_ALINTA_CI_ELEC_FOLDER_ID")
+        or "1lcVJvnz9WRI_r97UFrjTobyJML_r3Lef"
+    ).strip()
+
+
+def _alinta_ci_gas_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_ALINTA_CI_GAS_FOLDER_ID")
+        or "1zOomqSTNbeqUyulA5aWBrMO5X0383oGB"
+    ).strip()
+
+
+def _origin_ci_elec_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_ORIGIN_CI_ELEC_FOLDER_ID")
+        or "1x9ICT3givCaMEq5QA6ycW_6s1xU4guYi"
+    ).strip()
+
+
+def _origin_ci_gas_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_ORIGIN_CI_GAS_FOLDER_ID")
+        or "1gSCPY0Zu9mDL16D0ekhUTuW-H85-Card"
+    ).strip()
+
+
+def _trojan_oil_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_TROJAN_OIL_FOLDER_ID")
+        or "1Gy7bpvtPMdS3ob_5reCkn8Nc3S-X1A7f"
+    ).strip()
+
+
+def _momentum_ci_elec_parent() -> str:
+    return (
+        os.getenv("INVOICING_DRIVE_MOMENTUM_CI_ELEC_FOLDER_ID")
+        or "1tALVORxf30uIXo4_IYQS4tHewZy9IAgi"
+    ).strip()
+
+
+def retailer_synthetic_id(category_key: str) -> str:
+    return f"retailer_{category_key}"
+
+
 def get_category_config(category_key: str) -> Optional[CategoryConfig]:
     key = (category_key or "").strip().lower().replace(" ", "_").replace("-", "_")
     configs: Dict[str, CategoryConfig] = {
@@ -101,6 +152,42 @@ def get_category_config(category_key: str) -> Optional[CategoryConfig]:
             business_parent_folder_id=_oms_parent(),
             discovery="flat_files_group_by_filename",
         ),
+        "alinta_ci_electricity": CategoryConfig(
+            key="alinta_ci_electricity",
+            business_parent_folder_id=_alinta_ci_elec_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Alinta C&I Electricity",
+        ),
+        "alinta_ci_gas": CategoryConfig(
+            key="alinta_ci_gas",
+            business_parent_folder_id=_alinta_ci_gas_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Alinta C&I Gas",
+        ),
+        "origin_ci_electricity": CategoryConfig(
+            key="origin_ci_electricity",
+            business_parent_folder_id=_origin_ci_elec_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Origin C&I Electricity",
+        ),
+        "origin_ci_gas": CategoryConfig(
+            key="origin_ci_gas",
+            business_parent_folder_id=_origin_ci_gas_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Origin C&I Gas",
+        ),
+        "trojan_oil": CategoryConfig(
+            key="trojan_oil",
+            business_parent_folder_id=_trojan_oil_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Trojan Oil",
+        ),
+        "momentum_ci_electricity": CategoryConfig(
+            key="momentum_ci_electricity",
+            business_parent_folder_id=_momentum_ci_elec_parent(),
+            discovery="pdfs_in_parent",
+            display_name="Momentum C&I Electricity",
+        ),
     }
     return configs.get(key)
 
@@ -112,6 +199,12 @@ def list_category_keys() -> list[str]:
         "equipment_rental",
         "solar_cleaning",
         "cleaning_scrubber",
+        "alinta_ci_electricity",
+        "alinta_ci_gas",
+        "origin_ci_electricity",
+        "origin_ci_gas",
+        "trojan_oil",
+        "momentum_ci_electricity",
     ]
 
 
@@ -125,6 +218,12 @@ def file_view_url(file_id: str) -> str:
 
 def file_preview_url(file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/preview"
+
+
+def _is_pdf(f: Dict[str, Any]) -> bool:
+    mime = (f.get("mimeType") or "").lower()
+    name = (f.get("name") or "").lower()
+    return mime == "application/pdf" or name.endswith(".pdf")
 
 
 def file_type_from_mime(mime: str, name: str) -> str:
@@ -242,6 +341,19 @@ def _list_children(
     return items, None
 
 
+def _document_recency_key(doc: Dict[str, Any]) -> Tuple[str, str]:
+    """Newest first: prefer created_time (Drive generate/upload), then modified_time."""
+    created = doc.get("created_time") or ""
+    modified = doc.get("modified_time") or ""
+    stamp = created or modified or ""
+    name = (doc.get("name") or "").lower()
+    return (stamp, name)
+
+
+def _sort_documents_newest_first(docs: List[Dict[str, Any]]) -> None:
+    docs.sort(key=_document_recency_key, reverse=True)
+
+
 def _normalize_document(f: Dict[str, Any], *, inferred: Optional[str] = None) -> Dict[str, Any]:
     fid = f.get("id") or ""
     name = f.get("name") or "Document"
@@ -311,6 +423,25 @@ def list_businesses(category_key: str) -> Tuple[Optional[Dict[str, Any]], Option
             "business_parent_folder_url": folder_url(cfg.business_parent_folder_id),
             "discovery": cfg.discovery,
             "businesses": businesses,
+        }, None, 200
+
+    if cfg.discovery == "pdfs_in_parent":
+        # One synthetic row for the retailer folder — never expose nested folders.
+        display = cfg.display_name or cfg.key
+        return {
+            "category": cfg.key,
+            "business_parent_folder_id": cfg.business_parent_folder_id,
+            "business_parent_folder_url": folder_url(cfg.business_parent_folder_id),
+            "discovery": cfg.discovery,
+            "businesses": [
+                {
+                    "id": retailer_synthetic_id(cfg.key),
+                    "name": display,
+                    "folder_id": cfg.business_parent_folder_id,
+                    "folder_url": folder_url(cfg.business_parent_folder_id),
+                    "document_count": None,
+                }
+            ],
         }, None, 200
 
     # OMS flat files
@@ -406,6 +537,35 @@ def list_documents(
     if err:
         return None, err, 502
 
+    if cfg.discovery == "pdfs_in_parent":
+        expected = retailer_synthetic_id(cfg.key)
+        if bid != expected:
+            return None, "business_not_found", 404
+
+        files, list_err = _list_children(
+            drive, cfg.business_parent_folder_id, files_only=True
+        )
+        if list_err:
+            return None, "drive_error", 502
+
+        docs = [
+            _normalize_document(f)
+            for f in files
+            if f.get("id") and _is_pdf(f)
+        ]
+        _sort_documents_newest_first(docs)
+        display = cfg.display_name or cfg.key
+        return {
+            "category": cfg.key,
+            "business": {
+                "id": expected,
+                "name": display,
+                "folder_id": cfg.business_parent_folder_id,
+                "folder_url": folder_url(cfg.business_parent_folder_id),
+            },
+            "documents": docs,
+        }, None, 200
+
     if cfg.discovery == "child_folders":
         meta, not_ok = _confirm_direct_child_folder(
             drive, cfg.business_parent_folder_id, bid
@@ -418,7 +578,7 @@ def list_documents(
             return None, "drive_error", 502
 
         docs = [_normalize_document(f) for f in files if f.get("id")]
-        docs.sort(key=lambda d: (d.get("name") or "").lower())
+        _sort_documents_newest_first(docs)
         return {
             "category": cfg.key,
             "business": {
@@ -457,7 +617,7 @@ def list_documents(
     if display_name is None:
         return None, "business_not_found", 404
 
-    matched.sort(key=lambda d: (d.get("name") or "").lower())
+    _sort_documents_newest_first(matched)
     return {
         "category": cfg.key,
         "business": {
