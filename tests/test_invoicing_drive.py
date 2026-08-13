@@ -9,8 +9,11 @@ from tools.invoicing_access import (
 from tools.invoicing_drive import (
     get_category_config,
     infer_invoice_number,
+    list_category_keys,
     oms_business_key,
     parse_oms_filename,
+    retailer_synthetic_id,
+    _sort_documents_newest_first,
 )
 
 
@@ -49,6 +52,19 @@ def test_category_keys():
     assert get_category_config("automation_services") is not None
     assert get_category_config("one_month_savings") is not None
     assert get_category_config("bogus") is None
+    for key in (
+        "alinta_ci_electricity",
+        "alinta_ci_gas",
+        "origin_ci_electricity",
+        "origin_ci_gas",
+        "trojan_oil",
+        "momentum_ci_electricity",
+    ):
+        cfg = get_category_config(key)
+        assert cfg is not None
+        assert cfg.discovery == "pdfs_in_parent"
+    assert "trojan_oil" in list_category_keys()
+    assert retailer_synthetic_id("trojan_oil") == "retailer_trojan_oil"
 
 
 def test_oms_filename_parse():
@@ -66,3 +82,13 @@ def test_oms_business_key_stable():
 def test_infer_invoice_number_simple():
     assert infer_invoice_number("Acme - INV-42.pdf") == "INV-42"
     assert infer_invoice_number("random notes.pdf") is None
+
+
+def test_sort_documents_newest_first():
+    docs = [
+        {"name": "old.pdf", "created_time": "2025-01-01T00:00:00.000Z"},
+        {"name": "new.pdf", "created_time": "2026-08-01T00:00:00.000Z"},
+        {"name": "mid.pdf", "created_time": "2026-03-15T00:00:00.000Z"},
+    ]
+    _sort_documents_newest_first(docs)
+    assert [d["name"] for d in docs] == ["new.pdf", "mid.pdf", "old.pdf"]
