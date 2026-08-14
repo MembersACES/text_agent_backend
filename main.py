@@ -48,6 +48,7 @@ import io
 from tools.business_info import get_business_information, get_base1_landing_responses
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.drive_file_metadata import get_drive_file_times
+from tools.share_folder import ShareFolderError, get_share_folder_status, share_member_folder
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
@@ -1366,6 +1367,55 @@ def drive_file_metadata(
         user_info.get("email"),
     )
     return {"files": get_drive_file_times(request.file_ids or [])}
+
+
+class ShareFolderStatusRequest(BaseModel):
+    gdrive_url: str = ""
+
+
+class ShareFolderRequest(BaseModel):
+    gdrive_url: str = ""
+    file_ids: List[str] = Field(default_factory=list)
+    email: str = ""
+    send_notification: bool = True
+    business_name: str = ""
+
+
+@app.post("/api/share-folder/status")
+def share_folder_status(
+    request: ShareFolderStatusRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("share-folder/status user=%s", user_info.get("email"))
+    try:
+        return get_share_folder_status(request.gdrive_url)
+    except ShareFolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/share-folder")
+def share_folder(
+    request: ShareFolderRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "share-folder user=%s files=%s email=%s",
+        user_info.get("email"),
+        len(request.file_ids or []),
+        request.email,
+    )
+    try:
+        return share_member_folder(
+            gdrive_url=request.gdrive_url,
+            file_ids=request.file_ids or [],
+            email=request.email,
+            send_notification=request.send_notification,
+            business_name=request.business_name,
+            sender_name=str(user_info.get("name") or ""),
+            sender_email=str(user_info.get("email") or ""),
+        )
+    except ShareFolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
 @app.post("/api/loa-business-details")
