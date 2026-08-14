@@ -217,7 +217,7 @@ def test_share_creates_folder_copies_and_shares():
             gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
             file_ids=["abc1234567890"],
             email="jane@client.com",
-            send_notification=True,
+            send_notification=False,
             drive=drive,
         )
     assert result["ok"] is True
@@ -226,6 +226,47 @@ def test_share_creates_folder_copies_and_shares():
     assert result["permission"]["action"] == "added"
     drive.files.return_value.copy.assert_called_once()
     drive.permissions.return_value.create.assert_called_once()
+    perm_kwargs = drive.permissions.return_value.create.call_args.kwargs
+    assert perm_kwargs["sendNotificationEmail"] is False
+
+
+def test_share_sends_branded_email_when_notification_enabled():
+    drive = _drive_mock(
+        folders=[{"id": "sharedFolder1", "name": "Shared Folder"}],
+        children=[],
+        source_files={"abc1234567890": {"id": "abc1234567890", "name": "Quote.pdf", "mimeType": "application/pdf"}},
+    )
+    drive.files.return_value.list.return_value.execute.side_effect = [
+        {"files": [{"id": "sharedFolder1", "name": "Shared Folder"}]},
+        {"files": []},
+        {"files": [{"id": "copied1", "name": "Quote.pdf"}]},
+    ]
+    with (
+        patch("tools.share_folder.get_configured_service_account_email", return_value=None),
+        patch(
+            "tools.share_folder.send_share_folder_emails",
+            return_value=[{"email": "jane@client.com", "action": "sent"}],
+        ) as send_email,
+    ):
+        result = share_member_folder(
+            gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
+            file_ids=["abc1234567890"],
+            email="jane@client.com",
+            send_notification=True,
+            business_name="Frankston RSL",
+            sender_name="Max H",
+            sender_email="max.h@acesolutions.com.au",
+            drive=drive,
+        )
+    send_email.assert_called_once()
+    kwargs = send_email.call_args.kwargs
+    assert kwargs["recipients"] == ["jane@client.com"]
+    assert kwargs["business_name"] == "Frankston RSL"
+    assert kwargs["sender_email"] == "max.h@acesolutions.com.au"
+    assert result["email_results"][0]["action"] == "sent"
+    assert "Carbon Zero Australasia" in result["email_preview"]["subject"]
+    perm_kwargs = drive.permissions.return_value.create.call_args.kwargs
+    assert perm_kwargs["sendNotificationEmail"] is False
 
 
 def test_share_accepts_multiple_emails():
@@ -244,6 +285,7 @@ def test_share_accepts_multiple_emails():
             gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
             file_ids=["abc1234567890"],
             email="max.h@acesolutions.com.au, morgan.h@acesolutions.com.au",
+            send_notification=False,
             drive=drive,
         )
     assert len(result["permissions"]) == 2
@@ -282,6 +324,7 @@ def test_share_uses_shortcut_when_not_on_shared_drive():
             gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
             file_ids=["abc1234567890"],
             email="max.h@acesolutions.com.au",
+            send_notification=False,
             drive=drive,
         )
     assert result["copy_results"][0]["action"] == "shortcut"
@@ -307,6 +350,7 @@ def test_share_falls_back_to_shortcut_on_quota_error():
             gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
             file_ids=["abc1234567890"],
             email="jane@client.com",
+            send_notification=False,
             drive=drive,
         )
     assert result["copy_results"][0]["action"] == "shortcut"
@@ -328,6 +372,7 @@ def test_share_skips_duplicate_filename():
             gdrive_url="https://drive.google.com/drive/folders/parentFolderId123",
             file_ids=["abc1234567890"],
             email="jane@client.com",
+            send_notification=False,
             drive=drive,
         )
     assert result["copy_results"][0]["action"] == "already_present"

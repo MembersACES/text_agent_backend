@@ -16,6 +16,10 @@ from tools.one_month_savings import (
     get_configured_service_account_email,
     get_drive_service,
 )
+from tools.share_folder_email import (
+    build_share_folder_email,
+    send_share_folder_emails,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +498,9 @@ def share_member_folder(
     file_ids: list[str],
     email: str,
     send_notification: bool = True,
+    business_name: str = "",
+    sender_name: str = "",
+    sender_email: str = "",
     drive: Any | None = None,
 ) -> dict[str, Any]:
     """Create Shared Folder if needed, add selected files, share with one or more emails as Viewer."""
@@ -568,7 +575,7 @@ def share_member_folder(
             service,
             folder_id=folder_id,
             email=share_email,
-            send_notification=send_notification,
+            send_notification=False,
         )
         for share_email in share_emails
     ]
@@ -588,6 +595,30 @@ def share_member_folder(
         raise ShareFolderError(_drive_error_message(e), status_code=502) from e
 
     failed_copies = [row for row in copy_results if row.get("action") == "failed"]
+    added_names = [
+        str(row.get("name") or "")
+        for row in copy_results
+        if row.get("action") in {"copied", "shortcut", "already_present"} and row.get("name")
+    ]
+    if not added_names:
+        added_names = [str(item.get("name") or "") for item in refreshed_files if item.get("name")]
+    email_preview = build_share_folder_email(
+        business_name=business_name,
+        folder_url=drive_folder_url(folder_id),
+        file_names=added_names,
+        sender_name=sender_name,
+        sender_email=sender_email,
+    )
+    email_results: list[dict[str, Any]] = []
+    if send_notification:
+        email_results = send_share_folder_emails(
+            recipients=share_emails,
+            business_name=business_name,
+            folder_url=drive_folder_url(folder_id),
+            file_names=added_names,
+            sender_name=sender_name,
+            sender_email=sender_email,
+        )
     return {
         "ok": True,
         "folder_created": created,
@@ -601,4 +632,6 @@ def share_member_folder(
         "files": refreshed_files,
         "shared_with": sharees,
         "exists": True,
+        "email_preview": email_preview,
+        "email_results": email_results,
     }

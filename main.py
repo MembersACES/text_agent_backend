@@ -1378,6 +1378,7 @@ class ShareFolderRequest(BaseModel):
     file_ids: List[str] = Field(default_factory=list)
     email: str = ""
     send_notification: bool = True
+    business_name: str = ""
 
 
 @app.post("/api/share-folder/status")
@@ -1409,6 +1410,9 @@ def share_folder(
             file_ids=request.file_ids or [],
             email=request.email,
             send_notification=request.send_notification,
+            business_name=request.business_name,
+            sender_name=str(user_info.get("name") or ""),
+            sender_email=str(user_info.get("email") or ""),
         )
     except ShareFolderError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
