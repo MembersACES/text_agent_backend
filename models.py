@@ -399,7 +399,7 @@ class AutonomousSequenceRun(Base):
     stop_reason = Column(String(120), nullable=True)
 
     anchor_at = Column(DateTime, nullable=False)
-    timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
+    timezone = Column(String(64), nullable=True, default=None)
     context_json = Column(Text, nullable=True)
     email_ID = Column("email_id", String(255), nullable=True)
     contact_phone = Column(String(64), nullable=True)
@@ -464,7 +464,7 @@ class AutonomousSequenceTemplate(Base):
     sequence_type = Column(String(80), nullable=False, unique=True, index=True)
     display_name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    timezone = Column(String(64), nullable=False, default="Australia/Brisbane")
+    timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
     is_active = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     created_at = Column(DateTime, server_default=func.now(), nullable=False)

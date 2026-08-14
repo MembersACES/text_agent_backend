@@ -5696,7 +5696,12 @@ def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verif
 def invoicing_drive_businesses_endpoint(
     category: str = Query(
         ...,
-        description="automation_services | one_month_savings | equipment_rental | solar_cleaning | cleaning_scrubber",
+        description=(
+            "automation_services | one_month_savings | equipment_rental | "
+            "solar_cleaning | cleaning_scrubber | alinta_ci_electricity | "
+            "alinta_ci_gas | origin_ci_electricity | origin_ci_gas | "
+            "trojan_oil | momentum_ci_electricity"
+        ),
     ),
     user_info: dict = Depends(verify_google_token),
 ):
@@ -10863,7 +10868,7 @@ def autonomous_sequence_start(
     else:
         anchor_utc = anchor_dt.astimezone(timezone.utc)
     valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
+    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Melbourne"))
 
     from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
 
@@ -10889,10 +10894,10 @@ def autonomous_sequence_start(
         if incoming_validity:
             try:
                 valid_date = date.fromisoformat(incoming_validity[:10])
-                # Noon Australia/Brisbane on that calendar day.
+                # Noon Australia/Melbourne on that calendar day.
                 valid_until_local = datetime(
                     valid_date.year, valid_date.month, valid_date.day, 12, 0, 0,
-                    tzinfo=ZoneInfo("Australia/Brisbane"),
+                    tzinfo=ZoneInfo("Australia/Melbourne"),
                 )
                 valid_until_utc = valid_until_local.astimezone(timezone.utc)
                 sequence_context["offer_validity_date"] = valid_date.isoformat()
@@ -11158,7 +11163,7 @@ def autonomous_sequence_create_template(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
         description=(body.description or "").strip() or None,
-        timezone=(body.timezone or "Australia/Brisbane").strip() or "Australia/Brisbane",
+        timezone=(body.timezone or "Australia/Melbourne").strip() or "Australia/Melbourne",
         is_active=1 if body.is_active else 0,
         is_restartable=1 if body.is_restartable else 0,
     )
