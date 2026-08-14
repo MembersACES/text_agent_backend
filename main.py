@@ -47,6 +47,7 @@ import io
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
 from tools.member_documents import get_eoi_ids, get_member_wip
+from tools.drive_file_metadata import get_drive_file_times
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
@@ -1348,6 +1349,23 @@ def member_wip(
 ):
     logging.info("member-wip request business_name=%r user=%s", request.business_name, user_info.get("email"))
     return get_member_wip(request.business_name)
+
+
+class DriveFileMetadataRequest(BaseModel):
+    file_ids: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/drive-file-metadata")
+def drive_file_metadata(
+    request: DriveFileMetadataRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "drive-file-metadata request count=%s user=%s",
+        len(request.file_ids or []),
+        user_info.get("email"),
+    )
+    return {"files": get_drive_file_times(request.file_ids or [])}
 
 
 @app.post("/api/loa-business-details")
