@@ -602,7 +602,7 @@ def generate_testimonial_document(
             content=dict(content),
         )
 
-    # Build data dict for n8n: keys match template placeholders {{key}}
+    # Build data dict for n8n: keys match template placeholders {key}
     monthly_savings_formatted = f"{monthly_savings:,.2f}"
     annual_savings_formatted = f"{annual_savings:,.2f}"
     net_outcome_formatted = f"{net_outcome:,.2f}"
