@@ -167,6 +167,23 @@ def get_eoi_ids(business_name: str) -> list[dict[str, Any]]:
     return []
 
 
+def _sheet_date_from_row(row: dict[str, Any]) -> str:
+    for key in (
+        "Upload Date",
+        "Uploaded",
+        "Date Uploaded",
+        "Signed Date",
+        "Sign Date",
+        "Date",
+        "Created",
+        "Timestamp",
+    ):
+        val = row.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
 def _read_additional_documents(wip_spreadsheet_id: str) -> list[dict[str, Any]]:
     headers, data_rows = _read_sheet_table(wip_spreadsheet_id, WIP_ADDITIONAL_DOCS_TAB)
     if not headers:
@@ -194,6 +211,7 @@ def _read_additional_documents(wip_spreadsheet_id: str) -> list[dict[str, Any]]:
                 "row_number": row_idx,
                 "File Name": str(file_name).strip() or "Unknown",
                 "File ID": str(file_id).strip(),
+                "uploaded_at": _sheet_date_from_row(row_dict),
             }
         )
     return docs
@@ -242,6 +260,7 @@ def _engagement_forms_from_central_sheet(business_name: str) -> list[dict[str, A
                 "webViewLink": None,
                 "mimeType": None,
                 "modifiedTime": None,
+                "uploaded_at": _sheet_date_from_row(row),
             }
         )
     return forms

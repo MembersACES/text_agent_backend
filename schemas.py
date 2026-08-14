@@ -978,7 +978,7 @@ class AutonomousSequenceStartRequest(BaseModel):
     client_id: Optional[int] = None
     crm_activity_id: Optional[int] = None
     anchor_at: datetime
-    timezone: str = "Australia/Brisbane"  # Ignored for scheduling; sequences always use fixed AEST (Brisbane)
+    timezone: Optional[str] = None
     # Accept either naming from webhook payloads.
     email_id: Optional[str] = None
     email_ID: Optional[str] = None
@@ -1013,7 +1013,7 @@ class AutonomousSequenceTemplateBase(BaseModel):
     sequence_type: str
     display_name: str
     description: Optional[str] = None
-    timezone: str = "Australia/Brisbane"
+    timezone: str = "Australia/Melbourne"
     is_active: bool = True
     is_restartable: bool = True
 
@@ -1121,7 +1121,7 @@ class AutonomousSequenceRunResponse(BaseModel):
     run_status: str
     stop_reason: Optional[str] = None
     anchor_at: datetime
-    timezone: str
+    timezone: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     business_name: Optional[str] = None

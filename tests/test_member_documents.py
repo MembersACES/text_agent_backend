@@ -4,6 +4,12 @@ from unittest.mock import patch
 from tools import member_documents
 
 
+def test_sheet_date_from_row():
+    assert member_documents._sheet_date_from_row({"Upload Date": "14/08/2026"}) == "14/08/2026"
+    assert member_documents._sheet_date_from_row({"Signed Date": "01/01/26"}) == "01/01/26"
+    assert member_documents._sheet_date_from_row({}) == ""
+
+
 def test_get_eoi_ids_prefers_sheets():
     rows = [{"EOI Type": "Demand Response", "EOI File ID": "abc123456789"}]
     with patch.object(member_documents, "get_eoi_ids_from_sheets", return_value=rows):

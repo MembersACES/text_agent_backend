@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -48,15 +49,18 @@ def _set_run_validity_date_if_supported(db: Session, run_id: int, validity: date
     """Persist validity_date when the DB column exists (safe across mixed env schemas)."""
     if not validity:
         return
-    insp = inspect(db.bind)
-    tables = _reflect_table_names(insp, db.bind)
+    # Use the Session's connection so reflection does not checkout a second pooled
+    # connection mid-transaction (breaks SQLite :memory: / StaticPool tests).
+    conn = db.connection()
+    insp = inspect(conn)
+    tables = _reflect_table_names(insp, conn)
     if "autonomous_sequence_runs" not in tables:
         return
-    skw = _inspector_schema_kw(db.bind)
+    skw = _inspector_schema_kw(conn)
     cols = [str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_runs", **skw)]
     if "validity_date" not in cols:
         return
-    runs_tbl = _qualified_table(db.bind, "autonomous_sequence_runs")
+    runs_tbl = _qualified_table(conn, "autonomous_sequence_runs")
     db.execute(
         text(f"UPDATE {runs_tbl} SET validity_date = :validity_date WHERE id = :run_id"),
         {"validity_date": validity, "run_id": run_id},
@@ -139,9 +143,8 @@ SOLAR_ENGAGEMENT_STEP_PROMPTS: tuple[str, str, str] = (
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
 
-# All autonomous step times are computed in fixed Australian Eastern Standard Time (UTC+10, no DST).
-# IANA zone Australia/Brisbane matches AEST year-round (unlike Sydney/Melbourne).
-AUTONOMOUS_SCHEDULE_TZ = "Australia/Brisbane"
+# Default when run/template do not supply an IANA zone. Scheduling is per-run via resolve_schedule_tz.
+AUTONOMOUS_SCHEDULE_TZ = "Australia/Melbourne"
 
 
 def _utc_now_naive() -> datetime:
@@ -152,6 +155,22 @@ def _to_utc_naive(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+def resolve_schedule_tz(
+    run: Optional[AutonomousSequenceRun] = None,
+    template: Optional[AutonomousSequenceTemplate] = None,
+) -> ZoneInfo:
+    """First present of run.timezone → template.timezone → Australia/Melbourne."""
+    for raw in (
+        run.timezone if run is not None else None,
+        template.timezone if template is not None else None,
+        AUTONOMOUS_SCHEDULE_TZ,
+    ):
+        name = (str(raw).strip() if raw is not None else "")
+        if name:
+            return ZoneInfo(name)
+    return ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
 
 
 def next_business_day(d: date) -> date:
@@ -231,12 +250,15 @@ def _plan_template_times(
     return plan
 
 
-def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
+def plan_solar_engagement_form_times(
+    anchor: datetime,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime]]:
     """
     Three follow-up emails after the client has already received the engagement form (n8n send).
-    Email 1 at +2 business days, email 2 at +4, email 3 at +6 — all 09:00 AEST. Returns UTC-naive.
+    Email 1 at +2 business days, email 2 at +4, email 3 at +6 — all 09:00 local. Returns UTC-naive.
     """
-    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+    tz = ZoneInfo(timezone_name)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
     base_date = a.astimezone(tz).date()
     out: list[tuple[int, str, datetime]] = []
@@ -253,9 +275,12 @@ def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, d
     return out
 
 
-def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
-    """Returns (day_number, channel, scheduled_at UTC naive). Always uses AEST (Australia/Brisbane)."""
-    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+def plan_gas_base2_followup_times(
+    anchor: datetime,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime]]:
+    """Returns (day_number, channel, scheduled_at UTC naive) in the given IANA zone."""
+    tz = ZoneInfo(timezone_name)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
     local = a.astimezone(tz)
     base_date = local.date()
@@ -763,7 +788,7 @@ def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[A
 def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dict[str, Any]]:
     """
     Start a new Base-2 follow-up run for the same offer/type as a finished run, reusing stored
-    context and client/activity IDs. Anchor is current time in AEST (Australia/Brisbane).
+    context and client/activity IDs. Anchor is current time in the resolved schedule timezone.
     If an active run already exists for that offer+type, returns that run with reused_existing=True.
     """
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
@@ -794,7 +819,8 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
     )
     reused_existing = existing is not None
 
-    anchor_at = datetime.now(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    schedule_zi = resolve_schedule_tz(run, tpl)
+    anchor_at = datetime.now(schedule_zi)
     ctx = _parse_context(run)
     # Restart should refresh offer validity window from the new anchor.
     if anchor_at.tzinfo is None:
@@ -802,7 +828,7 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
     else:
         anchor_utc = anchor_at.astimezone(timezone.utc)
     valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    valid_until_local = valid_until_utc.astimezone(schedule_zi)
     ctx["offer_generated_at"] = anchor_utc.isoformat()
     ctx["offer_valid_until"] = valid_until_utc.isoformat()
     ctx["offer_validity_date"] = valid_until_local.date().isoformat()
@@ -816,7 +842,7 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
         client_id=client_id,
         crm_activity_id=run.crm_activity_id,
         anchor_at=anchor_at,
-        tz=AUTONOMOUS_SCHEDULE_TZ,
+        tz=schedule_zi.key,
         context=ctx,
     )
 
@@ -931,10 +957,10 @@ def start_gas_base2_sequence(
     client_id: Optional[int],
     crm_activity_id: Optional[int],
     anchor_at: datetime,
-    tz: str,
+    tz: Optional[str],
     context: dict[str, Any],
 ) -> AutonomousSequenceRun:
-    """tz is accepted for API compatibility but ignored; schedules always use AUTONOMOUS_SCHEDULE_TZ (AEST)."""
+    """Store request timezone (or NULL); schedule via resolve_schedule_tz(run, template)."""
     existing = (
         db.query(AutonomousSequenceRun)
         .filter(
@@ -947,6 +973,15 @@ def start_gas_base2_sequence(
     if existing:
         logger.warning("Active autonomous run already exists offer_id=%s type=%s", offer_id, sequence_type)
         return existing
+
+    template = get_sequence_template_by_type(db, sequence_type)
+    # Explicit request only — do not inject Melbourne (or template) before resolve_schedule_tz.
+    request_tz = (tz or "").strip() or None
+    schedule_zi = resolve_schedule_tz(
+        SimpleNamespace(timezone=request_tz),
+        template,
+    )
+    schedule_tz_name = schedule_zi.key
 
     anchor_utc = _to_utc_naive(anchor_at)
     context_payload = dict(context or {})
@@ -969,14 +1004,9 @@ def start_gas_base2_sequence(
                 logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
         if run_validity_date is None:
             anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
-            run_validity_date = (
-                (anchor_aware_utc + timedelta(days=7))
-                .astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
-                .date()
-            )
+            run_validity_date = (anchor_aware_utc + timedelta(days=7)).astimezone(schedule_zi).date()
             context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
 
-    _ = tz  # caller may pass client timezone; scheduling is always AEST
     contact_fields = _context_contact_fields(context_payload)
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
@@ -985,7 +1015,7 @@ def start_gas_base2_sequence(
         crm_activity_id=crm_activity_id,
         run_status="running",
         anchor_at=anchor_utc,
-        timezone=AUTONOMOUS_SCHEDULE_TZ,
+        timezone=schedule_tz_name,
         context_json=json.dumps(context_payload) if context_payload else None,
         email_ID=contact_fields["email_ID"],
         contact_phone=contact_fields["contact_phone"],
@@ -994,21 +1024,21 @@ def start_gas_base2_sequence(
     )
     db.add(run)
     db.flush()
+
     if run_validity_date is not None:
         _set_run_validity_date_if_supported(db, run.id, run_validity_date)
 
-    template = get_sequence_template_by_type(db, sequence_type)
     if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
-        fallback_plan = plan_solar_engagement_form_times(anchor_at)
+        fallback_plan = plan_solar_engagement_form_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
     elif template and bool(template.is_active):
         plan = _plan_template_times(
             anchor_at,
             template.steps,
-            timezone_name=template.timezone or AUTONOMOUS_SCHEDULE_TZ,
+            timezone_name=schedule_tz_name,
         )
     else:
-        fallback_plan = plan_gas_base2_followup_times(anchor_at)
+        fallback_plan = plan_gas_base2_followup_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
 
     ctx_retell_agent_id = context_payload.get("retell_agent_id")
