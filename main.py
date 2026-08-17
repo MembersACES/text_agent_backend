@@ -5705,11 +5705,11 @@ def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google
 
 @app.get("/api/invoicing/commission-figures-client-count")
 def invoicing_commission_figures_client_count_endpoint(
-    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas"),
+    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas | alinta-ci-elec"),
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Count data rows on the Commission Figures tab (excludes header) for Origin Gas / Origin Elec / Alinta Gas retailer sheets.
+    Count data rows on the Commission Figures tab (excludes header) for Origin Gas / Origin Elec / Alinta Gas / Alinta C&I Elec retailer sheets.
     """
     allowed = set(list_retailer_keys())
     key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
