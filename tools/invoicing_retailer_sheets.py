@@ -21,6 +21,7 @@ _RETAILER_SHEETS: dict[str, str] = {
     "origin-gas": "13KUaL34dV8TCUtcExCZI9tC8yAb2XiYK3-MyVLglphE",
     "origin-elec": "1cqi0rFfcD8fLFehPIg6IDHJqwRL1AHR3b-_t2Gsyz7k",
     "alinta-gas": "16t1eFN8gIXr-EmcI08POzEMfCNwO3LazHYB2RSKDmk0",
+    "alinta-ci-elec": "1t_Eta4M8bgWVuj9UPgKLWz7A7WBw8U8GCSgrKrzgYzY",
 }
 
 # Trojan Oil mass invoice database — tab "All Data" (invoicing page gid).
