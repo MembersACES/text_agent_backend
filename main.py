@@ -53,9 +53,12 @@ from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
 from tools.invoicing_retailer_sheets import (
+    ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
+    get_commission_up_to_date_summary,
     get_trojan_oil_unique_client_count,
     list_retailer_keys,
+    list_retailer_sheet_tabs,
 )
 from tools.invoicing_access import require_invoicing_user
 from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
@@ -5724,6 +5727,56 @@ def invoicing_commission_figures_client_count_endpoint(
     return {
         "retailer": key,
         "client_count": count,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/retailer-sheet-tabs")
+def invoicing_retailer_sheet_tabs_endpoint(
+    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas | alinta-ci-elec"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Sheet tab names and gids for a retailer workbook (used to deep-link Invoices Sent, etc.)."""
+    allowed = set(list_retailer_keys())
+    key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
+    if key not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid retailer. Use one of: {', '.join(sorted(allowed))}",
+        )
+    tabs, err = list_retailer_sheet_tabs(key)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "retailer": key,
+        "tabs": tabs,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/commission-up-to-date-summary")
+def invoicing_commission_up_to_date_summary_endpoint(
+    retailer: str = Query(..., description="origin-gas | origin-elec"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Count identifier rows (MRIN / NMI) and sum Total Commission on the Commission Up to Date tab
+    for Origin Gas / Origin Elec.
+    """
+    key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
+    if key not in ORIGIN_COMMISSION_READY_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid retailer. Use one of: {', '.join(sorted(ORIGIN_COMMISSION_READY_KEYS))}",
+        )
+    data, err = get_commission_up_to_date_summary(key)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "retailer": key,
+        "row_count": data["row_count"] if data else 0,
+        "total_commission": data["total_commission"] if data else 0,
+        "row_label": data["row_label"] if data else "row",
         "user_email": user_info.get("email"),
     }
 
