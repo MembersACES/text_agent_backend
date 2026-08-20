@@ -242,6 +242,9 @@ from schemas import (
     AutonomousSequenceTemplateStepResponse,
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
+    RetellAgentListItem,
+    RetellAgentPromptResponse,
+    RetellAgentPromptUpdate,
 )
 from crm_enums import (
     ClientStage,
@@ -11141,14 +11144,43 @@ def _autonomous_template_response(
     )
 
 
+def _autonomous_sequence_type_table(db: Session) -> str:
+    from services.autonomous_sequence import _is_postgresql, _qualified_table, _reflect_table_names
+
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables and not _is_postgresql(bind):
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS autonomous_sequence_type (
+                    sequence_type VARCHAR(120) PRIMARY KEY,
+                    retell_agent_id VARCHAR(120),
+                    system_prompt TEXT,
+                    email_example TEXT,
+                    sms_example TEXT,
+                    voice_example TEXT,
+                    retell_agent_copied INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        )
+        db.commit()
+    return _qualified_table(bind, "autonomous_sequence_type")
+
+
 def _autonomous_sequence_type_columns(db: Session) -> List[str]:
-    insp = inspect(db.bind)
-    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    from services.autonomous_sequence import _inspector_schema_kw, _reflect_table_names
+
+    bind = db.bind
+    _autonomous_sequence_type_table(db)
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
     if "autonomous_sequence_type" not in tables:
         return []
-    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
-    if not cols:
-        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    skw = _inspector_schema_kw(bind)
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", **skw)]
     return [str(c) for c in cols if c]
 
 
@@ -11177,13 +11209,20 @@ def autonomous_sequence_get_type_prompts(
     select_cols = [c for c in wanted if c in cols]
     if "sequence_type" not in select_cols:
         raise HTTPException(status_code=500, detail="autonomous_sequence_type.sequence_type missing")
+    ast_tbl = _autonomous_sequence_type_table(db)
     sql = text(
         f"SELECT {', '.join(select_cols)} "
-        "FROM public.autonomous_sequence_type "
+        f"FROM {ast_tbl} "
         "WHERE sequence_type = :sequence_type "
         "LIMIT 1"
     )
     row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
+    if not row:
+        from services.autonomous_sequence import ensure_autonomous_sequence_type_row
+
+        ensure_autonomous_sequence_type_row(db, sequence_type.strip())
+        db.commit()
+        row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
     return dict(row)
@@ -11215,7 +11254,7 @@ def autonomous_sequence_patch_type_prompts(
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     exists_sql = text(
-        "SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"
+        f"SELECT 1 FROM {_autonomous_sequence_type_table(db)} WHERE sequence_type = :sequence_type LIMIT 1"
     )
     exists = db.execute(exists_sql, {"sequence_type": sequence_type}).first()
     if not exists:
@@ -11229,7 +11268,7 @@ def autonomous_sequence_patch_type_prompts(
     if "retell_agent_id" in patchable and "retell_agent_copied" in cols:
         row_cur = db.execute(
             text(
-                "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                f"SELECT retell_agent_id FROM {_autonomous_sequence_type_table(db)} "
                 "WHERE sequence_type = :sequence_type LIMIT 1"
             ),
             {"sequence_type": sequence_type},
@@ -11245,13 +11284,62 @@ def autonomous_sequence_patch_type_prompts(
     if not assignment_parts:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     assignments = ", ".join(assignment_parts)
+    ast_tbl = _autonomous_sequence_type_table(db)
     update_sql = text(
-        f"UPDATE public.autonomous_sequence_type SET {assignments} "
+        f"UPDATE {ast_tbl} SET {assignments} "
         "WHERE sequence_type = :sequence_type"
     )
     db.execute(update_sql, params)
     db.commit()
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get("/api/autonomous/retell/agents", response_model=List[RetellAgentListItem])
+def autonomous_retell_list_agents(
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List Retell voice agents for the sequence-templates picker."""
+    from services.retell_agents import RetellAgentsError, list_voice_agents
+
+    try:
+        return list_voice_agents()
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_get_agent(
+    agent_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Load a Retell agent's LLM prompt (general_prompt + begin_message)."""
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    try:
+        return get_agent_prompt(agent_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.patch("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_patch_agent(
+    agent_id: str,
+    body: RetellAgentPromptUpdate,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Save general_prompt / begin_message on the agent's Retell LLM."""
+    from services.retell_agents import RetellAgentsError, update_agent_prompt
+
+    if body.general_prompt is None and body.begin_message is None:
+        raise HTTPException(status_code=400, detail="Provide general_prompt and/or begin_message.")
+    try:
+        return update_agent_prompt(
+            agent_id,
+            general_prompt=body.general_prompt,
+            begin_message=body.begin_message,
+        )
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
 @app.get(

@@ -1185,3 +1185,34 @@ class AutonomousSequenceInboundRequest(BaseModel):
     intent: Optional[str] = None
     sentiment_negative: bool = False
     agreement_signed: bool = False
+
+
+class RetellAgentListItem(BaseModel):
+    agent_id: str
+    agent_name: str
+    channel: str = "voice"
+
+
+class RetellAgentPromptResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    response_engine_type: Optional[str] = None
+    llm_id: Optional[str] = None
+    llm_version: Optional[Any] = None
+    is_published: Optional[bool] = None
+    llm_is_published: Optional[bool] = None
+    prompt_editable: bool = False
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+
+
+class RetellAgentPromptUpdate(BaseModel):
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+
+    @field_validator("general_prompt", "begin_message")
+    @classmethod
+    def _strip_optional(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v
