@@ -1137,7 +1137,14 @@ def start_gas_base2_sequence(
         )
         .first()
     )
+    dashboard_test = bool((context or {}).get("dashboard_test"))
     if existing:
+        if dashboard_test:
+            raise ValueError(
+                f"This offer already has a running sequence (run #{existing.id}). "
+                "Open that run, or pick a different offer. A test uses the offer for comparison "
+                "data only — it does not copy the offer."
+            )
         logger.warning("Active autonomous run already exists offer_id=%s type=%s", offer_id, sequence_type)
         return existing
 
@@ -1207,6 +1214,13 @@ def start_gas_base2_sequence(
     else:
         fallback_plan = plan_gas_base2_followup_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
+
+    if dashboard_test and plan:
+        # Production Day 1 is the next business day, so a test started today is not due yet.
+        # Shift the whole cadence so the first step is due immediately.
+        first_at = plan[0][2]
+        delta = _utc_now_naive() - first_at
+        plan = [(d, c, at + delta, p, r) for d, c, at, p, r in plan]
 
     ctx_retell_agent_id = context_payload.get("retell_agent_id")
 
