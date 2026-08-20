@@ -201,3 +201,89 @@ def update_agent_prompt(
         patch["begin_message"] = begin_message
     _request("PATCH", f"/update-retell-llm/{llm_id}", json_body=patch)
     return get_agent_prompt(agent_id)
+
+
+_LLM_OMIT = {
+    "llm_id",
+    "version",
+    "is_published",
+    "last_modification_timestamp",
+    "is_transfer_llm",
+}
+_AGENT_OMIT = {
+    "agent_id",
+    "version",
+    "base_version",
+    "assigned_tags",
+    "is_published",
+    "last_modification_timestamp",
+}
+
+
+def _without_none(payload: dict[str, Any], omit: set[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in payload.items():
+        if k in omit or v is None:
+            continue
+        out[k] = v
+    return out
+
+
+def duplicate_agent(source_agent_id: str, new_name: str) -> dict[str, Any]:
+    """Clone a Retell LLM + voice agent so a new sequence has its own prompt."""
+    source_id = (source_agent_id or "").strip()
+    name = (new_name or "").strip()
+    if not source_id:
+        raise RetellAgentsError(400, "source_agent_id is required")
+    if not name:
+        raise RetellAgentsError(400, "new agent name is required")
+
+    agent = _request("GET", f"/get-agent/{source_id}")
+    if not isinstance(agent, dict):
+        raise RetellAgentsError(502, "Unexpected Retell get-agent response.")
+    engine = _engine(agent)
+    engine_type = str(engine.get("type") or "").strip()
+    llm_id = str(engine.get("llm_id") or "").strip()
+    if engine_type != RETELL_LLM_TYPE or not llm_id:
+        raise RetellAgentsError(
+            400,
+            f"Source agent {source_id} is not a Retell LLM agent, so it cannot be duplicated here.",
+        )
+
+    llm = _request("GET", f"/get-retell-llm/{llm_id}")
+    if not isinstance(llm, dict):
+        raise RetellAgentsError(502, "Unexpected Retell get-retell-llm response.")
+
+    llm_payload = _without_none(llm, _LLM_OMIT)
+    new_llm = _request("POST", "/create-retell-llm", json_body=llm_payload or {"general_prompt": llm.get("general_prompt") or ""})
+    if not isinstance(new_llm, dict) or not new_llm.get("llm_id"):
+        raise RetellAgentsError(502, "Retell created an LLM without an llm_id.")
+    new_llm_id = str(new_llm["llm_id"])
+
+    agent_payload = _without_none(agent, _AGENT_OMIT)
+    agent_payload["agent_name"] = name
+    agent_payload["response_engine"] = {"type": RETELL_LLM_TYPE, "llm_id": new_llm_id}
+    if not agent_payload.get("voice_id"):
+        raise RetellAgentsError(400, f"Source agent {source_id} has no voice_id; cannot duplicate.")
+
+    try:
+        new_agent = _request("POST", "/create-agent", json_body=agent_payload)
+    except RetellAgentsError:
+        new_agent = _request(
+            "POST",
+            "/create-agent",
+            json_body={
+                "agent_name": name,
+                "voice_id": agent_payload["voice_id"],
+                "response_engine": {"type": RETELL_LLM_TYPE, "llm_id": new_llm_id},
+            },
+        )
+    if not isinstance(new_agent, dict) or not new_agent.get("agent_id"):
+        raise RetellAgentsError(502, "Retell created an agent without an agent_id.")
+
+    return {
+        "agent_id": str(new_agent["agent_id"]),
+        "agent_name": str(new_agent.get("agent_name") or name),
+        "llm_id": new_llm_id,
+        "source_agent_id": source_id,
+    }

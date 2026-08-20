@@ -1020,6 +1020,8 @@ class AutonomousSequenceTemplateBase(BaseModel):
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
     steps: List[AutonomousSequenceTemplateStepCreate] = []
+    copy_from_sequence_type: Optional[str] = None
+    duplicate_retell: bool = False
 
 
 class AutonomousSequenceTemplateUpdate(BaseModel):
@@ -1216,3 +1218,23 @@ class RetellAgentPromptUpdate(BaseModel):
         if v is None:
             return None
         return v
+
+
+class RetellAgentDuplicateResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    llm_id: Optional[str] = None
+    source_agent_id: Optional[str] = None
+
+
+class AutonomousFlowSuggestion(BaseModel):
+    sequence_type: str
+    display_name: str
+    source: str
+    copy_hint: Optional[str] = None
+    has_template: bool = False
+    copy_hint_available: bool = False
+
+
+class AutonomousTemplateSuggestionsResponse(BaseModel):
+    uncovered_flows: List[AutonomousFlowSuggestion] = []
