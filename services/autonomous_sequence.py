@@ -293,8 +293,8 @@ Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">busi
 Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
 
 
-def _default_signature_html_for_type(sequence_type: str) -> str:
-    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+def default_signature_html_for_type(sequence_type: str) -> str:
+    if "solar" in (sequence_type or "").lower():
         return SOLAR_ENGAGEMENT_SIGNATURE_HTML
     return ACES_TEAM_FOLLOWUP_SIGNATURE_HTML
 
@@ -310,7 +310,7 @@ def _resolve_signature_html(
     tpl_sig = str(getattr(template, "signature_html", None) or "").strip() if template else ""
     if tpl_sig:
         return tpl_sig
-    return _default_signature_html_for_type(sequence_type)
+    return default_signature_html_for_type(sequence_type)
 
 
 SOLAR_ENGAGEMENT_SYSTEM_PROMPT = """You write follow-up emails for ACES Solar Panel Cleaning engagement forms.

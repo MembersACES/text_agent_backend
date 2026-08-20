@@ -11131,6 +11131,8 @@ def _autonomous_template_step_response(
 def _autonomous_template_response(
     template: AutonomousSequenceTemplate,
 ) -> AutonomousSequenceTemplateResponse:
+    from services.autonomous_sequence import default_signature_html_for_type
+
     steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
     return AutonomousSequenceTemplateResponse.model_validate(
         {
@@ -11141,7 +11143,8 @@ def _autonomous_template_response(
             "timezone": template.timezone,
             "is_active": bool(template.is_active),
             "is_restartable": bool(template.is_restartable),
-            "signature_html": getattr(template, "signature_html", None),
+            "signature_html": str(getattr(template, "signature_html", None) or "").strip()
+            or default_signature_html_for_type(template.sequence_type),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
