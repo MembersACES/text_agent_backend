@@ -1159,6 +1159,11 @@ class AutonomousSequenceStepsSchedulePatchRequest(BaseModel):
     updates: List[AutonomousSequenceStepScheduleItem]
 
 
+class AutonomousSequenceStepDispatchMarkRequest(BaseModel):
+    success: bool = True
+    summary: Optional[str] = None
+
+
 class AutonomousSequenceRunListItem(BaseModel):
     id: int
     offer_id: int
