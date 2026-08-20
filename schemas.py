@@ -1238,3 +1238,23 @@ class AutonomousFlowSuggestion(BaseModel):
 
 class AutonomousTemplateSuggestionsResponse(BaseModel):
     uncovered_flows: List[AutonomousFlowSuggestion] = []
+
+
+class AutonomousTemplateDeletePreview(BaseModel):
+    template_id: int
+    sequence_type: str
+    display_name: str
+    run_count: int
+    retell_agent_id: Optional[str] = None
+    retell_agent_name: Optional[str] = None
+    retell_will_delete: bool = False
+    retell_skip_reason: Optional[str] = None
+
+
+class AutonomousTemplateDeleteResponse(BaseModel):
+    template_id: int
+    sequence_type: str
+    deleted_runs: int
+    retell_deleted: bool = False
+    retell_agent_id: Optional[str] = None
+    warnings: List[str] = []

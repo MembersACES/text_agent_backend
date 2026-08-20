@@ -246,6 +246,8 @@ from schemas import (
     RetellAgentPromptResponse,
     RetellAgentPromptUpdate,
     AutonomousTemplateSuggestionsResponse,
+    AutonomousTemplateDeletePreview,
+    AutonomousTemplateDeleteResponse,
 )
 from crm_enums import (
     ClientStage,
@@ -11567,6 +11569,80 @@ def autonomous_sequence_update_template(
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template)
+
+
+@app.get(
+    "/api/autonomous/sequences/templates/{template_id}/delete-preview",
+    response_model=AutonomousTemplateDeletePreview,
+)
+def autonomous_sequence_delete_template_preview(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import preview_sequence_template_delete
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    plan = preview_sequence_template_delete(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    agent_name = None
+    agent_id = plan.get("retell_agent_id")
+    if agent_id:
+        try:
+            prompt = get_agent_prompt(str(agent_id))
+            agent_name = str(prompt.get("agent_name") or "").strip() or None
+        except RetellAgentsError:
+            agent_name = None
+    return AutonomousTemplateDeletePreview(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        display_name=str(plan["display_name"]),
+        run_count=int(plan["run_count"]),
+        retell_agent_id=str(agent_id) if agent_id else None,
+        retell_agent_name=agent_name,
+        retell_will_delete=bool(plan["retell_will_delete"]),
+        retell_skip_reason=plan.get("retell_skip_reason"),
+    )
+
+
+@app.delete(
+    "/api/autonomous/sequences/templates/{template_id}",
+    response_model=AutonomousTemplateDeleteResponse,
+)
+def autonomous_sequence_delete_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_sequence_template_db
+    from services.retell_agents import RetellAgentsError, delete_agent
+
+    plan = delete_sequence_template_db(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    db.commit()
+
+    warnings: list[str] = []
+    retell_deleted = False
+    agent_id = str(plan.get("retell_agent_id") or "").strip() or None
+    if plan.get("retell_will_delete") and agent_id:
+        try:
+            delete_agent(agent_id)
+            retell_deleted = True
+        except RetellAgentsError as e:
+            warnings.append(f"Database records were deleted, but Retell cleanup failed: {e.detail}")
+    elif plan.get("retell_skip_reason"):
+        warnings.append(str(plan["retell_skip_reason"]))
+
+    return AutonomousTemplateDeleteResponse(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        deleted_runs=int(plan.get("deleted_runs") or 0),
+        retell_deleted=retell_deleted,
+        retell_agent_id=agent_id,
+        warnings=warnings,
+    )
 
 
 @app.post(

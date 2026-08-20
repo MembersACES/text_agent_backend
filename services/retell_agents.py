@@ -287,3 +287,54 @@ def duplicate_agent(source_agent_id: str, new_name: str) -> dict[str, Any]:
         "llm_id": new_llm_id,
         "source_agent_id": source_id,
     }
+
+
+def _delete_ok(path: str) -> None:
+    """DELETE that treats 204 / 404 / 422 as success (already gone)."""
+    url = f"{RETELL_BASE}{path}"
+    try:
+        with httpx.Client(timeout=_TIMEOUT) as client:
+            r = client.request("DELETE", url, headers=_headers())
+    except httpx.RequestError as e:
+        raise RetellAgentsError(502, f"Retell request failed: {e}") from e
+    if r.status_code in (204, 404, 422):
+        return
+    body: Any
+    try:
+        body = r.json()
+    except Exception:
+        body = r.text
+    if r.status_code == 401:
+        raise RetellAgentsError(502, "Retell rejected the API key (401). Check RETELL_API_KEY.")
+    if r.status_code >= 400:
+        raise RetellAgentsError(502, _message_from_body(body, f"Retell returned {r.status_code}."))
+
+
+def delete_agent(agent_id: str) -> dict[str, Any]:
+    """Delete a Retell voice agent and its Retell LLM, if the LLM is dedicated."""
+    source_id = (agent_id or "").strip()
+    if not source_id:
+        raise RetellAgentsError(400, "agent_id is required")
+
+    llm_id = ""
+    agent_name = source_id
+    try:
+        agent = _request("GET", f"/get-agent/{source_id}")
+        if isinstance(agent, dict):
+            agent_name = str(agent.get("agent_name") or "").strip() or source_id
+            llm_id = str(_engine(agent).get("llm_id") or "").strip()
+    except RetellAgentsError as e:
+        if e.status_code != 404:
+            raise
+
+    _delete_ok(f"/delete-agent/{source_id}")
+    llm_deleted = False
+    if llm_id:
+        _delete_ok(f"/delete-retell-llm/{llm_id}")
+        llm_deleted = True
+    return {
+        "agent_id": source_id,
+        "agent_name": agent_name,
+        "llm_id": llm_id or None,
+        "llm_deleted": llm_deleted,
+    }

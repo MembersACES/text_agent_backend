@@ -91,6 +91,173 @@ def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     db.commit()
     return True
 
+
+def _type_row_retell(db: Session, sequence_type: str) -> tuple[str, bool]:
+    """Return (retell_agent_id, was_copied_from_another_sequence)."""
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return "", False
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    skw = _inspector_schema_kw(bind)
+    cols = {str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_type", **skw)}
+    select_cols = ["retell_agent_id"]
+    if "retell_agent_copied" in cols:
+        select_cols.append("retell_agent_copied")
+    row = db.execute(
+        text(f"SELECT {', '.join(select_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": sequence_type},
+    ).mappings().first()
+    if not row:
+        return "", False
+    agent_id = str(row.get("retell_agent_id") or "").strip()
+    copied = False
+    if "retell_agent_copied" in row:
+        raw = row.get("retell_agent_copied")
+        copied = raw in (1, True, "1", "true", "TRUE")
+    return agent_id, copied
+
+
+def _retell_agent_used_elsewhere(db: Session, agent_id: str, sequence_type: str) -> list[str]:
+    """Other sequence_type keys that still point at this Retell agent."""
+    agent_id = (agent_id or "").strip()
+    if not agent_id:
+        return []
+    others: list[str] = []
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        rows = db.execute(
+            text(
+                f"SELECT sequence_type FROM {ast_tbl} "
+                "WHERE COALESCE(TRIM(retell_agent_id), '') = :aid AND sequence_type <> :st"
+            ),
+            {"aid": agent_id, "st": sequence_type},
+        ).all()
+        others.extend(str(r[0]) for r in rows if r and r[0])
+    step_rows = (
+        db.query(AutonomousSequenceTemplate.sequence_type)
+        .join(
+            AutonomousSequenceTemplateStep,
+            AutonomousSequenceTemplateStep.template_id == AutonomousSequenceTemplate.id,
+        )
+        .filter(
+            AutonomousSequenceTemplateStep.retell_agent_id == agent_id,
+            AutonomousSequenceTemplate.sequence_type != sequence_type,
+        )
+        .distinct()
+        .all()
+    )
+    others.extend(str(r[0]) for r in step_rows if r and r[0])
+    seen: list[str] = []
+    for key in others:
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def preview_sequence_template_delete(db: Session, template_id: int) -> Optional[dict[str, Any]]:
+    template = (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .filter(AutonomousSequenceTemplate.id == template_id)
+        .first()
+    )
+    if not template:
+        return None
+    seq_type = str(template.sequence_type)
+    run_count = (
+        db.query(AutonomousSequenceRun)
+        .filter(AutonomousSequenceRun.sequence_type == seq_type)
+        .count()
+    )
+    type_agent, copied = _type_row_retell(db, seq_type)
+    step_agents = {
+        str(s.retell_agent_id).strip()
+        for s in template.steps
+        if (s.retell_agent_id or "").strip()
+    }
+    agent_id = type_agent or next(iter(step_agents), "")
+    others = _retell_agent_used_elsewhere(db, agent_id, seq_type) if agent_id else []
+    skip_reason = None
+    will_delete = False
+    if not agent_id:
+        skip_reason = "No Retell agent is linked on this sequence."
+    elif copied:
+        skip_reason = (
+            "This sequence still points at a shared default Retell agent, so that agent will not be deleted."
+        )
+    elif others:
+        skip_reason = (
+            "This Retell agent is also used by: "
+            + ", ".join(others)
+            + ". It will be unlinked here, not deleted."
+        )
+    else:
+        will_delete = True
+    return {
+        "template_id": template.id,
+        "sequence_type": seq_type,
+        "display_name": template.display_name,
+        "run_count": int(run_count),
+        "retell_agent_id": agent_id or None,
+        "retell_will_delete": will_delete,
+        "retell_skip_reason": skip_reason,
+    }
+
+
+def delete_sequence_template_db(db: Session, template_id: int) -> Optional[dict[str, Any]]:
+    """Delete template, type row, and all runs of this sequence_type. Does not commit."""
+    plan = preview_sequence_template_delete(db, template_id)
+    if not plan:
+        return None
+    seq_type = plan["sequence_type"]
+    run_ids = [
+        int(row[0])
+        for row in db.query(AutonomousSequenceRun.id)
+        .filter(AutonomousSequenceRun.sequence_type == seq_type)
+        .all()
+    ]
+    if run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        insp = inspect(db.bind)
+        tables = _reflect_table_names(insp, db.bind)
+        if "autonomous_sequence_context" in tables:
+            ctx_tbl = _qualified_table(db.bind, "autonomous_sequence_context")
+            for rid in run_ids:
+                db.execute(
+                    text(f"DELETE FROM {ctx_tbl} WHERE run_id = :run_id"),
+                    {"run_id": rid},
+                )
+        db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id.in_(run_ids)).delete(
+            synchronize_session=False
+        )
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        db.execute(
+            text(f"DELETE FROM {ast_tbl} WHERE sequence_type = :st"),
+            {"st": seq_type},
+        )
+    template = db.query(AutonomousSequenceTemplate).filter(
+        AutonomousSequenceTemplate.id == template_id
+    ).first()
+    if template:
+        db.delete(template)
+    plan["deleted_runs"] = len(run_ids)
+    return plan
+
+
 logger = logging.getLogger(__name__)
 
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
