@@ -23,6 +23,7 @@ from models import (
     AutonomousSequenceTemplate,
     AutonomousSequenceTemplateStep,
     Offer,
+    OfferActivity,
 )
 
 def _is_postgresql(bind) -> bool:
@@ -1591,41 +1592,8 @@ def execute_due_steps_sync(db: Session) -> int:
             step.started_at = now
             db.flush()
 
-            ctx = _parse_context(run)
-            ctx["offer_id"] = run.offer_id
-            ctx["run_id"] = run.id
-            template = get_sequence_template_by_type(db, run.sequence_type)
-            if template:
-                by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
-                t_step = by_idx.get(int(step.step_index))
-                if t_step and t_step.prompt_text:
-                    ctx["step_prompt"] = t_step.prompt_text
-
             try:
-                if step.channel == "email":
-                    email_ctx = _prepare_email_context(run, step, ctx)
-                    out = _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
-                elif step.channel == "sms":
-                    out = _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
-                elif step.channel == "voice_call":
-                    out = _voice_retell_placeholder(
-                        run.offer_id,
-                        run.id,
-                        step.id,
-                        step.retell_agent_id,
-                        ctx,
-                    )
-                elif step.channel == "engagement_form_generation":
-                    ctx.setdefault(
-                        "engagement_form_type",
-                        SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE,
-                    )
-                    out = _execute_engagement_form_generation(
-                        db, run.offer_id, run.id, step.id, ctx
-                    )
-                else:
-                    out = {"ok": False, "error": "unknown_channel", "channel": step.channel}
-
+                out = _send_one_step(db, run, step)
                 step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
@@ -1666,3 +1634,348 @@ def execute_due_steps_sync(db: Session) -> int:
             db.commit()
 
     return executed
+
+
+def _send_one_step(db: Session, run: AutonomousSequenceRun, step: AutonomousSequenceStep) -> dict[str, Any]:
+    ctx = _parse_context(run)
+    ctx["offer_id"] = run.offer_id
+    ctx["run_id"] = run.id
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    if template:
+        by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
+        t_step = by_idx.get(int(step.step_index))
+        if t_step and t_step.prompt_text:
+            ctx["step_prompt"] = t_step.prompt_text
+    if step.channel == "email":
+        email_ctx = _prepare_email_context(run, step, ctx)
+        return _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
+    if step.channel == "sms":
+        return _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
+    if step.channel == "voice_call":
+        return _voice_retell_placeholder(
+            run.offer_id,
+            run.id,
+            step.id,
+            step.retell_agent_id,
+            ctx,
+        )
+    if step.channel == "engagement_form_generation":
+        ctx.setdefault("engagement_form_type", SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE)
+        return _execute_engagement_form_generation(db, run.offer_id, run.id, step.id, ctx)
+    return {"ok": False, "error": "unknown_channel", "channel": step.channel}
+
+
+def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
+    """Send one step immediately from this API's database, ignoring scheduled_at."""
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    if run.run_status != "running":
+        raise ValueError(f"Run is {run.run_status}, not running")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    if step.step_status == "to_start":
+        step.step_status = "ready"
+        db.flush()
+    if step.step_status != "ready":
+        raise ValueError(f"Step is {step.step_status}, not ready")
+
+    now = _utc_now_naive()
+    step.started_at = now
+    db.flush()
+    try:
+        out = _send_one_step(db, run, step)
+    except Exception as e:
+        step.step_status = "error"
+        step.last_outcome_summary = str(e)[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": str(e), "channel": step.channel},
+        )
+        db.commit()
+        raise
+    if out.get("mode") == "placeholder":
+        step.step_status = "ready"
+        step.started_at = None
+        db.commit()
+        raise ValueError(
+            "This API cannot actually send this step (email/SMS webhook or Retell key missing), "
+            "and the send worker could not see the step in its database."
+        )
+    if out.get("ok") is False:
+        step.step_status = "error"
+        step.last_outcome_summary = json.dumps(out)[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": out, "channel": step.channel},
+        )
+        db.commit()
+        raise ValueError(str(out.get("error") or "Send failed"))
+
+    step.step_status = "executed"
+    step.completed_at = _utc_now_naive()
+    step.last_outcome_summary = json.dumps(out)[:4000]
+    _log_event(
+        db,
+        run.id,
+        "step_executed",
+        step_id=step.id,
+        payload={"channel": step.channel, "result": out},
+    )
+    pending = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == run.id,
+            AutonomousSequenceStep.id != step.id,
+            AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
+        )
+        .count()
+    )
+    if pending == 0 and run.run_status == "running":
+        run.run_status = "completed"
+        run.stop_reason = None
+        _log_event(db, run.id, "run_completed", payload={})
+    db.commit()
+    db.refresh(run)
+    return {"ok": True, "run_id": run.id, "step_id": step.id, "result": out}
+
+
+def _load_type_prompts(db: Session, sequence_type: str) -> dict[str, str]:
+    out = {
+        "retell_agent_id": "",
+        "email_system_prompt": "",
+        "email_example": "",
+        "sms_system_prompt": "",
+        "sms_example": "",
+    }
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return out
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    cols = {
+        str(c.get("name") or "")
+        for c in insp.get_columns("autonomous_sequence_type", **_inspector_schema_kw(bind))
+    }
+    wanted = [k for k in out if k in cols]
+    if not wanted:
+        return out
+    row = (
+        db.execute(
+            text(f"SELECT {', '.join(wanted)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+            {"st": sequence_type},
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        return out
+    for key in out:
+        raw = row.get(key)
+        if raw:
+            out[key] = str(raw)
+    return out
+
+
+def _activity_meta(db: Session, run: AutonomousSequenceRun) -> dict[str, Any]:
+    if not run.crm_activity_id:
+        return {}
+    activity = db.get(OfferActivity, run.crm_activity_id)
+    if not activity or activity.metadata_ is None:
+        return {}
+    raw = activity.metadata_
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _flatten_worker_variables(ctx: dict[str, Any], activity_meta: dict[str, Any]) -> dict[str, str]:
+    flat: dict[str, Any] = {}
+    snap = ctx.get("comparison_snapshot")
+    if isinstance(snap, dict):
+        for key, value in snap.items():
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            flat[key] = value
+    for key, value in ctx.items():
+        if key in ("comparison_snapshot", "signature_html"):
+            continue
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        flat[key] = value
+    for key, value in activity_meta.items():
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        flat[key] = value
+    label = str(flat.get("offer_validity_label") or "").strip()
+    if label:
+        flat["validity_date"] = label
+    return {str(k): str(v) for k, v in flat.items()}
+
+
+def _jsonable_context(ctx: dict[str, Any], activity_meta: dict[str, Any]) -> dict[str, Any]:
+    merged = {**ctx, **activity_meta}
+    try:
+        return json.loads(json.dumps(merged, default=str))
+    except (TypeError, ValueError):
+        return {str(k): str(v) for k, v in merged.items() if v is not None}
+
+
+def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
+    """Build a worker Action payload from this API's database (the one the dashboard reads)."""
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    if run.run_status != "running":
+        raise ValueError(f"Run is {run.run_status}, not running")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    if step.step_status == "to_start":
+        step.step_status = "ready"
+        db.flush()
+    if step.step_status != "ready":
+        raise ValueError(f"Step is {step.step_status}, not ready")
+
+    ctx = _parse_context(run)
+    ctx["offer_id"] = run.offer_id
+    ctx["run_id"] = run.id
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    if template:
+        by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
+        t_step = by_idx.get(int(step.step_index))
+        if t_step and t_step.prompt_text:
+            ctx["step_prompt"] = t_step.prompt_text
+    prompts = _load_type_prompts(db, run.sequence_type)
+    activity_meta = _activity_meta(db, run)
+    channel = (step.channel or "").strip()
+    email = str(ctx.get("contact_email") or run.contact_email or "").strip()
+    phone = str(ctx.get("contact_phone") or run.contact_phone or "").strip()
+
+    if channel == "email":
+        if not email:
+            raise ValueError("No contact email on this run")
+        email_ctx = _prepare_email_context(run, step, ctx)
+        payload = {
+            "to": email,
+            "email_id": str(run.email_ID or email_ctx.get("email_ID") or email_ctx.get("email_id") or ""),
+            "context": _jsonable_context(email_ctx, activity_meta),
+            "system_prompt": prompts["email_system_prompt"],
+            "example": prompts["email_example"],
+        }
+        action_type = "email"
+    elif channel == "sms":
+        if not phone:
+            raise ValueError("No contact phone on this run")
+        payload = {
+            "to": phone,
+            "context": _jsonable_context(ctx, activity_meta),
+            "system_prompt": prompts["sms_system_prompt"],
+            "example": prompts["sms_example"],
+        }
+        action_type = "sms"
+    elif channel == "voice_call":
+        if not phone:
+            raise ValueError("No contact phone on this run")
+        payload = {
+            "to": phone,
+            "agent_id": step.retell_agent_id or prompts["retell_agent_id"],
+            "dynamic_variables": _flatten_worker_variables(ctx, activity_meta),
+        }
+        action_type = "phone_call"
+    else:
+        raise ValueError(f"Channel {channel!r} cannot be sent via the worker")
+
+    return {
+        "action_type": action_type,
+        "step_id": step.id,
+        "run_id": run.id,
+        "payload": payload,
+        "channel": channel,
+    }
+
+
+def mark_step_dispatched(
+    db: Session,
+    run_id: int,
+    step_id: int,
+    success: bool,
+    summary: Optional[str] = None,
+) -> AutonomousSequenceRun:
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    now = _utc_now_naive()
+    if success:
+        step.step_status = "executed"
+        step.started_at = step.started_at or now
+        step.completed_at = now
+        if summary:
+            step.last_outcome_summary = summary[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_executed",
+            step_id=step.id,
+            payload={"channel": step.channel, "result": summary},
+        )
+    else:
+        step.step_status = "error"
+        step.completed_at = now
+        if summary:
+            step.last_outcome_summary = summary[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": summary, "channel": step.channel},
+        )
+    db.flush()
+    pending = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == run.id,
+            AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
+        )
+        .count()
+    )
+    if success and pending == 0 and run.run_status == "running":
+        run.run_status = "completed"
+        run.stop_reason = None
+        _log_event(db, run.id, "run_completed", payload={})
+    db.commit()
+    db.refresh(run)
+    return run

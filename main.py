@@ -236,6 +236,7 @@ from schemas import (
     AutonomousSequenceInboundRequest,
     AutonomousSequenceRunPatchRequest,
     AutonomousSequenceStepsSchedulePatchRequest,
+    AutonomousSequenceStepDispatchMarkRequest,
     AutonomousSequenceTemplateCreate,
     AutonomousSequenceTemplateResponse,
     AutonomousSequenceTemplateStepCreate,
@@ -11877,6 +11878,53 @@ def autonomous_sequence_patch_step_schedules(
         .filter(AutonomousSequenceRun.id == run_id)
         .first()
     )
+    return _autonomous_run_detail(db, run)
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/export-action")
+def autonomous_sequence_export_step_action(
+    run_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import export_step_action
+
+    try:
+        return export_step_action(db, run_id, step_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/execute-now")
+def autonomous_sequence_execute_step_now(
+    run_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import execute_step_now
+
+    try:
+        return execute_step_now(db, run_id, step_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/mark-dispatched")
+def autonomous_sequence_mark_step_dispatched(
+    run_id: int,
+    step_id: int,
+    body: AutonomousSequenceStepDispatchMarkRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import mark_step_dispatched
+
+    try:
+        run = mark_step_dispatched(db, run_id, step_id, body.success, body.summary)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return _autonomous_run_detail(db, run)
 
 
