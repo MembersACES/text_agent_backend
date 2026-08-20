@@ -11141,6 +11141,7 @@ def _autonomous_template_response(
             "timezone": template.timezone,
             "is_active": bool(template.is_active),
             "is_restartable": bool(template.is_restartable),
+            "signature_html": getattr(template, "signature_html", None),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -11470,6 +11471,9 @@ def autonomous_sequence_create_template(
         timezone=timezone,
         is_active=1 if body.is_active else 0,
         is_restartable=1 if body.is_restartable else (int(source.is_restartable) if source else 1),
+        signature_html=(body.signature_html or "").strip()
+        or ((source.signature_html or "").strip() if source else "")
+        or None,
     )
     db.add(template)
     db.flush()
@@ -11567,6 +11571,8 @@ def autonomous_sequence_update_template(
         template.is_active = 1 if body.is_active else 0
     if body.is_restartable is not None:
         template.is_restartable = 1 if body.is_restartable else 0
+    if body.signature_html is not None:
+        template.signature_html = body.signature_html.strip() or None
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template)

@@ -467,6 +467,7 @@ class AutonomousSequenceTemplate(Base):
     timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
     is_active = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
+    signature_html = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
