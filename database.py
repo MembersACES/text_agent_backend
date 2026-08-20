@@ -354,3 +354,15 @@ def init_db():
                 logging.info("✅ Added pudu_consumable_baseline_runs.detail_json column")
     except Exception as e:
         logging.warning("Could not ensure pudu_consumable_baseline_runs.detail_json column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "autonomous_sequence_templates" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("autonomous_sequence_templates")]
+            if "signature_html" not in cols:
+                logging.info("Adding missing autonomous_sequence_templates.signature_html column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN signature_html TEXT"))
+                logging.info("✅ Added autonomous_sequence_templates.signature_html column")
+    except Exception as e:
+        logging.warning("Could not ensure autonomous_sequence_templates.signature_html column: %s", e)

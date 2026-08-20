@@ -282,6 +282,37 @@ Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">busi
 470 St Kilda Road, Melbourne VIC 3004<br>
 Ph: 1300 849 908 | Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
 
+# Default for gas / electricity follow-ups. LLM already writes "Kind regards," — do not repeat it.
+ACES_TEAM_FOLLOWUP_SIGNATURE_HTML = """<p style="margin-bottom:0;"><strong>The Team</strong><br>
+Australian Circular Economy Solutions</p>
+<p style="margin-top:16px; margin-bottom:0;"><strong>Carbon Zero Australasia</strong><br>
+Australian Circular Economy Solutions Division<br>
+Direct: 0468 050 399<br>
+Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">business@acesolutions.com.au</a><br>
+470 St Kilda Road, Melbourne VIC 3004<br>
+Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
+
+
+def _default_signature_html_for_type(sequence_type: str) -> str:
+    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        return SOLAR_ENGAGEMENT_SIGNATURE_HTML
+    return ACES_TEAM_FOLLOWUP_SIGNATURE_HTML
+
+
+def _resolve_signature_html(
+    sequence_type: str,
+    template: Optional[AutonomousSequenceTemplate],
+    context: Optional[dict[str, Any]],
+) -> str:
+    existing = str((context or {}).get("signature_html") or "").strip()
+    if existing:
+        return existing
+    tpl_sig = str(getattr(template, "signature_html", None) or "").strip() if template else ""
+    if tpl_sig:
+        return tpl_sig
+    return _default_signature_html_for_type(sequence_type)
+
+
 SOLAR_ENGAGEMENT_SYSTEM_PROMPT = """You write follow-up emails for ACES Solar Panel Cleaning engagement forms.
 
 The client already received the initial email with the engagement form and testimonial PDFs attached. These follow-ups must REPLY on that Gmail thread (do not start a new email). Do not include Google Drive links — the client cannot access them; attachments are on the original message.
@@ -940,6 +971,7 @@ def _prepare_email_context(
     run: AutonomousSequenceRun,
     step: AutonomousSequenceStep,
     ctx: dict[str, Any],
+    template: Optional[AutonomousSequenceTemplate] = None,
 ) -> dict[str, Any]:
     out = dict(ctx)
     out["sequence_type"] = run.sequence_type
@@ -963,8 +995,8 @@ def _prepare_email_context(
         out.pop("offer_valid_until", None)
         out.pop("offer_validity_days", None)
         out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
-        out.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
-        out.setdefault("use_html_signature", True)
+    out["signature_html"] = _resolve_signature_html(run.sequence_type, template, out)
+    out["use_html_signature"] = True
     return out
 
 
@@ -1196,7 +1228,6 @@ def start_gas_base2_sequence(
         context_payload.setdefault("omit_validity", True)
         context_payload.setdefault("omit_document_links", True)
         context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
-        context_payload.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
     else:
         validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
         if validity_raw:
@@ -1208,6 +1239,11 @@ def start_gas_base2_sequence(
             anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
             run_validity_date = (anchor_aware_utc + timedelta(days=7)).astimezone(schedule_zi).date()
             context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
+
+    context_payload["signature_html"] = _resolve_signature_html(
+        sequence_type, template, context_payload
+    )
+    context_payload["use_html_signature"] = True
 
     contact_fields = _context_contact_fields(context_payload)
     if contact_fields["contact_phone"]:
@@ -1679,7 +1715,7 @@ def _send_one_step(db: Session, run: AutonomousSequenceRun, step: AutonomousSequ
         if t_step and t_step.prompt_text:
             ctx["step_prompt"] = t_step.prompt_text
     if step.channel == "email":
-        email_ctx = _prepare_email_context(run, step, ctx)
+        email_ctx = _prepare_email_context(run, step, ctx, template)
         return _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
     if step.channel == "sms":
         return _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
@@ -1915,7 +1951,7 @@ def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]
     if channel == "email":
         if not email:
             raise ValueError("No contact email on this run")
-        email_ctx = _prepare_email_context(run, step, ctx)
+        email_ctx = _prepare_email_context(run, step, ctx, template)
         payload = {
             "to": email,
             "email_id": str(run.email_ID or email_ctx.get("email_ID") or email_ctx.get("email_id") or ""),

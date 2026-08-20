@@ -1016,6 +1016,7 @@ class AutonomousSequenceTemplateBase(BaseModel):
     timezone: str = "Australia/Melbourne"
     is_active: bool = True
     is_restartable: bool = True
+    signature_html: Optional[str] = None
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
@@ -1030,6 +1031,7 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     timezone: Optional[str] = None
     is_active: Optional[bool] = None
     is_restartable: Optional[bool] = None
+    signature_html: Optional[str] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1072,6 +1074,7 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     timezone: str
     is_active: bool = True
     is_restartable: bool = True
+    signature_html: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
