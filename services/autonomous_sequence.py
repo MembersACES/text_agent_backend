@@ -509,6 +509,30 @@ def _merge_context(db: Session, run: AutonomousSequenceRun, extra: dict[str, Any
     update_run_context(db, run, base)
 
 
+def _to_e164_au(value: Any) -> Optional[str]:
+    """Turn AU local numbers into E.164 so Twilio/Retell can dial them.
+
+    0401941385 → +61401941385
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(c for c in text if c.isdigit())
+    if not digits:
+        return None
+    if text.startswith("+"):
+        return "+" + digits
+    if digits.startswith("61") and len(digits) >= 11:
+        return "+" + digits
+    if digits.startswith("0") and len(digits) >= 9:
+        return "+61" + digits[1:]
+    if len(digits) == 9 and digits.startswith("4"):
+        return "+61" + digits
+    return "+" + digits
+
+
 def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]:
     def _norm(value: Any) -> Optional[str]:
         if value is None:
@@ -519,7 +543,7 @@ def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]
     return {
         # Accept both historical `email_ID` and snake_case `email_id`.
         "email_ID": _norm(context.get("email_ID") or context.get("email_id")),
-        "contact_phone": _norm(context.get("contact_phone")),
+        "contact_phone": _to_e164_au(context.get("contact_phone")),
         "contact_name": _norm(context.get("contact_name")),
         "contact_email": _norm(context.get("contact_email")),
     }
@@ -1051,8 +1075,11 @@ def manual_stop_run(db: Session, run_id: int) -> Optional[AutonomousSequenceRun]
 
 
 def update_run_context(db: Session, run: AutonomousSequenceRun, context: dict[str, Any]) -> None:
-    run.context_json = json.dumps(context) if context else None
-    contact_fields = _context_contact_fields(context or {})
+    payload = dict(context or {})
+    contact_fields = _context_contact_fields(payload)
+    if contact_fields["contact_phone"]:
+        payload["contact_phone"] = contact_fields["contact_phone"]
+    run.context_json = json.dumps(payload) if payload else None
     run.email_ID = contact_fields["email_ID"]
     run.contact_phone = contact_fields["contact_phone"]
     run.contact_name = contact_fields["contact_name"]
@@ -1183,6 +1210,8 @@ def start_gas_base2_sequence(
             context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
 
     contact_fields = _context_contact_fields(context_payload)
+    if contact_fields["contact_phone"]:
+        context_payload["contact_phone"] = contact_fields["contact_phone"]
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
         offer_id=offer_id,
@@ -1640,6 +1669,9 @@ def _send_one_step(db: Session, run: AutonomousSequenceRun, step: AutonomousSequ
     ctx = _parse_context(run)
     ctx["offer_id"] = run.offer_id
     ctx["run_id"] = run.id
+    e164 = _to_e164_au(ctx.get("contact_phone") or run.contact_phone)
+    if e164:
+        ctx["contact_phone"] = e164
     template = get_sequence_template_by_type(db, run.sequence_type)
     if template:
         by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
@@ -1829,7 +1861,11 @@ def _flatten_worker_variables(ctx: dict[str, Any], activity_meta: dict[str, Any]
     label = str(flat.get("offer_validity_label") or "").strip()
     if label:
         flat["validity_date"] = label
-    return {str(k): str(v) for k, v in flat.items()}
+    out = {str(k): str(v) for k, v in flat.items()}
+    converted = _to_e164_au(out.get("contact_phone"))
+    if converted:
+        out["contact_phone"] = converted
+    return out
 
 
 def _jsonable_context(ctx: dict[str, Any], activity_meta: dict[str, Any]) -> dict[str, Any]:
@@ -1874,7 +1910,7 @@ def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]
     activity_meta = _activity_meta(db, run)
     channel = (step.channel or "").strip()
     email = str(ctx.get("contact_email") or run.contact_email or "").strip()
-    phone = str(ctx.get("contact_phone") or run.contact_phone or "").strip()
+    phone = _to_e164_au(ctx.get("contact_phone") or run.contact_phone) or ""
 
     if channel == "email":
         if not email:
