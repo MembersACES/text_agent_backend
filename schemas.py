@@ -1020,6 +1020,8 @@ class AutonomousSequenceTemplateBase(BaseModel):
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
     steps: List[AutonomousSequenceTemplateStepCreate] = []
+    copy_from_sequence_type: Optional[str] = None
+    duplicate_retell: bool = False
 
 
 class AutonomousSequenceTemplateUpdate(BaseModel):
@@ -1185,3 +1187,74 @@ class AutonomousSequenceInboundRequest(BaseModel):
     intent: Optional[str] = None
     sentiment_negative: bool = False
     agreement_signed: bool = False
+
+
+class RetellAgentListItem(BaseModel):
+    agent_id: str
+    agent_name: str
+    channel: str = "voice"
+
+
+class RetellAgentPromptResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    response_engine_type: Optional[str] = None
+    llm_id: Optional[str] = None
+    llm_version: Optional[Any] = None
+    is_published: Optional[bool] = None
+    llm_is_published: Optional[bool] = None
+    prompt_editable: bool = False
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+
+
+class RetellAgentPromptUpdate(BaseModel):
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+
+    @field_validator("general_prompt", "begin_message")
+    @classmethod
+    def _strip_optional(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v
+
+
+class RetellAgentDuplicateResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    llm_id: Optional[str] = None
+    source_agent_id: Optional[str] = None
+
+
+class AutonomousFlowSuggestion(BaseModel):
+    sequence_type: str
+    display_name: str
+    source: str
+    copy_hint: Optional[str] = None
+    has_template: bool = False
+    copy_hint_available: bool = False
+
+
+class AutonomousTemplateSuggestionsResponse(BaseModel):
+    uncovered_flows: List[AutonomousFlowSuggestion] = []
+
+
+class AutonomousTemplateDeletePreview(BaseModel):
+    template_id: int
+    sequence_type: str
+    display_name: str
+    run_count: int
+    retell_agent_id: Optional[str] = None
+    retell_agent_name: Optional[str] = None
+    retell_will_delete: bool = False
+    retell_skip_reason: Optional[str] = None
+
+
+class AutonomousTemplateDeleteResponse(BaseModel):
+    template_id: int
+    sequence_type: str
+    deleted_runs: int
+    retell_deleted: bool = False
+    retell_agent_id: Optional[str] = None
+    warnings: List[str] = []

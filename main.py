@@ -242,6 +242,12 @@ from schemas import (
     AutonomousSequenceTemplateStepResponse,
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
+    RetellAgentListItem,
+    RetellAgentPromptResponse,
+    RetellAgentPromptUpdate,
+    AutonomousTemplateSuggestionsResponse,
+    AutonomousTemplateDeletePreview,
+    AutonomousTemplateDeleteResponse,
 )
 from crm_enums import (
     ClientStage,
@@ -11141,14 +11147,43 @@ def _autonomous_template_response(
     )
 
 
+def _autonomous_sequence_type_table(db: Session) -> str:
+    from services.autonomous_sequence import _is_postgresql, _qualified_table, _reflect_table_names
+
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables and not _is_postgresql(bind):
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS autonomous_sequence_type (
+                    sequence_type VARCHAR(120) PRIMARY KEY,
+                    retell_agent_id VARCHAR(120),
+                    system_prompt TEXT,
+                    email_example TEXT,
+                    sms_example TEXT,
+                    voice_example TEXT,
+                    retell_agent_copied INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        )
+        db.commit()
+    return _qualified_table(bind, "autonomous_sequence_type")
+
+
 def _autonomous_sequence_type_columns(db: Session) -> List[str]:
-    insp = inspect(db.bind)
-    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    from services.autonomous_sequence import _inspector_schema_kw, _reflect_table_names
+
+    bind = db.bind
+    _autonomous_sequence_type_table(db)
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
     if "autonomous_sequence_type" not in tables:
         return []
-    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
-    if not cols:
-        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    skw = _inspector_schema_kw(bind)
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", **skw)]
     return [str(c) for c in cols if c]
 
 
@@ -11177,13 +11212,20 @@ def autonomous_sequence_get_type_prompts(
     select_cols = [c for c in wanted if c in cols]
     if "sequence_type" not in select_cols:
         raise HTTPException(status_code=500, detail="autonomous_sequence_type.sequence_type missing")
+    ast_tbl = _autonomous_sequence_type_table(db)
     sql = text(
         f"SELECT {', '.join(select_cols)} "
-        "FROM public.autonomous_sequence_type "
+        f"FROM {ast_tbl} "
         "WHERE sequence_type = :sequence_type "
         "LIMIT 1"
     )
     row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
+    if not row:
+        from services.autonomous_sequence import ensure_autonomous_sequence_type_row
+
+        ensure_autonomous_sequence_type_row(db, sequence_type.strip())
+        db.commit()
+        row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
     return dict(row)
@@ -11215,7 +11257,7 @@ def autonomous_sequence_patch_type_prompts(
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     exists_sql = text(
-        "SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"
+        f"SELECT 1 FROM {_autonomous_sequence_type_table(db)} WHERE sequence_type = :sequence_type LIMIT 1"
     )
     exists = db.execute(exists_sql, {"sequence_type": sequence_type}).first()
     if not exists:
@@ -11229,7 +11271,7 @@ def autonomous_sequence_patch_type_prompts(
     if "retell_agent_id" in patchable and "retell_agent_copied" in cols:
         row_cur = db.execute(
             text(
-                "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                f"SELECT retell_agent_id FROM {_autonomous_sequence_type_table(db)} "
                 "WHERE sequence_type = :sequence_type LIMIT 1"
             ),
             {"sequence_type": sequence_type},
@@ -11245,13 +11287,62 @@ def autonomous_sequence_patch_type_prompts(
     if not assignment_parts:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     assignments = ", ".join(assignment_parts)
+    ast_tbl = _autonomous_sequence_type_table(db)
     update_sql = text(
-        f"UPDATE public.autonomous_sequence_type SET {assignments} "
+        f"UPDATE {ast_tbl} SET {assignments} "
         "WHERE sequence_type = :sequence_type"
     )
     db.execute(update_sql, params)
     db.commit()
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get("/api/autonomous/retell/agents", response_model=List[RetellAgentListItem])
+def autonomous_retell_list_agents(
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List Retell voice agents (names for the locked sequence-template display)."""
+    from services.retell_agents import RetellAgentsError, list_voice_agents
+
+    try:
+        return list_voice_agents()
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_get_agent(
+    agent_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Load a Retell agent's LLM prompt (general_prompt + begin_message)."""
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    try:
+        return get_agent_prompt(agent_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.patch("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_patch_agent(
+    agent_id: str,
+    body: RetellAgentPromptUpdate,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Save general_prompt / begin_message on the agent's Retell LLM."""
+    from services.retell_agents import RetellAgentsError, update_agent_prompt
+
+    if body.general_prompt is None and body.begin_message is None:
+        raise HTTPException(status_code=400, detail="Provide general_prompt and/or begin_message.")
+    try:
+        return update_agent_prompt(
+            agent_id,
+            general_prompt=body.general_prompt,
+            begin_message=body.begin_message,
+        )
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
 @app.get(
@@ -11269,6 +11360,69 @@ def autonomous_sequence_list_templates(
         .all()
     )
     return [_autonomous_template_response(r) for r in rows]
+
+
+@app.get(
+    "/api/autonomous/sequences/template-suggestions",
+    response_model=AutonomousTemplateSuggestionsResponse,
+)
+def autonomous_sequence_template_suggestions(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Comparisons / flows that do not yet have an autonomous sequence template."""
+    from services.autonomous_flows import uncovered_flows
+
+    existing = {
+        str(t.sequence_type).strip()
+        for t in db.query(AutonomousSequenceTemplate.sequence_type).all()
+        if t.sequence_type
+    }
+    return AutonomousTemplateSuggestionsResponse(uncovered_flows=uncovered_flows(existing))
+
+
+def _sequence_type_retell_agent_id(db: Session, sequence_type: str) -> str:
+    cols = _autonomous_sequence_type_columns(db)
+    if "retell_agent_id" not in cols:
+        return ""
+    ast_tbl = _autonomous_sequence_type_table(db)
+    row = db.execute(
+        text(f"SELECT retell_agent_id FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": sequence_type},
+    ).mappings().first()
+    return str(row["retell_agent_id"] or "").strip() if row else ""
+
+
+def _copy_sequence_type_prompts(
+    db: Session,
+    source_type: str,
+    dest_type: str,
+    retell_agent_id: Optional[str],
+) -> None:
+    cols = _autonomous_sequence_type_columns(db)
+    ast_tbl = _autonomous_sequence_type_table(db)
+    src = db.execute(
+        text(f"SELECT * FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": source_type},
+    ).mappings().first()
+    assignments: list[str] = []
+    params: Dict[str, Union[str, None]] = {"st": dest_type}
+    for col in ("system_prompt", "email_example", "sms_example", "voice_example"):
+        if col in cols and src is not None:
+            assignments.append(f"{col} = :{col}")
+            val = src.get(col)
+            params[col] = None if val is None else str(val)
+    if "retell_agent_id" in cols and retell_agent_id is not None:
+        assignments.append("retell_agent_id = :retell_agent_id")
+        params["retell_agent_id"] = retell_agent_id
+        if "retell_agent_copied" in cols:
+            assignments.append("retell_agent_copied = 0")
+    if not assignments:
+        return
+    db.execute(
+        text(f"UPDATE {ast_tbl} SET {', '.join(assignments)} WHERE sequence_type = :st"),
+        params,
+    )
 
 
 @app.post(
@@ -11290,17 +11444,50 @@ def autonomous_sequence_create_template(
     )
     if existing:
         raise HTTPException(status_code=409, detail="sequence_type already exists")
+
+    copy_from = (body.copy_from_sequence_type or "").strip() or None
+    source: Optional[AutonomousSequenceTemplate] = None
+    if copy_from:
+        source = (
+            db.query(AutonomousSequenceTemplate)
+            .options(joinedload(AutonomousSequenceTemplate.steps))
+            .filter(AutonomousSequenceTemplate.sequence_type == copy_from)
+            .first()
+        )
+        if not source:
+            raise HTTPException(status_code=404, detail=f"copy_from template not found: {copy_from}")
+
+    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Melbourne"
+    description = (body.description or "").strip() or None
+    if description is None and source and source.description:
+        description = f"Copied from {source.display_name}."
+
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
-        description=(body.description or "").strip() or None,
-        timezone=(body.timezone or "Australia/Melbourne").strip() or "Australia/Melbourne",
+        description=description,
+        timezone=timezone,
         is_active=1 if body.is_active else 0,
-        is_restartable=1 if body.is_restartable else 0,
+        is_restartable=1 if body.is_restartable else (int(source.is_restartable) if source else 1),
     )
     db.add(template)
     db.flush()
-    for s in body.steps:
+
+    steps_src = body.steps
+    if not steps_src and source:
+        steps_src = [
+            AutonomousSequenceTemplateStepCreate(
+                step_index=int(s.step_index),
+                day_number=int(s.day_number),
+                channel=str(s.channel),
+                send_time_local=str(s.send_time_local or "09:00"),
+                prompt_text=s.prompt_text,
+                retell_agent_id=None,
+                is_active=bool(s.is_active),
+            )
+            for s in sorted(source.steps, key=lambda x: int(x.step_index))
+        ]
+    for s in steps_src:
         db.add(
             AutonomousSequenceTemplateStep(
                 template_id=template.id,
@@ -11309,15 +11496,39 @@ def autonomous_sequence_create_template(
                 channel=s.channel.strip(),
                 send_time_local=s.send_time_local.strip(),
                 prompt_text=(s.prompt_text or "").strip() or None,
-                retell_agent_id=(s.retell_agent_id or "").strip() or None,
+                retell_agent_id=None,
                 is_active=1 if s.is_active else 0,
             )
         )
+
     from services.autonomous_sequence import ensure_autonomous_sequence_type_row
 
     ensure_autonomous_sequence_type_row(db, seq_type)
+
+    new_agent_id: Optional[str] = None
+    if body.duplicate_retell:
+        if not copy_from:
+            raise HTTPException(
+                status_code=400,
+                detail="Pick a sequence to copy from before duplicating its Retell agent.",
+            )
+        source_agent = _sequence_type_retell_agent_id(db, copy_from)
+        if not source_agent:
+            raise HTTPException(
+                status_code=400,
+                detail="No Retell agent on the source sequence to duplicate.",
+            )
+        from services.retell_agents import RetellAgentsError, duplicate_agent
+
+        try:
+            cloned = duplicate_agent(source_agent, body.display_name.strip() or seq_type)
+        except RetellAgentsError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+        new_agent_id = cloned["agent_id"]
+
+    _copy_sequence_type_prompts(db, copy_from or seq_type, seq_type, new_agent_id or "")
+
     db.commit()
-    db.refresh(template)
     template = (
         db.query(AutonomousSequenceTemplate)
         .options(joinedload(AutonomousSequenceTemplate.steps))
@@ -11358,6 +11569,80 @@ def autonomous_sequence_update_template(
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template)
+
+
+@app.get(
+    "/api/autonomous/sequences/templates/{template_id}/delete-preview",
+    response_model=AutonomousTemplateDeletePreview,
+)
+def autonomous_sequence_delete_template_preview(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import preview_sequence_template_delete
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    plan = preview_sequence_template_delete(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    agent_name = None
+    agent_id = plan.get("retell_agent_id")
+    if agent_id:
+        try:
+            prompt = get_agent_prompt(str(agent_id))
+            agent_name = str(prompt.get("agent_name") or "").strip() or None
+        except RetellAgentsError:
+            agent_name = None
+    return AutonomousTemplateDeletePreview(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        display_name=str(plan["display_name"]),
+        run_count=int(plan["run_count"]),
+        retell_agent_id=str(agent_id) if agent_id else None,
+        retell_agent_name=agent_name,
+        retell_will_delete=bool(plan["retell_will_delete"]),
+        retell_skip_reason=plan.get("retell_skip_reason"),
+    )
+
+
+@app.delete(
+    "/api/autonomous/sequences/templates/{template_id}",
+    response_model=AutonomousTemplateDeleteResponse,
+)
+def autonomous_sequence_delete_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_sequence_template_db
+    from services.retell_agents import RetellAgentsError, delete_agent
+
+    plan = delete_sequence_template_db(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    db.commit()
+
+    warnings: list[str] = []
+    retell_deleted = False
+    agent_id = str(plan.get("retell_agent_id") or "").strip() or None
+    if plan.get("retell_will_delete") and agent_id:
+        try:
+            delete_agent(agent_id)
+            retell_deleted = True
+        except RetellAgentsError as e:
+            warnings.append(f"Database records were deleted, but Retell cleanup failed: {e.detail}")
+    elif plan.get("retell_skip_reason"):
+        warnings.append(str(plan["retell_skip_reason"]))
+
+    return AutonomousTemplateDeleteResponse(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        deleted_runs=int(plan.get("deleted_runs") or 0),
+        retell_deleted=retell_deleted,
+        retell_agent_id=agent_id,
+        warnings=warnings,
+    )
 
 
 @app.post(
