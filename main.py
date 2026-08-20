@@ -52,6 +52,7 @@ from tools.share_folder import ShareFolderError, get_share_folder_status, share_
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
+from tools.bne_gas_contracts import lookup_bne_gas_contract
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
@@ -1787,6 +1788,33 @@ def get_base2_sme_gas_airtable_annual_usage(
     )
     logging.info(_sme_line)
     print(_sme_line, flush=True)
+    return result
+
+
+@app.get("/api/base2/bne-gas-contract")
+def get_base2_bne_gas_contract(
+    mrin: str = Query(
+        ...,
+        min_length=6,
+        max_length=40,
+        description="Invoice MRIN; matched against signed C&I Gas sheet (checksum / last-digit tolerant)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Look up signed C&I Gas contract periods and rates for Base 2 B&E Gas."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    try:
+        result = lookup_bne_gas_contract(mrin)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-gas-contract] user=%s mrin=%r match=%s contracts=%s periods=%s",
+        email,
+        mrin,
+        result.get("match_kind"),
+        len(result.get("contracts") or []),
+        sum(len(c.get("periods") or []) for c in (result.get("contracts") or [])),
+    )
     return result
 
 
