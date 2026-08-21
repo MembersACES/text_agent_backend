@@ -724,16 +724,10 @@ N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK = (
 
 
 async def _maybe_forward_utility_linked_to_n8n(payload: dict) -> None:
-    """POST payload to n8n after utility link (path: update here if your webhook URL differs)."""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK, json=payload)
-            response.raise_for_status()
-    except Exception:
-        logging.exception(
-            "utility-linked: forward to n8n failed (url=%s)",
-            N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK,
-        )
+    """POST to n8n utility_linked_post_process (Drive move + file-ID register). Waits for n8n HTTP response."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK, json=payload)
+        response.raise_for_status()
 
 
 @app.post("/api/webhooks/utility-linked")
@@ -759,10 +753,20 @@ async def utility_linked_webhook(
 
     _dispatch_utility_linked_placeholder(request_body.utility_type)
     payload = request_body.model_dump()
-    await _maybe_forward_utility_linked_to_n8n(payload)
+    try:
+        await _maybe_forward_utility_linked_to_n8n(payload)
+    except Exception as e:
+        logging.exception(
+            "utility-linked: forward to n8n failed (url=%s)",
+            N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Invoice filing (utility_linked_post_process) failed or timed out. Airtable may already be linked.",
+        ) from e
     return {
         "ok": True,
-        "message": "utility-linked placeholder accepted",
+        "message": "utility-linked post-process completed",
         "utility_type": request_body.utility_type,
     }
 
