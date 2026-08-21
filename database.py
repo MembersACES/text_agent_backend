@@ -364,5 +364,10 @@ def init_db():
                 with engine.begin() as conn:
                     conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN signature_html TEXT"))
                 logging.info("✅ Added autonomous_sequence_templates.signature_html column")
+            if "extra_context" not in cols:
+                logging.info("Adding missing autonomous_sequence_templates.extra_context column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN extra_context TEXT"))
+                logging.info("✅ Added autonomous_sequence_templates.extra_context column")
     except Exception as e:
         logging.warning("Could not ensure autonomous_sequence_templates.signature_html column: %s", e)
