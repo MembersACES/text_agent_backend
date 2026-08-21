@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from googleapiclient.errors import HttpError
 
 from tools.one_month_savings import get_drive_service
+from tools.video_naming import parse_drive_filename
+from tools.video_registry_loader import solution_type_for_slug
 
 logger = logging.getLogger(__name__)
 
@@ -20,12 +22,17 @@ def get_resources_videos_folder_id() -> str:
     return (os.getenv("RESOURCES_VIDEOS_FOLDER_ID") or DEFAULT_RESOURCES_VIDEOS_FOLDER_ID).strip()
 
 
-def list_resources_folder_videos() -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def list_resources_folder_videos(
+    *,
+    kind_filter: Optional[str] = None,
+    db_file_ids: Optional[Set[str]] = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     List direct children of the folder that have a video/* MIME type.
 
     Returns (videos, error_message). error_message is None on success.
-    Each video dict: id, name, mimeType, webViewLink, previewUrl, createdTime.
+    Each video dict: id, name, mimeType, webViewLink, previewUrl, createdTime,
+    plus parsed slug/kind/variant/crm_solution_type_id/in_db when applicable.
     """
     folder_id = get_resources_videos_folder_id()
     if not folder_id:
@@ -42,6 +49,7 @@ def list_resources_folder_videos() -> Tuple[List[Dict[str, Any]], Optional[str]]
     q = f"'{folder_id}' in parents and trashed = false and mimeType contains 'video/'"
     videos: List[Dict[str, Any]] = []
     page_token: Optional[str] = None
+    db_ids = db_file_ids or set()
 
     try:
         while True:
@@ -60,15 +68,28 @@ def list_resources_folder_videos() -> Tuple[List[Dict[str, Any]], Optional[str]]
                 fid = f.get("id")
                 if not fid:
                     continue
+                name = f.get("name") or "Video"
+                parsed = parse_drive_filename(name)
+                entry_kind = parsed[0] if parsed else None
+                if kind_filter and entry_kind and entry_kind != kind_filter:
+                    continue
+                slug = parsed[1] if parsed else None
+                variant = parsed[2] if parsed else None
+                crm_solution_type_id = solution_type_for_slug(slug) if slug else None
                 videos.append(
                     {
                         "id": fid,
-                        "name": f.get("name") or "Video",
+                        "name": name,
                         "mimeType": f.get("mimeType") or "",
                         "webViewLink": f.get("webViewLink")
                         or f"https://drive.google.com/file/d/{fid}/view",
                         "previewUrl": f"https://drive.google.com/file/d/{fid}/preview",
                         "createdTime": f.get("createdTime"),
+                        "slug": slug,
+                        "kind": entry_kind,
+                        "variant": variant,
+                        "crm_solution_type_id": crm_solution_type_id,
+                        "in_db": fid in db_ids,
                     }
                 )
             page_token = result.get("nextPageToken")

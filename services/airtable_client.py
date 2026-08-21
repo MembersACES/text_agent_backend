@@ -374,8 +374,19 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
         identifiers = []
         retailers = []
         extras = []
+        # PERF: fetch this utility type's linked records CONCURRENTLY (independent Airtable GETs) rather
+        # than one-at-a-time. Sequential fetching here was the main driver of the slow manifest /
+        # get-business-info call (the ~2-min "frozen" load). Order is preserved (map keeps input order);
+        # all processing below stays sequential and unchanged.
+        if len(record_ids) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=min(6, len(record_ids))) as _ex:
+                _fetched = list(_ex.map(lambda rid: _fetch_record(table_name, rid), record_ids))
+        else:
+            _fetched = [_fetch_record(table_name, record_ids[0])]
         for rec_idx, rec_id in enumerate(record_ids):
-            rec = _fetch_record(table_name, rec_id)
+            rec = _fetched[rec_idx]
             if not rec:
                 continue
             f = rec.get("fields") or {}
@@ -491,6 +502,105 @@ def build_business_info_from_loa(loa_record: dict) -> dict:
         "contact_information": contact_information,
         "representative_details": representative_details,
         "gdrive": gdrive,
+    }
+
+
+# App field name → Airtable LOA Business Details column
+_LOA_EDITABLE_FIELDS: dict[str, str] = {
+    "trading_name": "Trading As",
+    "postal_address": "Postal Address",
+    "site_address": "Site Address",
+    "telephone": "Contact Number",
+    "email": "Contact Email",
+    "contact_name": "Contact Name",
+    "position": "Contact Position",
+}
+
+
+def update_loa_business_details(
+    *,
+    record_id: Optional[str] = None,
+    business_name: Optional[str] = None,
+    trading_name: Optional[str] = None,
+    postal_address: Optional[str] = None,
+    site_address: Optional[str] = None,
+    telephone: Optional[str] = None,
+    email: Optional[str] = None,
+    contact_name: Optional[str] = None,
+    position: Optional[str] = None,
+) -> dict:
+    """
+    PATCH editable LOA Business Details fields in Airtable.
+    Prefer record_id when available; otherwise resolve by business_name.
+
+    Returns {ok, record_id, updated_fields, business_info} where business_info is the
+    remapped payload shape used by get-business-info (without file IDs).
+    """
+    if not AIRTABLE_API_KEY:
+        raise RuntimeError("AIRTABLE_API_KEY is not set")
+
+    rid = (record_id or "").strip()
+    if not rid:
+        bn = (business_name or "").strip()
+        if not bn:
+            raise ValueError("record_id or business_name is required")
+        loa = get_loa_record_by_business_name(bn)
+        if not loa:
+            raise ValueError(f"No LOA record matched business_name={bn!r}")
+        rid = (loa.get("id") or "").strip()
+        if not rid:
+            raise ValueError(f"LOA match for {bn!r} has no record id")
+
+    raw_updates = {
+        "trading_name": trading_name,
+        "postal_address": postal_address,
+        "site_address": site_address,
+        "telephone": telephone,
+        "email": email,
+        "contact_name": contact_name,
+        "position": position,
+    }
+    fields: dict[str, str] = {}
+    for app_key, airtable_key in _LOA_EDITABLE_FIELDS.items():
+        if app_key not in raw_updates:
+            continue
+        val = raw_updates[app_key]
+        if val is None:
+            continue
+        fields[airtable_key] = str(val).strip()
+
+    if not fields:
+        raise ValueError("No editable fields provided")
+
+    url = _url(LOA_TABLE_ID, rid)
+    logger.info("[loa-update] PATCH %s fields=%s", url, list(fields.keys()))
+    try:
+        r = requests.patch(
+            url,
+            headers=_headers(),
+            json={"fields": fields},
+            timeout=20,
+        )
+    except requests.RequestException as e:
+        raise RuntimeError(f"Airtable LOA update request failed: {e}") from e
+
+    if not r.ok:
+        logger.warning(
+            "[loa-update] Airtable PATCH failed: status=%s body=%s",
+            r.status_code,
+            (r.text or "")[:500],
+        )
+        raise RuntimeError(f"Airtable LOA update failed ({r.status_code}): {(r.text or '')[:300]}")
+
+    # PATCH responses may only include changed fields — re-fetch full record for UI merge.
+    refreshed = get_loa_record_by_id(rid) or r.json()
+    return {
+        "ok": True,
+        "record_id": (refreshed.get("id") if isinstance(refreshed, dict) else None) or rid,
+        "updated_fields": list(fields.keys()),
+        "business_info": build_business_info_from_loa(
+            refreshed if isinstance(refreshed, dict) else {"id": rid, "fields": fields}
+        ),
     }
 
 
@@ -926,7 +1036,7 @@ def get_utility_invoice_rows_by_identifier(
         if not rec:
             continue
         fields = rec.get("fields") or {}
-        out.append({"record_id": rec.get("id", ""), **fields})
+        out.append({"record_id": rec.get("id", ""), **fields, "airtable_created_time": rec.get("createdTime")})
     out = _sort_invoice_rows(out, sort_by, sort_dir)
     return {
         "rows": out,

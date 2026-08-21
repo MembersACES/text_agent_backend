@@ -119,8 +119,11 @@ UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
         ],
     },
     "Oil": {
-        "activity_type": "diesel",
-        "scope": 1,
+        # Cooking oil (Trojan Oils fry oil + collected used oil) — NOT combustion fuel.
+        # Reclassified out of Scope 1: -> Scope 3 Cat 5 (waste generated in operations).
+        # Interim; confirm factor with Trojan Oils. See team_debrief.md.
+        "activity_type": "cooking_oil",
+        "scope": 3,
         "unit": "L",
         "quantity_fields": [
             "Litres",
@@ -257,6 +260,48 @@ def _resolve_quantity(row: dict, cfg: dict) -> Optional[float]:
     return None
 
 
+_OIL_COLLECTION_TOKENS = (
+    "used cooking oil", "used oil", "uco", "waste oil",
+    "collect", "collection", "collected", "pickup", "pick up", "pick-up",
+    "recover", "recovery", "recycle", "recycled", "recycling",
+)
+# Description-like fields most likely to name the product/service on an oil invoice.
+_OIL_DESC_FIELDS = (
+    "Description", "Product Description", "Charge Description",
+    "Line Item", "Line Items", "Product", "Products",
+    "Item", "Items", "Service", "Services", "Details", "Detail",
+    "Type", "Transaction Type", "Category", "Name",
+    "Notes", "Comment", "Comments",
+)
+
+
+def _classify_cooking_oil(row: dict) -> tuple[int, Optional[str], Optional[str]]:
+    """Split a cooking-oil invoice line into a Scope 3 category from its description text.
+
+      collection marker present -> Cat 5 (Waste generated in operations; used-oil recovery)
+      otherwise (default)       -> Cat 1 (Purchased goods & services; fresh-oil purchase)
+
+    Returns (scope3_category, matched_field, matched_token). Default is the purchase
+    case (majority + most-defensible). The match (or 'default-purchase') is stamped into
+    data_quality.flags so a mis-route is visible on the record, never silent. TUNE the
+    token / field lists once real Trojan Oils line-item wording is confirmed.
+    """
+    for fname in _OIL_DESC_FIELDS:
+        val = _first_field(row, [fname])
+        if isinstance(val, str):
+            low = val.lower()
+            for tok in _OIL_COLLECTION_TOKENS:
+                if tok in low:
+                    return 5, fname, tok
+    for k, v in (row or {}).items():
+        if isinstance(v, str):
+            low = v.lower()
+            for tok in _OIL_COLLECTION_TOKENS:
+                if tok in low:
+                    return 5, k, tok
+    return 1, None, None
+
+
 def _parse_iso_date(raw: Any) -> Optional[date]:
     if raw is None:
         return None
@@ -270,20 +315,75 @@ def _parse_iso_date(raw: Any) -> Optional[date]:
             return datetime.strptime(s[:10], fmt).date()
         except ValueError:
             continue
+    # human-readable dates on the oil invoices, e.g. "4 Apr 2025" / "23 July 2026"
+    for fmt in ("%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     return None
 
 
-def _row_period(row: dict, fallback_start: date, fallback_end: date) -> tuple[date, date]:
-    start_raw = _first_field(row, ["Period Start", "Billing Period Start", "Invoice Review Period Start"])
-    end_raw = _first_field(row, ["Period End", "Billing Period End", "Invoice Review Period End"])
-    start = _parse_iso_date(start_raw) or fallback_start
-    end = _parse_iso_date(end_raw) or fallback_end
-    if end < start:
-        start, end = end, start
-    return start, end
+def _parse_period_range(raw: Any) -> Optional[tuple[date, date]]:
+    """Parse a combined billing-period string into (start, end).
+
+    Handles the Airtable 'Invoice Review Period' shape, e.g.
+    '01/12/2025-31/12/2025' (Australian DD/MM/YYYY, '-' between the two dates),
+    as well as an ISO range such as '2025-12-01 to 2025-12-31'.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    tokens = re.findall(r"\d{1,2}/\d{1,2}/\d{4}|\d{4}-\d{2}-\d{2}", s)
+    if len(tokens) >= 2:
+        a = _parse_iso_date(tokens[0])
+        b = _parse_iso_date(tokens[1])
+        if a and b:
+            return (a, b) if a <= b else (b, a)
+    return None
+
+
+def _row_period(
+    row: dict, fallback_start: date, fallback_end: date
+) -> tuple[date, date, bool]:
+    """Return (start, end, period_known).
+
+    period_known is False only when no real billing period could be read and we
+    fell back to the FY window; callers must NOT reporting-period-filter those.
+    """
+    # 1) explicit separate start/end fields
+    start = _parse_iso_date(
+        _first_field(row, ["Period Start", "Billing Period Start", "Invoice Review Period Start"])
+    )
+    end = _parse_iso_date(
+        _first_field(row, ["Period End", "Billing Period End", "Invoice Review Period End"])
+    )
+    if start and end:
+        if end < start:
+            start, end = end, start
+        return start, end, True
+    # 2) combined 'Invoice Review Period' style field (the real Airtable shape)
+    rng = _parse_period_range(
+        _first_field(row, ["Invoice Review Period", "Review Period", "Billing Period"])
+    )
+    if rng:
+        return rng[0], rng[1], True
+    # 3) single invoice date -> treat as a same-day period.
+    #    Try each candidate field and use the FIRST that actually PARSES. Oil invoices
+    #    carry a human "Invoice Date" ("4 Apr 2025") plus a clean "Invoice Date Formatted"
+    #    ("04/04/2025"); some rows have "#ERROR!" in one of them, so we cannot just take
+    #    the first non-empty field.
+    for _dfld in ("Invoice Date Formatted", "Invoice Date", "invoice_date"):
+        single = _parse_iso_date(_first_field(row, [_dfld]))
+        if single:
+            return single, single, True
+    # 4) period unknown -> FY-window fallback (do NOT filter these out)
+    return fallback_start, fallback_end, False
 
 
 def _evidence_uri(row: dict) -> Optional[str]:
@@ -314,10 +414,34 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
     if quantity is None or quantity <= 0:
         return EtlRowResult(source_row_id, "", {}, True, "missing or zero quantity")
 
-    period_start, period_end = _row_period(row, ctx.period_start, ctx.period_end)
+    period_start, period_end, period_known = _row_period(row, ctx.period_start, ctx.period_end)
+    # Reporting-period filter: an invoice belongs to the FY its billing period ENDS in.
+    # Only filter rows whose period we actually parsed — never drop undated rows.
+    if period_known and not (ctx.period_start <= period_end <= ctx.period_end):
+        return EtlRowResult(
+            source_row_id,
+            "",
+            {},
+            True,
+            f"outside reporting window: invoice {period_start.isoformat()}..{period_end.isoformat()} "
+            f"not in {ctx.period_start.isoformat()}..{ctx.period_end.isoformat()}",
+        )
     activity_type = cfg["activity_type"]
     record_id = _make_record_id(ctx.entity_id, activity_type, source_row_id)
     evidence_uri = _evidence_uri(row)
+
+    # Scope 3 category routing. waste -> Cat 5; cooking oil -> SPLIT (purchase Cat 1 /
+    # collection Cat 5 via _classify_cooking_oil); everything else -> None.
+    _etl_flags = ["etl_from_airtable", f"utility:{ctx.utility_type}"]
+    if activity_type == "waste_generated_operations":
+        scope3_cat: Optional[int] = 5
+    elif activity_type == "cooking_oil":
+        scope3_cat, _oil_field, _oil_token = _classify_cooking_oil(row)
+        _etl_flags.append(
+            f"oil_class:cat{scope3_cat}:{_oil_token or 'default-purchase'}:field={_oil_field or '-'}"
+        )
+    else:
+        scope3_cat = None
 
     body: dict[str, Any] = {
         "schema_version": "1.0",
@@ -331,7 +455,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         },
         "activity_type": activity_type,
         "scope": cfg["scope"],
-        "scope_3_category": 5 if activity_type == "waste_generated_operations" else None,
+        "scope_3_category": scope3_cat,
         "quantity": quantity,
         "unit": cfg["unit"],
         "evidence_refs": [],
@@ -346,7 +470,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
             "estimation_method": "calculated_invoice",
             "uncertainty_pct": 8,
             "completeness_pct": 85,
-            "flags": ["etl_from_airtable", f"utility:{ctx.utility_type}"],
+            "flags": _etl_flags,
             "quantity_source": "airtable_invoice_etl",
         },
         "notes": f"ETL from Airtable invoice row {source_row_id}",
@@ -365,6 +489,120 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
     return EtlRowResult(source_row_id, record_id, body, False)
 
 
+# ---------------------------------------------------------------------------
+# Cooking-oil per-line split (Trojan invoices carry a FRESH purchase line, a
+# WASTE collection line and a delivery-fee line on the SAME invoice). We emit
+# up to two records per invoice: fresh -> Cat 1 (purchased goods), waste ->
+# Cat 5 (waste). Delivery fee is dropped (it is a $ fee count, not litres).
+# ---------------------------------------------------------------------------
+_OIL_DESC_QTY_PAIRS = [
+    ("Product / Description 1", "Quantity 1"),
+    ("Product / Description 2", "Quantity 2"),
+    ("Product / Description 3", "Quantity 3"),
+    ("Product / Description 4", "Quantity 4"),
+]
+_OIL_FRESH_TOKENS = ("fry oil", "ultra", "cooking oil", "canola", "vegetable", "veg oil", "sunflower")
+_OIL_WASTE_TOKENS = ("waste", "used", "uco", "recover", "recycle", "collect")
+_OIL_SKIP_TOKENS = ("delfee", "delivery", "fee")
+
+
+def _classify_oil_line(desc: str) -> str:
+    """Return 'fresh' | 'waste' | 'skip' for one oil invoice line description.
+    Waste is checked FIRST so 'used cooking oil' routes to waste, not fresh."""
+    low = (desc or "").lower()
+    if not low.strip():
+        return "skip"
+    for t in _OIL_WASTE_TOKENS:
+        if t in low:
+            return "waste"
+    for t in _OIL_FRESH_TOKENS:
+        if t in low:
+            return "fresh"
+    return "skip"
+
+
+def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
+                scope3_cat: int, quantity: float, kind: str, matched: list,
+                evidence_uri) -> EtlRowResult:
+    suffix = "p" if kind == "purchase" else "w"
+    record_id = _make_record_id(ctx.entity_id, "cooking_oil", f"{source_row_id}:{suffix}")
+    flags = ["etl_from_airtable", f"utility:{ctx.utility_type}",
+             f"oil_line:{kind}:cat{scope3_cat}:qty_from={'|'.join(matched) or '-'}"]
+    body: dict[str, Any] = {
+        "schema_version": "1.0",
+        "record_id": record_id,
+        "entity_id": ctx.entity_id,
+        "site_id": ctx.site_id or None,
+        "client_id": ctx.loa_client_id,
+        "reporting_period": {"start": period_start.isoformat(), "end": period_end.isoformat()},
+        "activity_type": "cooking_oil",
+        "scope": 3,
+        "scope_3_category": scope3_cat,
+        "quantity": quantity,
+        "unit": "L",
+        "evidence_refs": [],
+        "ingest_source": {"system": "aces_b4", "adapter_version": ADAPTER_VERSION,
+                          "n8n_webhook_id": None, "ocr_run_id": None},
+        "ingest_timestamp": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "data_quality": {"estimation_method": "calculated_invoice", "uncertainty_pct": 8,
+                         "completeness_pct": 85, "flags": flags, "quantity_source": "airtable_invoice_etl"},
+        "notes": f"ETL from Airtable oil invoice row {source_row_id} ({kind})",
+    }
+    if evidence_uri:
+        body["evidence_refs"].append({
+            "evidence_id": f"ev_{source_row_id[-8:]}",
+            "evidence_hash": "sha256:" + ("0" * 64),
+            "evidence_kind": "utility_bill",
+            "evidence_uri": evidence_uri,
+        })
+    return EtlRowResult(source_row_id, record_id, body, False)
+
+
+def oil_invoice_to_records(row: dict, ctx: EtlContext) -> list[EtlRowResult]:
+    """Split ONE Trojan oil invoice into up to two activity records by reading the
+    paired Product/Description N + Quantity N columns: fresh fry oil -> Cat 1,
+    WASTE (used oil collected) -> Cat 5, delivery fee dropped."""
+    source_row_id = str(row.get("record_id") or "").strip()
+    if not source_row_id:
+        return [EtlRowResult("", "", {}, True, "missing airtable record_id")]
+
+    period_start, period_end, period_known = _row_period(row, ctx.period_start, ctx.period_end)
+    if period_known and not (ctx.period_start <= period_end <= ctx.period_end):
+        return [EtlRowResult(source_row_id, "", {}, True,
+                f"outside reporting window: invoice {period_start.isoformat()}..{period_end.isoformat()} "
+                f"not in {ctx.period_start.isoformat()}..{ctx.period_end.isoformat()}")]
+
+    fresh_l = 0.0
+    waste_l = 0.0
+    fresh_fields: list = []
+    waste_fields: list = []
+    for dc, qc in _OIL_DESC_QTY_PAIRS:
+        desc = _first_field(row, [dc])
+        qty = _parse_number(_first_field(row, [qc]))
+        if qty is None or qty <= 0:
+            continue
+        kind = _classify_oil_line(str(desc) if desc is not None else "")
+        if kind == "fresh":
+            fresh_l += qty
+            fresh_fields.append(qc)
+        elif kind == "waste":
+            waste_l += qty
+            waste_fields.append(qc)
+        # 'skip' -> delivery fee / unrecognised line, excluded
+
+    evidence_uri = _evidence_uri(row)
+    out: list[EtlRowResult] = []
+    if fresh_l > 0:
+        out.append(_oil_record(ctx, source_row_id, period_start, period_end, 1,
+                               fresh_l, "purchase", fresh_fields, evidence_uri))
+    if waste_l > 0:
+        out.append(_oil_record(ctx, source_row_id, period_start, period_end, 5,
+                               waste_l, "collection", waste_fields, evidence_uri))
+    if not out:
+        out.append(EtlRowResult(source_row_id, "", {}, True, "no fresh or waste oil litres on invoice"))
+    return out
+
+
 def transform_invoice_rows(
     rows: list[dict],
     ctx: EtlContext,
@@ -375,10 +613,17 @@ def transform_invoice_rows(
         if not isinstance(row, dict):
             skipped += 1
             continue
-        res = invoice_row_to_activity_record(row, ctx)
-        results.append(res)
-        if res.skipped:
-            skipped += 1
+        _cfg = UTILITY_ACTIVITY_MAP.get(ctx.utility_type)
+        if _cfg and _cfg.get("activity_type") == "cooking_oil":
+            for res in oil_invoice_to_records(row, ctx):
+                results.append(res)
+                if res.skipped:
+                    skipped += 1
+        else:
+            res = invoice_row_to_activity_record(row, ctx)
+            results.append(res)
+            if res.skipped:
+                skipped += 1
     diagnostics = {
         "input_rows": len(rows),
         "produced": sum(1 for r in results if not r.skipped),

@@ -115,15 +115,22 @@ DEFAULT_CONTENT: Dict[str, Dict[str, Any]] = {}
 for st in ALL_SOLUTION_TYPE_IDS:
     DEFAULT_CONTENT[st] = _default_content(st)
 
-# Defaults mirror frontend src/lib/testimonial-solution-content.ts
+# Defaults must stay in sync with frontend src/lib/testimonial-solution-content.ts
 DEFAULT_CONTENT["ci_electricity"].update({
     "key_outcome_metrics": "Energy Cost Reduction, Contract Optimisation",
-    "key_challenge_of_solution": "High electricity costs and suboptimal retail contract terms for C&I sites.",
-    "key_approach_of_solution": (
-        "Review of contract structure, usage data, and market pricing to identify savings opportunities "
-        "and improve commercial terms."
+    "key_challenge_of_solution": (
+        "The member was paying more than necessary for electricity, with contract terms that were "
+        "hard to compare and invoices that did not clearly match what had been agreed."
     ),
-    "key_outcome_of_solution": "Reduced energy costs with improved contract clarity and ongoing visibility.",
+    "key_approach_of_solution": (
+        "The ACES team reviewed contract structure, usage data and market pricing to identify "
+        "savings opportunities and improve commercial terms."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team handled retailer negotiation on the member's behalf, reconciling proposed "
+        "rates to the member's invoices before anything went to the board. The member was not "
+        "asked to run the numbers or sit in the retailer meetings."
+    ),
     "key_outcome_dotpoints_1": "Lower energy rates and improved contract terms.",
     "key_outcome_dotpoints_2": "Improved billing transparency and structure.",
     "key_outcome_dotpoints_3": "Demand and usage visibility.",
@@ -136,9 +143,19 @@ DEFAULT_CONTENT["ci_electricity"].update({
 
 DEFAULT_CONTENT["sme_electricity"].update({
     "key_outcome_metrics": "Cost Savings, Simpler Energy Management",
-    "key_challenge_of_solution": "SME businesses often lack visibility into energy pricing and contract competitiveness.",
-    "key_approach_of_solution": "Benchmarking current rates against market offers and simplifying contract structures.",
-    "key_outcome_of_solution": "Lower electricity costs and simplified billing structures.",
+    "key_challenge_of_solution": (
+        "The member had little visibility of whether its electricity rates were competitive, "
+        "and found the contract and bills time-consuming to interpret."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team benchmarked the member's electricity rates against current market offers "
+        "and simplified contract structures."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team ran the electricity review in the background of a busy SME week, checking "
+        "proposed figures against the member's invoices as they went. The owner was not asked to "
+        "clear a diary for retailer calls or spreadsheet work."
+    ),
     "key_outcome_dotpoints_1": "Competitive market pricing secured.",
     "key_outcome_dotpoints_2": "Simplified contract terms.",
     "key_outcome_dotpoints_3": "Improved billing clarity.",
@@ -152,10 +169,17 @@ DEFAULT_CONTENT["sme_electricity"].update({
 DEFAULT_CONTENT["ci_gas"].update({
     "key_outcome_metrics": "Gas Cost Optimisation, Billing Accuracy",
     "key_challenge_of_solution": (
-        "Inconsistencies between contracted gas rates and invoiced charges, combined with limited market benchmarking."
+        "The member could not tell whether invoiced gas charges matched the contracted rates, "
+        "and had no independent view of whether the price was still competitive."
     ),
-    "key_approach_of_solution": "Forensic review of billing data and contracts alongside a market pricing review.",
-    "key_outcome_of_solution": "Improved billing accuracy and more competitive forward gas pricing.",
+    "key_approach_of_solution": (
+        "The ACES team forensically reviewed billing data and contracts alongside a market pricing review."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team conducted the gas retail negotiation so the member's operations team did "
+        "not have to. Each claimed saving was tied to an invoiced charge rather than a rate sitting "
+        "on the contract, and only then did the pack go to the board."
+    ),
     "key_outcome_dotpoints_1": "Identification of billing discrepancies.",
     "key_outcome_dotpoints_2": "Structured reconciliation process.",
     "key_outcome_dotpoints_3": "Improved cost transparency.",
@@ -168,9 +192,18 @@ DEFAULT_CONTENT["ci_gas"].update({
 
 DEFAULT_CONTENT["sme_gas"].update({
     "key_outcome_metrics": "Cost Reduction, Simpler Contracts",
-    "key_challenge_of_solution": "SME gas customers often operate on unoptimised contracts with limited pricing visibility.",
-    "key_approach_of_solution": "Market comparison and contract simplification.",
-    "key_outcome_of_solution": "Reduced gas costs and improved billing clarity.",
+    "key_challenge_of_solution": (
+        "The member was on a gas contract it had little time to review, with limited visibility "
+        "of whether pricing was fair or the bills were accurate."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team ran a market comparison and simplified the contract."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team sorted gas pricing around the member's existing workload rather than adding "
+        "another project to it. The new offer was matched to the member's invoices so the saving "
+        "was visible without a finance deep-dive."
+    ),
     "key_outcome_dotpoints_1": "Competitive pricing secured.",
     "key_outcome_dotpoints_2": "Simplified billing.",
     "key_outcome_dotpoints_3": "Improved transparency.",
@@ -184,10 +217,17 @@ DEFAULT_CONTENT["sme_gas"].update({
 DEFAULT_CONTENT["waste"].update({
     "key_outcome_metrics": "Waste Cost Reduction, Operational Efficiency",
     "key_challenge_of_solution": (
-        "Waste services are often misaligned with actual usage, leading to inefficiencies and unnecessary costs."
+        "The member was paying for waste services that no longer matched how the site actually "
+        "operated, with little time to check whether frequency and pricing were still right."
     ),
-    "key_approach_of_solution": "Review of waste volumes, service frequency, and pricing structures.",
-    "key_outcome_of_solution": "Optimised waste services and reduced operating costs.",
+    "key_approach_of_solution": (
+        "The ACES team reviewed waste volumes, service frequency and pricing structures."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team confirmed the current charges from the member's invoices, then changed "
+        "collection frequency and service levels with no interruption to site operations. Bins "
+        "kept moving while the contract caught up."
+    ),
     "key_outcome_dotpoints_1": "Right-sized service levels.",
     "key_outcome_dotpoints_2": "Reduced collection frequency where appropriate.",
     "key_outcome_dotpoints_3": "Improved pricing structures.",
@@ -201,17 +241,18 @@ DEFAULT_CONTENT["waste"].update({
 DEFAULT_CONTENT["resource_recovery"].update({
     "key_outcome_metrics": "Reduced oil consumption, revenue from used oil, kitchen efficiency",
     "key_challenge_of_solution": (
-        "Used cooking oil is often treated only as waste with disposal costs, while biodiesel pathways "
-        "can turn it into revenue. Sites may also overspend through high volumes of standard oil blends."
+        "Used cooking oil was treated only as a disposal cost, even though biodiesel pathways can "
+        "turn it into revenue, and the kitchen was buying more standard oil than it needed."
     ),
     "key_approach_of_solution": (
-        "Combine resource recovery with a tighter cooking-oil procurement and usage model: benchmarking "
-        "current vs optimised supply, aligning fry practices, and embedding monitoring so usage drops "
-        "without hurting throughput or plate quality."
+        "The ACES team combined resource recovery with a tighter cooking-oil procurement and usage "
+        "model: benchmarking current vs optimised supply, aligning fry practices, and embedding "
+        "monitoring so usage drops without hurting throughput or plate quality."
     ),
     "key_outcome_of_solution": (
-        "Lower litres purchased, measurable kitchen efficiency gains, and a clearer link between fry "
-        "performance, labour in the kitchen, and total oil spend."
+        "The ACES team coordinated collections and supply around kitchen service, not against it. "
+        "Pick-ups and replacement stock were timed to service periods, and usage was read from the "
+        "member's invoices rather than supplier estimates."
     ),
     "key_outcome_dotpoints_1": "Revenue from used oil instead of disposal-only treatment.",
     "key_outcome_dotpoints_2": "Lower litres used for comparable output.",
@@ -230,9 +271,18 @@ DEFAULT_CONTENT["resource_recovery"].update({
 
 DEFAULT_CONTENT["dma"].update({
     "key_outcome_metrics": "DMA metering cost reduction",
-    "key_challenge_of_solution": "Direct Metering Agreement charges were uncompetitive versus expected metering rates.",
-    "key_approach_of_solution": "Forensic review of metering line items and the agreement against benchmarks.",
-    "key_outcome_of_solution": "Lower metering costs quantified with a clear annual and multi-year saving.",
+    "key_challenge_of_solution": (
+        "The member's metering charges looked high against what similar sites would expect, but the "
+        "agreement and invoice line items were difficult to unpick without specialist time."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team forensically reviewed metering line items and the agreement against benchmarks."
+    ),
+    "key_outcome_of_solution": (
+        "The ACES team supplied the specialist metering review the member could not justify hiring "
+        "in-house, working from the invoices and the agreement rather than a generic benchmark pack. "
+        "Finance received a position that could be signed off without recruiting a metering analyst."
+    ),
     "key_outcome_dotpoints_1": "Annual metering spend and net saving identified.",
     "key_outcome_dotpoints_2": "Agreement and invoice-led review—not retail-only benchmarking.",
     "key_outcome_dotpoints_3": "Savings articulated for budgeting and approvals.",
@@ -248,16 +298,17 @@ DEFAULT_CONTENT["automated_cleaning_robot"] = {
     "solution_type_label": "Automated Cleaning Robot",
     "key_outcome_metrics": "Labour reduction, repeatable operating savings, safer consistent cleaning",
     "key_challenge_of_solution": (
-        "Routine floor cleaning absorbs repeated staff time and pulls people away from higher-value "
-        "guest- or revenue-facing tasks."
+        "Routine floor cleaning was absorbing staff time the member would rather spend on guests "
+        "and revenue-facing work, with no straightforward way to test a better method."
     ),
     "key_approach_of_solution": (
-        "Pilot an autonomous vacuum/mop robot on representative shifts, benchmark against incumbent "
-        "methods (time, quality, rework), then standardise rostering once performance is proven."
+        "The ACES team piloted an autonomous vacuum/mop robot on representative shifts, benchmarked "
+        "against incumbent methods (time, quality, rework), then standardised rostering once "
+        "performance was proven."
     ),
     "key_outcome_of_solution": (
-        "Freed labour hours redirected to core operations (e.g. service and member-facing work), "
-        "alongside more consistent cleaning coverage and lower exposure to slips from wet floors."
+        "The ACES team ran the trial without pulling staff off shift. Faster floor dry-down reduced "
+        "slip exposure versus manual mop cycles."
     ),
     "key_outcome_dotpoints_1": "Measurable reduction in baseline cleaning labour.",
     "key_outcome_dotpoints_2": "Annual labour cost avoidance at agreed rates once hours are contractual.",
@@ -277,16 +328,18 @@ DEFAULT_CONTENT["solar_panel_cleaning"] = {
     "solution_type_label": "Solar Panel Cleaning",
     "key_outcome_metrics": "Higher yield after clean plus inspection, reduced grid reliance, GHG avoidance",
     "key_challenge_of_solution": (
-        "Soiling and minor defects erode PV yield over time; many sites underservice cleaning while "
-        "assuming periodic checks alone are sufficient."
+        "The member's solar yield had drifted as soiling and minor defects built up, and it was "
+        "unclear whether periodic checks alone were enough or whether faults were going unnoticed."
     ),
     "key_approach_of_solution": (
-        "Perform a systematic clean paired with at least a level 1 electrical inspection—then compare "
-        "equivalent production intervals (aligned seasonality and metering) rather than anecdotal spikes."
+        "The ACES team performed a systematic clean paired with at least a level 1 electrical "
+        "inspection, then compared equivalent production intervals (aligned seasonality and "
+        "metering) rather than anecdotal spikes."
     ),
     "key_outcome_of_solution": (
-        "Restored yield on measured comparison intervals, translating to incremental kWh and an "
-        "indicative emissions wedge where grid factors apply."
+        "The ACES team measured the result off the member's own metering, so it is not a supplier's "
+        "claim. Like-for-like intervals were used so the comparison could not be dismissed as a "
+        "sunny-day spike."
     ),
     "key_outcome_dotpoints_1": "Measured uplift in daily energy harvest post-service.",
     "key_outcome_dotpoints_2": "Indicative dollar benefit from incremental kWh at agreed tariffs.",
