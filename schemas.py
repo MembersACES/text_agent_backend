@@ -239,6 +239,7 @@ class ClientLinkFromLoaRequest(BaseModel):
     primary_contact_email: Optional[str] = None
     gdrive_folder_url: Optional[str] = None
     client_id: Optional[int] = None
+    reassign: bool = False
 
 
 class ClientResponse(BaseModel):
@@ -1017,6 +1018,7 @@ class AutonomousSequenceTemplateBase(BaseModel):
     is_active: bool = True
     is_restartable: bool = True
     signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
@@ -1032,6 +1034,7 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     is_active: Optional[bool] = None
     is_restartable: Optional[bool] = None
     signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1075,6 +1078,7 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     is_active: bool = True
     is_restartable: bool = True
     signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
@@ -1203,6 +1207,14 @@ class RetellAgentListItem(BaseModel):
     channel: str = "voice"
 
 
+class RetellVoiceListItem(BaseModel):
+    voice_id: str
+    voice_name: str
+    gender: Optional[str] = None
+    accent: Optional[str] = None
+    provider: Optional[str] = None
+
+
 class RetellAgentPromptResponse(BaseModel):
     agent_id: str
     agent_name: str
@@ -1214,18 +1226,40 @@ class RetellAgentPromptResponse(BaseModel):
     prompt_editable: bool = False
     general_prompt: Optional[str] = None
     begin_message: Optional[str] = None
+    voice_id: Optional[str] = None
+    language: Optional[str] = None
+    voice_speed: Optional[float] = None
+    voice_temperature: Optional[float] = None
+    responsiveness: Optional[float] = None
+    interruption_sensitivity: Optional[float] = None
+    enable_backchannel: Optional[bool] = None
+    max_call_duration_ms: Optional[int] = None
+    end_call_after_silence_ms: Optional[int] = None
+    voicemail_action: Optional[str] = None
+    llm_model: Optional[str] = None
 
 
 class RetellAgentPromptUpdate(BaseModel):
     general_prompt: Optional[str] = None
     begin_message: Optional[str] = None
+    voice_id: Optional[str] = None
+    language: Optional[str] = None
+    voice_speed: Optional[float] = None
+    voice_temperature: Optional[float] = None
+    responsiveness: Optional[float] = None
+    interruption_sensitivity: Optional[float] = None
+    enable_backchannel: Optional[bool] = None
+    max_call_duration_ms: Optional[int] = None
+    end_call_after_silence_ms: Optional[int] = None
+    voicemail_action: Optional[str] = None
+    llm_model: Optional[str] = None
 
-    @field_validator("general_prompt", "begin_message")
+    @field_validator("general_prompt", "begin_message", "voice_id", "language", "voicemail_action", "llm_model")
     @classmethod
     def _strip_optional(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return None
-        return v
+        return v.strip() if isinstance(v, str) else v
 
 
 class RetellAgentDuplicateResponse(BaseModel):

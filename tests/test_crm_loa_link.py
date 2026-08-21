@@ -106,6 +106,52 @@ def test_create_from_loa_new_member():
     assert result.primary_contact_email == "ops@example.com"
 
 
+def test_link_existing_without_reassign_rejects_other_holder():
+    db = _make_test_session()
+    wrong = _make_client(db, business_name="Wrong Member", external_business_id="recSite")
+    correct = _make_client(db, business_name="Correct Member", external_business_id=None)
+
+    from fastapi import HTTPException
+
+    try:
+        link_or_create_client_from_loa(
+            db,
+            record_id="recSite",
+            business_name="Correct Member",
+            client_id=correct.id,
+        )
+        raise AssertionError("expected HTTPException")
+    except HTTPException as exc:
+        assert exc.status_code == 400
+        assert str(wrong.id) in str(exc.detail)
+
+    db.refresh(wrong)
+    db.refresh(correct)
+    assert wrong.external_business_id == "recSite"
+    assert correct.external_business_id is None
+
+
+def test_link_existing_with_reassign_moves_record_id():
+    db = _make_test_session()
+    wrong = _make_client(db, business_name="Wrong Member", external_business_id="recSite")
+    correct = _make_client(db, business_name="Correct Member", external_business_id=None)
+
+    result = link_or_create_client_from_loa(
+        db,
+        record_id="recSite",
+        business_name="Correct Member",
+        client_id=correct.id,
+        reassign=True,
+    )
+    assert result.id == correct.id
+    assert result.external_business_id == "recSite"
+
+    db.refresh(wrong)
+    db.refresh(correct)
+    assert wrong.external_business_id is None
+    assert correct.external_business_id == "recSite"
+
+
 def test_get_business_info_does_not_silent_upsert():
     from main import get_business_info, BusinessInfoRequest
 

@@ -151,6 +151,7 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
 
     general_prompt: Optional[str] = None
     begin_message: Optional[str] = None
+    llm_model: Optional[str] = None
     llm_is_published: Optional[bool] = None
 
     if engine_type == RETELL_LLM_TYPE and llm_id:
@@ -160,8 +161,17 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
             bm = llm.get("begin_message")
             general_prompt = gp if isinstance(gp, str) else None
             begin_message = bm if isinstance(bm, str) else None
+            model = llm.get("model")
+            llm_model = str(model).strip() if model else None
             if "is_published" in llm:
                 llm_is_published = bool(llm.get("is_published"))
+
+    voicemail = agent.get("voicemail_option")
+    voicemail_action: Optional[str] = None
+    if isinstance(voicemail, dict):
+        voicemail_action = str(voicemail.get("action") or "").strip() or None
+    elif isinstance(voicemail, str) and voicemail.strip():
+        voicemail_action = voicemail.strip()
 
     return {
         "agent_id": str(agent.get("agent_id") or agent_id),
@@ -174,32 +184,108 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
         "prompt_editable": engine_type == RETELL_LLM_TYPE and bool(llm_id),
         "general_prompt": general_prompt,
         "begin_message": begin_message,
+        "voice_id": str(agent.get("voice_id") or "").strip() or None,
+        "language": str(agent.get("language") or "").strip() or None,
+        "voice_speed": agent.get("voice_speed"),
+        "voice_temperature": agent.get("voice_temperature"),
+        "responsiveness": agent.get("responsiveness"),
+        "interruption_sensitivity": agent.get("interruption_sensitivity"),
+        "enable_backchannel": agent.get("enable_backchannel"),
+        "max_call_duration_ms": agent.get("max_call_duration_ms"),
+        "end_call_after_silence_ms": agent.get("end_call_after_silence_ms"),
+        "voicemail_action": voicemail_action,
+        "llm_model": llm_model,
     }
+
+
+def list_voices() -> list[dict[str, Any]]:
+    body = _request("GET", "/list-voices")
+    rows = body if isinstance(body, list) else (body.get("voices") if isinstance(body, dict) else [])
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        voice_id = str(row.get("voice_id") or "").strip()
+        if not voice_id:
+            continue
+        out.append(
+            {
+                "voice_id": voice_id,
+                "voice_name": str(row.get("voice_name") or row.get("voice_id") or voice_id).strip(),
+                "gender": str(row.get("gender") or "").strip() or None,
+                "accent": str(row.get("accent") or "").strip() or None,
+                "provider": str(row.get("provider") or "").strip() or None,
+            }
+        )
+    return out
 
 
 def update_agent_prompt(
     agent_id: str,
     general_prompt: Optional[str] = None,
     begin_message: Optional[str] = None,
+    voice_id: Optional[str] = None,
+    language: Optional[str] = None,
+    voice_speed: Optional[float] = None,
+    voice_temperature: Optional[float] = None,
+    responsiveness: Optional[float] = None,
+    interruption_sensitivity: Optional[float] = None,
+    enable_backchannel: Optional[bool] = None,
+    max_call_duration_ms: Optional[int] = None,
+    end_call_after_silence_ms: Optional[int] = None,
+    voicemail_action: Optional[str] = None,
+    llm_model: Optional[str] = None,
 ) -> dict[str, Any]:
-    if general_prompt is None and begin_message is None:
-        raise RetellAgentsError(400, "Provide general_prompt and/or begin_message.")
-
     current = get_agent_prompt(agent_id)
-    if not current.get("prompt_editable"):
-        engine_type = current.get("response_engine_type") or "unknown"
-        raise RetellAgentsError(
-            400,
-            f"This Retell agent uses response engine {engine_type!r}, which is not a "
-            "Retell LLM. Prompt text cannot be edited here.",
-        )
     llm_id = str(current.get("llm_id") or "").strip()
-    patch: dict[str, Any] = {}
+    llm_patch: dict[str, Any] = {}
     if general_prompt is not None:
-        patch["general_prompt"] = general_prompt
+        llm_patch["general_prompt"] = general_prompt
     if begin_message is not None:
-        patch["begin_message"] = begin_message
-    _request("PATCH", f"/update-retell-llm/{llm_id}", json_body=patch)
+        llm_patch["begin_message"] = begin_message
+    if llm_model is not None:
+        llm_patch["model"] = llm_model
+    if llm_patch:
+        if not current.get("prompt_editable") or not llm_id:
+            engine_type = current.get("response_engine_type") or "unknown"
+            raise RetellAgentsError(
+                400,
+                f"This Retell agent uses response engine {engine_type!r}, which is not a "
+                "Retell LLM. Prompt text cannot be edited here.",
+            )
+        _request("PATCH", f"/update-retell-llm/{llm_id}", json_body=llm_patch)
+
+    agent_patch: dict[str, Any] = {}
+    if voice_id is not None:
+        agent_patch["voice_id"] = voice_id
+    if language is not None:
+        agent_patch["language"] = language
+    if voice_speed is not None:
+        agent_patch["voice_speed"] = voice_speed
+    if voice_temperature is not None:
+        agent_patch["voice_temperature"] = voice_temperature
+    if responsiveness is not None:
+        agent_patch["responsiveness"] = responsiveness
+    if interruption_sensitivity is not None:
+        agent_patch["interruption_sensitivity"] = interruption_sensitivity
+    if enable_backchannel is not None:
+        agent_patch["enable_backchannel"] = enable_backchannel
+    if max_call_duration_ms is not None:
+        agent_patch["max_call_duration_ms"] = max_call_duration_ms
+    if end_call_after_silence_ms is not None:
+        agent_patch["end_call_after_silence_ms"] = end_call_after_silence_ms
+    if voicemail_action is not None:
+        action = voicemail_action.strip().lower()
+        if action:
+            agent_patch["voicemail_option"] = {"action": action}
+
+    if agent_patch:
+        _request("PATCH", f"/update-agent/{agent_id}", json_body=agent_patch)
+
+    if not llm_patch and not agent_patch:
+        raise RetellAgentsError(400, "No Retell fields to update.")
     return get_agent_prompt(agent_id)
 
 

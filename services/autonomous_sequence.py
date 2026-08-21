@@ -313,6 +313,18 @@ def _resolve_signature_html(
     return default_signature_html_for_type(sequence_type)
 
 
+def _resolve_extra_context(
+    template: Optional[AutonomousSequenceTemplate],
+    context: Optional[dict[str, Any]],
+) -> str:
+    existing = str((context or {}).get("extra_context") or "").strip()
+    if existing:
+        return existing
+    if template is None:
+        return ""
+    return str(getattr(template, "extra_context", None) or "").strip()
+
+
 SOLAR_ENGAGEMENT_SYSTEM_PROMPT = """You write follow-up emails for ACES Solar Panel Cleaning engagement forms.
 
 The client already received the initial email with the engagement form and testimonial PDFs attached. These follow-ups must REPLY on that Gmail thread (do not start a new email). Do not include Google Drive links — the client cannot access them; attachments are on the original message.
@@ -997,6 +1009,9 @@ def _prepare_email_context(
         out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
     out["signature_html"] = _resolve_signature_html(run.sequence_type, template, out)
     out["use_html_signature"] = True
+    extra = _resolve_extra_context(template, out)
+    if extra:
+        out["extra_context"] = extra
     return out
 
 
@@ -1244,6 +1259,9 @@ def start_gas_base2_sequence(
         sequence_type, template, context_payload
     )
     context_payload["use_html_signature"] = True
+    extra = _resolve_extra_context(template, context_payload)
+    if extra:
+        context_payload["extra_context"] = extra
 
     contact_fields = _context_contact_fields(context_payload)
     if contact_fields["contact_phone"]:
@@ -1937,6 +1955,9 @@ def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]
     ctx["offer_id"] = run.offer_id
     ctx["run_id"] = run.id
     template = get_sequence_template_by_type(db, run.sequence_type)
+    extra = _resolve_extra_context(template, ctx)
+    if extra:
+        ctx["extra_context"] = extra
     if template:
         by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
         t_step = by_idx.get(int(step.step_index))

@@ -79,6 +79,7 @@ def link_or_create_client_from_loa(
     gdrive_folder_url: Optional[str] = None,
     client_id: Optional[int] = None,
     owner_email: Optional[str] = None,
+    reassign: bool = False,
 ):
     """Explicit user-confirmed link to existing member or create new — ID-first."""
     rid = (record_id or "").strip()
@@ -101,10 +102,13 @@ def link_or_create_client_from_loa(
             raise HTTPException(status_code=404, detail="Client not found")
         other_holders = [c for c in holder if c.id != client_id]
         if other_holders:
-            raise HTTPException(
-                status_code=400,
-                detail=f"LOA record already linked to member #{other_holders[0].id}",
-            )
+            if not reassign:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"LOA record already linked to member #{other_holders[0].id}",
+                )
+            for other in other_holders:
+                other.external_business_id = None
         client.external_business_id = rid
         if primary_contact_email:
             client.primary_contact_email = primary_contact_email

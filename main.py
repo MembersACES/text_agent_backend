@@ -246,6 +246,7 @@ from schemas import (
     RetellAgentListItem,
     RetellAgentPromptResponse,
     RetellAgentPromptUpdate,
+    RetellVoiceListItem,
     AutonomousTemplateSuggestionsResponse,
     AutonomousTemplateDeletePreview,
     AutonomousTemplateDeleteResponse,
@@ -9456,6 +9457,7 @@ def link_client_from_loa(
         gdrive_folder_url=body.gdrive_folder_url,
         client_id=body.client_id,
         owner_email=owner_email,
+        reassign=body.reassign,
     )
 
 
@@ -9626,17 +9628,18 @@ def update_client(
     if not db_client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    update_payload = client_update.model_dump(exclude_unset=True)
     if client_update.business_name is not None:
         db_client.business_name = client_update.business_name
-    if client_update.external_business_id is not None:
-        db_client.external_business_id = client_update.external_business_id
+    if "external_business_id" in update_payload:
+        raw_id = client_update.external_business_id
+        db_client.external_business_id = (str(raw_id).strip() if raw_id else "") or None
     if client_update.primary_contact_email is not None:
         db_client.primary_contact_email = client_update.primary_contact_email
     if client_update.gdrive_folder_url is not None:
         db_client.gdrive_folder_url = client_update.gdrive_folder_url
     if client_update.owner_email is not None:
         db_client.owner_email = client_update.owner_email
-    update_payload = client_update.model_dump(exclude_unset=True)
     if "referred_by_client_id" in update_payload:
         db_client.referred_by_client_id = client_update.referred_by_client_id
     if "referred_by_business_name" in update_payload:
@@ -11149,6 +11152,7 @@ def _autonomous_template_response(
             "is_restartable": bool(template.is_restartable),
             "signature_html": str(getattr(template, "signature_html", None) or "").strip()
             or default_signature_html_for_type(template.sequence_type),
+            "extra_context": str(getattr(template, "extra_context", None) or "").strip() or None,
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -11306,6 +11310,18 @@ def autonomous_sequence_patch_type_prompts(
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
 
 
+@app.get("/api/autonomous/retell/voices", response_model=List[RetellVoiceListItem])
+def autonomous_retell_list_voices(
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.retell_agents import RetellAgentsError, list_voices
+
+    try:
+        return list_voices()
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
 @app.get("/api/autonomous/retell/agents", response_model=List[RetellAgentListItem])
 def autonomous_retell_list_agents(
     user_data: dict = Depends(get_current_user_with_db),
@@ -11339,17 +11355,14 @@ def autonomous_retell_patch_agent(
     body: RetellAgentPromptUpdate,
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    """Save general_prompt / begin_message on the agent's Retell LLM."""
+    """Save prompt, voice, and call settings on the Retell agent / LLM."""
     from services.retell_agents import RetellAgentsError, update_agent_prompt
 
-    if body.general_prompt is None and body.begin_message is None:
-        raise HTTPException(status_code=400, detail="Provide general_prompt and/or begin_message.")
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No Retell fields to update.")
     try:
-        return update_agent_prompt(
-            agent_id,
-            general_prompt=body.general_prompt,
-            begin_message=body.begin_message,
-        )
+        return update_agent_prompt(agent_id, **fields)
     except RetellAgentsError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
@@ -11466,7 +11479,7 @@ def autonomous_sequence_create_template(
         if not source:
             raise HTTPException(status_code=404, detail=f"copy_from template not found: {copy_from}")
 
-    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Melbourne"
+    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Brisbane"
     description = (body.description or "").strip() or None
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
@@ -11480,6 +11493,9 @@ def autonomous_sequence_create_template(
         is_restartable=1 if body.is_restartable else (int(source.is_restartable) if source else 1),
         signature_html=(body.signature_html or "").strip()
         or ((source.signature_html or "").strip() if source else "")
+        or None,
+        extra_context=(body.extra_context or "").strip()
+        or ((getattr(source, "extra_context", None) or "").strip() if source else "")
         or None,
     )
     db.add(template)
@@ -11580,6 +11596,8 @@ def autonomous_sequence_update_template(
         template.is_restartable = 1 if body.is_restartable else 0
     if body.signature_html is not None:
         template.signature_html = body.signature_html.strip() or None
+    if body.extra_context is not None:
+        template.extra_context = body.extra_context.strip() or None
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template)
@@ -11730,6 +11748,28 @@ def autonomous_sequence_update_template_step(
     db.commit()
     db.refresh(step)
     return _autonomous_template_step_response(step)
+
+
+@app.delete("/api/autonomous/sequences/templates/{template_id}/steps/{step_id}")
+def autonomous_sequence_delete_template_step(
+    template_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    step = (
+        db.query(AutonomousSequenceTemplateStep)
+        .filter(
+            AutonomousSequenceTemplateStep.id == step_id,
+            AutonomousSequenceTemplateStep.template_id == template_id,
+        )
+        .first()
+    )
+    if not step:
+        raise HTTPException(status_code=404, detail="Template step not found")
+    db.delete(step)
+    db.commit()
+    return {"ok": True, "id": step_id}
 
 
 @app.get("/api/autonomous/sequences/runs")
