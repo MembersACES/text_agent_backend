@@ -47,6 +47,13 @@ EXTRA_SOLUTION_TYPES: Dict[str, str] = {
     "automated_cleaning_robot": "Automated Cleaning Robot",
     "dma": "Direct Metering Agreement",
     "solar_panel_cleaning": "Solar Panel Cleaning",
+    "client_endorsement": "Client Endorsement",
+    "ghg_roadmap": "GHG Roadmap",
+    "solar_review": "Solar Review",
+    "gas_discrepancy": "Gas Discrepancy Recovery",
+    "electricity_discrepancy": "Electricity Discrepancy",
+    "demand_reset": "Demand Reset",
+    "cds": "CDS (Container Deposit Scheme)",
 }
 
 ALL_SOLUTION_TYPE_IDS = SOLUTION_TYPE_IDS + list(EXTRA_SOLUTION_TYPES.keys())
@@ -355,6 +362,194 @@ DEFAULT_CONTENT["solar_panel_cleaning"] = {
     "esg_scope_for_solution": "SCOPE 3",
     "sdg_impact_for_solution": "SDG 7, 8, 9, 13",
 }
+
+DEFAULT_CONTENT["client_endorsement"].update({
+    "key_outcome_metrics": "Trusted advice, less admin, a single energy and sustainability partner",
+    "key_challenge_of_solution": (
+        "The member was dealing with retailers, contractors and invoices in pieces, with no one "
+        "owner who could explain what was worth doing and then actually do it."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team sat with the member as an ongoing adviser — reviewing bills and contracts, "
+        "prioritising work, and running the conversations with suppliers so staff were not the project managers."
+    ),
+    "key_outcome_of_solution": (
+        "The member had a named team they could call, a clear picture of what had been done, and "
+        "less time spent chasing quotes, contracts and follow-up."
+    ),
+    "key_outcome_dotpoints_1": "One accountable partner across energy, waste and related services.",
+    "key_outcome_dotpoints_2": "Retailer and contractor conversations handled on the member's behalf.",
+    "key_outcome_dotpoints_3": "Less internal time spent interpreting bills, offers and next steps.",
+    "key_outcome_dotpoints_4": "A documented trail of work suitable for board and committee reporting.",
+    "key_outcome_dotpoints_5": "A relationship that continues after the first saving is banked.",
+    "conclusion": (
+        "Client endorsement testimonials capture the service relationship itself: ACES as the member's "
+        "energy and sustainability team, not a one-off quote."
+    ),
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 8, 12, 17",
+})
+
+DEFAULT_CONTENT["ghg_roadmap"].update({
+    "key_outcome_metrics": "A realistic net-zero pathway, Scope visibility, board-ready GHG plan",
+    "key_challenge_of_solution": (
+        "The member needed a credible greenhouse-gas story for committees and stakeholders, but "
+        "inventory, baselines and next actions were scattered or incomplete."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team built a GHG roadmap from the member's own activity data, set out Scope 1–3 "
+        "priorities, and sequenced practical projects rather than a generic net-zero slogan."
+    ),
+    "key_outcome_of_solution": (
+        "The member received a plan they could defend: what the footprint is, which actions move it, "
+        "and what can be done this year versus later."
+    ),
+    "key_outcome_dotpoints_1": "Inventory structured to Scope 1, 2 and relevant Scope 3.",
+    "key_outcome_dotpoints_2": "A sequenced roadmap instead of an unstructured wish-list.",
+    "key_outcome_dotpoints_3": "Actions tied to operations the member already runs (energy, waste, oil, plant).",
+    "key_outcome_dotpoints_4": "Language and numbers suitable for board, audit and member reporting.",
+    "key_outcome_dotpoints_5": "A baseline that later projects (DMA, waste, solar) can report against.",
+    "conclusion": (
+        "A GHG roadmap turns climate reporting from a one-off document into an operating plan the "
+        "member can update as projects land."
+    ),
+    "esg_scope_for_solution": "SCOPE 1, 2, 3",
+    "sdg_impact_for_solution": "SDG 7, 12, 13",
+})
+
+DEFAULT_CONTENT["solar_review"].update({
+    "key_outcome_metrics": "System performance, tariff fit, whether more solar or storage is justified",
+    "key_challenge_of_solution": (
+        "The member had solar (or was considering it) but could not tell whether the array was "
+        "performing, whether the tariff still fitted, or whether a quoted upgrade would pay back."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team reviewed generation, imports, exports and the current commercial terms, then "
+        "compared options against the member's load rather than a generic installer brochure."
+    ),
+    "key_outcome_of_solution": (
+        "The member had a clear finding: keep, maintain, or change the system and tariff, with numbers "
+        "that could be shown to a committee."
+    ),
+    "key_outcome_dotpoints_1": "Generation and grid-use checked against expected performance.",
+    "key_outcome_dotpoints_2": "Tariff and export settings reviewed for the actual load profile.",
+    "key_outcome_dotpoints_3": "Upgrade or storage claims tested, not taken at brochure value.",
+    "key_outcome_dotpoints_4": "Maintenance or cleaning called out only where it changes yield.",
+    "key_outcome_dotpoints_5": "A written recommendation suitable for capex discussion.",
+    "conclusion": (
+        "A solar review is a commercial and technical check of an existing or proposed PV asset — "
+        "distinct from a one-off panel clean."
+    ),
+    "esg_scope_for_solution": "SCOPE 2",
+    "sdg_impact_for_solution": "SDG 7, 9, 13",
+})
+
+DEFAULT_CONTENT["gas_discrepancy"].update({
+    "key_outcome_metrics": "Recovered overcharge, corrected billing, retailer credit",
+    "key_challenge_of_solution": (
+        "Gas invoices did not match the contract or meter, and the member was absorbing the difference "
+        "because reconciling retailer bills is slow and specialist."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team reconstructed what should have been billed from the contract, meter data and "
+        "invoice history, then put the discrepancy to the retailer with a documented claim."
+    ),
+    "key_outcome_of_solution": (
+        "The overcharge was quantified and pursued, so the member was not left to argue a technical "
+        "billing error without evidence."
+    ),
+    "key_outcome_dotpoints_1": "Invoice lines checked against contracted rates and meter reads.",
+    "key_outcome_dotpoints_2": "The dollar discrepancy stated clearly for finance.",
+    "key_outcome_dotpoints_3": "Retailer engagement handled by ACES, not venue staff.",
+    "key_outcome_dotpoints_4": "A paper trail if the credit is queried later.",
+    "key_outcome_dotpoints_5": "Ongoing bills watched so the same error does not recur.",
+    "conclusion": (
+        "Gas discrepancy recovery is a billing-correction outcome: money back (or stopped leakage) "
+        "where the invoice did not match what was agreed."
+    ),
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 12",
+})
+
+DEFAULT_CONTENT["electricity_discrepancy"].update({
+    "key_outcome_metrics": "Corrected electricity billing, recovered overcharge, cleaner invoices",
+    "key_challenge_of_solution": (
+        "Electricity invoices were out of step with the contract, meter or agreed adjustments, and "
+        "the error was easy to miss in a long tax invoice."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team compared billed rates, quantities and adjustments to the contract and metering, "
+        "then raised a documented correction with the retailer."
+    ),
+    "key_outcome_of_solution": (
+        "The member had a quantified adjustment and a corrected billing position, without having to "
+        "run the reconciliation in-house."
+    ),
+    "key_outcome_dotpoints_1": "Rates and quantities checked line by line against the agreement.",
+    "key_outcome_dotpoints_2": "Discrepancy value stated for finance and committee reporting.",
+    "key_outcome_dotpoints_3": "Retailer correction requested with working papers attached.",
+    "key_outcome_dotpoints_4": "Network or metering issues separated from retailer billing errors.",
+    "key_outcome_dotpoints_5": "A watch on subsequent invoices to confirm the fix held.",
+    "conclusion": (
+        "Electricity discrepancy work is about making the bill match the deal — a recoverable error, "
+        "not a new procurement."
+    ),
+    "esg_scope_for_solution": "SCOPE 2",
+    "sdg_impact_for_solution": "SDG 7, 12",
+})
+
+DEFAULT_CONTENT["demand_reset"].update({
+    "key_outcome_metrics": "Lower maximum demand, reduced network charges, reset of a stale demand ratchet",
+    "key_challenge_of_solution": (
+        "Network charges were still based on a high maximum demand that no longer reflected how the "
+        "site ran, so the member was paying for a peak that was history."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team evidenced actual demand, prepared the reset case, and managed the distributor "
+        "or retailer process so the ratchet could be reviewed."
+    ),
+    "key_outcome_of_solution": (
+        "Demand was reset (or a clear pathway obtained) so ongoing network charges better matched "
+        "current operations."
+    ),
+    "key_outcome_dotpoints_1": "Historical versus current maximum demand documented.",
+    "key_outcome_dotpoints_2": "Network tariff impact of a reset estimated in dollars.",
+    "key_outcome_dotpoints_3": "Distributor or retailer process run by ACES.",
+    "key_outcome_dotpoints_4": "Operational notes so a one-off spike does not rebuild the ratchet.",
+    "key_outcome_dotpoints_5": "A result that shows up on subsequent network invoices.",
+    "conclusion": (
+        "A demand reset is a network-charge outcome: stop paying for a peak the site no longer sets."
+    ),
+    "esg_scope_for_solution": "SCOPE 2",
+    "sdg_impact_for_solution": "SDG 7, 12",
+})
+
+DEFAULT_CONTENT["cds"].update({
+    "key_outcome_metrics": "Container refunds captured, less residual waste, a workable CDS process",
+    "key_challenge_of_solution": (
+        "Eligible drink containers were still going out with general waste or recycling, so refund "
+        "value and diversion were being left on the table."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team set up a practical CDS collection path for the venue — what is eligible, where "
+        "it sits, and how refunds are claimed — without adding a complex extra roster."
+    ),
+    "key_outcome_of_solution": (
+        "Containers that qualify are separated and claimed, so the member sees both a small revenue "
+        "line and a cleaner waste profile."
+    ),
+    "key_outcome_dotpoints_1": "Eligible containers identified in the existing waste stream.",
+    "key_outcome_dotpoints_2": "A collection method that staff can actually run on shift.",
+    "key_outcome_dotpoints_3": "Refunds tracked so finance can see the return.",
+    "key_outcome_dotpoints_4": "Less eligible material in residual or commingled recycling.",
+    "key_outcome_dotpoints_5": "A process that sits beside the broader waste review, not instead of it.",
+    "conclusion": (
+        "CDS testimonials record a container-deposit outcome: refunds and diversion from a scheme "
+        "the venue was previously leaking."
+    ),
+    "esg_scope_for_solution": "SCOPE 3",
+    "sdg_impact_for_solution": "SDG 12",
+})
 
 
 def _ensure_data_dir() -> None:
