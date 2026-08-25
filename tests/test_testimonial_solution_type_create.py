@@ -7,6 +7,7 @@ from database import Base
 from tools.testimonial_solution_content import (
     ALL_SOLUTION_TYPE_IDS,
     create_custom_type,
+    delete_custom_type,
     get_merged_content,
     save_override,
     slugify_solution_type,
@@ -63,6 +64,37 @@ def test_create_rejects_built_in_name():
         assert "already exists" in str(exc).lower() or "existing type" in str(exc).lower()
     else:
         raise AssertionError("expected ValueError")
+
+
+def test_delete_custom_type_removes_it_from_list():
+    from models import TestimonialSolutionType
+
+    db = _session()
+    create_custom_type(db, "LED Upgrade")
+    delete_custom_type(db, "led_upgrade")
+    assert db.query(TestimonialSolutionType).filter_by(solution_type="led_upgrade").first() is None
+    ids = [item["solution_type"] for item in get_merged_content(None, db)]
+    assert "led_upgrade" not in ids
+
+
+def test_delete_rejects_built_in_type():
+    db = _session()
+    try:
+        delete_custom_type(db, "ci_electricity")
+    except ValueError as exc:
+        assert "built-in" in str(exc).lower()
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_delete_unknown_custom_type():
+    db = _session()
+    try:
+        delete_custom_type(db, "not_a_real_type")
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("expected LookupError")
 
 
 def test_save_override_updates_custom_type():
