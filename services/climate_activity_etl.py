@@ -179,6 +179,14 @@ class EtlRowResult:
     body: dict
     skipped: bool
     skip_reason: Optional[str] = None
+    # Row status as written to climate_activity_records.status.
+    #   "draft"   -> a real billing period was read; countable in that FY.
+    #   "undated" -> no billing period could be read. The row is STAGED so it is
+    #                visible and fixable, but compute excludes it (see
+    #                prograde_b4_client.collect_v1_bodies) because an activity
+    #                record with no period cannot be attributed to a reporting
+    #                year. Fix the date in Airtable and re-sync.
+    status: str = "draft"
 
 
 def default_fy_period(fy_label: str = "FY26") -> tuple[date, date]:
@@ -415,17 +423,20 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         return EtlRowResult(source_row_id, "", {}, True, "missing or zero quantity")
 
     period_start, period_end, period_known = _row_period(row, ctx.period_start, ctx.period_end)
-    # Reporting-period filter: an invoice belongs to the FY its billing period ENDS in.
-    # Only filter rows whose period we actually parsed — never drop undated rows.
-    if period_known and not (ctx.period_start <= period_end <= ctx.period_end):
-        return EtlRowResult(
-            source_row_id,
-            "",
-            {},
-            True,
-            f"outside reporting window: invoice {period_start.isoformat()}..{period_end.isoformat()} "
-            f"not in {ctx.period_start.isoformat()}..{ctx.period_end.isoformat()}",
-        )
+    # NO reporting-period filter here — deliberately.
+    #
+    # Staging holds EVERY year the source has. The financial year is a *view*
+    # decision made at compute time (prograde_b4_client.collect_v1_bodies filters
+    # by the FY window), not a load decision. This is what makes prior-year
+    # comparatives, baseline years and trend estimation possible at all — AASB S2
+    # requires comparatives, and you cannot set a target without a base year.
+    #
+    # Undated rows are staged with status="undated" rather than being stamped with
+    # whatever FY happened to be requested. Guessing a year for an undated invoice
+    # was previously a silent data-corruption path: record_id does not include the
+    # period, so re-syncing under a different FY label rewrote those rows into the
+    # new year. Now they simply never count until someone dates them.
+    row_status = "draft" if period_known else "undated"
     activity_type = cfg["activity_type"]
     record_id = _make_record_id(ctx.entity_id, activity_type, source_row_id)
     evidence_uri = _evidence_uri(row)
@@ -475,6 +486,9 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         },
         "notes": f"ETL from Airtable invoice row {source_row_id}",
     }
+    if not period_known:
+        body["data_quality"]["flags"].append("period_unknown")
+        body["notes"] += " — NO billing period on the source row; excluded from compute"
 
     if evidence_uri:
         body["evidence_refs"].append(
@@ -486,7 +500,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
             }
         )
 
-    return EtlRowResult(source_row_id, record_id, body, False)
+    return EtlRowResult(source_row_id, record_id, body, False, None, row_status)
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +537,7 @@ def _classify_oil_line(desc: str) -> str:
 
 def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
                 scope3_cat: int, quantity: float, kind: str, matched: list,
-                evidence_uri) -> EtlRowResult:
+                evidence_uri, row_status: str = "draft") -> EtlRowResult:
     suffix = "p" if kind == "purchase" else "w"
     record_id = _make_record_id(ctx.entity_id, "cooking_oil", f"{source_row_id}:{suffix}")
     flags = ["etl_from_airtable", f"utility:{ctx.utility_type}",
@@ -548,6 +562,9 @@ def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
                          "completeness_pct": 85, "flags": flags, "quantity_source": "airtable_invoice_etl"},
         "notes": f"ETL from Airtable oil invoice row {source_row_id} ({kind})",
     }
+    if row_status == "undated":
+        flags.append("period_unknown")
+        body["notes"] += " — NO billing period on the source row; excluded from compute"
     if evidence_uri:
         body["evidence_refs"].append({
             "evidence_id": f"ev_{source_row_id[-8:]}",
@@ -555,7 +572,7 @@ def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
             "evidence_kind": "utility_bill",
             "evidence_uri": evidence_uri,
         })
-    return EtlRowResult(source_row_id, record_id, body, False)
+    return EtlRowResult(source_row_id, record_id, body, False, None, row_status)
 
 
 def oil_invoice_to_records(row: dict, ctx: EtlContext) -> list[EtlRowResult]:
@@ -566,11 +583,9 @@ def oil_invoice_to_records(row: dict, ctx: EtlContext) -> list[EtlRowResult]:
     if not source_row_id:
         return [EtlRowResult("", "", {}, True, "missing airtable record_id")]
 
+    # No FY filter — see the note in invoice_row_to_activity_record. Stage all years.
     period_start, period_end, period_known = _row_period(row, ctx.period_start, ctx.period_end)
-    if period_known and not (ctx.period_start <= period_end <= ctx.period_end):
-        return [EtlRowResult(source_row_id, "", {}, True,
-                f"outside reporting window: invoice {period_start.isoformat()}..{period_end.isoformat()} "
-                f"not in {ctx.period_start.isoformat()}..{ctx.period_end.isoformat()}")]
+    row_status = "draft" if period_known else "undated"
 
     fresh_l = 0.0
     waste_l = 0.0
@@ -594,10 +609,10 @@ def oil_invoice_to_records(row: dict, ctx: EtlContext) -> list[EtlRowResult]:
     out: list[EtlRowResult] = []
     if fresh_l > 0:
         out.append(_oil_record(ctx, source_row_id, period_start, period_end, 1,
-                               fresh_l, "purchase", fresh_fields, evidence_uri))
+                               fresh_l, "purchase", fresh_fields, evidence_uri, row_status))
     if waste_l > 0:
         out.append(_oil_record(ctx, source_row_id, period_start, period_end, 5,
-                               waste_l, "collection", waste_fields, evidence_uri))
+                               waste_l, "collection", waste_fields, evidence_uri, row_status))
     if not out:
         out.append(EtlRowResult(source_row_id, "", {}, True, "no fresh or waste oil litres on invoice"))
     return out
@@ -624,10 +639,26 @@ def transform_invoice_rows(
             results.append(res)
             if res.skipped:
                 skipped += 1
+    kept = [r for r in results if not r.skipped]
+    undated = sum(1 for r in kept if r.status == "undated")
+    # Which financial years this pull actually covered — staging is no longer
+    # FY-scoped, so this is how a caller sees the span of what it just loaded.
+    years: dict[str, int] = {}
+    for r in kept:
+        if r.status == "undated":
+            continue
+        end = ((r.body.get("reporting_period") or {}).get("end") or "")[:10]
+        if len(end) == 10:
+            y, m = int(end[:4]), int(end[5:7])
+            years[f"FY{(y + 1 if m >= 7 else y) % 100:02d}"] = (
+                years.get(f"FY{(y + 1 if m >= 7 else y) % 100:02d}", 0) + 1
+            )
     diagnostics = {
         "input_rows": len(rows),
-        "produced": sum(1 for r in results if not r.skipped),
+        "produced": len(kept),
         "skipped": skipped,
+        "undated": undated,
+        "financial_years": dict(sorted(years.items())),
         "utility_type": ctx.utility_type,
         "entity_id": ctx.entity_id,
         "site_id": ctx.site_id,
