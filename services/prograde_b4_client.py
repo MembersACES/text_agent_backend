@@ -36,11 +36,23 @@ def _b4_base() -> str:
 
 
 def collect_v1_bodies(db: Session, reporting_entity: str, period_label: str) -> list[dict]:
-    """Staged activity_record.v1 bodies for this entity, within the FY period."""
+    """
+    Staged activity_record.v1 bodies for this entity, within the FY period.
+
+    THIS is where the financial year is decided. Staging holds every year the
+    source has (the ETL no longer filters on load), so the FY window here is what
+    scopes a report — which is what makes prior-year comparatives and baseline
+    years possible at all.
+
+    Rows with status "undated" are excluded: no billing period could be read off
+    the source invoice, so they cannot be attributed to any reporting year. They
+    stay staged and visible so someone can fix the date in Airtable and re-sync.
+    """
     fy_start, fy_end = default_fy_period(period_label)
     rows = (
         db.query(ClimateActivityRecord)
         .filter(ClimateActivityRecord.entity_id == reporting_entity)
+        .filter(ClimateActivityRecord.status != "undated")
         .filter(ClimateActivityRecord.reporting_period_start >= fy_start)
         .filter(ClimateActivityRecord.reporting_period_start <= fy_end)
         .all()

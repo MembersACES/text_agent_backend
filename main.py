@@ -1151,7 +1151,9 @@ class ClimateEtlSyncRequest(BaseModel):
     utility_type: str = Field(..., description="e.g. C&I Electricity, C&I Gas")
     identifier: str = Field(..., description="NMI, MRIN, or account identifier")
     reporting_period_label: str = Field("FY26", description="FY label e.g. FY26")
-    max_records: int = Field(100, ge=1, le=500)
+    # Airtable link-field slice cap is 500. Staging is no longer FY-scoped, so pull
+    # the full history by default; diagnostics.total_count reveals any truncation.
+    max_records: int = Field(500, ge=1, le=500)
     dry_run: bool = Field(False, description="If true, transform only — do not write climate_activity_records")
 
 
@@ -1288,6 +1290,7 @@ def sync_client_climate_activity_records(
             body=res.body,
             source_utility_type=request.utility_type,
             source_row_id=res.source_row_id,
+            status=res.status,
         )
         if was_created:
             created += 1
@@ -13129,7 +13132,8 @@ def rebuild_staged_activity(
                 s_skipped += 1
                 continue
             upsert_activity_record(db, record_id=res.record_id, client_id=member_client_id,
-                                   body=res.body, source_utility_type=ut, source_row_id=res.source_row_id)
+                                   body=res.body, source_utility_type=ut, source_row_id=res.source_row_id,
+                                   status=res.status)
             s_staged += 1
         staged += s_staged
         skipped += s_skipped
