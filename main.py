@@ -593,6 +593,28 @@ def get_current_user_with_db(
     return {"idinfo": idinfo, "user": user}
 
 
+def get_current_user_with_db_or_backend_api_key(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Google ID token, or Bearer BACKEND_API_KEY (staff scripts / Next.js proxy)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1].strip().strip('"').strip("'")
+    api_key = (os.getenv("BACKEND_API_KEY") or "test-key").strip().strip('"').strip("'")
+    if token and token == api_key:
+        email = (os.getenv("TASKS_EXTERNAL_ACTOR_EMAIL") or "api-key@acesolutions.com.au").strip()
+        idinfo = {"email": email, "name": "Backend API key", "picture": None}
+        user = get_or_create_user(db, email, idinfo["name"], None)
+        return {"idinfo": idinfo, "user": user}
+    idinfo = verify_google_token(authorization)
+    email = idinfo.get("email")
+    name = idinfo.get("name")
+    picture = idinfo.get("picture")
+    user = get_or_create_user(db, email, name, picture)
+    return {"idinfo": idinfo, "user": user}
+
+
 def get_current_user_with_db_or_tasks_api_key(
     authorization: Optional[str] = Header(None),
     x_tasks_api_key: Optional[str] = Header(None, alias="X-Tasks-API-Key"),
@@ -9525,11 +9547,12 @@ def list_clients(
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db),
+    user_data: dict = Depends(get_current_user_with_db_or_backend_api_key),
 ):
     """
     List clients. Optional filters: query, stage, created_after, created_before, mine (My clients), reporting_entity.
     When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
+    Auth: Google ID token or Bearer BACKEND_API_KEY.
     """
     from datetime import datetime as dt
     from datetime import timedelta

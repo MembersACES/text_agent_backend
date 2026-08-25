@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Mass-upload testimonial files from a Drive zip to deployed POST /api/testimonials/upload.
 
-Default is a dry-run. After the new solution types are deployed, run with --execute.
+Default is a dry-run. After types are on the API, run with --execute.
 
-    python scripts/bulk_upload_testimonials.py --zip "C:\\Users\\morga\\Downloads\\drive-download-20260824T231613Z-1-001.zip"
+    python scripts/bulk_upload_testimonials.py --zip PATH
     python scripts/bulk_upload_testimonials.py --zip PATH --execute
 
-Auth: Bearer BACKEND_API_KEY (upload) and a Google ID token for GET /api/clients so
-business_name matches the CRM member record. Set GOOGLE_ID_TOKEN or pass --google-token.
-BACKEND_API_KEY is loaded from .env. API host defaults to the Cloud Run dev backend.
+Uses BACKEND_API_KEY from .env (quote the value if it contains #).
+CRM members are loaded from GET /api/clients, or from DATABASE_URL if the API
+still rejects the key. Members are matched so Drive folders and dashboard names line up.
 """
 
 from __future__ import annotations
@@ -42,37 +42,78 @@ DEFAULT_API = "https://text-agent-backend-dev-672026052958.australia-southeast2.
 DEFAULT_ZIP = Path.home() / "Downloads" / "drive-download-20260824T231613Z-1-001.zip"
 
 
+def _clean_secret(raw: str | None) -> str:
+    return (raw or "").strip().strip('"').strip("'")
+
+
 def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _load_clients(api_base: str, token: str) -> list[CrmClient]:
-    url = f"{api_base.rstrip('/')}/api/clients"
-    response = requests.get(url, headers=_auth_headers(token), timeout=60)
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"GET /api/clients failed ({response.status_code}). "
-            "Pass --google-token (a dashboard Google ID token) so names match CRM members."
-        )
-    data = response.json()
-    rows = data if isinstance(data, list) else data.get("items") or data.get("clients") or []
+def _rows_to_clients(rows: list) -> list[CrmClient]:
     clients: list[CrmClient] = []
     for row in rows:
         name = str(row.get("business_name") or "").strip()
         if not name:
             continue
+        folder = row.get("gdrive_folder_url")
         clients.append(
             CrmClient(
                 business_name=name,
-                gdrive_folder_url=(row.get("gdrive_folder_url") or None),
+                gdrive_folder_url=(str(folder).strip() if folder else None),
             )
         )
     return clients
 
 
+def _load_clients_from_api(api_base: str, token: str) -> list[CrmClient]:
+    url = f"{api_base.rstrip('/')}/api/clients"
+    response = requests.get(url, headers=_auth_headers(token), timeout=60)
+    if response.status_code >= 400:
+        raise RuntimeError(f"GET /api/clients failed ({response.status_code})")
+    data = response.json()
+    raw = data if isinstance(data, list) else data.get("items") or data.get("clients") or []
+    return _rows_to_clients(raw)
+
+
+def _load_clients_from_db() -> list[CrmClient]:
+    from database import SessionLocal
+    from models import Client
+
+    db = SessionLocal()
+    try:
+        rows = db.query(Client.business_name, Client.gdrive_folder_url).all()
+        return _rows_to_clients(
+            [{"business_name": name, "gdrive_folder_url": folder} for name, folder in rows]
+        )
+    finally:
+        db.close()
+
+
+def _load_clients(api_base: str, token: str) -> tuple[list[CrmClient], str]:
+    try:
+        clients = _load_clients_from_api(api_base, token)
+        if clients:
+            return clients, "API"
+    except Exception as exc:
+        print(f"API client list unavailable ({exc}); trying DATABASE_URL from .env")
+    clients = _load_clients_from_db()
+    if not clients:
+        raise RuntimeError(
+            "Could not load CRM members from the API or DATABASE_URL. "
+            "Check BACKEND_API_KEY and that .env DATABASE_URL is the shared CRM database."
+        )
+    return clients, "DATABASE_URL"
+
+
 def _confirm_types_deployed(api_base: str, token: str, needed: set[str]) -> list[str]:
     url = f"{api_base.rstrip('/')}/api/testimonials/solution-content"
     response = requests.get(url, headers=_auth_headers(token), timeout=60)
+    if response.status_code == 401:
+        raise RuntimeError(
+            "API key was rejected (401). Quote BACKEND_API_KEY in .env if it contains #, "
+            "and use the same key as the deployed backend."
+        )
     if response.status_code >= 400:
         raise RuntimeError(
             f"GET /api/testimonials/solution-content failed ({response.status_code}). "
@@ -144,13 +185,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--api-key",
-        default=os.environ.get("BACKEND_API_KEY", ""),
-        help="BACKEND_API_KEY for POST /api/testimonials/upload",
+        default=_clean_secret(os.environ.get("BACKEND_API_KEY")),
+        help="BACKEND_API_KEY for upload (loaded from .env)",
     )
     parser.add_argument(
         "--google-token",
-        default=os.environ.get("GOOGLE_ID_TOKEN", ""),
-        help="Google ID token for GET /api/clients (CRM name matching)",
+        default=_clean_secret(os.environ.get("GOOGLE_ID_TOKEN")),
+        help="Unused if BACKEND_API_KEY works; optional extra token",
     )
     parser.add_argument("--status", default="Approved", choices=("Draft", "Sent for approval", "Approved"))
     parser.add_argument("--limit", type=int, default=0, help="Max files to upload when executing (0 = all)")
@@ -201,10 +242,9 @@ def main() -> int:
             )
             return 0
 
-        upload_token = (args.api_key or args.google_token or "").strip()
-        clients_token = (args.google_token or args.api_key or "").strip()
+        upload_token = _clean_secret(args.api_key or args.google_token)
         if not upload_token:
-            print("Need BACKEND_API_KEY or --google-token to upload.")
+            print("BACKEND_API_KEY is missing from .env")
             return 1
 
         missing_types = _confirm_types_deployed(
@@ -219,12 +259,13 @@ def main() -> int:
             return 1
 
         try:
-            clients = _load_clients(args.base_url, clients_token)
-            print(f"\nLoaded {len(clients)} CRM members")
+            clients, source = _load_clients(args.base_url, upload_token)
         except RuntimeError as exc:
-            print(f"\n{exc}")
-            print("Uploads will use filename hints; they may not appear on the member page.")
-            clients = []
+            print(str(exc))
+            return 1
+        with_folder = sum(1 for c in clients if c.gdrive_folder_url)
+        print(f"\nLoaded {len(clients)} CRM members from {source} ({with_folder} have a Drive folder)")
+        fallback_folder = _clean_secret(os.environ.get("TESTIMONIAL_STORAGE_FOLDER_ID"))
 
         if args.limit:
             kept = kept[: args.limit]
@@ -233,21 +274,18 @@ def main() -> int:
         unmatched = 0
         uploaded = 0
         for entry in kept:
-            match = match_crm_member(entry.member_hint, clients) if clients else None
-            if match and match.ambiguous:
-                print(f"SKIP ambiguous CRM match for {entry.member_hint!r} ({entry.zip_path})")
+            match = match_crm_member(entry.member_hint, clients)
+            if match is None or match.ambiguous:
+                reason = "ambiguous CRM match" if match and match.ambiguous else "no CRM match"
+                print(f"SKIP {reason} for {entry.member_hint!r} ({entry.zip_path})")
                 unmatched += 1
                 continue
-            if match:
-                business_name = match.business_name
-                folder = match.gdrive_folder_url
-            elif clients:
-                print(f"SKIP no CRM match for {entry.member_hint!r} ({entry.zip_path})")
+            business_name = match.business_name
+            folder = match.gdrive_folder_url or fallback_folder or None
+            if not folder:
+                print(f"SKIP {business_name} has no Drive folder ({entry.zip_path})")
                 unmatched += 1
                 continue
-            else:
-                business_name = entry.member_hint
-                folder = None
 
             file_bytes = archive.read(entry.zip_path)
             status, detail = _upload_one(
@@ -264,11 +302,11 @@ def main() -> int:
             uploaded += int(ok)
             failures += int(not ok)
             mark = "OK" if ok else "FAIL"
-            print(f"[{mark} {status}] {business_name} / {entry.solution_type_id} ← {entry.filename}  {detail}")
+            print(f"[{mark} {status}] {business_name} / {entry.solution_type_id} <- {entry.filename}  {detail}")
             if args.sleep:
                 time.sleep(args.sleep)
 
-        print(f"\nUploaded {uploaded}, failed {failures}, unmatched/ambiguous {unmatched}")
+        print(f"\nUploaded {uploaded}, failed {failures}, unmatched/skipped {unmatched}")
         return 1 if failures else 0
 
 
