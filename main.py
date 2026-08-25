@@ -49,6 +49,15 @@ from tools.business_info import get_business_information, get_base1_landing_resp
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.drive_file_metadata import get_drive_file_times
 from tools.share_folder import ShareFolderError, get_share_folder_status, share_member_folder
+from tools.member_folder_drive import MemberFolderDriveError
+from services.member_folder import (
+    create_distributor_folder,
+    create_member_folder,
+    extract_distributor_pdf,
+    list_industry_folders,
+    list_subfolders,
+)
+from tools.distributor_agreement import list_distributor_master_rows
 from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
@@ -1510,6 +1519,173 @@ def share_folder(
 def loa_business_details(user_info: dict = Depends(verify_google_token)):
     logging.info("loa-business-details request user=%s", user_info.get("email"))
     return get_return_business_details()
+
+
+class MemberFolderCreateRequest(BaseModel):
+    business_name: str
+    trading_as: str = "N/A"
+    classification: str
+    state: str
+    classification_folder_id: Optional[str] = None
+    state_folder_id: Optional[str] = None
+    loa_record_id: Optional[str] = None
+
+
+@app.get("/api/member-folders/industries")
+def member_folder_industries(user_info: dict = Depends(verify_google_token)):
+    logging.info("member-folders/industries user=%s", user_info.get("email"))
+    try:
+        return {"folders": list_industry_folders()}
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.get("/api/member-folders/subfolders")
+def member_folder_subfolders(
+    parent_id: str = Query(..., description="Industry folder Drive ID"),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-folders/subfolders parent=%s user=%s", parent_id, user_info.get("email"))
+    try:
+        return {"folders": list_subfolders(parent_id)}
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/member-folders/create")
+def member_folder_create(
+    request: MemberFolderCreateRequest,
+    user_info: dict = Depends(verify_google_token),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "member-folders/create business=%r classification=%s state=%s user=%s",
+        request.business_name,
+        request.classification,
+        request.state,
+        user_info.get("email"),
+    )
+    try:
+        result = create_member_folder(
+            business_name=request.business_name,
+            trading_as=request.trading_as,
+            classification=request.classification,
+            state=request.state,
+            classification_folder_id=request.classification_folder_id,
+            state_folder_id=request.state_folder_id,
+            loa_record_id=request.loa_record_id,
+            user_access_token=x_google_access_token,
+        )
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    if not result.get("ok") and result.get("loa_candidates"):
+        raise HTTPException(status_code=409, detail=result)
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "Folder creation failed")
+    return result
+
+
+@app.post("/api/distributors/extract")
+async def distributors_extract(
+    file: UploadFile = File(...),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("distributors/extract file=%s user=%s", file.filename, user_info.get("email"))
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    return extract_distributor_pdf(contents)
+
+
+@app.get("/api/distributors")
+def distributors_list(
+    user_info: dict = Depends(verify_google_token),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "distributors/list user=%s has_user_drive_token=%s",
+        user_info.get("email"),
+        bool((x_google_access_token or "").strip()),
+    )
+    try:
+        return list_distributor_master_rows(
+            user_access_token=(x_google_access_token or "").strip() or None,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/distributors/create")
+async def distributors_create(
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+    distributor_business: str = Form(...),
+    trading_as: str = Form(""),
+    abn: str = Form(""),
+    acn: str = Form(""),
+    contact_name: str = Form(""),
+    contact_position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    mobile: str = Form(""),
+    address: str = Form(""),
+    state: str = Form(""),
+    postcode: str = Form(""),
+    start_date: str = Form(""),
+    signed_date: str = Form(""),
+    initial_term_months: str = Form(""),
+    territory: str = Form(""),
+    exclusivity: str = Form("Y"),
+    status: str = Form("Active"),
+    folder_name: str = Form(...),
+    notes: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "distributors/create business=%r folder=%r user=%s has_user_drive_token=%s",
+        distributor_business,
+        folder_name,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    details = {
+        "distributor_business": distributor_business,
+        "trading_as": trading_as,
+        "abn": abn,
+        "acn": acn,
+        "contact_name": contact_name,
+        "contact_position": contact_position,
+        "email": email,
+        "phone": phone,
+        "mobile": mobile,
+        "address": address,
+        "state": state,
+        "postcode": postcode,
+        "start_date": start_date,
+        "signed_date": signed_date,
+        "initial_term_months": initial_term_months,
+        "territory": territory,
+        "exclusivity": exclusivity or "Y",
+        "status": status or "Active",
+        "folder_name": folder_name,
+        "notes": notes,
+        "extraction_warnings": [],
+    }
+    try:
+        return create_distributor_folder(
+            details=details,
+            pdf_bytes=contents,
+            pdf_filename=file.filename or "Distribution Agreement.pdf",
+            user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+        )
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
 
 
 @app.post("/api/return-utility-info")
