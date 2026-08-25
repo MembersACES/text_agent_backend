@@ -84,6 +84,7 @@ from services.climate_entity_sources import (
     build_entity_activity_manifest,
     build_entity_site_detail,
 )
+from services.climate_data_gaps import build_entity_data_gaps, build_roster_data_gaps
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -1092,6 +1093,50 @@ def get_climate_entity_activity_manifest(
     if not payload.get("found"):
         raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
     return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/data-gaps")
+def get_climate_entity_data_gaps(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label"),
+    include_sites: bool = Query(
+        True,
+        description="Resolve the live LOA site list so linked sites with nothing staged appear. "
+                    "Set false for a DB-only report (faster, but blind to empty sites).",
+    ),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """
+    What is MISSING from this entity's activity data for the period.
+
+    Flags, worst first: sites with nothing brought in, invoices with no readable
+    date (staged but excluded from the total), months with no invoice, and utility
+    types linked on the LOA that have no emission factor yet.
+    """
+    sites = None
+    if include_sites:
+        try:
+            manifest = build_entity_activity_manifest(db, entity_id, period_label=period)
+            if manifest.get("found"):
+                sites = manifest.get("sites") or []
+        except Exception as e:  # never let the Airtable side break the report
+            logging.warning("[data-gaps] site resolution failed for %s: %s", entity_id, e)
+    payload = build_entity_data_gaps(db, entity_id, period_label=period, sites=sites)
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/data-gaps")
+def get_climate_roster_data_gaps(
+    period: str = Query("FY26", description="Reporting period label"),
+    limit: int = Query(100, ge=1, le=500),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """One line per reporting entity: how much needs attention. DB-only, no Airtable."""
+    return build_roster_data_gaps(db, period_label=period, limit=limit)
 
 
 @app.get("/api/climate/entities/{entity_id}/activity-sources/site")
