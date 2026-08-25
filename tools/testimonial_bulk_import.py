@@ -170,6 +170,13 @@ class MemberMatch:
     ambiguous: bool
 
 
+@dataclass(frozen=True)
+class ExistingTestimonial:
+    business_name: str
+    solution_type_id: str | None = None
+    testimonial_type: str | None = None
+
+
 def normalize_folder(name: str) -> str:
     return re.sub(r"\s+", " ", (name or "").strip().lower())
 
@@ -384,6 +391,57 @@ def score_client(hint: str, business_name: str) -> int:
         ratio = int(70 * len(overlap) / len(nt))
         best = max(best, ratio)
     return best
+
+
+def _norm_type_label(text: str) -> str:
+    lowered = (text or "").strip().lower().replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", lowered).split())
+
+
+def type_already_on_member(
+    business_name: str,
+    solution_type_id: str,
+    existing: Sequence[ExistingTestimonial],
+) -> bool:
+    """True if this CRM member already has a testimonial of the same solution type."""
+    wanted_id = (solution_type_id or "").strip()
+    wanted_name = (business_name or "").strip().lower()
+    if not wanted_id or not wanted_name:
+        return False
+    wanted_labels = {
+        _norm_type_label(wanted_id),
+        _norm_type_label(solution_type_label(wanted_id)),
+    }
+    for row in existing:
+        if (row.business_name or "").strip().lower() != wanted_name:
+            continue
+        if (row.solution_type_id or "").strip() == wanted_id:
+            return True
+        row_label = _norm_type_label(row.testimonial_type or "")
+        if row_label and row_label in wanted_labels:
+            return True
+    return False
+
+
+def existing_from_api_rows(
+    rows: Sequence[dict],
+    fallback_business_name: str = "",
+) -> list[ExistingTestimonial]:
+    out: list[ExistingTestimonial] = []
+    for row in rows:
+        name = str(row.get("business_name") or fallback_business_name).strip()
+        if not name:
+            continue
+        sid = str(row.get("testimonial_solution_type_id") or "").strip() or None
+        label = str(row.get("testimonial_type") or "").strip() or None
+        out.append(
+            ExistingTestimonial(
+                business_name=name,
+                solution_type_id=sid,
+                testimonial_type=label,
+            )
+        )
+    return out
 
 
 def match_crm_member(hint: str, clients: Sequence[CrmClient]) -> MemberMatch | None:
