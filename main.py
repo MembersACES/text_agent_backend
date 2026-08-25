@@ -155,6 +155,7 @@ from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
     build_testimonial_file_name,
+    create_custom_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -7965,7 +7966,7 @@ async def upload_testimonial(
 
     type_label_for_name = norm_testimonial_type
     if not type_label_for_name and norm_solution_type_id:
-        merged_type = get_merged_content(norm_solution_type_id)
+        merged_type = get_merged_content(norm_solution_type_id, db)
         if isinstance(merged_type, dict):
             type_label_for_name = (
                 (merged_type.get("solution_type_label") or "").strip() or norm_solution_type_id
@@ -8075,6 +8076,7 @@ async def delete_testimonial(
 async def list_testimonial_solution_content(
     solution_type: Optional[str] = Query(None, description="Filter to one solution type"),
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """List merged testimonial content for all solution types, or one if solution_type is provided."""
     if not authorization.startswith("Bearer "):
@@ -8087,18 +8089,45 @@ async def list_testimonial_solution_content(
             logging.error(f"Token verification failed: {e}")
             raise HTTPException(status_code=401, detail="Invalid Google token")
     if solution_type:
-        merged = get_merged_content(solution_type)
+        merged = get_merged_content(solution_type, db)
         if not merged:
             raise HTTPException(status_code=404, detail=f"Unknown solution_type: {solution_type}")
         return [TestimonialSolutionContentItem(**merged)]
-    items = get_merged_content(None)
+    items = get_merged_content(None, db)
     return [TestimonialSolutionContentItem(**item) for item in items]
+
+
+@app.post("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
+async def create_testimonial_solution_content(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Create a staff-defined solution type. Body: solution_type_label (required) + optional copy fields."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    label = body.get("solution_type_label") or body.get("name")
+    payload = {k: v for k, v in body.items() if k not in ("solution_type", "solution_type_label", "name")}
+    try:
+        created = create_custom_type(db, str(label or ""), payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return TestimonialSolutionContentItem(**created)
 
 
 @app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
 async def update_testimonial_solution_content(
     request: Request,
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """Save overrides for one solution type. Body: solution_type (required) + any content fields."""
     if not authorization.startswith("Bearer "):
@@ -8116,7 +8145,7 @@ async def update_testimonial_solution_content(
         raise HTTPException(status_code=400, detail="solution_type is required")
     payload = {k: v for k, v in body.items() if k != "solution_type"}
     try:
-        merged = save_override(st.strip(), payload)
+        merged = save_override(st.strip(), payload, db)
         return TestimonialSolutionContentItem(**merged)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8200,6 +8229,7 @@ async def generate_testimonial_document_endpoint(
         pv_system_size=(body.get("pv_system_size") or "").strip(),
         solar_pre_daily_kwh=solar_pre,
         solar_post_daily_kwh=solar_post,
+        db=db,
     )
     if result.get("status") == "error":
         raise HTTPException(
@@ -8213,7 +8243,7 @@ async def generate_testimonial_document_endpoint(
             # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
             file_id = extract_folder_id_from_url(document_link)
             if file_id:
-                merged = get_merged_content(solution_type_id)
+                merged = get_merged_content(solution_type_id, db)
                 label = (
                     (merged.get("solution_type_label") if merged else None)
                     or solution_type_id

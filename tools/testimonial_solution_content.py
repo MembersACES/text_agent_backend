@@ -6,6 +6,7 @@ Used to populate testimonial document templates (challenge, approach, outcome, d
 import os
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -552,6 +553,125 @@ DEFAULT_CONTENT["cds"].update({
 })
 
 
+CONTENT_FIELD_KEYS = {
+    "key_outcome_metrics",
+    "key_challenge_of_solution",
+    "key_approach_of_solution",
+    "key_outcome_of_solution",
+    "conclusion",
+    "esg_scope_for_solution",
+    "sdg_impact_for_solution",
+    "key_outcome_dotpoints_1",
+    "key_outcome_dotpoints_2",
+    "key_outcome_dotpoints_3",
+    "key_outcome_dotpoints_4",
+    "key_outcome_dotpoints_5",
+}
+
+
+def slugify_solution_type(label: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", (label or "").strip().lower()).strip("_")
+    if not text:
+        raise ValueError("Solution type name must include at least one letter or number.")
+    if not text[0].isalpha():
+        text = f"type_{text}"
+    return text[:80]
+
+
+def _custom_row_to_content(row: Any) -> Dict[str, Any]:
+    return {
+        "solution_type": row.solution_type,
+        "solution_type_label": row.solution_type_label,
+        "key_outcome_metrics": row.key_outcome_metrics or "",
+        "key_challenge_of_solution": row.key_challenge_of_solution or "",
+        "key_approach_of_solution": row.key_approach_of_solution or "",
+        "key_outcome_of_solution": row.key_outcome_of_solution or "",
+        "key_outcome_dotpoints_1": row.key_outcome_dotpoints_1 or "",
+        "key_outcome_dotpoints_2": row.key_outcome_dotpoints_2 or "",
+        "key_outcome_dotpoints_3": row.key_outcome_dotpoints_3 or "",
+        "key_outcome_dotpoints_4": row.key_outcome_dotpoints_4 or "",
+        "key_outcome_dotpoints_5": row.key_outcome_dotpoints_5 or "",
+        "conclusion": row.conclusion or "",
+        "esg_scope_for_solution": row.esg_scope_for_solution or "",
+        "sdg_impact_for_solution": row.sdg_impact_for_solution or "",
+    }
+
+
+def _get_custom_row(db: Any, solution_type_id: str) -> Any:
+    from models import TestimonialSolutionType
+
+    return (
+        db.query(TestimonialSolutionType)
+        .filter(TestimonialSolutionType.solution_type == solution_type_id)
+        .first()
+    )
+
+
+def list_custom_contents(db: Any) -> List[Dict[str, Any]]:
+    from models import TestimonialSolutionType
+
+    rows = (
+        db.query(TestimonialSolutionType)
+        .order_by(TestimonialSolutionType.solution_type_label.asc())
+        .all()
+    )
+    return [
+        _custom_row_to_content(row)
+        for row in rows
+        if row.solution_type not in ALL_SOLUTION_TYPE_IDS
+    ]
+
+
+def create_custom_type(db: Any, label: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    from models import TestimonialSolutionType
+
+    clean_label = (label or "").strip()
+    if not clean_label:
+        raise ValueError("Solution type name is required.")
+    slug = slugify_solution_type(clean_label)
+    if slug in ALL_SOLUTION_TYPE_IDS:
+        existing_label = SOLUTION_TYPE_LABELS.get(slug, slug)
+        raise ValueError(
+            f"That name matches an existing type ({existing_label}). Edit that type instead."
+        )
+    existing = _get_custom_row(db, slug)
+    if existing:
+        n = 2
+        candidate = f"{slug}_{n}"
+        while candidate in ALL_SOLUTION_TYPE_IDS or _get_custom_row(db, candidate):
+            n += 1
+            candidate = f"{slug}_{n}"
+        slug = candidate
+
+    label_key = clean_label.casefold()
+    for built_in_label in SOLUTION_TYPE_LABELS.values():
+        if built_in_label.casefold() == label_key:
+            raise ValueError(
+                f"A type named {built_in_label!r} already exists. Edit that type instead."
+            )
+    for item in list_custom_contents(db):
+        if (item.get("solution_type_label") or "").casefold() == label_key:
+            raise ValueError(f"A type named {clean_label!r} already exists.")
+
+    fields = {k: "" for k in CONTENT_FIELD_KEYS}
+    fields.update(_default_content(slug))
+    fields["solution_type"] = slug
+    fields["solution_type_label"] = clean_label
+    for key, value in (payload or {}).items():
+        if key in CONTENT_FIELD_KEYS and value is not None:
+            fields[key] = str(value).strip()
+
+    row = TestimonialSolutionType(
+        solution_type=slug,
+        solution_type_label=clean_label,
+        **{k: fields[k] for k in CONTENT_FIELD_KEYS},
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _custom_row_to_content(row)
+
+
 def _ensure_data_dir() -> None:
     d = os.path.dirname(_OVERRIDES_PATH)
     if not os.path.isdir(d):
@@ -578,49 +698,66 @@ def _save_overrides(overrides: Dict[str, Dict[str, Any]]) -> None:
         json.dump(overrides, f, indent=2, ensure_ascii=False)
 
 
-def get_merged_content(solution_type_id: Optional[str] = None) -> Any:
+def get_merged_content(solution_type_id: Optional[str] = None, db: Any = None) -> Any:
     """
-    Return merged content (defaults + overrides).
+    Return merged content (defaults + overrides + staff-created types).
     If solution_type_id is None, return list of merged content for all solution types.
     Otherwise return single merged dict for that solution type.
     """
     overrides = _load_overrides()
     if solution_type_id is not None:
         base = DEFAULT_CONTENT.get(solution_type_id)
-        if not base:
-            return None
-        merged = dict(base)
-        if solution_type_id in overrides:
-            for k, v in overrides[solution_type_id].items():
-                if v is not None and (isinstance(v, str) or not isinstance(merged.get(k), str)):
-                    merged[k] = v
-        return merged
+        if base:
+            merged = dict(base)
+            if solution_type_id in overrides:
+                for k, v in overrides[solution_type_id].items():
+                    if v is not None and (isinstance(v, str) or not isinstance(merged.get(k), str)):
+                        merged[k] = v
+            return merged
+        if db is not None:
+            row = _get_custom_row(db, solution_type_id)
+            if row:
+                return _custom_row_to_content(row)
+        return None
     result: List[Dict[str, Any]] = []
     for st in ALL_SOLUTION_TYPE_IDS:
-        merged = get_merged_content(st)
+        merged = get_merged_content(st, db)
         if merged:
             result.append(merged)
+    if db is not None:
+        result.extend(list_custom_contents(db))
     return result
 
 
-def save_override(solution_type_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def save_override(solution_type_id: str, payload: Dict[str, Any], db: Any = None) -> Dict[str, Any]:
     """
-    Save override for one solution type. Only provided keys are updated.
-    Returns merged content after save.
+    Save override for one solution type. Built-in types go to the JSON file;
+    staff-created types update the database row. Returns merged content after save.
     """
-    if solution_type_id not in ALL_SOLUTION_TYPE_IDS:
+    if solution_type_id in ALL_SOLUTION_TYPE_IDS:
+        overrides = _load_overrides()
+        current = overrides.get(solution_type_id) or {}
+        for k, v in payload.items():
+            if k in CONTENT_FIELD_KEYS and v is not None:
+                current[k] = str(v).strip() if isinstance(v, str) else v
+        if "solution_type_label" in payload and payload["solution_type_label"] is not None:
+            current["solution_type_label"] = str(payload["solution_type_label"]).strip()
+        overrides[solution_type_id] = current
+        _save_overrides(overrides)
+        return get_merged_content(solution_type_id, db)
+
+    if db is None:
         raise ValueError(f"Unknown solution_type: {solution_type_id}")
-    overrides = _load_overrides()
-    allowed_keys = {
-        "key_outcome_metrics", "key_challenge_of_solution", "key_approach_of_solution",
-        "key_outcome_of_solution", "conclusion", "esg_scope_for_solution", "sdg_impact_for_solution",
-        "key_outcome_dotpoints_1", "key_outcome_dotpoints_2", "key_outcome_dotpoints_3",
-        "key_outcome_dotpoints_4", "key_outcome_dotpoints_5",
-    }
-    current = overrides.get(solution_type_id) or {}
+    row = _get_custom_row(db, solution_type_id)
+    if not row:
+        raise ValueError(f"Unknown solution_type: {solution_type_id}")
     for k, v in payload.items():
-        if k in allowed_keys and v is not None:
-            current[k] = str(v).strip() if isinstance(v, str) else v
-    overrides[solution_type_id] = current
-    _save_overrides(overrides)
-    return get_merged_content(solution_type_id)
+        if k in CONTENT_FIELD_KEYS and v is not None:
+            setattr(row, k, str(v).strip() if isinstance(v, str) else v)
+    label = payload.get("solution_type_label")
+    if isinstance(label, str) and label.strip():
+        row.solution_type_label = label.strip()
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _custom_row_to_content(row)
