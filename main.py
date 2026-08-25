@@ -11901,6 +11901,12 @@ def autonomous_sequence_update_template(
     )
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if body.sequence_type is not None:
+        from services.autonomous_sequence import rename_sequence_template_type
+        try:
+            rename_sequence_template_type(db, template, body.sequence_type)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     if body.display_name is not None:
         template.display_name = body.display_name.strip() or template.display_name
     if body.description is not None:
