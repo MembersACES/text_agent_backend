@@ -156,6 +156,7 @@ from tools.testimonial_solution_content import (
     save_override,
     build_testimonial_file_name,
     create_custom_type,
+    delete_custom_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -8146,6 +8147,31 @@ async def create_testimonial_solution_content(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return TestimonialSolutionContentItem(**created)
+
+
+@app.delete("/api/testimonials/solution-content/{solution_type}", status_code=204)
+async def delete_testimonial_solution_content(
+    solution_type: str,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Remove a staff-created solution type. Built-in types cannot be deleted."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    try:
+        delete_custom_type(db, solution_type)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)

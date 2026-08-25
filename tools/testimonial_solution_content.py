@@ -690,6 +690,26 @@ def create_custom_type(db: Any, label: str, payload: Optional[Dict[str, Any]] = 
     return _custom_row_to_content(row)
 
 
+def delete_custom_type(db: Any, solution_type_id: str) -> None:
+    """Remove a staff-created solution type. Built-in types cannot be deleted."""
+    from models import TestimonialSolutionType
+
+    clean_id = (solution_type_id or "").strip()
+    if not clean_id:
+        raise ValueError("solution_type is required.")
+    if clean_id in ALL_SOLUTION_TYPE_IDS:
+        raise ValueError("Built-in solution types cannot be deleted.")
+    row = (
+        db.query(TestimonialSolutionType)
+        .filter(TestimonialSolutionType.solution_type == clean_id)
+        .first()
+    )
+    if not row:
+        raise LookupError(f"Unknown solution_type: {clean_id}")
+    db.delete(row)
+    db.commit()
+
+
 def _ensure_data_dir() -> None:
     d = os.path.dirname(_OVERRIDES_PATH)
     if not os.path.isdir(d):
