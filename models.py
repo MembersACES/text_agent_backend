@@ -297,6 +297,29 @@ class Testimonial(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class TestimonialSolutionType(Base):
+    """Staff-created testimonial solution types (stored in DB so they survive Cloud Run deploys)."""
+
+    __tablename__ = "testimonial_solution_types"
+
+    solution_type = Column(String(100), primary_key=True)
+    solution_type_label = Column(String(255), nullable=False)
+    key_outcome_metrics = Column(Text, nullable=False, default="")
+    key_challenge_of_solution = Column(Text, nullable=False, default="")
+    key_approach_of_solution = Column(Text, nullable=False, default="")
+    key_outcome_of_solution = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_1 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_2 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_3 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_4 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_5 = Column(Text, nullable=False, default="")
+    conclusion = Column(Text, nullable=False, default="")
+    esg_scope_for_solution = Column(Text, nullable=False, default="")
+    sdg_impact_for_solution = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class MarketingVideo(Base):
     """
     CZA marketing or testimonial video registered in the Interface Videos library.

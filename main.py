@@ -155,6 +155,7 @@ from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
     build_testimonial_file_name,
+    create_custom_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -7883,7 +7884,9 @@ async def upload_testimonial(
 ):
     """
     Upload a testimonial document via the unified n8n file-upload webhook
-    (upload_type=testimonial). Returns file_id from n8n and logs a CRM Testimonial row.
+    (upload_type=testimonial). PNG/JPEG images are converted to a one-page PDF
+    before upload so Drive never stores the original image. Returns file_id from
+    n8n and logs a CRM Testimonial row.
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
@@ -7898,9 +7901,12 @@ async def upload_testimonial(
     filename = (file.filename or "document").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
-    allowed = (".pdf", ".docx", ".doc")
+    allowed = (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg")
     if not any(filename.lower().endswith(ext) for ext in allowed):
-        raise HTTPException(status_code=400, detail="File must be PDF or Word (.pdf, .docx, .doc)")
+        raise HTTPException(
+            status_code=400,
+            detail="File must be PDF, Word, PNG, or JPEG (.pdf, .docx, .doc, .png, .jpg, .jpeg)",
+        )
     status_val = (status or "Draft").strip()
     if status_val not in ("Draft", "Sent for approval", "Approved"):
         status_val = "Draft"
@@ -7908,7 +7914,17 @@ async def upload_testimonial(
     # Prefer the explicit client folder URL; fall back to TESTIMONIAL_STORAGE_FOLDER_ID if set.
     drive_folder = (gdrive_folder_url or "").strip() or TESTIMONIAL_STORAGE_FOLDER_ID
 
+    from tools.image_to_pdf import image_bytes_to_pdf, is_image_filename
     from tools.n8n_file_upload import UPLOAD_TYPE_TESTIMONIAL, upload_file_via_n8n
+
+    contents = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    if is_image_filename(filename):
+        try:
+            contents, filename = image_bytes_to_pdf(contents, filename)
+            content_type = "application/pdf"
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     norm_testimonial_type = (testimonial_type or "").strip()
     norm_solution_type_id = (testimonial_solution_type_id or "").strip()
@@ -7923,14 +7939,13 @@ async def upload_testimonial(
         extra_form["invoice_number"] = invoice_number.strip()
 
     try:
-        contents = await file.read()
         n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
             file_bytes=contents,
             filename=filename,
             upload_type=UPLOAD_TYPE_TESTIMONIAL,
             business_name=business_name.strip(),
             drive_folder=drive_folder,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=content_type,
             extra_form=extra_form,
         )
     except Exception as e:
@@ -7951,7 +7966,7 @@ async def upload_testimonial(
 
     type_label_for_name = norm_testimonial_type
     if not type_label_for_name and norm_solution_type_id:
-        merged_type = get_merged_content(norm_solution_type_id)
+        merged_type = get_merged_content(norm_solution_type_id, db)
         if isinstance(merged_type, dict):
             type_label_for_name = (
                 (merged_type.get("solution_type_label") or "").strip() or norm_solution_type_id
@@ -8061,6 +8076,7 @@ async def delete_testimonial(
 async def list_testimonial_solution_content(
     solution_type: Optional[str] = Query(None, description="Filter to one solution type"),
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """List merged testimonial content for all solution types, or one if solution_type is provided."""
     if not authorization.startswith("Bearer "):
@@ -8073,18 +8089,45 @@ async def list_testimonial_solution_content(
             logging.error(f"Token verification failed: {e}")
             raise HTTPException(status_code=401, detail="Invalid Google token")
     if solution_type:
-        merged = get_merged_content(solution_type)
+        merged = get_merged_content(solution_type, db)
         if not merged:
             raise HTTPException(status_code=404, detail=f"Unknown solution_type: {solution_type}")
         return [TestimonialSolutionContentItem(**merged)]
-    items = get_merged_content(None)
+    items = get_merged_content(None, db)
     return [TestimonialSolutionContentItem(**item) for item in items]
+
+
+@app.post("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
+async def create_testimonial_solution_content(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Create a staff-defined solution type. Body: solution_type_label (required) + optional copy fields."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    label = body.get("solution_type_label") or body.get("name")
+    payload = {k: v for k, v in body.items() if k not in ("solution_type", "solution_type_label", "name")}
+    try:
+        created = create_custom_type(db, str(label or ""), payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return TestimonialSolutionContentItem(**created)
 
 
 @app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
 async def update_testimonial_solution_content(
     request: Request,
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """Save overrides for one solution type. Body: solution_type (required) + any content fields."""
     if not authorization.startswith("Bearer "):
@@ -8102,7 +8145,7 @@ async def update_testimonial_solution_content(
         raise HTTPException(status_code=400, detail="solution_type is required")
     payload = {k: v for k, v in body.items() if k != "solution_type"}
     try:
-        merged = save_override(st.strip(), payload)
+        merged = save_override(st.strip(), payload, db)
         return TestimonialSolutionContentItem(**merged)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -8186,6 +8229,7 @@ async def generate_testimonial_document_endpoint(
         pv_system_size=(body.get("pv_system_size") or "").strip(),
         solar_pre_daily_kwh=solar_pre,
         solar_post_daily_kwh=solar_post,
+        db=db,
     )
     if result.get("status") == "error":
         raise HTTPException(
@@ -8199,7 +8243,7 @@ async def generate_testimonial_document_endpoint(
             # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
             file_id = extract_folder_id_from_url(document_link)
             if file_id:
-                merged = get_merged_content(solution_type_id)
+                merged = get_merged_content(solution_type_id, db)
                 label = (
                     (merged.get("solution_type_label") if merged else None)
                     or solution_type_id
