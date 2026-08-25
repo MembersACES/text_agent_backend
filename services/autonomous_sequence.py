@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any, Optional, Union
@@ -683,6 +684,85 @@ def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool
             {"sequence_type": st},
         )
     return True
+
+
+_SEQUENCE_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def _copy_autonomous_sequence_type_row(db: Session, old_type: str, new_type: str) -> None:
+    """Insert `new_type` as a copy of `old_type` in autonomous_sequence_type (no-op if table missing)."""
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    skw = _inspector_schema_kw(bind)
+    cols = [str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_type", **skw)]
+    if "sequence_type" not in cols:
+        return
+    exists_new = db.execute(
+        text(f"SELECT 1 FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": new_type},
+    ).first()
+    if exists_new:
+        return
+    src = db.execute(
+        text(f"SELECT * FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": old_type},
+    ).mappings().first()
+    if src is None:
+        ensure_autonomous_sequence_type_row(db, new_type)
+        return
+    copy_cols = [c for c in cols if c != "sequence_type" and c.isidentifier()]
+    insert_cols = ["sequence_type"] + copy_cols
+    params: dict[str, Any] = {"sequence_type": new_type}
+    for col in copy_cols:
+        params[col] = src.get(col)
+    cols_sql = ", ".join(insert_cols)
+    vals_sql = ", ".join(f":{c}" for c in insert_cols)
+    db.execute(text(f"INSERT INTO {ast_tbl} ({cols_sql}) VALUES ({vals_sql})"), params)
+
+
+def rename_sequence_template_type(
+    db: Session,
+    template: AutonomousSequenceTemplate,
+    new_type: str,
+) -> None:
+    """Rename template.sequence_type and cascade to runs + type-prompt row."""
+    old = str(template.sequence_type or "").strip()
+    new = (new_type or "").strip()
+    if not old or new == old:
+        return
+    if not _SEQUENCE_TYPE_RE.match(new):
+        raise ValueError(
+            "Call key must start with a letter or number and use only letters, numbers, dots, underscores, or hyphens (max 80)."
+        )
+    clash = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(
+            AutonomousSequenceTemplate.sequence_type == new,
+            AutonomousSequenceTemplate.id != template.id,
+        )
+        .first()
+    )
+    if clash:
+        raise ValueError(f"Call key already in use: {new}")
+    _copy_autonomous_sequence_type_row(db, old, new)
+    db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.sequence_type == old).update(
+        {AutonomousSequenceRun.sequence_type: new},
+        synchronize_session=False,
+    )
+    template.sequence_type = new
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        db.execute(
+            text(f"DELETE FROM {ast_tbl} WHERE sequence_type = :st"),
+            {"st": old},
+        )
 
 
 def ensure_default_sequence_templates(db: Session) -> None:

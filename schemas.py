@@ -1035,6 +1035,7 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     is_restartable: Optional[bool] = None
     signature_html: Optional[str] = None
     extra_context: Optional[str] = None
+    sequence_type: Optional[str] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
