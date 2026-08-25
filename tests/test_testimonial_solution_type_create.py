@@ -10,6 +10,7 @@ from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
     slugify_solution_type,
+    solution_type_id_from_label,
 )
 
 
@@ -77,3 +78,32 @@ def test_save_override_updates_custom_type():
     assert updated["key_approach_of_solution"] == "Sized against the evening peak."
     row = db.query(TestimonialSolutionType).filter_by(solution_type="battery_storage").one()
     assert row.key_approach_of_solution == "Sized against the evening peak."
+
+
+def test_sheet_labels_map_to_solution_type_ids():
+    assert solution_type_id_from_label("Client Endorsement") == "client_endorsement"
+    assert solution_type_id_from_label("C&I Gas Reviews") == "ci_gas"
+    assert solution_type_id_from_label("Oil / Resource Recovery") == "resource_recovery"
+    assert solution_type_id_from_label("CDS (Container Deposit Scheme)") == "cds"
+    assert solution_type_id_from_label("client_endorsement") == "client_endorsement"
+    assert solution_type_id_from_label("not a real type") is None
+
+
+def test_sheet_row_gets_solution_type_id():
+    from tools.testimonial_sheet import _sheet_row_to_testimonial
+
+    mapped = _sheet_row_to_testimonial(
+        [
+            "Longbeach RSL Sub Branch Inc",
+            "Client Endorsement",
+            "",
+            "Testimonial for Longbeach RSL Sub Branch Inc - Client Endorsement",
+            "https://drive.google.com/file/d/abc123xyz/view",
+            "Approved",
+            "",
+        ],
+        27,
+    )
+    assert mapped is not None
+    assert mapped["testimonial_solution_type_id"] == "client_endorsement"
+    assert mapped["source"] == "sheet"

@@ -62,6 +62,24 @@ for k, v in EXTRA_SOLUTION_TYPES.items():
     SOLUTION_TYPE_LABELS[k] = v
 
 
+def _norm_solution_label(text: str) -> str:
+    lowered = (text or "").strip().lower().replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", lowered).split())
+
+
+def solution_type_id_from_label(label: str) -> Optional[str]:
+    """Map a sheet/UI type label (or id) to testimonial_solution_type_id."""
+    wanted = _norm_solution_label(label)
+    if not wanted:
+        return None
+    if label.strip() in SOLUTION_TYPE_LABELS:
+        return label.strip()
+    for type_id, type_label in SOLUTION_TYPE_LABELS.items():
+        if _norm_solution_label(type_id) == wanted or _norm_solution_label(type_label) == wanted:
+            return type_id
+    return None
+
+
 def build_testimonial_file_name(
     type_label: str,
     business_name: str,

@@ -140,6 +140,46 @@ def test_crm_match_uses_exact_business_name():
     assert match.gdrive_folder_url
 
 
+def test_skips_existing_crm_and_sheet_types():
+    from tools.testimonial_bulk_import import (
+        ExistingTestimonial,
+        existing_from_api_rows,
+        type_already_on_member,
+    )
+
+    name = "Frankston RSL Sub Branch Inc"
+    existing = existing_from_api_rows(
+        [
+            {
+                "business_name": name,
+                "testimonial_solution_type_id": "automated_cleaning_robot",
+                "testimonial_type": "Automated Cleaning Robot",
+            },
+            {
+                "business_name": name,
+                "testimonial_solution_type_id": None,
+                "testimonial_type": "Oil / Resource Recovery",
+            },
+            {
+                "business_name": name,
+                "testimonial_solution_type_id": None,
+                "testimonial_type": "C&I Gas Reviews",
+            },
+        ],
+        fallback_business_name=name,
+    )
+    assert type_already_on_member(name, "automated_cleaning_robot", existing)
+    assert type_already_on_member(name, "resource_recovery", existing)
+    assert type_already_on_member(name, "ci_gas", existing)
+    assert not type_already_on_member(name, "waste", existing)
+    assert not type_already_on_member("Darebin RSL Sub Branch Inc", "ci_gas", existing)
+    assert not type_already_on_member(
+        name,
+        "waste",
+        [ExistingTestimonial(business_name=name, solution_type_id="ci_electricity")],
+    )
+
+
 def test_colleague_zip_maps_new_types_when_present():
     from pathlib import Path
     import zipfile

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 from googleapiclient.errors import HttpError
 
 from tools.one_month_savings import get_sheets_service
+from tools.testimonial_solution_content import solution_type_id_from_label
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,7 @@ def _sheet_row_to_testimonial(row: List[Any], sheet_row_number: int) -> Optional
         "status": status,
         "sheet_status_raw": status_raw or None,
         "testimonial_type": testimonial_type or None,
-        "testimonial_solution_type_id": None,
+        "testimonial_solution_type_id": solution_type_id_from_label(testimonial_type),
         "testimonial_savings": testimonial_savings or None,
         "created_at": placeholder_ts,
         "updated_at": placeholder_ts,

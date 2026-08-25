@@ -9,6 +9,7 @@ Default is a dry-run. After types are on the API, run with --execute.
 Uses BACKEND_API_KEY from .env (quote the value if it contains #).
 CRM members are loaded from GET /api/clients, or from DATABASE_URL if the API
 still rejects the key. Members are matched so Drive folders and dashboard names line up.
+Already-filed types (CRM row or sheet) are skipped unless you pass --force.
 """
 
 from __future__ import annotations
@@ -33,9 +34,11 @@ from tools.testimonial_bulk_import import (  # noqa: E402
     ClassifiedEntry,
     CrmClient,
     SkipReason,
+    existing_from_api_rows,
     match_crm_member,
     plan_zip_entries,
     solution_type_label,
+    type_already_on_member,
 )
 
 DEFAULT_API = "https://text-agent-backend-dev-672026052958.australia-southeast2.run.app"
@@ -154,6 +157,33 @@ def _upload_one(
     return response.status_code, detail
 
 
+def _load_existing_testimonials(
+    api_base: str,
+    token: str,
+    business_name: str,
+    cache: dict[str, list],
+) -> list:
+    key = business_name.strip().lower()
+    if key in cache:
+        return cache[key]
+    url = f"{api_base.rstrip('/')}/api/testimonials"
+    response = requests.get(
+        url,
+        headers=_auth_headers(token),
+        params={"business_name": business_name},
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"GET /api/testimonials failed ({response.status_code}) for {business_name!r}"
+        )
+    payload = response.json()
+    rows = payload if isinstance(payload, list) else []
+    existing = existing_from_api_rows(rows, fallback_business_name=business_name)
+    cache[key] = existing
+    return existing
+
+
 def _print_plan(entries: list[ClassifiedEntry]) -> None:
     kept = [e for e in entries if e.preferred]
     skipped = [e for e in entries if not e.preferred]
@@ -198,6 +228,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only-type", default="", help="Only this solution_type_id")
     parser.add_argument("--sleep", type=float, default=0.4, help="Seconds between uploads")
     parser.add_argument("--execute", action="store_true", help="Upload to the deployed API (otherwise dry-run)")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Upload even if this member already has this solution type",
+    )
     parser.add_argument("--json", action="store_true", help="Also print machine-readable plan JSON")
     return parser.parse_args()
 
@@ -237,8 +272,9 @@ def main() -> int:
 
         if not args.execute:
             print(
-                "\nDry-run only. After backend + interface are deployed with the new types:\n"
-                f"  python scripts/bulk_upload_testimonials.py --zip \"{zip_path}\" --execute"
+                "\nDry-run only. Cloud Run already has the CRM member list. To upload remaining files:\n"
+                f"  python scripts/bulk_upload_testimonials.py --zip \"{zip_path}\" --execute\n"
+                "Already-filed member+type pairs are skipped. Use --force to overwrite that check."
             )
             return 0
 
@@ -272,7 +308,9 @@ def main() -> int:
 
         failures = 0
         unmatched = 0
+        already = 0
         uploaded = 0
+        existing_cache: dict[str, list] = {}
         for entry in kept:
             match = match_crm_member(entry.member_hint, clients)
             if match is None or match.ambiguous:
@@ -287,6 +325,21 @@ def main() -> int:
                 unmatched += 1
                 continue
 
+            type_id = entry.solution_type_id or ""
+            if not args.force:
+                try:
+                    existing = _load_existing_testimonials(
+                        args.base_url, upload_token, business_name, existing_cache
+                    )
+                except RuntimeError as exc:
+                    print(f"FAIL {exc}")
+                    failures += 1
+                    continue
+                if type_already_on_member(business_name, type_id, existing):
+                    print(f"SKIP already exists {business_name} / {type_id} ({entry.filename})")
+                    already += 1
+                    continue
+
             file_bytes = archive.read(entry.zip_path)
             status, detail = _upload_one(
                 args.base_url,
@@ -294,7 +347,7 @@ def main() -> int:
                 filename=entry.filename,
                 file_bytes=file_bytes,
                 business_name=business_name,
-                solution_type_id=entry.solution_type_id or "",
+                solution_type_id=type_id,
                 gdrive_folder_url=folder,
                 status=args.status,
             )
@@ -302,11 +355,27 @@ def main() -> int:
             uploaded += int(ok)
             failures += int(not ok)
             mark = "OK" if ok else "FAIL"
-            print(f"[{mark} {status}] {business_name} / {entry.solution_type_id} <- {entry.filename}  {detail}")
+            print(f"[{mark} {status}] {business_name} / {type_id} <- {entry.filename}  {detail}")
+            if ok:
+                existing_cache.setdefault(business_name.strip().lower(), []).extend(
+                    existing_from_api_rows(
+                        [
+                            {
+                                "business_name": business_name,
+                                "testimonial_solution_type_id": type_id,
+                                "testimonial_type": solution_type_label(type_id),
+                            }
+                        ],
+                        fallback_business_name=business_name,
+                    )
+                )
             if args.sleep:
                 time.sleep(args.sleep)
 
-        print(f"\nUploaded {uploaded}, failed {failures}, unmatched/skipped {unmatched}")
+        print(
+            f"\nUploaded {uploaded}, failed {failures}, "
+            f"already existed {already}, unmatched/skipped {unmatched}"
+        )
         return 1 if failures else 0
 
 
