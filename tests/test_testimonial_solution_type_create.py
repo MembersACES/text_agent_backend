@@ -119,6 +119,30 @@ def test_sheet_labels_map_to_solution_type_ids():
     assert solution_type_id_from_label("CDS (Container Deposit Scheme)") == "cds"
     assert solution_type_id_from_label("client_endorsement") == "client_endorsement"
     assert solution_type_id_from_label("not a real type") is None
+    assert solution_type_id_from_label(
+        "Gas Account contract for MRIN 53313283865 From AGL To Alinta Energy"
+    ) is None
+
+
+def test_resolve_testimonial_type_maps_gas_review_and_clears_junk():
+    from tools.testimonial_solution_content import resolve_testimonial_type
+
+    db = _session()
+    type_id, label = resolve_testimonial_type(db, "ci_gas", None)
+    assert type_id == "ci_gas"
+    assert label == "C&I Gas Reviews"
+
+    type_id, label = resolve_testimonial_type(
+        db,
+        None,
+        "Gas Account contract for MRIN 53313283865 From AGL To Alinta Energy",
+    )
+    assert type_id is None
+    assert "MRIN" in (label or "")
+
+    type_id, label = resolve_testimonial_type(db, "", "")
+    assert type_id is None
+    assert label is None
 
 
 def test_sheet_row_gets_solution_type_id():

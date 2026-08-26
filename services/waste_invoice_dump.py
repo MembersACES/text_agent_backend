@@ -182,6 +182,7 @@ UTILITY_TAB_CONFIG: dict[str, tuple[str, tuple[str, ...], str]] = {
     "Oil": ("8th Sheet - Oil", ("Client Name", "Account Number / Customer Code"), "Invoice Number"),
     "Grease Trap": ("9th Sheet - Grease Trap", ("Client Name", "Account Number / Customer Code"), "Invoice Number"),
     "Cleaning": ("14th Sheet - Cleaning Invoices", ("client_name",), "invoice_number"),
+    "Linen Cleaning": ("16th Sheet - Linen Cleaning", ("client_name",), "invoice_number"),
 }
 
 _TAB_CACHE: dict[str, dict] = {}  # tab name -> {ts, rows (list of header-keyed dicts)}
@@ -219,6 +220,19 @@ def _read_tab_rows(tab: str) -> list[dict]:
             rows.append(obj)
     _TAB_CACHE[tab] = {"ts": now, "rows": rows}
     return rows
+
+
+def read_utility_tab_rows(utility_type: str) -> list[dict]:
+    """All invoice rows for a utility tab (cached). Empty list if unsupported or read fails."""
+    cfg = UTILITY_TAB_CONFIG.get(utility_type)
+    if not cfg:
+        return []
+    tab, _key_cols, _label_col = cfg
+    try:
+        return _read_tab_rows(tab)
+    except Exception as e:  # pragma: no cover - defensive
+        logging.info("[utility-tab-rows] read failed for %s (%s): %s", utility_type, tab, e)
+        return []
 
 
 def read_utility_invoice_links(utility_type: str, identifier: str) -> dict:

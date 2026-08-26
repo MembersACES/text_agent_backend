@@ -167,6 +167,7 @@ from tools.testimonial_solution_content import (
     build_testimonial_file_name,
     create_custom_type,
     delete_custom_type,
+    resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -951,6 +952,158 @@ def get_utility_invoice_links(
     except Exception as e:
         logging.error("[utility-invoice-links] %s", e)
         raise HTTPException(status_code=502, detail=f"Utility invoice links lookup failed: {e}")
+
+
+class UnsignedPipelinePackRequest(BaseModel):
+    utility: str = "gas"
+    unsigned_only: bool = True
+    pdfs: str = "all"
+    include_base1: bool = True
+    segment: str = "all"
+    states: Optional[List[str]] = None
+    retailers: Optional[List[str]] = None
+    exclude_retailers: Optional[List[str]] = None
+    max_files: int = 250
+
+
+def _unsigned_pipeline_crm_clients(db: Session) -> list[dict]:
+    rows = (
+        db.query(
+            Client.id,
+            Client.business_name,
+            Client.external_business_id,
+            Client.stage,
+            Client.primary_contact_email,
+        )
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "business_name": r.business_name,
+            "external_business_id": r.external_business_id,
+            "stage": r.stage,
+            "primary_contact_email": r.primary_contact_email,
+        }
+        for r in rows
+    ]
+
+
+def _run_unsigned_pipeline(
+    db: Session,
+    *,
+    utility: str,
+    unsigned_only: bool,
+    pdfs: str,
+    include_base1: bool,
+    segment: str,
+    states: Optional[List[str]] = None,
+    retailers: Optional[List[str]] = None,
+    exclude_retailers: Optional[List[str]] = None,
+) -> dict:
+    from services.unsigned_pipeline import UTILITY_GROUPS, build_pipeline
+
+    group = (utility or "gas").strip().lower()
+    if group not in UTILITY_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"utility must be one of: {', '.join(UTILITY_GROUPS)}",
+        )
+    pdfs_mode = (pdfs or "all").strip().lower()
+    if pdfs_mode not in ("all", "latest"):
+        raise HTTPException(status_code=400, detail="pdfs must be all or latest")
+    seg = (segment or "all").strip().lower()
+    if seg not in ("all", "ci", "sme"):
+        raise HTTPException(status_code=400, detail="segment must be all, ci, or sme")
+    return build_pipeline(
+        utility_group=group,
+        unsigned_only=unsigned_only,
+        pdfs=pdfs_mode,
+        include_base1=include_base1,
+        segment=seg,
+        states=states,
+        retailers=retailers,
+        exclude_retailers=exclude_retailers,
+        crm_clients=_unsigned_pipeline_crm_clients(db),
+    )
+
+
+@app.get("/api/unsigned-pipeline")
+def get_unsigned_pipeline(
+    utility: str = Query("gas", description="gas | electricity | waste | oil | water | cleaning | all"),
+    unsigned_only: bool = Query(True),
+    pdfs: str = Query("all", description="all | latest"),
+    include_base1: bool = Query(True),
+    segment: str = Query("all", description="all | ci | sme"),
+    states: Optional[str] = Query(None, description="Comma-separated AU states, e.g. VIC,NSW"),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Unsigned utility pipeline: load by state + invoice PDFs.
+
+    Unsigned means this utility is not Signed via ACES on FILE_IDS — members still
+    appear if they have invoices but no contract on that utility.
+    """
+    state_list = [s.strip() for s in (states or "").split(",") if s.strip()] or None
+    try:
+        payload = _run_unsigned_pipeline(
+            db,
+            utility=utility,
+            unsigned_only=unsigned_only,
+            pdfs=pdfs,
+            include_base1=include_base1,
+            segment=segment,
+            states=state_list,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("[unsigned-pipeline] %s", e)
+        raise HTTPException(status_code=502, detail=f"Unsigned pipeline failed: {e}")
+    payload["user_email"] = user_info.get("email")
+    return payload
+
+
+@app.post("/api/unsigned-pipeline/drive-pack")
+def post_unsigned_pipeline_drive_pack(
+    request: UnsignedPipelinePackRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Copy current unsigned-pipeline PDFs into a dated Drive folder (plus _summary.csv)."""
+    from tools.member_folder_drive import MemberFolderDriveError
+    from services.unsigned_pipeline import create_drive_pack
+
+    try:
+        payload = _run_unsigned_pipeline(
+            db,
+            utility=request.utility,
+            unsigned_only=request.unsigned_only,
+            pdfs=request.pdfs,
+            include_base1=request.include_base1,
+            segment=request.segment,
+            states=request.states,
+            retailers=request.retailers,
+            exclude_retailers=request.exclude_retailers,
+        )
+        max_files = request.max_files if request.max_files and request.max_files > 0 else 250
+        pack = create_drive_pack(
+            payload,
+            user_access_token=(x_google_access_token or "").strip() or None,
+            max_files=min(max_files, 500),
+        )
+    except HTTPException:
+        raise
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except Exception as e:
+        logging.error("[unsigned-pipeline/drive-pack] %s", e)
+        raise HTTPException(status_code=502, detail=f"Drive pack failed: {e}")
+    pack["user_email"] = user_info.get("email")
+    pack["totals"] = payload.get("totals")
+    pack["by_state"] = payload.get("by_state")
+    return pack
 
 
 @app.get("/api/climate/config")
@@ -8248,7 +8401,7 @@ async def update_testimonial(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Update testimonial status, invoice number, and/or linked Drive document (file_id, file_name)."""
+    """Update testimonial status, invoice number, type, and/or linked Drive document (file_id, file_name)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -8258,13 +8411,50 @@ async def update_testimonial(
         except Exception as e:
             raise HTTPException(status_code=401, detail="Invalid Google token")
     testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    sheet_row_number = -testimonial_id if testimonial_id < 0 else None
+    if not testimonial and sheet_row_number:
+        from tools.testimonial_sheet import adopt_sheet_row_to_crm
+
+        testimonial = adopt_sheet_row_to_crm(db, sheet_row_number)
     if not testimonial:
         raise HTTPException(status_code=404, detail="Testimonial not found")
     if body.status is not None:
         if body.status.strip() in ("Draft", "Sent for approval", "Approved"):
             testimonial.status = body.status.strip()
+            if sheet_row_number:
+                from tools.testimonial_sheet import update_sheet_status
+
+                update_sheet_status(sheet_row_number, testimonial.status)
     if body.invoice_number is not None:
         testimonial.invoice_number = body.invoice_number.strip() or None
+        from tools.testimonial_sheet import update_sheet_linked_invoice
+
+        if sheet_row_number:
+            update_sheet_linked_invoice(sheet_row_number, testimonial.invoice_number)
+        elif testimonial.file_id:
+            from tools.testimonial_sheet import get_all_testimonials_from_sheet
+
+            for sheet_item in get_all_testimonials_from_sheet():
+                if str(sheet_item.get("file_id") or "").strip() == str(testimonial.file_id).strip():
+                    update_sheet_linked_invoice(-int(sheet_item["id"]), testimonial.invoice_number)
+                    break
+    if body.testimonial_solution_type_id is not None or body.testimonial_type is not None:
+        type_id, type_label = resolve_testimonial_type(
+            db,
+            body.testimonial_solution_type_id,
+            body.testimonial_type,
+        )
+        testimonial.testimonial_solution_type_id = type_id
+        testimonial.testimonial_type = type_label
+        from tools.testimonial_sheet import get_all_testimonials_from_sheet, update_sheet_type
+
+        if sheet_row_number:
+            update_sheet_type(sheet_row_number, type_label)
+        elif testimonial.file_id:
+            for sheet_item in get_all_testimonials_from_sheet():
+                if str(sheet_item.get("file_id") or "").strip() == str(testimonial.file_id).strip():
+                    update_sheet_type(-int(sheet_item["id"]), type_label)
+                    break
     if body.file_id is not None:
         raw = body.file_id.strip()
         extracted = extract_folder_id_from_url(raw) if raw else None
@@ -8425,12 +8615,12 @@ async def update_testimonial_solution_content(
 
 @app.get("/api/testimonials/examples", response_model=List[TestimonialResponse])
 async def get_testimonial_examples_for_solution_type(
-    solution_type: str = Query(..., description="testimonial_solution_type_id to filter by"),
-    limit: int = Query(5, ge=1, le=20),
+    solution_type: Optional[str] = Query(None, description="testimonial_solution_type_id to filter by; omit for all"),
+    limit: int = Query(20, ge=1, le=500),
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Return recent testimonials for a given testimonial solution type (for content page examples)."""
+    """Return recent testimonials, optionally filtered by solution type (content page register)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
