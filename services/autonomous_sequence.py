@@ -69,6 +69,149 @@ def _set_run_validity_date_if_supported(db: Session, run_id: int, validity: date
     )
 
 
+# --- Offer validity configuration -------------------------------------------
+# Validity used to be a hardcoded "anchor + 7 days" in five places. That meant the
+# software invented a deadline the retailer never set, and a restart silently moved
+# a deadline the client had already been given. Mode + days now live on the sequence
+# template. Columns are read defensively: if the migration has not run, callers get
+# ("fixed_days", 7) and behaviour is identical to before.
+
+VALIDITY_MODE_NONE = "none"           # never mention validity
+VALIDITY_MODE_FIXED_DAYS = "fixed_days"  # anchor + N days (our review window)
+VALIDITY_MODE_RETAILER = "retailer_date"  # only a date a human supplied; never invented
+VALIDITY_MODES = (VALIDITY_MODE_NONE, VALIDITY_MODE_FIXED_DAYS, VALIDITY_MODE_RETAILER)
+
+DEFAULT_VALIDITY_MODE = VALIDITY_MODE_FIXED_DAYS
+DEFAULT_VALIDITY_DAYS = 7
+
+
+def _template_validity_columns_present(conn) -> bool:
+    insp = inspect(conn)
+    tables = _reflect_table_names(insp, conn)
+    if "autonomous_sequence_templates" not in tables:
+        return False
+    skw = _inspector_schema_kw(conn)
+    cols = {str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_templates", **skw)}
+    return "validity_mode" in cols and "validity_days" in cols
+
+
+def get_template_validity_config(db: Session, template: Optional[Any]) -> tuple[str, int]:
+    """Return (mode, days) for a template, defaulting to today's behaviour."""
+    if template is None or getattr(template, "id", None) is None:
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    try:
+        conn = db.connection()
+        if not _template_validity_columns_present(conn):
+            return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+        tbl = _qualified_table(conn, "autonomous_sequence_templates")
+        row = db.execute(
+            text(f"SELECT validity_mode, validity_days FROM {tbl} WHERE id = :tid"),
+            {"tid": int(template.id)},
+        ).first()
+    except Exception:  # noqa: BLE001 - never let config lookup break a send
+        logger.warning("Validity config lookup failed; using defaults", exc_info=True)
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    if not row:
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    mode = str(row[0] or "").strip() or DEFAULT_VALIDITY_MODE
+    if mode not in VALIDITY_MODES:
+        mode = DEFAULT_VALIDITY_MODE
+    try:
+        days = int(row[1]) if row[1] is not None else DEFAULT_VALIDITY_DAYS
+    except (TypeError, ValueError):
+        days = DEFAULT_VALIDITY_DAYS
+    if days < 1:
+        days = DEFAULT_VALIDITY_DAYS
+    return mode, days
+
+
+def set_template_validity_config(
+    db: Session, template_id: int, mode: Optional[str], days: Optional[int]
+) -> None:
+    """Persist validity config when the columns exist (no-op before the migration)."""
+    if mode is None and days is None:
+        return
+    conn = db.connection()
+    if not _template_validity_columns_present(conn):
+        logger.warning(
+            "autonomous_sequence_templates.validity_mode/validity_days missing - "
+            "run migrations/add_template_validity_config.sql"
+        )
+        return
+    tbl = _qualified_table(conn, "autonomous_sequence_templates")
+    sets, params = [], {"tid": int(template_id)}
+    if mode is not None:
+        clean = str(mode).strip()
+        if clean not in VALIDITY_MODES:
+            raise ValueError(f"validity_mode must be one of {VALIDITY_MODES}")
+        sets.append("validity_mode = :mode")
+        params["mode"] = clean
+    if days is not None:
+        n = int(days)
+        if n < 1 or n > 365:
+            raise ValueError("validity_days must be between 1 and 365")
+        sets.append("validity_days = :days")
+        params["days"] = n
+    db.execute(text(f"UPDATE {tbl} SET {', '.join(sets)} WHERE id = :tid"), params)
+
+
+def clear_validity_context(context: dict[str, Any]) -> None:
+    """Strip every validity key and tell the agent not to mention one."""
+    for key in (
+        "offer_validity_date",
+        "offer_valid_until",
+        "offer_validity_days",
+        "offer_validity_label",
+        "validity_date",
+        "offer_validity",
+    ):
+        context.pop(key, None)
+    context["omit_validity"] = True
+
+
+def apply_validity_to_context(
+    context: dict[str, Any],
+    anchor_utc: datetime,
+    mode: str,
+    days: int,
+    schedule_zi: ZoneInfo,
+    explicit_date: Optional[date] = None,
+) -> Optional[date]:
+    """Single place that decides an offer validity date. Returns the local date, or None.
+
+    - none          -> no validity at all
+    - retailer_date -> only an explicitly supplied date; never invents one
+    - fixed_days    -> anchor + N days (previous behaviour, N was hardcoded 7)
+    """
+    if mode == VALIDITY_MODE_NONE:
+        clear_validity_context(context)
+        return None
+
+    if explicit_date is None and mode == VALIDITY_MODE_RETAILER:
+        # No human-supplied retailer expiry: say nothing rather than manufacture one.
+        logger.info("validity_mode=retailer_date but no date supplied - omitting validity")
+        clear_validity_context(context)
+        return None
+
+    if explicit_date is not None:
+        valid_local = datetime(
+            explicit_date.year, explicit_date.month, explicit_date.day, 12, 0, 0, tzinfo=schedule_zi
+        )
+    else:
+        valid_local = (anchor_utc + timedelta(days=int(days))).astimezone(schedule_zi)
+
+    valid_date = valid_local.date()
+    context.pop("omit_validity", None)
+    context["offer_validity_date"] = valid_date.isoformat()
+    context["offer_valid_until"] = valid_local.astimezone(timezone.utc).isoformat()
+    context["validity_date"] = valid_local.strftime("%d/%m/%Y") + " (12pm)"
+    if explicit_date is not None:
+        context.pop("offer_validity_days", None)
+    else:
+        context["offer_validity_days"] = int(days)
+    return valid_date
+
+
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     """Remove a run and all dependent rows (events, steps, context extension table)."""
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
@@ -1141,17 +1284,31 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
     schedule_zi = resolve_schedule_tz(run, tpl)
     anchor_at = datetime.now(schedule_zi)
     ctx = _parse_context(run)
-    # Restart should refresh offer validity window from the new anchor.
+    # Restart refreshes the validity window from the new anchor, using the template's
+    # configured mode/days rather than a hardcoded 7. A restart previously moved a
+    # deadline the client had already been told, with no record that it changed.
     if anchor_at.tzinfo is None:
         anchor_utc = anchor_at.replace(tzinfo=timezone.utc)
     else:
         anchor_utc = anchor_at.astimezone(timezone.utc)
-    valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(schedule_zi)
     ctx["offer_generated_at"] = anchor_utc.isoformat()
-    ctx["offer_valid_until"] = valid_until_utc.isoformat()
-    ctx["offer_validity_date"] = valid_until_local.date().isoformat()
-    ctx["offer_validity_days"] = 7
+    _restart_template = get_sequence_template_by_type(db, run.sequence_type)
+    _restart_mode, _restart_days = get_template_validity_config(db, _restart_template)
+    _previous_validity = str(ctx.get("offer_validity_date") or "").strip()
+    _restart_explicit: Optional[date] = None
+    if _restart_mode == VALIDITY_MODE_RETAILER and _previous_validity:
+        try:
+            _restart_explicit = date.fromisoformat(_previous_validity[:10])
+        except ValueError:
+            _restart_explicit = None
+    apply_validity_to_context(
+        ctx, anchor_utc, _restart_mode, _restart_days, schedule_zi, _restart_explicit
+    )
+    if _previous_validity and ctx.get("offer_validity_date") != _previous_validity:
+        logger.info(
+            "Restart moved offer validity for run %s: %s -> %s",
+            getattr(run, "id", "?"), _previous_validity, ctx.get("offer_validity_date"),
+        )
     client_id = run.client_id if run.client_id is not None else offer.client_id
 
     out = start_gas_base2_sequence(
@@ -1330,10 +1487,11 @@ def start_gas_base2_sequence(
                 run_validity_date = date.fromisoformat(validity_raw[:10])
             except ValueError:
                 logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
-        if run_validity_date is None:
-            anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
-            run_validity_date = (anchor_aware_utc + timedelta(days=7)).astimezone(schedule_zi).date()
-            context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
+        _mode, _days = get_template_validity_config(db, template)
+        anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
+        run_validity_date = apply_validity_to_context(
+            context_payload, anchor_aware_utc, _mode, _days, schedule_zi, run_validity_date
+        )
 
     context_payload["signature_html"] = _resolve_signature_html(
         sequence_type, template, context_payload

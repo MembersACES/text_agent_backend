@@ -11511,18 +11511,32 @@ def autonomous_sequence_start(
         sequence_context["email_ID"] = incoming_email_id
         sequence_context.setdefault("email_id", incoming_email_id)
 
-    # Provide consistent offer timing fields for prompts/workflows.
-    # Prefer an explicit offer_validity_date from the client/UI when provided.
-    # Otherwise default the offer validity window to exactly 7 days from generation.
+    # Offer timing fields for prompts/workflows.
+    # An explicit offer_validity_date from the client/UI always wins. Otherwise the
+    # sequence template decides: none / retailer_date / fixed_days(N). The old code
+    # hardcoded "anchor + 7 days" here, which meant the software invented a client
+    # deadline no retailer had set.
     anchor_dt = body.anchor_at
     if anchor_dt.tzinfo is None:
         anchor_utc = anchor_dt.replace(tzinfo=timezone.utc)
     else:
         anchor_utc = anchor_dt.astimezone(timezone.utc)
-    valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Melbourne"))
 
-    from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
+    from services.autonomous_sequence import (
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        apply_validity_to_context,
+        get_template_validity_config,
+    )
+
+    template = get_sequence_template_by_type(db, sequence_type)
+    if not template:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
+                "Create it under Autonomous Agent \u2192 Sequence templates, or check the mono key under the display name."
+            ),
+        )
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
     if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
@@ -11543,46 +11557,28 @@ def autonomous_sequence_start(
                     incoming_validity = f"{m_iso.group(1)}-{m_iso.group(2)}-{m_iso.group(3)}"
                     break
 
+        explicit_validity: Optional[date] = None
         if incoming_validity:
             try:
-                valid_date = date.fromisoformat(incoming_validity[:10])
-                # Noon Australia/Melbourne on that calendar day.
-                valid_until_local = datetime(
-                    valid_date.year, valid_date.month, valid_date.day, 12, 0, 0,
-                    tzinfo=ZoneInfo("Australia/Melbourne"),
-                )
-                valid_until_utc = valid_until_local.astimezone(timezone.utc)
-                sequence_context["offer_validity_date"] = valid_date.isoformat()
-                sequence_context["offer_valid_until"] = valid_until_utc.isoformat()
-                sequence_context["validity_date"] = valid_until_local.strftime("%d/%m/%Y") + " (12pm)"
-                sequence_context["offer_validity_label"] = (
-                    str(sequence_context.get("offer_validity_label") or "").strip()
-                    or f"12pm on {valid_until_local.strftime('%d/%m/%Y')}"
-                )
-                sequence_context.pop("offer_validity_days", None)
+                explicit_validity = date.fromisoformat(incoming_validity[:10])
             except ValueError:
                 logging.warning("Ignoring invalid offer_validity_date=%r", incoming_validity)
-                sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-                sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-                sequence_context.setdefault("offer_validity_days", 7)
-        else:
-            sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-            sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-            sequence_context.setdefault("offer_validity_days", 7)
+
+        validity_mode, validity_days = get_template_validity_config(db, template)
+        resolved_validity = apply_validity_to_context(
+            sequence_context,
+            anchor_utc,
+            validity_mode,
+            validity_days,
+            ZoneInfo("Australia/Melbourne"),
+            explicit_validity,
+        )
+        if resolved_validity is not None:
             sequence_context.setdefault(
-                "validity_date",
-                valid_until_local.strftime("%d/%m/%Y") + " (12pm)",
+                "offer_validity_label",
+                f"12pm on {resolved_validity.strftime('%d/%m/%Y')}",
             )
 
-    template = get_sequence_template_by_type(db, sequence_type)
-    if not template:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
-                "Create it under Autonomous Agent → Sequence templates, or check the mono key under the display name."
-            ),
-        )
     if not bool(template.is_active):
         raise HTTPException(
             status_code=400,
@@ -11644,8 +11640,19 @@ def _autonomous_template_step_response(
 
 def _autonomous_template_response(
     template: AutonomousSequenceTemplate,
+    db: Optional[Session] = None,
 ) -> AutonomousSequenceTemplateResponse:
-    from services.autonomous_sequence import default_signature_html_for_type
+    from services.autonomous_sequence import (
+        DEFAULT_VALIDITY_DAYS,
+        DEFAULT_VALIDITY_MODE,
+        default_signature_html_for_type,
+        get_template_validity_config,
+    )
+
+    if db is not None:
+        validity_mode, validity_days = get_template_validity_config(db, template)
+    else:
+        validity_mode, validity_days = DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
 
     steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
     return AutonomousSequenceTemplateResponse.model_validate(
@@ -11660,6 +11667,8 @@ def _autonomous_template_response(
             "signature_html": str(getattr(template, "signature_html", None) or "").strip()
             or default_signature_html_for_type(template.sequence_type),
             "extra_context": str(getattr(template, "extra_context", None) or "").strip() or None,
+            "validity_mode": validity_mode,
+            "validity_days": validity_days,
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -11888,7 +11897,7 @@ def autonomous_sequence_list_templates(
         .order_by(AutonomousSequenceTemplate.sequence_type.asc())
         .all()
     )
-    return [_autonomous_template_response(r) for r in rows]
+    return [_autonomous_template_response(r, db) for r in rows]
 
 
 @app.get(
@@ -12070,7 +12079,7 @@ def autonomous_sequence_create_template(
         .filter(AutonomousSequenceTemplate.id == template.id)
         .first()
     )
-    return _autonomous_template_response(template)
+    return _autonomous_template_response(template, db)
 
 
 @app.patch(
@@ -12111,9 +12120,15 @@ def autonomous_sequence_update_template(
         template.signature_html = body.signature_html.strip() or None
     if body.extra_context is not None:
         template.extra_context = body.extra_context.strip() or None
+    if body.validity_mode is not None or body.validity_days is not None:
+        from services.autonomous_sequence import set_template_validity_config
+        try:
+            set_template_validity_config(db, template.id, body.validity_mode, body.validity_days)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     db.commit()
     db.refresh(template)
-    return _autonomous_template_response(template)
+    return _autonomous_template_response(template, db)
 
 
 @app.get(
