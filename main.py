@@ -11495,13 +11495,16 @@ def autonomous_sequence_start(
     user_data: dict = Depends(get_current_user_with_db),
 ):
     from services.autonomous_sequence import (
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        apply_validity_to_context,
         ensure_autonomous_sequence_type_row,
         get_sequence_template_by_type,
+        get_template_validity_config,
         start_gas_base2_sequence,
     )
 
-    sequence_type = (body.sequence_type or "").strip()
-    if not sequence_type:
+    requested_type = (body.sequence_type or "").strip()
+    if not requested_type:
         raise HTTPException(status_code=400, detail="sequence_type is required")
 
     sequence_context = dict(body.context or {})
@@ -11522,24 +11525,19 @@ def autonomous_sequence_start(
     else:
         anchor_utc = anchor_dt.astimezone(timezone.utc)
 
-    from services.autonomous_sequence import (
-        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
-        apply_validity_to_context,
-        get_template_validity_config,
-    )
-
-    template = get_sequence_template_by_type(db, sequence_type)
+    template = get_sequence_template_by_type(db, requested_type)
     if not template:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
+                f"Unsupported sequence_type (template not found): {requested_type!r}. "
                 "Create it under Autonomous Agent \u2192 Sequence templates, or check the mono key under the display name."
             ),
         )
+    sequence_type = str(template.sequence_type)
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if requested_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
         incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
         if not incoming_validity:
             # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
@@ -11582,7 +11580,7 @@ def autonomous_sequence_start(
     if not bool(template.is_active):
         raise HTTPException(
             status_code=400,
-            detail=f"Sequence template is inactive: {sequence_type!r}. Enable Active and Save template.",
+            detail=f"Sequence template is inactive: {requested_type!r}. Enable Active and Save template.",
         )
     offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
     if not offer:
@@ -11646,13 +11644,16 @@ def _autonomous_template_response(
         DEFAULT_VALIDITY_DAYS,
         DEFAULT_VALIDITY_MODE,
         default_signature_html_for_type,
+        get_template_linked_flow_keys,
         get_template_validity_config,
     )
 
     if db is not None:
         validity_mode, validity_days = get_template_validity_config(db, template)
+        linked_flow_keys = get_template_linked_flow_keys(db, template)
     else:
         validity_mode, validity_days = DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+        linked_flow_keys = []
 
     steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
     return AutonomousSequenceTemplateResponse.model_validate(
@@ -11669,6 +11670,7 @@ def _autonomous_template_response(
             "extra_context": str(getattr(template, "extra_context", None) or "").strip() or None,
             "validity_mode": validity_mode,
             "validity_days": validity_days,
+            "linked_flow_keys": linked_flow_keys,
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -11910,12 +11912,12 @@ def autonomous_sequence_template_suggestions(
 ):
     """Comparisons / flows that do not yet have an autonomous sequence template."""
     from services.autonomous_flows import uncovered_flows
+    from services.autonomous_sequence import get_template_linked_flow_keys
 
-    existing = {
-        str(t.sequence_type).strip()
-        for t in db.query(AutonomousSequenceTemplate.sequence_type).all()
-        if t.sequence_type
-    }
+    rows = db.query(AutonomousSequenceTemplate).all()
+    existing = {str(t.sequence_type).strip() for t in rows if t.sequence_type}
+    for t in rows:
+        existing.update(get_template_linked_flow_keys(db, t))
     return AutonomousTemplateSuggestionsResponse(uncovered_flows=uncovered_flows(existing))
 
 
@@ -12126,6 +12128,9 @@ def autonomous_sequence_update_template(
             set_template_validity_config(db, template.id, body.validity_mode, body.validity_days)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    if body.linked_flow_keys is not None:
+        from services.autonomous_sequence import set_template_linked_flow_keys
+        set_template_linked_flow_keys(db, template.id, body.linked_flow_keys)
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template, db)
