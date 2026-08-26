@@ -854,6 +854,8 @@ class TestimonialUpdate(BaseModel):
     invoice_number: Optional[str] = None
     file_id: Optional[str] = None
     file_name: Optional[str] = None
+    testimonial_type: Optional[str] = None
+    testimonial_solution_type_id: Optional[str] = None
     video_long_file_id: Optional[str] = None
     video_short_file_id: Optional[str] = None
 

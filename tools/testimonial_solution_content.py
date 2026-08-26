@@ -80,6 +80,34 @@ def solution_type_id_from_label(label: str) -> Optional[str]:
     return None
 
 
+def resolve_testimonial_type(
+    db: Any,
+    solution_type_id: Optional[str] = None,
+    type_label: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Map a PATCH payload to (solution_type_id, display label). Blank both → uncategorised."""
+    clean_id = (solution_type_id or "").strip() or None
+    clean_label = (type_label or "").strip() or None
+    if not clean_id and not clean_label:
+        return None, None
+    wanted = clean_id or clean_label or ""
+    mapped = solution_type_id_from_label(wanted)
+    if not mapped and clean_label and clean_id:
+        mapped = solution_type_id_from_label(clean_label)
+    if mapped:
+        merged = get_merged_content(mapped, db)
+        label = None
+        if isinstance(merged, dict):
+            label = str(merged.get("solution_type_label") or "").strip() or None
+        return mapped, label or SOLUTION_TYPE_LABELS.get(mapped) or clean_label or mapped
+    if clean_id:
+        merged = get_merged_content(clean_id, db)
+        if isinstance(merged, dict):
+            label = str(merged.get("solution_type_label") or "").strip() or None
+            return clean_id, label or clean_label or clean_id
+    return None, clean_label
+
+
 def build_testimonial_file_name(
     type_label: str,
     business_name: str,
