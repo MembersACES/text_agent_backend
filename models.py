@@ -154,8 +154,17 @@ class Offer(Base):
     # Additional Base 2 / comparison offer metrics (e.g. C&I gas/electricity)
     annual_usage_gj = Column(Float, nullable=True)
     energy_charge_pct = Column(Float, nullable=True)
+    # Blended single rates — used for utilities priced as one rate (e.g. C&I gas).
     contracted_rate = Column(Float, nullable=True)
     offer_rate = Column(Float, nullable=True)
+    # Time-of-use (TOU) rates for C&I electricity (c/kWh). 'current_*' = invoiced/contracted now,
+    # 'new_*' = offered. shoulder is null for peak/off-peak-only sites; all null for non-electricity.
+    current_peak_rate = Column(Float, nullable=True)
+    current_shoulder_rate = Column(Float, nullable=True)
+    current_offpeak_rate = Column(Float, nullable=True)
+    new_peak_rate = Column(Float, nullable=True)
+    new_shoulder_rate = Column(Float, nullable=True)
+    new_offpeak_rate = Column(Float, nullable=True)
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
     document_link = Column(Text, nullable=True)
@@ -282,6 +291,60 @@ class Testimonial(Base):
     testimonial_type = Column(String(255), nullable=True)  # e.g. C&I Electricity Reviews
     testimonial_solution_type_id = Column(String(100), nullable=True)  # e.g. ci_electricity
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
+    video_long_file_id = Column(String(255), nullable=True)  # Drive ID for long-cut MP4
+    video_short_file_id = Column(String(255), nullable=True)  # Drive ID for 30s-cut MP4
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class TestimonialSolutionType(Base):
+    """Staff-created testimonial solution types (stored in DB so they survive Cloud Run deploys)."""
+
+    __tablename__ = "testimonial_solution_types"
+
+    solution_type = Column(String(100), primary_key=True)
+    solution_type_label = Column(String(255), nullable=False)
+    key_outcome_metrics = Column(Text, nullable=False, default="")
+    key_challenge_of_solution = Column(Text, nullable=False, default="")
+    key_approach_of_solution = Column(Text, nullable=False, default="")
+    key_outcome_of_solution = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_1 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_2 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_3 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_4 = Column(Text, nullable=False, default="")
+    key_outcome_dotpoints_5 = Column(Text, nullable=False, default="")
+    conclusion = Column(Text, nullable=False, default="")
+    esg_scope_for_solution = Column(Text, nullable=False, default="")
+    sdg_impact_for_solution = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class MarketingVideo(Base):
+    """
+    CZA marketing or testimonial video registered in the Interface Videos library.
+    MP4s live in RESOURCES_VIDEOS_FOLDER_ID on Google Drive.
+    """
+    __tablename__ = "marketing_videos"
+
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String(128), nullable=False, index=True)
+    kind = Column(String(32), nullable=False, index=True)  # marketing | testimonial
+    variant = Column(String(16), nullable=False, index=True)  # long | 30s
+    file_id = Column(String(255), nullable=False)
+    file_name = Column(String(512), nullable=False)
+    preview_url = Column(String(512), nullable=True)
+    web_view_link = Column(String(512), nullable=True)
+    crm_solution_type_id = Column(String(100), nullable=True, index=True)
+    testimonial_id = Column(Integer, nullable=True, index=True)
+    business_name = Column(String(255), nullable=True, index=True)
+    client_id = Column(Integer, nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="draft", index=True)
+    source_doc_file_id = Column(String(255), nullable=True)
+    qa_review_path = Column(String(1024), nullable=True)
+    tool_output_zip_path = Column(String(1024), nullable=True)
+    render_job_id = Column(String(128), nullable=True)
+    notes = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -359,7 +422,7 @@ class AutonomousSequenceRun(Base):
     stop_reason = Column(String(120), nullable=True)
 
     anchor_at = Column(DateTime, nullable=False)
-    timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
+    timezone = Column(String(64), nullable=True, default=None)
     context_json = Column(Text, nullable=True)
     email_ID = Column("email_id", String(255), nullable=True)
     contact_phone = Column(String(64), nullable=True)
@@ -424,9 +487,11 @@ class AutonomousSequenceTemplate(Base):
     sequence_type = Column(String(80), nullable=False, unique=True, index=True)
     display_name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    timezone = Column(String(64), nullable=False, default="Australia/Brisbane")
+    timezone = Column(String(64), nullable=False, default="Australia/Melbourne")
     is_active = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
+    signature_html = Column(Text, nullable=True)
+    extra_context = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

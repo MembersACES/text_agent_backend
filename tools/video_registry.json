@@ -1,0 +1,416 @@
+{
+  "version": "1.0.0",
+  "source": "tools/export_video_registry.py",
+  "entries": [
+    {
+      "slug": "ai-cleaning-bots",
+      "composition_id": "AiCleaningBots",
+      "video_id": "ai-cleaning-bots",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "autonomous-follow-up",
+      "composition_id": "AutonomousFollowUp",
+      "video_id": "autonomous-follow-up",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "base-1-hub",
+      "composition_id": "Base1Hub",
+      "video_id": "base-1-hub",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "base-2-review",
+      "composition_id": "Base2Review",
+      "video_id": "base-2-review",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "blend-and-extend",
+      "composition_id": "BlendAndExtend",
+      "video_id": "blend-and-extend",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "contract-ending",
+      "composition_id": "ContractEnding",
+      "video_id": "contract-ending",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "demand-response",
+      "composition_id": "DemandResponse",
+      "video_id": "demand-response",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "document-lodgement",
+      "composition_id": "DocumentLodgement",
+      "video_id": "document-lodgement",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "find-the-money",
+      "composition_id": "FindTheMoney",
+      "video_id": "find-the-money",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "ci_gas",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "first-month-savings",
+      "composition_id": "FirstMonthSavings",
+      "video_id": "first-month-savings",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "ghg-reporting",
+      "composition_id": "GhgReporting",
+      "video_id": "ghg-reporting",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "ghg_roadmap",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "one-system",
+      "composition_id": "OneSystem",
+      "video_id": "one-system",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "dma",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "overcharge-proof",
+      "composition_id": "OverchargeProof",
+      "video_id": "overcharge-proof",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "ci_gas",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "profile-reset",
+      "composition_id": "ProfileReset",
+      "video_id": "profile-reset",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "dma",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "prograde-climate",
+      "composition_id": "ProgradeClimate",
+      "video_id": "prograde-climate",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "resource-recovery",
+      "composition_id": "ResourceRecovery",
+      "video_id": "resource-recovery",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "resource_recovery",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "send-your-bills",
+      "composition_id": "SendYourBills",
+      "video_id": "send-your-bills",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "sme_gas",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "site-profiling",
+      "composition_id": "SiteProfiling",
+      "video_id": "site-profiling",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "solar-panel-cleaning",
+      "composition_id": "SolarPanelCleaning",
+      "video_id": "solar-panel-cleaning",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "solar_panel_cleaning",
+      "solution_range_ids": [
+        "solar_panel_cleaning"
+      ]
+    },
+    {
+      "slug": "strategy-in-minutes",
+      "composition_id": "StrategyInMinutes",
+      "video_id": "strategy-in-minutes",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "ghg_roadmap",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "this-is-cza",
+      "composition_id": "ThisIsCza",
+      "video_id": "this-is-cza",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": "client_endorsement",
+      "solution_range_ids": []
+    },
+    {
+      "slug": "trojan-oil-docket",
+      "composition_id": "TrojanOilDocket",
+      "video_id": "trojan-oil-docket",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "voice-agents",
+      "composition_id": "VoiceAgents",
+      "video_id": "voice-agents",
+      "kind": "marketing",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "box-hill-waste",
+      "composition_id": "Testimonial-BoxHillWaste",
+      "video_id": "testimonial-box-hill-waste",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "cheltenham-dma",
+      "composition_id": "Testimonial-CheltenhamDma",
+      "video_id": "testimonial-cheltenham-dma",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "cheltenham-gas",
+      "composition_id": "Testimonial-CheltenhamGas",
+      "video_id": "testimonial-cheltenham-gas",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "cheltenham-ghg",
+      "composition_id": "Testimonial-CheltenhamGhg",
+      "video_id": "testimonial-cheltenham-ghg",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "darebin-waste",
+      "composition_id": "Testimonial-DarebinWaste",
+      "video_id": "testimonial-darebin-waste",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "frankston-gas",
+      "composition_id": "Testimonial-FrankstonGas",
+      "video_id": "testimonial-frankston-gas",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "healesville-solar",
+      "composition_id": "Testimonial-HealesvilleSolar",
+      "video_id": "testimonial-healesville-solar",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "highett-gas",
+      "composition_id": "Testimonial-HighettGas",
+      "video_id": "testimonial-highett-gas",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "longbeach-endorsement",
+      "composition_id": "Testimonial-LongbeachEndorsement",
+      "video_id": "testimonial-longbeach-endorsement",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "longbeach-oil",
+      "composition_id": "Testimonial-LongbeachOil",
+      "video_id": "testimonial-longbeach-oil",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    },
+    {
+      "slug": "longbeach-waste",
+      "composition_id": "Testimonial-LongbeachWaste",
+      "video_id": "testimonial-longbeach-waste",
+      "kind": "testimonial",
+      "cuts": [
+        "long",
+        "30s"
+      ],
+      "crm_solution_type_id": null,
+      "solution_range_ids": []
+    }
+  ]
+}

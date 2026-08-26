@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 from googleapiclient.errors import HttpError
 
 from tools.one_month_savings import get_sheets_service
+from tools.testimonial_solution_content import solution_type_id_from_label
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,7 @@ def _sheet_row_to_testimonial(row: List[Any], sheet_row_number: int) -> Optional
         "status": status,
         "sheet_status_raw": status_raw or None,
         "testimonial_type": testimonial_type or None,
-        "testimonial_solution_type_id": None,
+        "testimonial_solution_type_id": solution_type_id_from_label(testimonial_type),
         "testimonial_savings": testimonial_savings or None,
         "created_at": placeholder_ts,
         "updated_at": placeholder_ts,
@@ -232,3 +233,80 @@ def merge_db_and_sheet_testimonials(
             seen_file_ids.add(fid)
 
     return merged
+
+
+def _crm_status_from_sheet(status: Optional[str]) -> str:
+    value = (status or "").strip()
+    if value in VALID_STATUSES:
+        return value
+    return "Approved"
+
+
+def update_sheet_linked_invoice(sheet_row_number: int, invoice_number: Optional[str]) -> None:
+    """Write column G (Linked Invoice) for a Sheet1 row. Row 1 is the header."""
+    _write_sheet_cell(sheet_row_number, "G", invoice_number)
+
+
+def update_sheet_status(sheet_row_number: int, status: Optional[str]) -> None:
+    """Write column F (Status) for a Sheet1 row."""
+    _write_sheet_cell(sheet_row_number, "F", status)
+
+
+def update_sheet_type(sheet_row_number: int, type_label: Optional[str]) -> None:
+    """Write column B (Testimonial Type) for a Sheet1 row."""
+    _write_sheet_cell(sheet_row_number, "B", type_label)
+
+
+def _write_sheet_cell(sheet_row_number: int, column: str, value: Optional[str]) -> None:
+    if sheet_row_number < 2:
+        return
+    service = get_sheets_service()
+    if not service:
+        logger.error("[TESTIMONIAL_SHEET] Could not create Google Sheets service to write %s", column)
+        return
+    try:
+        service.spreadsheets().values().update(
+            spreadsheetId=TESTIMONIAL_SHEET_ID,
+            range=f"{TESTIMONIAL_SHEET_NAME}!{column}{sheet_row_number}",
+            valueInputOption="USER_ENTERED",
+            body={"values": [[(value or "").strip()]]},
+        ).execute()
+    except HttpError as e:
+        logger.error("[TESTIMONIAL_SHEET] Failed to write %s on row %s: %s", column, sheet_row_number, e)
+
+
+def adopt_sheet_row_to_crm(db: Any, sheet_row_number: int) -> Any:
+    """
+    Copy a sheet register row into CRM (or return the existing CRM row with
+    the same Drive file_id). Lets staff link invoices from the content page
+    without re-uploading the file.
+    """
+    from models import Testimonial
+
+    wanted_id = -int(sheet_row_number)
+    item = next(
+        (row for row in get_all_testimonials_from_sheet() if row.get("id") == wanted_id),
+        None,
+    )
+    if not item:
+        return None
+
+    file_id = str(item.get("file_id") or "").strip()
+    if file_id:
+        existing = db.query(Testimonial).filter(Testimonial.file_id == file_id).first()
+        if existing:
+            return existing
+
+    created = Testimonial(
+        business_name=str(item.get("business_name") or "").strip(),
+        file_name=str(item.get("file_name") or "").strip() or "Testimonial",
+        file_id=file_id,
+        invoice_number=item.get("invoice_number") or None,
+        status=_crm_status_from_sheet(item.get("status")),
+        testimonial_type=item.get("testimonial_type") or None,
+        testimonial_solution_type_id=item.get("testimonial_solution_type_id") or None,
+        testimonial_savings=item.get("testimonial_savings") or None,
+    )
+    db.add(created)
+    db.flush()
+    return created

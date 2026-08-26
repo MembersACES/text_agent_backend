@@ -1,0 +1,44 @@
+# Carbon Zero (czeroanz-ai) — backend Cloud Run deploy.
+# Uses Artifact Registry (same as crm-frontend / mcp-server in this project).
+# Triggers: dev → _CLOUD_RUN_SERVICE=text-agent-backend-dev | main → default.
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _REGION: australia-southeast2
+  _CLOUD_RUN_SERVICE: text-agent-backend
+  _AR_REPOSITORY: cloud-run-source-deploy
+  _AR_PACKAGE: text_agent_backend
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_AR_PACKAGE}/${_CLOUD_RUN_SERVICE}:$COMMIT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_AR_PACKAGE}/${_CLOUD_RUN_SERVICE}:$COMMIT_SHA
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_CLOUD_RUN_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_AR_PACKAGE}/${_CLOUD_RUN_SERVICE}:$COMMIT_SHA
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --allow-unauthenticated
+      - --project
+      - $PROJECT_ID
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/${_AR_PACKAGE}/${_CLOUD_RUN_SERVICE}:$COMMIT_SHA

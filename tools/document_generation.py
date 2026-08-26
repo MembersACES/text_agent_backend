@@ -527,6 +527,7 @@ def generate_testimonial_document(
     pv_system_size: str = "",
     solar_pre_daily_kwh: Optional[float] = None,
     solar_post_daily_kwh: Optional[float] = None,
+    db: Any = None,
 ) -> Dict[str, Any]:
     """
     Generate a testimonial document using the testimonial Google Doc template.
@@ -542,14 +543,13 @@ def generate_testimonial_document(
     current_date = datetime.datetime.now()
     current_year = current_date.year
 
-    content = get_merged_content(solution_type_id)
+    content = get_merged_content(solution_type_id, db)
     if not content:
         return {
             "status": "error",
             "message": (
                 f"Unknown solution type: {solution_type_id}. "
-                "Redeploy the API service so it includes the latest "
-                "`tools/testimonial_solution_content.py` (extra testimonial types are defined there)."
+                "Create it on Testimonial content, or redeploy the API so built-in types are current."
             ),
             "document_link": None,
         }
@@ -602,7 +602,7 @@ def generate_testimonial_document(
             content=dict(content),
         )
 
-    # Build data dict for n8n: keys match template placeholders {{key}}
+    # Build data dict for n8n: keys match template placeholders {key}
     monthly_savings_formatted = f"{monthly_savings:,.2f}"
     annual_savings_formatted = f"{annual_savings:,.2f}"
     net_outcome_formatted = f"{net_outcome:,.2f}"

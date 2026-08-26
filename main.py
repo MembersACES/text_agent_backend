@@ -25,6 +25,7 @@ from urllib.parse import urlparse, parse_qs
 import os
 import sys
 import logging
+import subprocess
 import time
 import tempfile
 import os
@@ -32,7 +33,7 @@ import httpx
 from typing import Annotated, Any, Dict, List, Optional, Union
 import json
 from fastapi import HTTPException, Depends
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -45,11 +46,34 @@ import io
 
 # Adjust this import if your function is in a different location
 from tools.business_info import get_business_information, get_base1_landing_responses
+from tools.member_documents import get_eoi_ids, get_member_wip
+from tools.drive_file_metadata import get_drive_file_times
+from tools.share_folder import ShareFolderError, get_share_folder_status, share_member_folder
+from tools.member_folder_drive import MemberFolderDriveError
+from services.member_folder import (
+    create_distributor_folder,
+    create_member_folder,
+    extract_distributor_pdf,
+    list_industry_folders,
+    list_subfolders,
+)
+from tools.distributor_agreement import list_distributor_master_rows
+from tools.loa_business_details import get_return_business_details
+from tools.return_utility_info import get_return_utility_info
+from tools.sheet_preview import get_sheet_preview
+from tools.bne_gas_contracts import lookup_bne_gas_contract
 from tools.invoicing_retailer_sheets import (
+    ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
+    get_commission_up_to_date_summary,
     get_trojan_oil_unique_client_count,
     list_retailer_keys,
+    list_retailer_sheet_tabs,
 )
+from tools.invoicing_access import require_invoicing_user
+from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
+from tools.invoicing_drive import list_documents as list_invoicing_drive_documents
+from tools.invoicing_drive import list_category_keys as list_invoicing_drive_category_keys
 from services import airtable_client
 from services.prograde_drift_webhook import get_nonce_cache, verify_signature
 from services.climate_store import (
@@ -66,7 +90,10 @@ from services.climate_activity_etl import EtlContext, default_fy_period, transfo
 from services.climate_entity_sources import (
     build_client_linked_utilities,
     build_entity_activity_sources,
+    build_entity_activity_manifest,
+    build_entity_site_detail,
 )
+from services.climate_data_gaps import build_entity_data_gaps, build_roster_data_gaps
 from services.pudu_dashboard import (
     annotate_robot_list_with_canonical_sn,
     build_dashboard_payload,
@@ -133,10 +160,14 @@ from tools.resources_drive_videos import (
     get_resources_videos_folder_id,
     list_resources_folder_videos,
 )
+from tools.plus_es_dma import get_plus_es_dma_folder_id, list_plus_es_dma_pdfs
 from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
     build_testimonial_file_name,
+    create_custom_type,
+    delete_custom_type,
+    resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
 
@@ -155,6 +186,7 @@ from models import (
     ClientManualActivity,
     StrategyItem,
     Testimonial,
+    MarketingVideo,
     AutonomousSequenceEvent,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
@@ -203,6 +235,11 @@ from schemas import (
     TestimonialResponse,
     TestimonialUpdate,
     TestimonialCheckApprovedResponse,
+    MarketingVideoResponse,
+    MarketingVideoUpdate,
+    MarketingVideoPublishPackRequest,
+    VideoRegistryResponse,
+    MARKETING_VIDEO_STATUSES,
     TestimonialSolutionContentItem,
     TestimonialSolutionContentUpdate,
     AutonomousSequenceStartRequest,
@@ -212,12 +249,20 @@ from schemas import (
     AutonomousSequenceInboundRequest,
     AutonomousSequenceRunPatchRequest,
     AutonomousSequenceStepsSchedulePatchRequest,
+    AutonomousSequenceStepDispatchMarkRequest,
     AutonomousSequenceTemplateCreate,
     AutonomousSequenceTemplateResponse,
     AutonomousSequenceTemplateStepCreate,
     AutonomousSequenceTemplateStepResponse,
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
+    RetellAgentListItem,
+    RetellAgentPromptResponse,
+    RetellAgentPromptUpdate,
+    RetellVoiceListItem,
+    AutonomousTemplateSuggestionsResponse,
+    AutonomousTemplateDeletePreview,
+    AutonomousTemplateDeleteResponse,
 )
 from crm_enums import (
     ClientStage,
@@ -356,11 +401,14 @@ def on_shutdown() -> None:
         _autonomous_scheduler = None
 
 # CORS: allow these origins so error responses (e.g. 500) can include CORS headers
-CORS_ORIGINS = [
+_CORS_ORIGINS_BASE = [
     "https://acesagentinterface-672026052958.australia-southeast2.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acesagentinterface-672026052958.australia-southeast7.run.app",
     "https://acesagentinterfacedev-672026052958.australia-southeast7.run.app",
+    # czeroanz-ai Cloud Run frontends (CZA hosting)
+    "https://czagentinterface-522472397014.australia-southeast2.run.app",
+    "https://czagentinterfacedev-522472397014.australia-southeast2.run.app",
     "https://prograde-sustainability-dev-63gwbzzcdq-km.a.run.app",
     "https://prograde-sustainability-dev-672026052958.australia-southeast2.run.app",
     "http://localhost:3000",
@@ -371,6 +419,20 @@ CORS_ORIGINS = [
     "http://127.0.0.1:8081",
     "https://script.google.com",
 ]
+
+
+def _build_cors_origins() -> list[str]:
+    """Static allowlist plus optional comma-separated CORS_EXTRA_ORIGINS (CZA Cloud Run URLs)."""
+    extra_raw = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
+    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    merged = list(_CORS_ORIGINS_BASE)
+    for origin in extra:
+        if origin not in merged:
+            merged.append(origin)
+    return merged
+
+
+CORS_ORIGINS = _build_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,
@@ -406,9 +468,12 @@ async def global_exception_handler(request: StarletteRequest, exc: Exception):
             headers=headers,
         )
     logging.exception("Unhandled exception: %s", exc)
+    detail = "Internal server error"
+    if os.getenv("ENVIRONMENT", "development").lower() not in ("production", "prod"):
+        detail = f"Internal server error: {exc}"
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error"},
+        content={"detail": detail},
         headers=headers,
     )
 
@@ -540,6 +605,28 @@ def get_current_user_with_db(
     return {"idinfo": idinfo, "user": user}
 
 
+def get_current_user_with_db_or_backend_api_key(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Google ID token, or Bearer BACKEND_API_KEY (staff scripts / Next.js proxy)."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1].strip().strip('"').strip("'")
+    api_key = (os.getenv("BACKEND_API_KEY") or "test-key").strip().strip('"').strip("'")
+    if token and token == api_key:
+        email = (os.getenv("TASKS_EXTERNAL_ACTOR_EMAIL") or "api-key@acesolutions.com.au").strip()
+        idinfo = {"email": email, "name": "Backend API key", "picture": None}
+        user = get_or_create_user(db, email, idinfo["name"], None)
+        return {"idinfo": idinfo, "user": user}
+    idinfo = verify_google_token(authorization)
+    email = idinfo.get("email")
+    name = idinfo.get("name")
+    picture = idinfo.get("picture")
+    user = get_or_create_user(db, email, name, picture)
+    return {"idinfo": idinfo, "user": user}
+
+
 def get_current_user_with_db_or_tasks_api_key(
     authorization: Optional[str] = Header(None),
     x_tasks_api_key: Optional[str] = Header(None, alias="X-Tasks-API-Key"),
@@ -619,6 +706,11 @@ class UtilityInfoRequest(BaseModel):
     identifier: Optional[str]
 
 
+class ReturnUtilityInfoRequest(BaseModel):
+    utility_type: str
+    business_name: str = ""
+
+
 class UtilityLinkedDetailItem(BaseModel):
     identifier: Optional[str] = None
     identifier_type: Optional[str] = None
@@ -668,16 +760,10 @@ N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK = (
 
 
 async def _maybe_forward_utility_linked_to_n8n(payload: dict) -> None:
-    """POST payload to n8n after utility link (path: update here if your webhook URL differs)."""
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK, json=payload)
-            response.raise_for_status()
-    except Exception:
-        logging.exception(
-            "utility-linked: forward to n8n failed (url=%s)",
-            N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK,
-        )
+    """POST to n8n utility_linked_post_process (Drive move + file-ID register). Waits for n8n HTTP response."""
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK, json=payload)
+        response.raise_for_status()
 
 
 @app.post("/api/webhooks/utility-linked")
@@ -703,10 +789,20 @@ async def utility_linked_webhook(
 
     _dispatch_utility_linked_placeholder(request_body.utility_type)
     payload = request_body.model_dump()
-    await _maybe_forward_utility_linked_to_n8n(payload)
+    try:
+        await _maybe_forward_utility_linked_to_n8n(payload)
+    except Exception as e:
+        logging.exception(
+            "utility-linked: forward to n8n failed (url=%s)",
+            N8N_UTILITY_LINKED_POST_PROCESS_WEBHOOK,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Invoice filing (utility_linked_post_process) failed or timed out. Airtable may already be linked.",
+        ) from e
     return {
         "ok": True,
-        "message": "utility-linked placeholder accepted",
+        "message": "utility-linked post-process completed",
         "utility_type": request_body.utility_type,
     }
 
@@ -825,6 +921,304 @@ def get_climate_roster(
     }
 
 
+@app.get("/api/waste-invoice-rows")
+def get_waste_invoice_rows(
+    account: str = Query(..., description="Account / customer number to match in the raw waste dump sheet"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Raw waste invoice rows (per-bin schedule + Invoice Total Amount + Webview Link / Drive PDF)
+    from 'Member ACES Data' -> '7th Sheet - Waste', matched by account number. Uncleaned source —
+    the caller computes expected cost from the bins and flags blank Webview Links as missing invoices."""
+    from services.waste_invoice_dump import read_waste_invoice_rows
+    try:
+        return read_waste_invoice_rows(account)
+    except Exception as e:
+        logging.error("[waste-invoice-rows] %s", e)
+        raise HTTPException(status_code=502, detail=f"Waste invoice lookup failed: {e}")
+
+
+@app.get("/api/utility-invoice-links")
+def get_utility_invoice_links(
+    utility_type: str = Query(..., description="Utility type, e.g. 'C&I Electricity', 'Waste', 'Oil'"),
+    identifier: str = Query(..., description="The meter/account identifier (NMI / MRIN / account number)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Invoice PDF links for one (utility_type, identifier) from that utility's tab of the
+    'Member ACES Data' workbook. Matches identifier against the tab's key column (NMI/MRIN/account).
+    Read-only; used by the Disc Engine evidence panel to show invoice files across all utilities."""
+    from services.waste_invoice_dump import read_utility_invoice_links
+    try:
+        return read_utility_invoice_links(utility_type, identifier)
+    except Exception as e:
+        logging.error("[utility-invoice-links] %s", e)
+        raise HTTPException(status_code=502, detail=f"Utility invoice links lookup failed: {e}")
+
+
+class UnsignedPipelinePackRequest(BaseModel):
+    utility: str = "gas"
+    unsigned_only: bool = True
+    pdfs: str = "all"
+    include_base1: bool = True
+    segment: str = "all"
+    states: Optional[List[str]] = None
+    retailers: Optional[List[str]] = None
+    exclude_retailers: Optional[List[str]] = None
+    max_files: int = 250
+
+
+def _unsigned_pipeline_crm_clients(db: Session) -> list[dict]:
+    rows = (
+        db.query(
+            Client.id,
+            Client.business_name,
+            Client.external_business_id,
+            Client.stage,
+            Client.primary_contact_email,
+        )
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "business_name": r.business_name,
+            "external_business_id": r.external_business_id,
+            "stage": r.stage,
+            "primary_contact_email": r.primary_contact_email,
+        }
+        for r in rows
+    ]
+
+
+def _run_unsigned_pipeline(
+    db: Session,
+    *,
+    utility: str,
+    unsigned_only: bool,
+    pdfs: str,
+    include_base1: bool,
+    segment: str,
+    states: Optional[List[str]] = None,
+    retailers: Optional[List[str]] = None,
+    exclude_retailers: Optional[List[str]] = None,
+) -> dict:
+    from services.unsigned_pipeline import UTILITY_GROUPS, build_pipeline
+
+    group = (utility or "gas").strip().lower()
+    if group not in UTILITY_GROUPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"utility must be one of: {', '.join(UTILITY_GROUPS)}",
+        )
+    pdfs_mode = (pdfs or "all").strip().lower()
+    if pdfs_mode not in ("all", "latest"):
+        raise HTTPException(status_code=400, detail="pdfs must be all or latest")
+    seg = (segment or "all").strip().lower()
+    if seg not in ("all", "ci", "sme"):
+        raise HTTPException(status_code=400, detail="segment must be all, ci, or sme")
+    return build_pipeline(
+        utility_group=group,
+        unsigned_only=unsigned_only,
+        pdfs=pdfs_mode,
+        include_base1=include_base1,
+        segment=seg,
+        states=states,
+        retailers=retailers,
+        exclude_retailers=exclude_retailers,
+        crm_clients=_unsigned_pipeline_crm_clients(db),
+    )
+
+
+@app.get("/api/unsigned-pipeline")
+def get_unsigned_pipeline(
+    utility: str = Query("gas", description="gas | electricity | waste | oil | water | cleaning | all"),
+    unsigned_only: bool = Query(True),
+    pdfs: str = Query("all", description="all | latest"),
+    include_base1: bool = Query(True),
+    segment: str = Query("all", description="all | ci | sme"),
+    states: Optional[str] = Query(None, description="Comma-separated AU states, e.g. VIC,NSW"),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Unsigned utility pipeline: load by state + invoice PDFs.
+
+    Unsigned means this utility is not Signed via ACES on FILE_IDS — members still
+    appear if they have invoices but no contract on that utility.
+    """
+    state_list = [s.strip() for s in (states or "").split(",") if s.strip()] or None
+    try:
+        payload = _run_unsigned_pipeline(
+            db,
+            utility=utility,
+            unsigned_only=unsigned_only,
+            pdfs=pdfs,
+            include_base1=include_base1,
+            segment=segment,
+            states=state_list,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error("[unsigned-pipeline] %s", e)
+        raise HTTPException(status_code=502, detail=f"Unsigned pipeline failed: {e}")
+    payload["user_email"] = user_info.get("email")
+    return payload
+
+
+@app.post("/api/unsigned-pipeline/drive-pack")
+def post_unsigned_pipeline_drive_pack(
+    request: UnsignedPipelinePackRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Copy current unsigned-pipeline PDFs into a dated Drive folder (plus _summary.csv)."""
+    from tools.member_folder_drive import MemberFolderDriveError
+    from services.unsigned_pipeline import create_drive_pack
+
+    try:
+        payload = _run_unsigned_pipeline(
+            db,
+            utility=request.utility,
+            unsigned_only=request.unsigned_only,
+            pdfs=request.pdfs,
+            include_base1=request.include_base1,
+            segment=request.segment,
+            states=request.states,
+            retailers=request.retailers,
+            exclude_retailers=request.exclude_retailers,
+        )
+        max_files = request.max_files if request.max_files and request.max_files > 0 else 250
+        pack = create_drive_pack(
+            payload,
+            user_access_token=(x_google_access_token or "").strip() or None,
+            max_files=min(max_files, 500),
+        )
+    except HTTPException:
+        raise
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+    except Exception as e:
+        logging.error("[unsigned-pipeline/drive-pack] %s", e)
+        raise HTTPException(status_code=502, detail=f"Drive pack failed: {e}")
+    pack["user_email"] = user_info.get("email")
+    pack["totals"] = payload.get("totals")
+    pack["by_state"] = payload.get("by_state")
+    return pack
+
+
+@app.get("/api/climate/config")
+def get_climate_config(
+    period: str = Query("FY26"),
+    user_info: dict = Depends(verify_roster_access),
+):
+    """Env/config block for the Prograde Disc Engine embed. Returns fast so the embed's
+    getConfig() stops 404-storming this route (it calls it ~8x per render)."""
+    from datetime import datetime, timezone
+    return {
+        "aces_data_env": os.environ.get("ACES_DATA_ENV", "prod"),
+        "aces_api_host": "",
+        "period": period,
+        "today": datetime.now(timezone.utc).strftime("%Y-%m"),
+    }
+
+
+@app.get("/api/contracts/by-business")
+def get_contracts_by_business(
+    business_name: str = Query(..., description="Business name to match in the FILE_IDS 'Data from Airtable' tab"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Signed-contract file IDs + status per utility for a business (from the FILE_IDS sheet).
+    Read-only; reuses services.signed_contract_dry_run. Surfaces 'is there a signed contract'."""
+    from services.signed_contract_dry_run import get_contracts_for_business
+    try:
+        return get_contracts_for_business(business_name)
+    except Exception as e:
+        logging.error("[contracts/by-business] %s", e)
+        raise HTTPException(status_code=502, detail=f"Contract lookup failed: {e}")
+
+
+class ContractStatusUpdateRequest(BaseModel):
+    business_name: str
+    contract_key: str  # e.g. "DMA", "C&I Electricity"
+    status: str = ""  # "Signed via ACES" | "Existing Contract" | "Signed Externally" | ""
+    file_index: int = 0  # for comma-separated multi-file rows
+
+
+class BusinessInfoUpdateRequest(BaseModel):
+    """Patch editable LOA Business Details fields (Airtable). Prefer record_id when known."""
+    business_name: Optional[str] = None
+    record_id: Optional[str] = None
+    trading_name: Optional[str] = None
+    postal_address: Optional[str] = None
+    site_address: Optional[str] = None
+    telephone: Optional[str] = None
+    email: Optional[str] = None
+    contact_name: Optional[str] = None
+    position: Optional[str] = None
+
+
+@app.patch("/api/contracts/status")
+def patch_contract_status(
+    request: ContractStatusUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update one FILE_IDS signed-contract status cell (multi-file index-safe). No file upload required."""
+    from services.contract_status_update import update_contract_status
+
+    try:
+        result = update_contract_status(
+            request.business_name,
+            request.contract_key,
+            request.status,
+            file_index=request.file_index,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logging.error("[contracts/status] %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logging.exception("[contracts/status] unexpected error")
+        raise HTTPException(status_code=502, detail=f"Contract status update failed: {e}")
+
+    result["user_email"] = user_info.get("email")
+    return result
+
+
+@app.patch("/api/business-info")
+def patch_business_info(
+    request: BusinessInfoUpdateRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Update LOA contact / business detail fields in Airtable (dashboard inline edit)."""
+    from services import airtable_client
+
+    payload = request.model_dump(exclude_unset=True)
+    try:
+        result = airtable_client.update_loa_business_details(
+            record_id=payload.get("record_id"),
+            business_name=payload.get("business_name"),
+            trading_name=payload.get("trading_name"),
+            postal_address=payload.get("postal_address"),
+            site_address=payload.get("site_address"),
+            telephone=payload.get("telephone"),
+            email=payload.get("email"),
+            contact_name=payload.get("contact_name"),
+            position=payload.get("position"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        logging.error("[business-info PATCH] %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        logging.exception("[business-info PATCH] unexpected error")
+        raise HTTPException(status_code=502, detail=f"Business info update failed: {e}")
+
+    result["user_email"] = user_info.get("email")
+    return result
+
+
 @app.get("/api/climate/entities/{entity_id}/activity-sources")
 def get_climate_entity_activity_sources(
     entity_id: str,
@@ -846,6 +1240,92 @@ def get_climate_entity_activity_sources(
     if not payload.get("found"):
         raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
     return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/manifest")
+def get_climate_entity_activity_manifest(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label"),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Fast manifest (entity + members + site list, no per-site Airtable detail)
+    for progressive loading. Pair with .../activity-sources/site."""
+    payload = build_entity_activity_manifest(db, entity_id, period_label=period)
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/entities/{entity_id}/data-gaps")
+def get_climate_entity_data_gaps(
+    entity_id: str,
+    period: str = Query("FY26", description="Reporting period label"),
+    include_sites: bool = Query(
+        True,
+        description="Resolve the live LOA site list so linked sites with nothing staged appear. "
+                    "Set false for a DB-only report (faster, but blind to empty sites).",
+    ),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """
+    What is MISSING from this entity's activity data for the period.
+
+    Flags, worst first: sites with nothing brought in, invoices with no readable
+    date (staged but excluded from the total), months with no invoice, and utility
+    types linked on the LOA that have no emission factor yet.
+    """
+    sites = None
+    if include_sites:
+        try:
+            manifest = build_entity_activity_manifest(db, entity_id, period_label=period)
+            if manifest.get("found"):
+                sites = manifest.get("sites") or []
+        except Exception as e:  # never let the Airtable side break the report
+            logging.warning("[data-gaps] site resolution failed for %s: %s", entity_id, e)
+    payload = build_entity_data_gaps(db, entity_id, period_label=period, sites=sites)
+    if not payload.get("found"):
+        raise HTTPException(status_code=404, detail=payload.get("message") or "Entity not found")
+    return payload
+
+
+@app.get("/api/climate/data-gaps")
+def get_climate_roster_data_gaps(
+    period: str = Query("FY26", description="Reporting period label"),
+    limit: int = Query(100, ge=1, le=500),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """One line per reporting entity: how much needs attention. DB-only, no Airtable."""
+    return build_roster_data_gaps(db, period_label=period, limit=limit)
+
+
+@app.get("/api/climate/entities/{entity_id}/activity-sources/site")
+def get_climate_entity_site_detail(
+    entity_id: str,
+    utility_type: str = Query(..., description="e.g. C&I Electricity"),
+    identifier: str = Query(..., description="NMI / MRIN / account identifier"),
+    member_aces_client_id: Optional[int] = Query(None),
+    member_loa_record_id: Optional[str] = Query(None),
+    period: str = Query("FY26"),
+    invoice_sample_limit: int = Query(3, ge=0, le=10),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Per-site Airtable invoice + ETL preview + staged activity for ONE site.
+    Inputs come from the manifest's site entries (utility_type, identifier,
+    member_aces_client_id, member_loa_record_id)."""
+    return build_entity_site_detail(
+        db,
+        entity_id,
+        utility_type,
+        identifier,
+        member_aces_client_id=member_aces_client_id,
+        member_loa_record_id=member_loa_record_id,
+        period_label=period,
+        invoice_sample_limit=invoice_sample_limit,
+    )
 
 
 @app.get("/api/climate/drift-events")
@@ -879,7 +1359,9 @@ class ClimateEtlSyncRequest(BaseModel):
     utility_type: str = Field(..., description="e.g. C&I Electricity, C&I Gas")
     identifier: str = Field(..., description="NMI, MRIN, or account identifier")
     reporting_period_label: str = Field("FY26", description="FY label e.g. FY26")
-    max_records: int = Field(100, ge=1, le=500)
+    # Airtable link-field slice cap is 500. Staging is no longer FY-scoped, so pull
+    # the full history by default; diagnostics.total_count reveals any truncation.
+    max_records: int = Field(500, ge=1, le=500)
     dry_run: bool = Field(False, description="If true, transform only — do not write climate_activity_records")
 
 
@@ -1016,6 +1498,7 @@ def sync_client_climate_activity_records(
             body=res.body,
             source_utility_type=request.utility_type,
             source_row_id=res.source_row_id,
+            status=res.status,
         )
         if was_created:
             created += 1
@@ -1099,6 +1582,292 @@ def get_business_info(
 
     logging.info(f"Returning response to frontend: {result}")
     return result
+
+
+@app.post("/api/member-eoi-ids")
+def member_eoi_ids(
+    request: BusinessInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-eoi-ids request business_name=%r user=%s", request.business_name, user_info.get("email"))
+    return get_eoi_ids(request.business_name)
+
+
+@app.post("/api/member-wip")
+def member_wip(
+    request: BusinessInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-wip request business_name=%r user=%s", request.business_name, user_info.get("email"))
+    return get_member_wip(request.business_name)
+
+
+class DriveFileMetadataRequest(BaseModel):
+    file_ids: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/drive-file-metadata")
+def drive_file_metadata(
+    request: DriveFileMetadataRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "drive-file-metadata request count=%s user=%s",
+        len(request.file_ids or []),
+        user_info.get("email"),
+    )
+    return {"files": get_drive_file_times(request.file_ids or [])}
+
+
+class ShareFolderStatusRequest(BaseModel):
+    gdrive_url: str = ""
+
+
+class ShareFolderRequest(BaseModel):
+    gdrive_url: str = ""
+    file_ids: List[str] = Field(default_factory=list)
+    email: str = ""
+    send_notification: bool = True
+    business_name: str = ""
+
+
+@app.post("/api/share-folder/status")
+def share_folder_status(
+    request: ShareFolderStatusRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("share-folder/status user=%s", user_info.get("email"))
+    try:
+        return get_share_folder_status(request.gdrive_url)
+    except ShareFolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/share-folder")
+def share_folder(
+    request: ShareFolderRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "share-folder user=%s files=%s email=%s",
+        user_info.get("email"),
+        len(request.file_ids or []),
+        request.email,
+    )
+    try:
+        return share_member_folder(
+            gdrive_url=request.gdrive_url,
+            file_ids=request.file_ids or [],
+            email=request.email,
+            send_notification=request.send_notification,
+            business_name=request.business_name,
+            sender_name=str(user_info.get("name") or ""),
+            sender_email=str(user_info.get("email") or ""),
+        )
+    except ShareFolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/loa-business-details")
+def loa_business_details(user_info: dict = Depends(verify_google_token)):
+    logging.info("loa-business-details request user=%s", user_info.get("email"))
+    return get_return_business_details()
+
+
+class MemberFolderCreateRequest(BaseModel):
+    business_name: str
+    trading_as: str = "N/A"
+    classification: str
+    state: str
+    classification_folder_id: Optional[str] = None
+    state_folder_id: Optional[str] = None
+    loa_record_id: Optional[str] = None
+
+
+@app.get("/api/member-folders/industries")
+def member_folder_industries(user_info: dict = Depends(verify_google_token)):
+    logging.info("member-folders/industries user=%s", user_info.get("email"))
+    try:
+        return {"folders": list_industry_folders()}
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.get("/api/member-folders/subfolders")
+def member_folder_subfolders(
+    parent_id: str = Query(..., description="Industry folder Drive ID"),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("member-folders/subfolders parent=%s user=%s", parent_id, user_info.get("email"))
+    try:
+        return {"folders": list_subfolders(parent_id)}
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/member-folders/create")
+def member_folder_create(
+    request: MemberFolderCreateRequest,
+    user_info: dict = Depends(verify_google_token),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "member-folders/create business=%r classification=%s state=%s user=%s",
+        request.business_name,
+        request.classification,
+        request.state,
+        user_info.get("email"),
+    )
+    try:
+        result = create_member_folder(
+            business_name=request.business_name,
+            trading_as=request.trading_as,
+            classification=request.classification,
+            state=request.state,
+            classification_folder_id=request.classification_folder_id,
+            state_folder_id=request.state_folder_id,
+            loa_record_id=request.loa_record_id,
+            user_access_token=x_google_access_token,
+        )
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    if not result.get("ok") and result.get("loa_candidates"):
+        raise HTTPException(status_code=409, detail=result)
+    if not result.get("ok"):
+        raise HTTPException(status_code=502, detail=result.get("error") or "Folder creation failed")
+    return result
+
+
+@app.post("/api/distributors/extract")
+async def distributors_extract(
+    file: UploadFile = File(...),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info("distributors/extract file=%s user=%s", file.filename, user_info.get("email"))
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    return extract_distributor_pdf(contents)
+
+
+@app.get("/api/distributors")
+def distributors_list(
+    user_info: dict = Depends(verify_google_token),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "distributors/list user=%s has_user_drive_token=%s",
+        user_info.get("email"),
+        bool((x_google_access_token or "").strip()),
+    )
+    try:
+        return list_distributor_master_rows(
+            user_access_token=(x_google_access_token or "").strip() or None,
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/distributors/create")
+async def distributors_create(
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+    distributor_business: str = Form(...),
+    trading_as: str = Form(""),
+    abn: str = Form(""),
+    acn: str = Form(""),
+    contact_name: str = Form(""),
+    contact_position: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+    mobile: str = Form(""),
+    address: str = Form(""),
+    state: str = Form(""),
+    postcode: str = Form(""),
+    start_date: str = Form(""),
+    signed_date: str = Form(""),
+    initial_term_months: str = Form(""),
+    territory: str = Form(""),
+    exclusivity: str = Form("Y"),
+    status: str = Form("Active"),
+    folder_name: str = Form(...),
+    notes: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "distributors/create business=%r folder=%r user=%s has_user_drive_token=%s",
+        distributor_business,
+        folder_name,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    details = {
+        "distributor_business": distributor_business,
+        "trading_as": trading_as,
+        "abn": abn,
+        "acn": acn,
+        "contact_name": contact_name,
+        "contact_position": contact_position,
+        "email": email,
+        "phone": phone,
+        "mobile": mobile,
+        "address": address,
+        "state": state,
+        "postcode": postcode,
+        "start_date": start_date,
+        "signed_date": signed_date,
+        "initial_term_months": initial_term_months,
+        "territory": territory,
+        "exclusivity": exclusivity or "Y",
+        "status": status or "Active",
+        "folder_name": folder_name,
+        "notes": notes,
+        "extraction_warnings": [],
+    }
+    try:
+        return create_distributor_folder(
+            details=details,
+            pdf_bytes=contents,
+            pdf_filename=file.filename or "Distribution Agreement.pdf",
+            user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+        )
+    except MemberFolderDriveError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.post("/api/return-utility-info")
+def return_utility_info(
+    request: ReturnUtilityInfoRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "return-utility-info request utility_type=%s business_name=%r user=%s",
+        request.utility_type,
+        request.business_name,
+        user_info.get("email"),
+    )
+    return get_return_utility_info(request.utility_type, request.business_name)
+
+
+@app.get("/api/sheet-preview")
+def sheet_preview(
+    utility_type: str = Query(..., description="Utility type key, e.g. LOA, WASTE, ELECTRICITY_CI"),
+    rows: int = Query(5, ge=1, le=10, description="Number of data rows to return (from row 2 downward)"),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "sheet-preview request utility_type=%s rows=%s user=%s",
+        utility_type,
+        rows,
+        user_info.get("email"),
+    )
+    return get_sheet_preview(utility_type, rows)
 
 
 @app.get("/api/utility-extra")
@@ -1432,6 +2201,33 @@ def get_base2_sme_gas_airtable_annual_usage(
     )
     logging.info(_sme_line)
     print(_sme_line, flush=True)
+    return result
+
+
+@app.get("/api/base2/bne-gas-contract")
+def get_base2_bne_gas_contract(
+    mrin: str = Query(
+        ...,
+        min_length=6,
+        max_length=40,
+        description="Invoice MRIN; matched against signed C&I Gas sheet (checksum / last-digit tolerant)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Look up signed C&I Gas contract periods and rates for Base 2 B&E Gas."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    try:
+        result = lookup_bne_gas_contract(mrin)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-gas-contract] user=%s mrin=%r match=%s contracts=%s periods=%s",
+        email,
+        mrin,
+        result.get("match_kind"),
+        len(result.get("contracts") or []),
+        sum(len(c.get("periods") or []) for c in (result.get("contracts") or [])),
+    )
     return result
 
 
@@ -3546,6 +4342,8 @@ def get_discrepancy_check(
 @app.get("/api/resources/drive-videos")
 def get_resources_drive_videos(
     user_info: dict = Depends(verify_google_token),
+    kind: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
 ):
     """
     List video files in the configured Google Drive folder (service account).
@@ -3553,13 +4351,1449 @@ def get_resources_drive_videos(
     """
     _ = user_info  # require authenticated ACES session
     folder_id = get_resources_videos_folder_id()
-    videos, err = list_resources_folder_videos()
+    db_ids = {row.file_id for row in db.query(MarketingVideo.file_id).all() if row.file_id}
+    videos, err = list_resources_folder_videos(kind_filter=kind, db_file_ids=db_ids)
     if err:
         raise HTTPException(status_code=503, detail=err)
     return {
         "folder_id": folder_id,
         "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "videos": videos,
+    }
+
+
+@app.get("/api/base1/plus-es-dma")
+def get_plus_es_dma_pdfs(user_info: dict = Depends(verify_google_token)):
+    """List PDF DMA documents in the Plus ES Google Drive folder (service account)."""
+    _ = user_info
+    folder_id = get_plus_es_dma_folder_id()
+    pdfs, err = list_plus_es_dma_pdfs()
+    if err:
+        raise HTTPException(status_code=503, detail=err)
+    return {
+        "folder_id": folder_id,
+        "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
+        "pdfs": pdfs,
+    }
+
+
+def _verify_video_write_auth(authorization: str) -> None:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid authorization")
+
+
+def _require_video_dev_tools() -> None:
+    """Block destructive dev-only video tooling in production unless explicitly enabled."""
+    env = (os.getenv("ENVIRONMENT") or "development").strip().lower()
+    flag = (os.getenv("VIDEO_DEV_TOOLS") or "").strip().lower()
+    if env in ("production", "prod") and flag not in ("1", "true", "yes", "on"):
+        raise HTTPException(
+            status_code=403,
+            detail="Video dev tools are disabled in production (set VIDEO_DEV_TOOLS=1 to override)",
+        )
+
+
+@app.get("/api/videos/registry", response_model=VideoRegistryResponse)
+def get_video_registry(user_info: dict = Depends(verify_google_token)):
+    _ = user_info
+    from tools.video_registry_loader import load_video_registry
+
+    data = load_video_registry()
+    return VideoRegistryResponse(
+        version=str(data.get("version") or "0"),
+        source=data.get("source"),
+        entries=data.get("entries") or [],
+    )
+
+
+@app.get("/api/videos", response_model=List[MarketingVideoResponse])
+def list_marketing_videos(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    kind: Optional[str] = Query(None),
+    solution_type_id: Optional[str] = Query(None, alias="solution_type_id"),
+    business_name: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    slug: Optional[str] = Query(None),
+):
+    _ = user_info
+    q = db.query(MarketingVideo)
+    if kind:
+        q = q.filter(MarketingVideo.kind == kind.strip().lower())
+    if solution_type_id:
+        q = q.filter(MarketingVideo.crm_solution_type_id == solution_type_id.strip())
+    if business_name:
+        q = q.filter(func.lower(MarketingVideo.business_name) == business_name.strip().lower())
+    if status:
+        q = q.filter(MarketingVideo.status == status.strip().lower())
+    if slug:
+        q = q.filter(MarketingVideo.slug == slug.strip().lower())
+    rows = q.order_by(MarketingVideo.updated_at.desc()).all()
+    return [MarketingVideoResponse.model_validate(r) for r in rows]
+
+
+@app.get("/api/videos/suggest-slug")
+def suggest_video_slug(
+    user_info: dict = Depends(verify_google_token),
+    business_name: str = Query(...),
+    solution_type_id: Optional[str] = Query(None),
+):
+    _ = user_info
+    from tools.video_upload import suggest_testimonial_slug
+
+    slug = suggest_testimonial_slug(business_name.strip(), (solution_type_id or "").strip() or None)
+    return {"slug": slug, "business_name": business_name.strip()}
+
+
+@app.get("/api/videos/render-job")
+def get_video_render_job_status(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: Optional[str] = Query(None),
+    job_id: Optional[str] = Query(None),
+):
+    """Proxy CZA Videos job status, read local progress file, or infer from CRM rows."""
+    _verify_video_write_auth(authorization)
+    slug_val = (slug or "").strip().lower()
+    job_id_val = (job_id or "").strip()
+
+    from tools.video_pipeline_progress import (
+        build_running_progress_from_sources,
+        message_from_progress,
+        merge_progress,
+        progress_failure,
+        progress_is_complete,
+        read_pipeline_progress_file,
+    )
+
+    file_progress = read_pipeline_progress_file(slug_val) if slug_val else None
+
+    api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/")
+    if api_url and (job_id_val or slug_val):
+        try:
+            import httpx
+
+            key = (os.getenv("CZA_VIDEOS_API_KEY") or "").strip()
+            headers: Dict[str, str] = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            path = (
+                f"/jobs/{job_id_val}"
+                if job_id_val
+                else f"/jobs/by-slug/{slug_val}"
+            )
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get(f"{api_url}{path}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                live = merge_progress(data.get("progress"), file_progress)
+                if live.get("steps"):
+                    data["progress"] = live
+                fail = progress_failure(live)
+                if fail:
+                    data["status"] = "failed"
+                    data["error"] = data.get("error") or fail[1]
+                msg = message_from_progress(live)
+                if msg:
+                    data["message"] = msg
+                return data
+            if resp.status_code != 404:
+                logging.warning("[video] render-job proxy %s: %s", resp.status_code, resp.text[:300])
+        except Exception as exc:
+            logging.warning("[video] render-job proxy error: %s", exc)
+
+    if file_progress and slug_val:
+        running = build_running_progress_from_sources(slug_val, job_progress=file_progress)
+        fail = progress_failure(running)
+        return {
+            "status": "failed" if fail else ("completed" if progress_is_complete(running) else "running"),
+            "slug": slug_val,
+            "message": message_from_progress(running) or "Render pipeline in progress",
+            "error": fail[1] if fail else None,
+            "progress": running,
+        }
+
+    if slug_val:
+        rows = (
+            db.query(MarketingVideo)
+            .filter(MarketingVideo.slug == slug_val)
+            .order_by(MarketingVideo.variant.asc())
+            .all()
+        )
+        if rows:
+            rendered = [r for r in rows if r.file_id and r.file_id != "pending"]
+            has_qa = any((r.qa_review_path or "").strip() for r in rows)
+            if len(rendered) >= 1 and has_qa:
+                return {
+                    "status": "completed",
+                    "slug": slug_val,
+                    "message": "MP4s and QA uploaded — ready to review",
+                }
+            pack_url = next((r.tool_output_zip_path for r in rows if r.tool_output_zip_path), None)
+            if pack_url or rendered:
+                skeleton = build_running_progress_from_sources(slug_val)
+                fail = progress_failure(skeleton)
+                return {
+                    "status": "failed" if fail else "running",
+                    "slug": slug_val,
+                    "message": message_from_progress(skeleton)
+                    or "Waiting for render pipeline to start…",
+                    "error": fail[1] if fail else None,
+                    "progress": skeleton,
+                }
+
+    raise HTTPException(status_code=404, detail="No render job found for this slug")
+
+
+@app.get("/api/videos/local-stream")
+def stream_local_rendered_video(
+    request: Request,
+    authorization: str = Header(...),
+    slug: str = Query(...),
+    variant: str = Query("long"),
+    kind: str = Query("testimonial"),
+):
+    """Stream freshly rendered MP4 from claude-videos disk (before / during Drive upload)."""
+    _verify_video_write_auth(authorization)
+    from tools.local_video_render import find_local_mp4
+
+    path, err = find_local_mp4(slug.strip().lower(), variant, kind)
+    if err or not path:
+        raise HTTPException(status_code=404, detail=err or "Local render not found")
+
+    from tools.video_creation_pack import _parse_range_header
+
+    total = path.stat().st_size
+    range_header = request.headers.get("range")
+    start, end = _parse_range_header(range_header, total)
+    content_length = end - start + 1
+    filename = path.name.replace('"', "")
+
+    def iter_file():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = content_length
+            while remaining > 0:
+                chunk = f.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": "video/mp4",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(content_length)
+        status_code = 206
+    else:
+        headers["Content-Length"] = str(total)
+        status_code = 200
+
+    return StreamingResponse(iter_file(), status_code=status_code, headers=headers, media_type="video/mp4")
+
+
+@app.get("/api/videos/{video_id}", response_model=MarketingVideoResponse)
+def get_marketing_video(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return MarketingVideoResponse.model_validate(row)
+
+
+@app.get("/api/videos/{video_id}/creation-pack")
+def get_video_creation_pack_links(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Direct Drive URLs for pack root and qa/renders/scripts/slides subfolders."""
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    pack_url = (row.tool_output_zip_path or "").strip()
+    if not pack_url or "drive.google.com" not in pack_url:
+        raise HTTPException(status_code=404, detail="No creation pack folder linked")
+
+    from tools.video_creation_pack import list_pack_subfolder_urls
+
+    result = list_pack_subfolder_urls(pack_url)
+    if result.get("error"):
+        raise HTTPException(status_code=502, detail=result["error"])
+    result["pack_folder_name"] = row.render_job_id
+    result["slug"] = row.slug
+    # Where publish actually stored assets (may differ from empty pack subfolders)
+    result["linked_assets"] = {
+        "qa_review_url": (row.qa_review_path or "").strip() or None,
+        "cuts": [],
+    }
+    siblings = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == row.slug, MarketingVideo.kind == row.kind)
+        .all()
+    )
+    for s in siblings:
+        if s.file_id and s.file_id != "pending":
+            result["linked_assets"]["cuts"].append(
+                {
+                    "variant": s.variant,
+                    "file_id": s.file_id,
+                    "file_name": s.file_name,
+                    "preview_url": s.preview_url,
+                    "web_view_link": s.web_view_link,
+                }
+            )
+    subfolder_file_count = sum(
+        (v.get("file_count") or 0) for v in (result.get("subfolders") or {}).values()
+    )
+    result["pack_subfolders_empty"] = subfolder_file_count == 0
+    result["linked_assets_outside_pack"] = bool(
+        result["linked_assets"]["cuts"] or result["linked_assets"]["qa_review_url"]
+    ) and result["pack_subfolders_empty"]
+    return result
+
+
+@app.get("/api/videos/{video_id}/qa-html")
+def get_video_qa_html(
+    video_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    """Serve QA-Review.html for in-app iframe preview (Drive download, not Drive embed)."""
+    _ = user_info
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    from tools.video_creation_pack import load_qa_review_html
+    from fastapi.responses import HTMLResponse
+
+    html, err = load_qa_review_html(qa_review_path=row.qa_review_path)
+    if err or not html:
+        raise HTTPException(status_code=404, detail=err or "QA review not available")
+    return HTMLResponse(content=html, media_type="text/html; charset=utf-8")
+
+
+@app.get("/api/videos/{video_id}/stream")
+def stream_marketing_video(
+    video_id: int,
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Stream MP4 from Drive via service account (HTML5 video; supports Range)."""
+    _verify_video_write_auth(authorization)
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row or not row.file_id or row.file_id == "pending":
+        raise HTTPException(status_code=404, detail="Video not found or not uploaded")
+
+    from tools.video_creation_pack import (
+        _parse_range_header,
+        get_drive_file_meta,
+        iter_drive_file_chunks,
+    )
+
+    meta = get_drive_file_meta(row.file_id)
+    if not meta:
+        raise HTTPException(status_code=502, detail="Could not read video from Drive")
+
+    total = int(meta.get("size") or 0)
+    if total <= 0:
+        raise HTTPException(status_code=502, detail="Video file has no size on Drive")
+
+    range_header = request.headers.get("range")
+    start, end = _parse_range_header(range_header, total)
+    content_length = end - start + 1
+    filename = (row.file_name or meta.get("name") or f"{row.slug}.mp4").replace('"', "")
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Type": meta.get("mimeType") or "video/mp4",
+        "Content-Disposition": f'inline; filename="{filename}"',
+    }
+    if range_header:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+        headers["Content-Length"] = str(content_length)
+        status_code = 206
+    else:
+        headers["Content-Length"] = str(total)
+        status_code = 200
+
+    return StreamingResponse(
+        iter_drive_file_chunks(
+            row.file_id,
+            start=start,
+            end=end,
+            partial=bool(range_header),
+        ),
+        status_code=status_code,
+        headers=headers,
+        media_type=headers["Content-Type"],
+    )
+
+
+@app.post("/api/videos/upload", response_model=MarketingVideoResponse)
+async def upload_marketing_video(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    slug: str = Form(...),
+    kind: str = Form("marketing"),
+    variant: str = Form("long"),
+    status: Optional[str] = Form("draft"),
+    business_name: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    testimonial_id: Optional[int] = Form(None),
+    crm_solution_type_id: Optional[str] = Form(None),
+    source_doc_file_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Upload MP4 to Interface Videos folder and register metadata."""
+    _verify_video_write_auth(authorization)
+    slug_val = slug.strip().lower()
+    kind_val = (kind or "marketing").strip().lower()
+    variant_val = (variant or "long").strip().lower()
+    if kind_val not in ("marketing", "testimonial"):
+        raise HTTPException(status_code=400, detail="kind must be marketing or testimonial")
+    if variant_val not in ("long", "30s"):
+        raise HTTPException(status_code=400, detail="variant must be long or 30s")
+    status_val = (status or "draft").strip().lower()
+    if status_val not in MARKETING_VIDEO_STATUSES:
+        status_val = "draft"
+
+    filename = (file.filename or "").strip()
+    if not filename.lower().endswith(".mp4"):
+        raise HTTPException(status_code=400, detail="File must be .mp4")
+
+    from tools.video_upload import (
+        drive_links_for_file,
+        resolve_crm_solution_type_id,
+        upload_video_to_library,
+    )
+
+    contents = await file.read()
+    file_id, stored_name, err = upload_video_to_library(
+        file_bytes=contents,
+        slug=slug_val,
+        variant=variant_val,  # type: ignore[arg-type]
+        kind=kind_val,  # type: ignore[arg-type]
+        filename=filename,
+    )
+    if err or not file_id:
+        raise HTTPException(status_code=502, detail=err or "Upload failed")
+
+    links = drive_links_for_file(file_id)
+    crm_id = resolve_crm_solution_type_id(slug_val, kind_val, crm_solution_type_id)  # type: ignore[arg-type]
+
+    existing = (
+        db.query(MarketingVideo)
+        .filter(
+            MarketingVideo.slug == slug_val,
+            MarketingVideo.kind == kind_val,
+            MarketingVideo.variant == variant_val,
+        )
+        .first()
+    )
+    if existing:
+        existing.file_id = file_id
+        existing.file_name = stored_name
+        existing.preview_url = links["preview_url"]
+        existing.web_view_link = links["web_view_link"]
+        existing.status = status_val
+        existing.crm_solution_type_id = crm_id
+        existing.business_name = (business_name or "").strip() or existing.business_name
+        existing.client_id = client_id if client_id is not None else existing.client_id
+        existing.testimonial_id = testimonial_id if testimonial_id is not None else existing.testimonial_id
+        if source_doc_file_id:
+            existing.source_doc_file_id = source_doc_file_id.strip()
+        db.commit()
+        db.refresh(existing)
+        _sync_testimonial_video_ids(db, existing)
+        return MarketingVideoResponse.model_validate(existing)
+
+    row = MarketingVideo(
+        slug=slug_val,
+        kind=kind_val,
+        variant=variant_val,
+        file_id=file_id,
+        file_name=stored_name,
+        preview_url=links["preview_url"],
+        web_view_link=links["web_view_link"],
+        crm_solution_type_id=crm_id,
+        business_name=(business_name or "").strip() or None,
+        client_id=client_id,
+        testimonial_id=testimonial_id,
+        status=status_val,
+        source_doc_file_id=(source_doc_file_id or "").strip() or None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    _sync_testimonial_video_ids(db, row)
+    return MarketingVideoResponse.model_validate(row)
+
+
+def _sync_testimonial_video_ids(db: Session, video: MarketingVideo) -> None:
+    if not video.testimonial_id:
+        return
+    testimonial = db.query(Testimonial).filter(Testimonial.id == video.testimonial_id).first()
+    if not testimonial:
+        return
+    if video.variant == "long":
+        testimonial.video_long_file_id = video.file_id
+    elif video.variant == "30s":
+        testimonial.video_short_file_id = video.file_id
+    db.commit()
+
+
+def _log_video_published_activity(db: Session, video: MarketingVideo) -> None:
+    """CRM timeline entry when a video is published (optional client_id)."""
+    if video.status != "published" or not video.client_id or video.file_id == "pending":
+        return
+    client = db.query(Client).filter(Client.id == video.client_id).first()
+    if not client:
+        return
+    offer = resolve_offer_for_member_upload(
+        db,
+        client=client,
+        business_name=(client.business_name or "").strip(),
+        created_by="video-pipeline@system",
+        offer_id=None,
+        filing_type=None,
+        utility_key=None,
+    )
+    create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.MEMBER_DOCUMENT_UPLOAD,
+        document_link=video.web_view_link or f"https://drive.google.com/file/d/{video.file_id}/view",
+        metadata={
+            "upload_kind": "marketing_video",
+            "filename": video.file_name,
+            "video_slug": video.slug,
+            "video_variant": video.variant,
+        },
+        created_by="video-pipeline@system",
+    )
+
+
+@app.patch("/api/videos/{video_id}", response_model=MarketingVideoResponse)
+def patch_marketing_video(
+    video_id: int,
+    body: MarketingVideoUpdate,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    _verify_video_write_auth(authorization)
+    row = db.query(MarketingVideo).filter(MarketingVideo.id == video_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Video not found")
+    if body.status is not None:
+        st = body.status.strip().lower()
+        if st in MARKETING_VIDEO_STATUSES:
+            row.status = st
+    for field in (
+        "crm_solution_type_id",
+        "business_name",
+        "qa_review_path",
+        "tool_output_zip_path",
+        "render_job_id",
+        "notes",
+        "source_doc_file_id",
+    ):
+        val = getattr(body, field)
+        if val is not None:
+            setattr(row, field, val.strip() if isinstance(val, str) else val)
+    if body.testimonial_id is not None:
+        row.testimonial_id = body.testimonial_id
+    if body.client_id is not None:
+        row.client_id = body.client_id
+    db.commit()
+    db.refresh(row)
+    _sync_testimonial_video_ids(db, row)
+    if row.status == "published":
+        _log_video_published_activity(db, row)
+    return MarketingVideoResponse.model_validate(row)
+
+
+@app.post("/api/videos/publish-pack")
+async def publish_video_pack(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: str = Form(...),
+    kind: str = Form("marketing"),
+    status: Optional[str] = Form("qa_pending"),
+    business_name: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    testimonial_id: Optional[int] = Form(None),
+    crm_solution_type_id: Optional[str] = Form(None),
+    qa_review_path: Optional[str] = Form(None),
+    tool_output_zip_path: Optional[str] = Form(None),
+    render_job_id: Optional[str] = Form(None),
+    long_file: Optional[UploadFile] = File(None),
+    short_file: Optional[UploadFile] = File(None),
+    qa_review_file: Optional[UploadFile] = File(None),
+    pack_script_files: List[UploadFile] = File(default=[]),
+    pack_slide_files: List[UploadFile] = File(default=[]),
+):
+    """
+    Register long + 30s cuts after local render. Requires BACKEND_API_KEY or Google token.
+    Upload one or both MP4 files; metadata-only update if files omitted.
+    When draft rows link a creation pack folder, QA + MP4 copies upload into pack subfolders.
+    """
+    _verify_video_write_auth(authorization)
+    slug_val = slug.strip().lower()
+    kind_val = (kind or "marketing").strip().lower()
+    status_val = (status or "qa_pending").strip().lower()
+    if status_val not in MARKETING_VIDEO_STATUSES:
+        status_val = "qa_pending"
+
+    from tools.video_upload import drive_links_for_file, resolve_crm_solution_type_id, upload_video_to_library
+    from tools.video_creation_pack import upload_pack_artifacts
+    from tools.video_naming import build_drive_filename
+
+    crm_id = resolve_crm_solution_type_id(slug_val, kind_val, crm_solution_type_id)  # type: ignore[arg-type]
+    results: List[MarketingVideoResponse] = []
+
+    long_bytes: Optional[bytes] = await long_file.read() if long_file else None
+    short_bytes: Optional[bytes] = await short_file.read() if short_file else None
+    qa_bytes: Optional[bytes] = await qa_review_file.read() if qa_review_file else None
+    if not qa_bytes and qa_review_path and os.path.isfile(qa_review_path.strip()):
+        try:
+            qa_bytes = open(qa_review_path.strip(), "rb").read()
+        except OSError:
+            pass
+
+    script_files: Dict[str, bytes] = {}
+    for uf in pack_script_files or []:
+        if not uf.filename:
+            continue
+        script_files[uf.filename] = await uf.read()
+    slide_files: Dict[str, bytes] = {}
+    for uf in pack_slide_files or []:
+        if not uf.filename:
+            continue
+        slide_files[uf.filename] = await uf.read()
+
+    draft_row = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == slug_val, MarketingVideo.kind == kind_val)
+        .first()
+    )
+    pack_folder_url = ""
+    if draft_row and draft_row.tool_output_zip_path and "drive.google.com" in draft_row.tool_output_zip_path:
+        pack_folder_url = draft_row.tool_output_zip_path.strip()
+    elif tool_output_zip_path and "drive.google.com" in (tool_output_zip_path or ""):
+        pack_folder_url = tool_output_zip_path.strip()
+
+    resolved_qa_url = (qa_review_path or "").strip()
+    pack_upload: Dict[str, Any] = {}
+    if pack_folder_url and (qa_bytes or long_bytes or short_bytes or script_files or slide_files):
+        long_name = (long_file.filename if long_file else None) or f"testimonial-{slug_val}-long.mp4"
+        short_name = (short_file.filename if short_file else None) or f"testimonial-{slug_val}-30s.mp4"
+        pack_upload = upload_pack_artifacts(
+            pack_folder_url=pack_folder_url,
+            qa_html_bytes=qa_bytes,
+            long_mp4_bytes=long_bytes,
+            short_mp4_bytes=short_bytes,
+            long_filename=long_name,
+            short_filename=short_name,
+            script_files=script_files or None,
+            slide_files=slide_files or None,
+        )
+        if pack_upload.get("qa_review_url"):
+            resolved_qa_url = pack_upload["qa_review_url"]
+        if pack_upload.get("error"):
+            logging.warning("[publish-pack] pack upload: %s", pack_upload["error"])
+
+    async def _upsert_variant(variant: str, upload: Optional[UploadFile], contents: Optional[bytes]) -> None:
+        nonlocal results
+        if contents is None:
+            existing = (
+                db.query(MarketingVideo)
+                .filter(
+                    MarketingVideo.slug == slug_val,
+                    MarketingVideo.kind == kind_val,
+                    MarketingVideo.variant == variant,
+                )
+                .first()
+            )
+            if existing:
+                if resolved_qa_url:
+                    existing.qa_review_path = resolved_qa_url
+                if pack_folder_url:
+                    existing.tool_output_zip_path = pack_folder_url
+                elif tool_output_zip_path:
+                    existing.tool_output_zip_path = tool_output_zip_path.strip()
+                if render_job_id:
+                    existing.render_job_id = render_job_id.strip()
+                existing.status = status_val
+                db.commit()
+                db.refresh(existing)
+                results.append(MarketingVideoResponse.model_validate(existing))
+            return
+
+        stored_name = (upload.filename if upload else None) or build_drive_filename(
+            slug_val, variant, kind_val  # type: ignore[arg-type]
+        )
+        file_id, _, err = upload_video_to_library(
+            file_bytes=contents,
+            slug=slug_val,
+            variant=variant,  # type: ignore[arg-type]
+            kind=kind_val,  # type: ignore[arg-type]
+            filename=stored_name,
+        )
+        pack_key = "long_mp4_file_id" if variant == "long" else "short_mp4_file_id"
+        pack_preview = "long_mp4_preview_url" if variant == "long" else "short_mp4_preview_url"
+        pack_view = "long_mp4_web_view_link" if variant == "long" else "short_mp4_web_view_link"
+        if (err or not file_id) and pack_upload.get(pack_key):
+            file_id = pack_upload[pack_key]
+            err = None
+        if err or not file_id:
+            raise HTTPException(status_code=502, detail=err or f"Upload failed for {variant}")
+        links = drive_links_for_file(file_id)
+        if pack_upload.get(pack_preview):
+            links["preview_url"] = pack_upload[pack_preview]
+        if pack_upload.get(pack_view):
+            links["web_view_link"] = pack_upload[pack_view]
+        existing = (
+            db.query(MarketingVideo)
+            .filter(
+                MarketingVideo.slug == slug_val,
+                MarketingVideo.kind == kind_val,
+                MarketingVideo.variant == variant,
+            )
+            .first()
+        )
+        if existing:
+            existing.file_id = file_id
+            existing.file_name = stored_name
+            existing.preview_url = links["preview_url"]
+            existing.web_view_link = links["web_view_link"]
+            existing.status = status_val
+            existing.crm_solution_type_id = crm_id
+            existing.business_name = (business_name or "").strip() or existing.business_name
+            existing.client_id = client_id if client_id is not None else existing.client_id
+            existing.testimonial_id = testimonial_id if testimonial_id is not None else existing.testimonial_id
+            if resolved_qa_url:
+                existing.qa_review_path = resolved_qa_url
+            if pack_folder_url:
+                existing.tool_output_zip_path = pack_folder_url
+            elif tool_output_zip_path:
+                existing.tool_output_zip_path = tool_output_zip_path.strip()
+            if render_job_id:
+                existing.render_job_id = render_job_id.strip()
+            db.commit()
+            db.refresh(existing)
+            _sync_testimonial_video_ids(db, existing)
+            if existing.status == "published":
+                _log_video_published_activity(db, existing)
+            results.append(MarketingVideoResponse.model_validate(existing))
+            return
+        row = MarketingVideo(
+            slug=slug_val,
+            kind=kind_val,
+            variant=variant,
+            file_id=file_id,
+            file_name=stored_name,
+            preview_url=links["preview_url"],
+            web_view_link=links["web_view_link"],
+            crm_solution_type_id=crm_id,
+            business_name=(business_name or "").strip() or None,
+            client_id=client_id,
+            testimonial_id=testimonial_id,
+            status=status_val,
+            qa_review_path=resolved_qa_url or None,
+            tool_output_zip_path=pack_folder_url or ((tool_output_zip_path or "").strip() or None),
+            render_job_id=(render_job_id or "").strip() or None,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        _sync_testimonial_video_ids(db, row)
+        if row.status == "published":
+            _log_video_published_activity(db, row)
+        results.append(MarketingVideoResponse.model_validate(row))
+
+    await _upsert_variant("long", long_file, long_bytes)
+    await _upsert_variant("30s", short_file, short_bytes)
+
+    return {"slug": slug_val, "kind": kind_val, "videos": results, "pack_upload": pack_upload or None}
+
+
+def _create_video_draft_placeholders(
+    db: Session,
+    *,
+    slug: str,
+    kind: str,
+    business_name: str,
+    testimonial_id: Optional[int] = None,
+    client_id: Optional[int] = None,
+    crm_solution_type_id: Optional[str] = None,
+    source_doc_file_id: Optional[str] = None,
+) -> List[MarketingVideo]:
+    slug_val = slug.strip().lower()
+    kind_val = kind.strip().lower()
+    rows: List[MarketingVideo] = []
+    for variant in ("long", "30s"):
+        existing = (
+            db.query(MarketingVideo)
+            .filter(
+                MarketingVideo.slug == slug_val,
+                MarketingVideo.kind == kind_val,
+                MarketingVideo.variant == variant,
+            )
+            .first()
+        )
+        if existing:
+            if testimonial_id:
+                existing.testimonial_id = testimonial_id
+            if client_id:
+                existing.client_id = client_id
+            if source_doc_file_id:
+                existing.source_doc_file_id = source_doc_file_id
+            if crm_solution_type_id:
+                existing.crm_solution_type_id = crm_solution_type_id
+            rows.append(existing)
+            continue
+        row = MarketingVideo(
+            slug=slug_val,
+            kind=kind_val,
+            variant=variant,
+            file_id="pending",
+            file_name=f"{'testimonial-' if kind_val == 'testimonial' else ''}{'custom-' if kind_val == 'custom' else ''}{slug_val}-{variant}.mp4",
+            status="draft",
+            testimonial_id=testimonial_id,
+            business_name=business_name.strip() or None,
+            client_id=client_id,
+            crm_solution_type_id=(crm_solution_type_id or "").strip() or None,
+            source_doc_file_id=source_doc_file_id,
+        )
+        db.add(row)
+        rows.append(row)
+    db.commit()
+    for r in rows:
+        db.refresh(r)
+    return rows
+
+
+def _attach_creation_pack_to_videos(
+    db: Session,
+    rows: List[MarketingVideo],
+    pack: Dict[str, Any],
+) -> None:
+    folder_url = (pack.get("folder_url") or "").strip()
+    if not folder_url:
+        return
+    folder_name = (pack.get("folder_name") or "").strip()
+    for row in rows:
+        row.tool_output_zip_path = folder_url
+        if folder_name:
+            row.render_job_id = folder_name
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+
+def _reset_rows_for_new_video_session(db: Session, rows: List[MarketingVideo]) -> None:
+    """Clear prior publish artifacts so the UI waits for this session's render + publish."""
+    for row in rows:
+        row.file_id = "pending"
+        row.preview_url = None
+        row.web_view_link = None
+        row.qa_review_path = None
+        row.status = "draft"
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+
+def _create_new_creation_pack(
+    db: Session,
+    rows: List[MarketingVideo],
+    *,
+    slug: str,
+    kind: str,
+    business_name: Optional[str] = None,
+    testimonial_id: Optional[int] = None,
+    client_id: Optional[int] = None,
+    source_doc_file_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Always create a fresh pack folder for this create-session (never reuse an old one)."""
+    from tools.video_creation_pack import create_video_creation_pack
+
+    _reset_rows_for_new_video_session(db, rows)
+    pack = create_video_creation_pack(
+        slug=slug,
+        kind=kind,
+        business_name=business_name,
+        testimonial_id=testimonial_id,
+        client_id=client_id,
+        source_doc_file_id=source_doc_file_id,
+    )
+    if pack.get("folder_url"):
+        _attach_creation_pack_to_videos(db, rows, pack)
+    return pack
+
+
+def _video_cli_steps(
+    slug: str,
+    kind: str,
+    testimonial_id: Optional[int],
+    filename: Optional[str] = None,
+    source_doc_file_id: Optional[str] = None,
+    pack_folder_url: Optional[str] = None,
+) -> List[str]:
+    steps: List[str] = ["# Run from claude-videos repo root (see docs/LOCAL_DEV.md)"]
+    if kind == "custom":
+        steps.extend([
+            f"# Custom project '{slug}' — refine slides in the Interface review HTML, then:",
+            f"python -m engine videos/{slug}/script.yaml --prepare  # after exporting script.yaml",
+            "cd remotion",
+            f"npm run render:only -- {slug}",
+            "npm run postrender",
+            f"npm run publish:local -- --slug {slug} --kind custom",
+        ])
+        if pack_folder_url:
+            steps.append(f"# Upload QA + MP4s into pack folder: {pack_folder_url}")
+        return steps
+    if kind == "testimonial":
+        if source_doc_file_id:
+            steps.append(
+                f"# 1. Download CRM source: https://drive.google.com/file/d/{source_doc_file_id}/view"
+            )
+        fn = (filename or "document.docx").strip()
+        src_arg = f'downloads/{fn}'
+        if fn.lower().endswith(".pdf"):
+            steps.append(f'python tools/build_one_testimonial.py --slug {slug} --source "{src_arg}"')
+        elif fn.lower().endswith((".docx", ".doc")):
+            steps.append(f'python tools/build_one_testimonial.py --slug {slug} --source "{src_arg}"')
+        else:
+            steps.append(f'# 2. Prepare source ({fn}) then run build_one_testimonial.py --source …')
+        steps.append("python tools/gen_render_manifest.py")
+    elif filename:
+        steps.append(f'python tools/understand_testimonial.py --docx "{filename}"')
+    steps.extend([
+        "cd remotion",
+        f"npm run render:only -- {slug}",
+        "npm run postrender",
+        f"npm run publish:local -- --slug {slug} --kind {kind}"
+        + (f" --testimonial-id {testimonial_id}" if testimonial_id else ""),
+    ])
+    if pack_folder_url:
+        steps.append(f"# Pack folder (QA + renders upload automatically on publish): {pack_folder_url}")
+    return steps
+
+
+def _default_claude_videos_root() -> str:
+    sibling = Path(__file__).resolve().parent.parent / "claude-videos"
+    return str(sibling) if sibling.is_dir() else ""
+
+
+def _trigger_testimonial_render_job(
+    slug: str,
+    source_doc_file_id: Optional[str],
+    testimonial_id: int,
+    client_id: Optional[int] = None,
+    business_name: Optional[str] = None,
+    source_file_name: Optional[str] = None,
+    *,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Enqueue Step 2 (render + publish) via CZA Videos API or local subprocess."""
+    if not (source_doc_file_id or "").strip():
+        logging.warning("[video] auto-render skipped — testimonial has no Drive file_id")
+        return None
+
+    slug_val = slug.strip().lower()
+    publish_env = (os.getenv("VIDEO_PUBLISH_ENV") or "local").strip() or "local"
+    payload: Dict[str, Any] = {
+        "slug": slug_val,
+        "source_doc_file_id": source_doc_file_id.strip(),
+        "testimonial_id": testimonial_id,
+        "client_id": client_id,
+        "business_name": business_name,
+        "source_file_name": source_file_name,
+        "publish_env": publish_env,
+        "force": force,
+    }
+
+    api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/")
+    if api_url:
+        try:
+            import httpx
+
+            key = (os.getenv("CZA_VIDEOS_API_KEY") or "").strip()
+            headers: Dict[str, str] = {}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            with httpx.Client(timeout=30.0) as client:
+                resp = client.post(f"{api_url}/jobs/testimonial", json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logging.error(
+                    "[video] CZA job enqueue failed %s: %s",
+                    resp.status_code,
+                    resp.text[:500],
+                )
+                return {
+                    "status": "enqueue_failed",
+                    "error": resp.text[:500],
+                    "api_url": api_url,
+                }
+            data = resp.json()
+            return {
+                "id": data.get("id"),
+                "status": data.get("status"),
+                "type": "testimonial",
+                "api_url": api_url,
+                "error": data.get("error"),
+                "message": data.get("message"),
+                "progress": data.get("progress"),
+            }
+        except Exception as exc:
+            logging.exception("[video] CZA job enqueue error")
+            return {"status": "enqueue_failed", "error": str(exc), "api_url": api_url}
+
+    videos_root = (os.getenv("CLAUDE_VIDEOS_ROOT") or _default_claude_videos_root()).strip()
+    script = os.path.join(videos_root, "tools", "run_testimonial_pipeline.py")
+    if videos_root and os.path.isdir(videos_root) and os.path.isfile(script):
+        argv = [
+            sys.executable,
+            script,
+            "--slug",
+            slug_val,
+            "--source-doc-file-id",
+            payload["source_doc_file_id"],
+            "--testimonial-id",
+            str(testimonial_id),
+            "--publish-env",
+            publish_env,
+        ]
+        if client_id is not None:
+            argv.extend(["--client-id", str(client_id)])
+        if business_name:
+            argv.extend(["--business-name", business_name])
+        if source_file_name:
+            argv.extend(["--source-file-name", source_file_name])
+        try:
+            subprocess.Popen(argv, cwd=videos_root)
+            return {
+                "id": None,
+                "status": "started_local",
+                "type": "testimonial",
+                "message": "Pipeline started as local subprocess",
+            }
+        except Exception as exc:
+            logging.exception("[video] local pipeline spawn failed")
+            return {"status": "spawn_failed", "error": str(exc)}
+
+    logging.warning(
+        "[video] auto-render not configured — set CZA_VIDEOS_API_URL or CLAUDE_VIDEOS_ROOT"
+    )
+    return None
+
+
+@app.post("/api/videos/restart-pipeline")
+def restart_video_pipeline(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    slug: str = Form(...),
+):
+    """Re-enqueue a stalled testimonial render job (force=true on CZA API)."""
+    _verify_video_write_auth(authorization)
+    slug_val = (slug or "").strip().lower()
+    if not slug_val:
+        raise HTTPException(status_code=400, detail="slug is required")
+
+    row = (
+        db.query(MarketingVideo)
+        .filter(MarketingVideo.slug == slug_val)
+        .order_by(MarketingVideo.id.asc())
+        .first()
+    )
+    if not row or not row.testimonial_id:
+        raise HTTPException(status_code=404, detail="No testimonial video draft found for slug")
+
+    testimonial = db.query(Testimonial).filter(Testimonial.id == row.testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+
+    source_doc_file_id = (row.source_doc_file_id or testimonial.file_id or "").strip()
+    if not source_doc_file_id:
+        raise HTTPException(status_code=400, detail="Testimonial has no Drive source document")
+
+    render_job = _trigger_testimonial_render_job(
+        slug=slug_val,
+        source_doc_file_id=source_doc_file_id,
+        testimonial_id=testimonial.id,
+        client_id=row.client_id,
+        business_name=row.business_name or testimonial.business_name,
+        source_file_name=testimonial.file_name,
+        force=True,
+    )
+    if not render_job:
+        raise HTTPException(status_code=503, detail="Render service not configured")
+
+    from tools.video_pipeline_progress import build_running_progress_from_sources
+
+    progress = build_running_progress_from_sources(slug_val, job_progress=render_job.get("progress"))
+    return {
+        "slug": slug_val,
+        "render_job": render_job,
+        "progress": progress,
+        "message": render_job.get("message") or "Render pipeline restarted",
+    }
+
+
+@app.post("/api/videos/ingest-testimonial")
+async def ingest_testimonial_for_video(
+    authorization: str = Header(...),
+    file: UploadFile = File(...),
+    business_name: str = Form(...),
+    testimonial_solution_type_id: Optional[str] = Form(None),
+    testimonial_type: Optional[str] = Form(None),
+    slug_hint: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+    gdrive_folder_url: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload testimonial .docx for video pipeline — n8n with Drive fallback for local dev.
+    """
+    _verify_video_write_auth(authorization)
+    if not business_name or not business_name.strip():
+        raise HTTPException(status_code=400, detail="business_name is required")
+    filename = (file.filename or "document").strip()
+    if not filename.lower().endswith((".docx", ".doc")):
+        raise HTTPException(status_code=400, detail="File must be Word (.docx, .doc)")
+
+    client_gdrive: Optional[str] = None
+    if client_id:
+        client = db.query(Client).filter(Client.id == client_id).first()
+        if client:
+            client_gdrive = client.gdrive_folder_url
+
+    from tools.video_upload import (
+        resolve_testimonial_drive_folder,
+        suggest_testimonial_slug,
+        upload_testimonial_document,
+    )
+
+    folder_id, folder_err = resolve_testimonial_drive_folder(
+        drive_folder_url=gdrive_folder_url,
+        client_gdrive_url=client_gdrive,
+    )
+    if not folder_id:
+        raise HTTPException(status_code=503, detail=folder_err or "Drive folder not configured")
+
+    contents = await file.read()
+    file_id, upload_err = upload_testimonial_document(
+        file_bytes=contents,
+        filename=filename,
+        business_name=business_name.strip(),
+        drive_folder_id=folder_id,
+        content_type=file.content_type or None,
+        testimonial_type=(testimonial_type or "").strip() or None,
+        testimonial_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+    )
+    if not file_id:
+        raise HTTPException(status_code=502, detail=upload_err or "Upload failed")
+
+    testimonial = Testimonial(
+        business_name=business_name.strip(),
+        file_name=filename,
+        file_id=file_id,
+        status="Draft",
+        testimonial_type=(testimonial_type or "").strip() or None,
+        testimonial_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+    )
+    db.add(testimonial)
+    db.commit()
+    db.refresh(testimonial)
+
+    slug = (slug_hint or "").strip().lower() or suggest_testimonial_slug(
+        business_name.strip(),
+        (testimonial_solution_type_id or "").strip() or None,
+    )
+
+    _create_video_draft_placeholders(
+        db,
+        slug=slug,
+        kind="testimonial",
+        business_name=business_name.strip(),
+        testimonial_id=testimonial.id,
+        client_id=client_id,
+        crm_solution_type_id=(testimonial_solution_type_id or "").strip() or None,
+        source_doc_file_id=file_id,
+    )
+
+    return {
+        "testimonial": TestimonialResponse.model_validate(testimonial),
+        "slug": slug,
+        "cli": _video_cli_steps(
+            slug, "testimonial", testimonial.id, filename, file_id
+        ),
+    }
+
+
+@app.post("/api/videos/start-from-testimonial")
+async def start_video_from_testimonial(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    testimonial_id: int = Form(...),
+    slug_hint: Optional[str] = Form(None),
+    client_id: Optional[int] = Form(None),
+):
+    """Create draft video rows from an existing CRM testimonial (no re-upload)."""
+    _verify_video_write_auth(authorization)
+    testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    if not testimonial:
+        raise HTTPException(status_code=404, detail="Testimonial not found")
+    if testimonial.id < 0:
+        raise HTTPException(status_code=400, detail="Sheet-sourced testimonials cannot start video pipeline")
+
+    from tools.video_upload import suggest_testimonial_slug
+
+    slug = (slug_hint or "").strip().lower() or suggest_testimonial_slug(
+        testimonial.business_name,
+        testimonial.testimonial_solution_type_id,
+    )
+
+    resolved_client_id = client_id
+    if not resolved_client_id:
+        client = (
+            db.query(Client)
+            .filter(func.lower(Client.business_name) == testimonial.business_name.strip().lower())
+            .first()
+        )
+        if client:
+            resolved_client_id = client.id
+
+    rows = _create_video_draft_placeholders(
+        db,
+        slug=slug,
+        kind="testimonial",
+        business_name=testimonial.business_name,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        crm_solution_type_id=testimonial.testimonial_solution_type_id,
+        source_doc_file_id=testimonial.file_id,
+    )
+
+    pack = _create_new_creation_pack(
+        db,
+        rows,
+        slug=slug,
+        kind="testimonial",
+        business_name=testimonial.business_name,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        source_doc_file_id=testimonial.file_id,
+    )
+    pack_error = pack.get("error")
+
+    render_job = _trigger_testimonial_render_job(
+        slug=slug,
+        source_doc_file_id=testimonial.file_id,
+        testimonial_id=testimonial.id,
+        client_id=resolved_client_id,
+        business_name=testimonial.business_name,
+        source_file_name=testimonial.file_name,
+    )
+    cza_api_url = (os.getenv("CZA_VIDEOS_API_URL") or "").strip().rstrip("/") or None
+
+    from tools.video_pipeline_progress import build_pack_progress_steps
+
+    progress = build_pack_progress_steps(pack, render_job=render_job, slug=slug)
+
+    return {
+        "testimonial": TestimonialResponse.model_validate(testimonial),
+        "slug": slug,
+        "videos": [MarketingVideoResponse.model_validate(r) for r in rows],
+        "pack_folder_id": pack.get("folder_id"),
+        "pack_folder_name": pack.get("folder_name"),
+        "pack_folder_url": pack.get("folder_url"),
+        "pack_parent_folder_url": pack.get("parent_folder_url"),
+        "pack_reused": False,
+        "pack_error": pack_error,
+        "pack_warnings": pack.get("warnings") or [],
+        "render_job": render_job,
+        "cza_videos_api_url": cza_api_url,
+        "progress": progress,
+        "cli": _video_cli_steps(
+            slug,
+            "testimonial",
+            testimonial.id,
+            testimonial.file_name,
+            testimonial.file_id,
+            pack.get("folder_url"),
+        ),
+    }
+
+
+@app.post("/api/videos/custom/extract-text")
+async def extract_custom_video_text(
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+):
+    _ = user_info
+    from tools.video_brief import extract_upload_text
+
+    content = await file.read()
+    filename = file.filename or "upload"
+    text = extract_upload_text(content, filename)
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from this file")
+    return {"text": text, "filename": filename}
+
+
+@app.post("/api/videos/custom/start")
+async def start_custom_video_project(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+    file: UploadFile = File(...),
+    title: str = Form(...),
+    slug: str = Form(...),
+    brief_json: str = Form("{}"),
+    client_id: Optional[int] = Form(None),
+):
+    """Upload source material and create draft custom video rows."""
+    _verify_video_write_auth(authorization)
+    from tools.video_brief import slugify_title
+    from tools.video_upload import resolve_testimonial_drive_folder, upload_custom_source_document
+
+    filename = file.filename or "source.docx"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    slug_val = slugify_title(slug or title, "custom-video")
+    folder_id, folder_err = resolve_testimonial_drive_folder()
+    if not folder_id:
+        raise HTTPException(status_code=502, detail=folder_err or "No Drive folder configured")
+
+    file_id, upload_err = upload_custom_source_document(
+        file_bytes=content,
+        filename=filename,
+        drive_folder_id=folder_id,
+    )
+    if not file_id:
+        raise HTTPException(status_code=502, detail=upload_err or "Upload failed")
+
+    rows = _create_video_draft_placeholders(
+        db,
+        slug=slug_val,
+        kind="custom",
+        business_name=title.strip(),
+        client_id=client_id,
+        source_doc_file_id=file_id,
+    )
+    for row in rows:
+        row.notes = (brief_json or "").strip() or None
+    db.commit()
+    for row in rows:
+        db.refresh(row)
+
+    pack = _create_new_creation_pack(
+        db,
+        rows,
+        slug=slug_val,
+        kind="custom",
+        business_name=title.strip(),
+        client_id=client_id,
+        source_doc_file_id=file_id,
+    )
+
+    return {
+        "slug": slug_val,
+        "title": title.strip(),
+        "source_doc_file_id": file_id,
+        "videos": [MarketingVideoResponse.model_validate(r) for r in rows],
+        "pack_folder_id": pack.get("folder_id"),
+        "pack_folder_name": pack.get("folder_name"),
+        "pack_folder_url": pack.get("folder_url"),
+        "pack_parent_folder_url": pack.get("parent_folder_url"),
+        "pack_reused": False,
+        "pack_error": pack.get("error"),
+        "pack_warnings": pack.get("warnings") or [],
+        "cli": _video_cli_steps(
+            slug_val,
+            "custom",
+            None,
+            filename,
+            file_id,
+            pack.get("folder_url"),
+        ),
+    }
+
+
+@app.post("/api/videos/dev/regenerate-all")
+def dev_regenerate_all_videos(
+    authorization: str = Header(...),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Dev-only: return the full local regenerate-all CLI workflow.
+    Does NOT run renders on the server — operator runs commands on claude-videos machine.
+    """
+    _ = user_info
+    _require_video_dev_tools()
+    _verify_video_write_auth(authorization)
+
+    from tools.video_registry_loader import load_video_registry
+
+    reg = load_video_registry()
+    entries = reg.get("entries") or []
+    marketing = [e for e in entries if e.get("kind") == "marketing"]
+    testimonials = [e for e in entries if e.get("kind") == "testimonial"]
+
+    publish_lines = [
+        f"npm run publish:local -- --slug {e.get('slug')} --kind marketing"
+        for e in marketing
+        if e.get("slug")
+    ]
+    publish_lines.extend(
+        f"npm run publish:local -- --slug {e.get('slug')} --kind testimonial"
+        for e in testimonials
+        if e.get("slug")
+    )
+
+    cli = [
+        "# TESTING & DEVELOPMENT ONLY — full library regenerate on claude-videos machine",
+        "cd \"C:\\My Projects\\claude-videos\"",
+        "npm run export:registry",
+        "cd remotion",
+        "npm run make:all",
+        "npm run postrender",
+        "cd ..",
+        "# Publish rendered MP4s back to local interface (one per slug):",
+        *publish_lines[:5],
+    ]
+    if len(publish_lines) > 5:
+        cli.append(f"# … plus {len(publish_lines) - 5} more publish:local commands (see publish_commands)")
+
+    return {
+        "warning": "TESTING & DEVELOPMENT ONLY — Do not run in production unless you intend a full re-render.",
+        "registry_version": reg.get("version"),
+        "registry_count": len(entries),
+        "marketing_count": len(marketing),
+        "testimonial_count": len(testimonials),
+        "cli": cli,
+        "publish_commands": publish_lines,
     }
 
 
@@ -3915,11 +6149,11 @@ def get_base1_landing_responses_endpoint(user_info: dict = Depends(verify_google
 
 @app.get("/api/invoicing/commission-figures-client-count")
 def invoicing_commission_figures_client_count_endpoint(
-    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas"),
+    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas | alinta-ci-elec"),
     user_info: dict = Depends(verify_google_token),
 ):
     """
-    Count data rows on the Commission Figures tab (excludes header) for Origin Gas / Origin Elec / Alinta Gas retailer sheets.
+    Count data rows on the Commission Figures tab (excludes header) for Origin Gas / Origin Elec / Alinta Gas / Alinta C&I Elec retailer sheets.
     """
     allowed = set(list_retailer_keys())
     key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
@@ -3938,6 +6172,56 @@ def invoicing_commission_figures_client_count_endpoint(
     }
 
 
+@app.get("/api/invoicing/retailer-sheet-tabs")
+def invoicing_retailer_sheet_tabs_endpoint(
+    retailer: str = Query(..., description="origin-gas | origin-elec | alinta-gas | alinta-ci-elec"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Sheet tab names and gids for a retailer workbook (used to deep-link Invoices Sent, etc.)."""
+    allowed = set(list_retailer_keys())
+    key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
+    if key not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid retailer. Use one of: {', '.join(sorted(allowed))}",
+        )
+    tabs, err = list_retailer_sheet_tabs(key)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "retailer": key,
+        "tabs": tabs,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/commission-up-to-date-summary")
+def invoicing_commission_up_to_date_summary_endpoint(
+    retailer: str = Query(..., description="origin-gas | origin-elec"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Count identifier rows (MRIN / NMI) and sum Total Commission on the Commission Up to Date tab
+    for Origin Gas / Origin Elec.
+    """
+    key = retailer.strip().lower().replace(" ", "-").replace("_", "-")
+    if key not in ORIGIN_COMMISSION_READY_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid retailer. Use one of: {', '.join(sorted(ORIGIN_COMMISSION_READY_KEYS))}",
+        )
+    data, err = get_commission_up_to_date_summary(key)
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "retailer": key,
+        "row_count": data["row_count"] if data else 0,
+        "total_commission": data["total_commission"] if data else 0,
+        "row_label": data["row_label"] if data else "row",
+        "user_email": user_info.get("email"),
+    }
+
+
 @app.get("/api/invoicing/trojan-oil-unique-clients")
 def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verify_google_token)):
     """
@@ -3950,6 +6234,61 @@ def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verif
         "unique_client_count": count,
         "user_email": user_info.get("email"),
     }
+
+
+@app.get("/api/invoicing/drive/businesses")
+def invoicing_drive_businesses_endpoint(
+    category: str = Query(
+        ...,
+        description=(
+            "automation_services | one_month_savings | equipment_rental | "
+            "solar_cleaning | cleaning_scrubber | alinta_ci_electricity | "
+            "alinta_ci_gas | origin_ci_electricity | origin_ci_gas | "
+            "trojan_oil | momentum_ci_electricity"
+        ),
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List businesses for an invoicing Drive category (lazy discovery under configured parent).
+    document_count is always null — avoid N+1 Drive calls.
+    """
+    require_invoicing_user(user_info)
+    payload, err, status = list_invoicing_drive_businesses(category)
+    if err:
+        if status == 400:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid category. Use one of: {', '.join(list_invoicing_drive_category_keys())}",
+            )
+        raise HTTPException(status_code=status, detail=err)
+    return payload
+
+
+@app.get("/api/invoicing/drive/documents")
+def invoicing_drive_documents_endpoint(
+    category: str = Query(...),
+    businessId: str = Query(..., description="Business id from /businesses response"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    List invoice files for one business. Folder categories validate the folder is a
+    direct child of the category parent before listing (no arbitrary folder ID access).
+    """
+    require_invoicing_user(user_info)
+    payload, err, status = list_invoicing_drive_documents(category, businessId)
+    if err:
+        if err == "unknown_category":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid category. Use one of: {', '.join(list_invoicing_drive_category_keys())}",
+            )
+        if err == "missing_business_id":
+            raise HTTPException(status_code=400, detail="businessId is required")
+        if err == "business_not_found":
+            raise HTTPException(status_code=404, detail="Business not found in this category")
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
 
 
 @app.get("/api/base1-leads")
@@ -5945,7 +8284,9 @@ async def upload_testimonial(
 ):
     """
     Upload a testimonial document via the unified n8n file-upload webhook
-    (upload_type=testimonial). Returns file_id from n8n and logs a CRM Testimonial row.
+    (upload_type=testimonial). PNG/JPEG images are converted to a one-page PDF
+    before upload so Drive never stores the original image. Returns file_id from
+    n8n and logs a CRM Testimonial row.
     """
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
@@ -5960,9 +8301,12 @@ async def upload_testimonial(
     filename = (file.filename or "document").strip()
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
-    allowed = (".pdf", ".docx", ".doc")
+    allowed = (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg")
     if not any(filename.lower().endswith(ext) for ext in allowed):
-        raise HTTPException(status_code=400, detail="File must be PDF or Word (.pdf, .docx, .doc)")
+        raise HTTPException(
+            status_code=400,
+            detail="File must be PDF, Word, PNG, or JPEG (.pdf, .docx, .doc, .png, .jpg, .jpeg)",
+        )
     status_val = (status or "Draft").strip()
     if status_val not in ("Draft", "Sent for approval", "Approved"):
         status_val = "Draft"
@@ -5970,7 +8314,17 @@ async def upload_testimonial(
     # Prefer the explicit client folder URL; fall back to TESTIMONIAL_STORAGE_FOLDER_ID if set.
     drive_folder = (gdrive_folder_url or "").strip() or TESTIMONIAL_STORAGE_FOLDER_ID
 
+    from tools.image_to_pdf import image_bytes_to_pdf, is_image_filename
     from tools.n8n_file_upload import UPLOAD_TYPE_TESTIMONIAL, upload_file_via_n8n
+
+    contents = await file.read()
+    content_type = file.content_type or "application/octet-stream"
+    if is_image_filename(filename):
+        try:
+            contents, filename = image_bytes_to_pdf(contents, filename)
+            content_type = "application/pdf"
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
     norm_testimonial_type = (testimonial_type or "").strip()
     norm_solution_type_id = (testimonial_solution_type_id or "").strip()
@@ -5985,14 +8339,13 @@ async def upload_testimonial(
         extra_form["invoice_number"] = invoice_number.strip()
 
     try:
-        contents = await file.read()
         n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
             file_bytes=contents,
             filename=filename,
             upload_type=UPLOAD_TYPE_TESTIMONIAL,
             business_name=business_name.strip(),
             drive_folder=drive_folder,
-            content_type=file.content_type or "application/octet-stream",
+            content_type=content_type,
             extra_form=extra_form,
         )
     except Exception as e:
@@ -6013,7 +8366,7 @@ async def upload_testimonial(
 
     type_label_for_name = norm_testimonial_type
     if not type_label_for_name and norm_solution_type_id:
-        merged_type = get_merged_content(norm_solution_type_id)
+        merged_type = get_merged_content(norm_solution_type_id, db)
         if isinstance(merged_type, dict):
             type_label_for_name = (
                 (merged_type.get("solution_type_label") or "").strip() or norm_solution_type_id
@@ -6048,7 +8401,7 @@ async def update_testimonial(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Update testimonial status, invoice number, and/or linked Drive document (file_id, file_name)."""
+    """Update testimonial status, invoice number, type, and/or linked Drive document (file_id, file_name)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -6058,13 +8411,50 @@ async def update_testimonial(
         except Exception as e:
             raise HTTPException(status_code=401, detail="Invalid Google token")
     testimonial = db.query(Testimonial).filter(Testimonial.id == testimonial_id).first()
+    sheet_row_number = -testimonial_id if testimonial_id < 0 else None
+    if not testimonial and sheet_row_number:
+        from tools.testimonial_sheet import adopt_sheet_row_to_crm
+
+        testimonial = adopt_sheet_row_to_crm(db, sheet_row_number)
     if not testimonial:
         raise HTTPException(status_code=404, detail="Testimonial not found")
     if body.status is not None:
         if body.status.strip() in ("Draft", "Sent for approval", "Approved"):
             testimonial.status = body.status.strip()
+            if sheet_row_number:
+                from tools.testimonial_sheet import update_sheet_status
+
+                update_sheet_status(sheet_row_number, testimonial.status)
     if body.invoice_number is not None:
         testimonial.invoice_number = body.invoice_number.strip() or None
+        from tools.testimonial_sheet import update_sheet_linked_invoice
+
+        if sheet_row_number:
+            update_sheet_linked_invoice(sheet_row_number, testimonial.invoice_number)
+        elif testimonial.file_id:
+            from tools.testimonial_sheet import get_all_testimonials_from_sheet
+
+            for sheet_item in get_all_testimonials_from_sheet():
+                if str(sheet_item.get("file_id") or "").strip() == str(testimonial.file_id).strip():
+                    update_sheet_linked_invoice(-int(sheet_item["id"]), testimonial.invoice_number)
+                    break
+    if body.testimonial_solution_type_id is not None or body.testimonial_type is not None:
+        type_id, type_label = resolve_testimonial_type(
+            db,
+            body.testimonial_solution_type_id,
+            body.testimonial_type,
+        )
+        testimonial.testimonial_solution_type_id = type_id
+        testimonial.testimonial_type = type_label
+        from tools.testimonial_sheet import get_all_testimonials_from_sheet, update_sheet_type
+
+        if sheet_row_number:
+            update_sheet_type(sheet_row_number, type_label)
+        elif testimonial.file_id:
+            for sheet_item in get_all_testimonials_from_sheet():
+                if str(sheet_item.get("file_id") or "").strip() == str(testimonial.file_id).strip():
+                    update_sheet_type(-int(sheet_item["id"]), type_label)
+                    break
     if body.file_id is not None:
         raw = body.file_id.strip()
         extracted = extract_folder_id_from_url(raw) if raw else None
@@ -6084,6 +8474,10 @@ async def update_testimonial(
         if len(fn) > 512:
             raise HTTPException(status_code=400, detail="file_name is too long")
         testimonial.file_name = fn
+    if body.video_long_file_id is not None:
+        testimonial.video_long_file_id = body.video_long_file_id.strip() or None
+    if body.video_short_file_id is not None:
+        testimonial.video_short_file_id = body.video_short_file_id.strip() or None
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)
@@ -6119,6 +8513,7 @@ async def delete_testimonial(
 async def list_testimonial_solution_content(
     solution_type: Optional[str] = Query(None, description="Filter to one solution type"),
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """List merged testimonial content for all solution types, or one if solution_type is provided."""
     if not authorization.startswith("Bearer "):
@@ -6131,18 +8526,70 @@ async def list_testimonial_solution_content(
             logging.error(f"Token verification failed: {e}")
             raise HTTPException(status_code=401, detail="Invalid Google token")
     if solution_type:
-        merged = get_merged_content(solution_type)
+        merged = get_merged_content(solution_type, db)
         if not merged:
             raise HTTPException(status_code=404, detail=f"Unknown solution_type: {solution_type}")
         return [TestimonialSolutionContentItem(**merged)]
-    items = get_merged_content(None)
+    items = get_merged_content(None, db)
     return [TestimonialSolutionContentItem(**item) for item in items]
+
+
+@app.post("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
+async def create_testimonial_solution_content(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Create a staff-defined solution type. Body: solution_type_label (required) + optional copy fields."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    body = await request.json()
+    label = body.get("solution_type_label") or body.get("name")
+    payload = {k: v for k, v in body.items() if k not in ("solution_type", "solution_type_label", "name")}
+    try:
+        created = create_custom_type(db, str(label or ""), payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return TestimonialSolutionContentItem(**created)
+
+
+@app.delete("/api/testimonials/solution-content/{solution_type}", status_code=204)
+async def delete_testimonial_solution_content(
+    solution_type: str,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """Remove a staff-created solution type. Built-in types cannot be deleted."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    try:
+        delete_custom_type(db, solution_type)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.put("/api/testimonials/solution-content", response_model=TestimonialSolutionContentItem)
 async def update_testimonial_solution_content(
     request: Request,
     authorization: str = Header(...),
+    db: Session = Depends(get_db),
 ):
     """Save overrides for one solution type. Body: solution_type (required) + any content fields."""
     if not authorization.startswith("Bearer "):
@@ -6160,7 +8607,7 @@ async def update_testimonial_solution_content(
         raise HTTPException(status_code=400, detail="solution_type is required")
     payload = {k: v for k, v in body.items() if k != "solution_type"}
     try:
-        merged = save_override(st.strip(), payload)
+        merged = save_override(st.strip(), payload, db)
         return TestimonialSolutionContentItem(**merged)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -6168,12 +8615,12 @@ async def update_testimonial_solution_content(
 
 @app.get("/api/testimonials/examples", response_model=List[TestimonialResponse])
 async def get_testimonial_examples_for_solution_type(
-    solution_type: str = Query(..., description="testimonial_solution_type_id to filter by"),
-    limit: int = Query(5, ge=1, le=20),
+    solution_type: Optional[str] = Query(None, description="testimonial_solution_type_id to filter by; omit for all"),
+    limit: int = Query(20, ge=1, le=500),
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Return recent testimonials for a given testimonial solution type (for content page examples)."""
+    """Return recent testimonials, optionally filtered by solution type (content page register)."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -6244,6 +8691,7 @@ async def generate_testimonial_document_endpoint(
         pv_system_size=(body.get("pv_system_size") or "").strip(),
         solar_pre_daily_kwh=solar_pre,
         solar_post_daily_kwh=solar_post,
+        db=db,
     )
     if result.get("status") == "error":
         raise HTTPException(
@@ -6257,7 +8705,7 @@ async def generate_testimonial_document_endpoint(
             # Reuse folder-ID extraction helper; it also handles /d/ and ?id= patterns for files.
             file_id = extract_folder_id_from_url(document_link)
             if file_id:
-                merged = get_merged_content(solution_type_id)
+                merged = get_merged_content(solution_type_id, db)
                 label = (
                     (merged.get("solution_type_label") if merged else None)
                     or solution_type_id
@@ -7515,6 +9963,7 @@ def link_client_from_loa(
         gdrive_folder_url=body.gdrive_folder_url,
         client_id=body.client_id,
         owner_email=owner_email,
+        reassign=body.reassign,
     )
 
 
@@ -7538,11 +9987,12 @@ def list_clients(
     limit: Optional[int] = Query(None, description="Max number of clients to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of clients to skip (use with limit)"),
     db: Session = Depends(get_db),
-    user_data: dict = Depends(get_current_user_with_db),
+    user_data: dict = Depends(get_current_user_with_db_or_backend_api_key),
 ):
     """
     List clients. Optional filters: query, stage, created_after, created_before, mine (My clients), reporting_entity.
     When limit (or offset) is set, returns { "items": [...], "total": N }; otherwise returns a plain list (backward compatible).
+    Auth: Google ID token or Bearer BACKEND_API_KEY.
     """
     from datetime import datetime as dt
     from datetime import timedelta
@@ -7685,17 +10135,18 @@ def update_client(
     if not db_client:
         raise HTTPException(status_code=404, detail="Client not found")
 
+    update_payload = client_update.model_dump(exclude_unset=True)
     if client_update.business_name is not None:
         db_client.business_name = client_update.business_name
-    if client_update.external_business_id is not None:
-        db_client.external_business_id = client_update.external_business_id
+    if "external_business_id" in update_payload:
+        raw_id = client_update.external_business_id
+        db_client.external_business_id = (str(raw_id).strip() if raw_id else "") or None
     if client_update.primary_contact_email is not None:
         db_client.primary_contact_email = client_update.primary_contact_email
     if client_update.gdrive_folder_url is not None:
         db_client.gdrive_folder_url = client_update.gdrive_folder_url
     if client_update.owner_email is not None:
         db_client.owner_email = client_update.owner_email
-    update_payload = client_update.model_dump(exclude_unset=True)
     if "referred_by_client_id" in update_payload:
         db_client.referred_by_client_id = client_update.referred_by_client_id
     if "referred_by_business_name" in update_payload:
@@ -8412,6 +10863,12 @@ def create_offer(
         if isinstance(getattr(offer, "pipeline_stage", None), OfferPipelineStageSchema)
         else getattr(offer, "pipeline_stage", None),
         estimated_value=offer.estimated_value,
+        current_peak_rate=getattr(offer, "current_peak_rate", None),
+        current_shoulder_rate=getattr(offer, "current_shoulder_rate", None),
+        current_offpeak_rate=getattr(offer, "current_offpeak_rate", None),
+        new_peak_rate=getattr(offer, "new_peak_rate", None),
+        new_shoulder_rate=getattr(offer, "new_shoulder_rate", None),
+        new_offpeak_rate=getattr(offer, "new_offpeak_rate", None),
         created_by=user_email,
         external_record_id=offer.external_record_id,
         document_link=offer.document_link,
@@ -9037,7 +11494,15 @@ def autonomous_sequence_start(
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    from services.autonomous_sequence import get_sequence_template_by_type, start_gas_base2_sequence
+    from services.autonomous_sequence import (
+        ensure_autonomous_sequence_type_row,
+        get_sequence_template_by_type,
+        start_gas_base2_sequence,
+    )
+
+    sequence_type = (body.sequence_type or "").strip()
+    if not sequence_type:
+        raise HTTPException(status_code=400, detail="sequence_type is required")
 
     sequence_context = dict(body.context or {})
     incoming_email_id = (body.email_id or body.email_ID or "").strip()
@@ -9046,43 +11511,103 @@ def autonomous_sequence_start(
         sequence_context["email_ID"] = incoming_email_id
         sequence_context.setdefault("email_id", incoming_email_id)
 
-    # Provide consistent offer timing fields for prompts/workflows.
-    # The offer validity window defaults to exactly 7 days from generation.
+    # Offer timing fields for prompts/workflows.
+    # An explicit offer_validity_date from the client/UI always wins. Otherwise the
+    # sequence template decides: none / retailer_date / fixed_days(N). The old code
+    # hardcoded "anchor + 7 days" here, which meant the software invented a client
+    # deadline no retailer had set.
     anchor_dt = body.anchor_at
     if anchor_dt.tzinfo is None:
         anchor_utc = anchor_dt.replace(tzinfo=timezone.utc)
     else:
         anchor_utc = anchor_dt.astimezone(timezone.utc)
-    valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(ZoneInfo("Australia/Brisbane"))
 
-    from services.autonomous_sequence import SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE
+    from services.autonomous_sequence import (
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        apply_validity_to_context,
+        get_template_validity_config,
+    )
+
+    template = get_sequence_template_by_type(db, sequence_type)
+    if not template:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
+                "Create it under Autonomous Agent \u2192 Sequence templates, or check the mono key under the display name."
+            ),
+        )
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if body.sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
-        sequence_context.setdefault("offer_valid_until", valid_until_utc.isoformat())
-        sequence_context.setdefault("offer_validity_date", valid_until_local.date().isoformat())
-        sequence_context.setdefault("offer_validity_days", 7)
+    if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+        incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
+        if not incoming_validity:
+            # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
+            for key in ("offer_validity_label", "validity_date", "offer_validity"):
+                label = str(sequence_context.get(key) or "").strip()
+                if not label:
+                    continue
+                m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", label)
+                if m:
+                    dd, mm, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+                    incoming_validity = f"{yyyy}-{mm}-{dd}"
+                    break
+                m_iso = re.search(r"(\d{4})-(\d{2})-(\d{2})", label)
+                if m_iso:
+                    incoming_validity = f"{m_iso.group(1)}-{m_iso.group(2)}-{m_iso.group(3)}"
+                    break
 
-    template = get_sequence_template_by_type(db, body.sequence_type)
-    if not template:
-        raise HTTPException(status_code=400, detail="Unsupported sequence_type (template not found)")
+        explicit_validity: Optional[date] = None
+        if incoming_validity:
+            try:
+                explicit_validity = date.fromisoformat(incoming_validity[:10])
+            except ValueError:
+                logging.warning("Ignoring invalid offer_validity_date=%r", incoming_validity)
+
+        validity_mode, validity_days = get_template_validity_config(db, template)
+        resolved_validity = apply_validity_to_context(
+            sequence_context,
+            anchor_utc,
+            validity_mode,
+            validity_days,
+            ZoneInfo("Australia/Melbourne"),
+            explicit_validity,
+        )
+        if resolved_validity is not None:
+            sequence_context.setdefault(
+                "offer_validity_label",
+                f"12pm on {resolved_validity.strftime('%d/%m/%Y')}",
+            )
+
     if not bool(template.is_active):
-        raise HTTPException(status_code=400, detail="Sequence template is inactive")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Sequence template is inactive: {sequence_type!r}. Enable Active and Save template.",
+        )
     offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
     if not offer:
         raise HTTPException(status_code=404, detail="Offer not found")
 
-    run = start_gas_base2_sequence(
-        db,
-        sequence_type=body.sequence_type,
-        offer_id=body.offer_id,
-        client_id=body.client_id if body.client_id is not None else offer.client_id,
-        crm_activity_id=body.crm_activity_id,
-        anchor_at=body.anchor_at,
-        tz=body.timezone,
-        context=sequence_context,
-    )
+    # Ensure FK parent row exists (shared DB may enforce autonomous_sequence_type).
+    ensure_autonomous_sequence_type_row(db, sequence_type)
+
+    try:
+        run = start_gas_base2_sequence(
+            db,
+            sequence_type=sequence_type,
+            offer_id=body.offer_id,
+            client_id=body.client_id if body.client_id is not None else offer.client_id,
+            crm_activity_id=body.crm_activity_id,
+            anchor_at=body.anchor_at,
+            tz=body.timezone,
+            context=sequence_context,
+        )
+    except Exception as e:
+        logging.exception("autonomous sequence start failed type=%s offer_id=%s", sequence_type, body.offer_id)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to start sequence {sequence_type!r}: {e}",
+        ) from e
     steps_planned = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.run_id == run.id).count()
     return {
         "run_id": run.id,
@@ -9115,7 +11640,20 @@ def _autonomous_template_step_response(
 
 def _autonomous_template_response(
     template: AutonomousSequenceTemplate,
+    db: Optional[Session] = None,
 ) -> AutonomousSequenceTemplateResponse:
+    from services.autonomous_sequence import (
+        DEFAULT_VALIDITY_DAYS,
+        DEFAULT_VALIDITY_MODE,
+        default_signature_html_for_type,
+        get_template_validity_config,
+    )
+
+    if db is not None:
+        validity_mode, validity_days = get_template_validity_config(db, template)
+    else:
+        validity_mode, validity_days = DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+
     steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
     return AutonomousSequenceTemplateResponse.model_validate(
         {
@@ -9126,6 +11664,11 @@ def _autonomous_template_response(
             "timezone": template.timezone,
             "is_active": bool(template.is_active),
             "is_restartable": bool(template.is_restartable),
+            "signature_html": str(getattr(template, "signature_html", None) or "").strip()
+            or default_signature_html_for_type(template.sequence_type),
+            "extra_context": str(getattr(template, "extra_context", None) or "").strip() or None,
+            "validity_mode": validity_mode,
+            "validity_days": validity_days,
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -9133,14 +11676,43 @@ def _autonomous_template_response(
     )
 
 
+def _autonomous_sequence_type_table(db: Session) -> str:
+    from services.autonomous_sequence import _is_postgresql, _qualified_table, _reflect_table_names
+
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables and not _is_postgresql(bind):
+        db.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS autonomous_sequence_type (
+                    sequence_type VARCHAR(120) PRIMARY KEY,
+                    retell_agent_id VARCHAR(120),
+                    system_prompt TEXT,
+                    email_example TEXT,
+                    sms_example TEXT,
+                    voice_example TEXT,
+                    retell_agent_copied INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+        )
+        db.commit()
+    return _qualified_table(bind, "autonomous_sequence_type")
+
+
 def _autonomous_sequence_type_columns(db: Session) -> List[str]:
-    insp = inspect(db.bind)
-    tables = set(insp.get_table_names(schema="public")) | set(insp.get_table_names())
+    from services.autonomous_sequence import _inspector_schema_kw, _reflect_table_names
+
+    bind = db.bind
+    _autonomous_sequence_type_table(db)
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
     if "autonomous_sequence_type" not in tables:
         return []
-    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", schema="public")]
-    if not cols:
-        cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type")]
+    skw = _inspector_schema_kw(bind)
+    cols = [c.get("name") for c in insp.get_columns("autonomous_sequence_type", **skw)]
     return [str(c) for c in cols if c]
 
 
@@ -9169,13 +11741,20 @@ def autonomous_sequence_get_type_prompts(
     select_cols = [c for c in wanted if c in cols]
     if "sequence_type" not in select_cols:
         raise HTTPException(status_code=500, detail="autonomous_sequence_type.sequence_type missing")
+    ast_tbl = _autonomous_sequence_type_table(db)
     sql = text(
         f"SELECT {', '.join(select_cols)} "
-        "FROM public.autonomous_sequence_type "
+        f"FROM {ast_tbl} "
         "WHERE sequence_type = :sequence_type "
         "LIMIT 1"
     )
     row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
+    if not row:
+        from services.autonomous_sequence import ensure_autonomous_sequence_type_row
+
+        ensure_autonomous_sequence_type_row(db, sequence_type.strip())
+        db.commit()
+        row = db.execute(sql, {"sequence_type": sequence_type.strip()}).mappings().first()
     if not row:
         raise HTTPException(status_code=404, detail="sequence_type not found in autonomous_sequence_type")
     return dict(row)
@@ -9207,7 +11786,7 @@ def autonomous_sequence_patch_type_prompts(
         raise HTTPException(status_code=400, detail="No valid fields to update")
 
     exists_sql = text(
-        "SELECT 1 FROM public.autonomous_sequence_type WHERE sequence_type = :sequence_type LIMIT 1"
+        f"SELECT 1 FROM {_autonomous_sequence_type_table(db)} WHERE sequence_type = :sequence_type LIMIT 1"
     )
     exists = db.execute(exists_sql, {"sequence_type": sequence_type}).first()
     if not exists:
@@ -9221,7 +11800,7 @@ def autonomous_sequence_patch_type_prompts(
     if "retell_agent_id" in patchable and "retell_agent_copied" in cols:
         row_cur = db.execute(
             text(
-                "SELECT retell_agent_id FROM public.autonomous_sequence_type "
+                f"SELECT retell_agent_id FROM {_autonomous_sequence_type_table(db)} "
                 "WHERE sequence_type = :sequence_type LIMIT 1"
             ),
             {"sequence_type": sequence_type},
@@ -9237,13 +11816,71 @@ def autonomous_sequence_patch_type_prompts(
     if not assignment_parts:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     assignments = ", ".join(assignment_parts)
+    ast_tbl = _autonomous_sequence_type_table(db)
     update_sql = text(
-        f"UPDATE public.autonomous_sequence_type SET {assignments} "
+        f"UPDATE {ast_tbl} SET {assignments} "
         "WHERE sequence_type = :sequence_type"
     )
     db.execute(update_sql, params)
     db.commit()
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get("/api/autonomous/retell/voices", response_model=List[RetellVoiceListItem])
+def autonomous_retell_list_voices(
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.retell_agents import RetellAgentsError, list_voices
+
+    try:
+        return list_voices()
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/agents", response_model=List[RetellAgentListItem])
+def autonomous_retell_list_agents(
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """List Retell voice agents (names for the locked sequence-template display)."""
+    from services.retell_agents import RetellAgentsError, list_voice_agents
+
+    try:
+        return list_voice_agents()
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_get_agent(
+    agent_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Load a Retell agent's LLM prompt (general_prompt + begin_message)."""
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    try:
+        return get_agent_prompt(agent_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.patch("/api/autonomous/retell/agents/{agent_id}", response_model=RetellAgentPromptResponse)
+def autonomous_retell_patch_agent(
+    agent_id: str,
+    body: RetellAgentPromptUpdate,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Save prompt, voice, and call settings on the Retell agent / LLM."""
+    from services.retell_agents import RetellAgentsError, update_agent_prompt
+
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No Retell fields to update.")
+    try:
+        return update_agent_prompt(agent_id, **fields)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
 @app.get(
@@ -9260,7 +11897,70 @@ def autonomous_sequence_list_templates(
         .order_by(AutonomousSequenceTemplate.sequence_type.asc())
         .all()
     )
-    return [_autonomous_template_response(r) for r in rows]
+    return [_autonomous_template_response(r, db) for r in rows]
+
+
+@app.get(
+    "/api/autonomous/sequences/template-suggestions",
+    response_model=AutonomousTemplateSuggestionsResponse,
+)
+def autonomous_sequence_template_suggestions(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Comparisons / flows that do not yet have an autonomous sequence template."""
+    from services.autonomous_flows import uncovered_flows
+
+    existing = {
+        str(t.sequence_type).strip()
+        for t in db.query(AutonomousSequenceTemplate.sequence_type).all()
+        if t.sequence_type
+    }
+    return AutonomousTemplateSuggestionsResponse(uncovered_flows=uncovered_flows(existing))
+
+
+def _sequence_type_retell_agent_id(db: Session, sequence_type: str) -> str:
+    cols = _autonomous_sequence_type_columns(db)
+    if "retell_agent_id" not in cols:
+        return ""
+    ast_tbl = _autonomous_sequence_type_table(db)
+    row = db.execute(
+        text(f"SELECT retell_agent_id FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": sequence_type},
+    ).mappings().first()
+    return str(row["retell_agent_id"] or "").strip() if row else ""
+
+
+def _copy_sequence_type_prompts(
+    db: Session,
+    source_type: str,
+    dest_type: str,
+    retell_agent_id: Optional[str],
+) -> None:
+    cols = _autonomous_sequence_type_columns(db)
+    ast_tbl = _autonomous_sequence_type_table(db)
+    src = db.execute(
+        text(f"SELECT * FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": source_type},
+    ).mappings().first()
+    assignments: list[str] = []
+    params: Dict[str, Union[str, None]] = {"st": dest_type}
+    for col in ("system_prompt", "email_example", "sms_example", "voice_example"):
+        if col in cols and src is not None:
+            assignments.append(f"{col} = :{col}")
+            val = src.get(col)
+            params[col] = None if val is None else str(val)
+    if "retell_agent_id" in cols and retell_agent_id is not None:
+        assignments.append("retell_agent_id = :retell_agent_id")
+        params["retell_agent_id"] = retell_agent_id
+        if "retell_agent_copied" in cols:
+            assignments.append("retell_agent_copied = 0")
+    if not assignments:
+        return
+    db.execute(
+        text(f"UPDATE {ast_tbl} SET {', '.join(assignments)} WHERE sequence_type = :st"),
+        params,
+    )
 
 
 @app.post(
@@ -9282,17 +11982,56 @@ def autonomous_sequence_create_template(
     )
     if existing:
         raise HTTPException(status_code=409, detail="sequence_type already exists")
+
+    copy_from = (body.copy_from_sequence_type or "").strip() or None
+    source: Optional[AutonomousSequenceTemplate] = None
+    if copy_from:
+        source = (
+            db.query(AutonomousSequenceTemplate)
+            .options(joinedload(AutonomousSequenceTemplate.steps))
+            .filter(AutonomousSequenceTemplate.sequence_type == copy_from)
+            .first()
+        )
+        if not source:
+            raise HTTPException(status_code=404, detail=f"copy_from template not found: {copy_from}")
+
+    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Brisbane"
+    description = (body.description or "").strip() or None
+    if description is None and source and source.description:
+        description = f"Copied from {source.display_name}."
+
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
-        description=(body.description or "").strip() or None,
-        timezone=(body.timezone or "Australia/Brisbane").strip() or "Australia/Brisbane",
+        description=description,
+        timezone=timezone,
         is_active=1 if body.is_active else 0,
-        is_restartable=1 if body.is_restartable else 0,
+        is_restartable=1 if body.is_restartable else (int(source.is_restartable) if source else 1),
+        signature_html=(body.signature_html or "").strip()
+        or ((source.signature_html or "").strip() if source else "")
+        or None,
+        extra_context=(body.extra_context or "").strip()
+        or ((getattr(source, "extra_context", None) or "").strip() if source else "")
+        or None,
     )
     db.add(template)
     db.flush()
-    for s in body.steps:
+
+    steps_src = body.steps
+    if not steps_src and source:
+        steps_src = [
+            AutonomousSequenceTemplateStepCreate(
+                step_index=int(s.step_index),
+                day_number=int(s.day_number),
+                channel=str(s.channel),
+                send_time_local=str(s.send_time_local or "09:00"),
+                prompt_text=s.prompt_text,
+                retell_agent_id=None,
+                is_active=bool(s.is_active),
+            )
+            for s in sorted(source.steps, key=lambda x: int(x.step_index))
+        ]
+    for s in steps_src:
         db.add(
             AutonomousSequenceTemplateStep(
                 template_id=template.id,
@@ -9301,22 +12040,46 @@ def autonomous_sequence_create_template(
                 channel=s.channel.strip(),
                 send_time_local=s.send_time_local.strip(),
                 prompt_text=(s.prompt_text or "").strip() or None,
-                retell_agent_id=(s.retell_agent_id or "").strip() or None,
+                retell_agent_id=None,
                 is_active=1 if s.is_active else 0,
             )
         )
+
     from services.autonomous_sequence import ensure_autonomous_sequence_type_row
 
     ensure_autonomous_sequence_type_row(db, seq_type)
+
+    new_agent_id: Optional[str] = None
+    if body.duplicate_retell:
+        if not copy_from:
+            raise HTTPException(
+                status_code=400,
+                detail="Pick a sequence to copy from before duplicating its Retell agent.",
+            )
+        source_agent = _sequence_type_retell_agent_id(db, copy_from)
+        if not source_agent:
+            raise HTTPException(
+                status_code=400,
+                detail="No Retell agent on the source sequence to duplicate.",
+            )
+        from services.retell_agents import RetellAgentsError, duplicate_agent
+
+        try:
+            cloned = duplicate_agent(source_agent, body.display_name.strip() or seq_type)
+        except RetellAgentsError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+        new_agent_id = cloned["agent_id"]
+
+    _copy_sequence_type_prompts(db, copy_from or seq_type, seq_type, new_agent_id or "")
+
     db.commit()
-    db.refresh(template)
     template = (
         db.query(AutonomousSequenceTemplate)
         .options(joinedload(AutonomousSequenceTemplate.steps))
         .filter(AutonomousSequenceTemplate.id == template.id)
         .first()
     )
-    return _autonomous_template_response(template)
+    return _autonomous_template_response(template, db)
 
 
 @app.patch(
@@ -9337,6 +12100,12 @@ def autonomous_sequence_update_template(
     )
     if not template:
         raise HTTPException(status_code=404, detail="Template not found")
+    if body.sequence_type is not None:
+        from services.autonomous_sequence import rename_sequence_template_type
+        try:
+            rename_sequence_template_type(db, template, body.sequence_type)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     if body.display_name is not None:
         template.display_name = body.display_name.strip() or template.display_name
     if body.description is not None:
@@ -9347,9 +12116,93 @@ def autonomous_sequence_update_template(
         template.is_active = 1 if body.is_active else 0
     if body.is_restartable is not None:
         template.is_restartable = 1 if body.is_restartable else 0
+    if body.signature_html is not None:
+        template.signature_html = body.signature_html.strip() or None
+    if body.extra_context is not None:
+        template.extra_context = body.extra_context.strip() or None
+    if body.validity_mode is not None or body.validity_days is not None:
+        from services.autonomous_sequence import set_template_validity_config
+        try:
+            set_template_validity_config(db, template.id, body.validity_mode, body.validity_days)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     db.commit()
     db.refresh(template)
-    return _autonomous_template_response(template)
+    return _autonomous_template_response(template, db)
+
+
+@app.get(
+    "/api/autonomous/sequences/templates/{template_id}/delete-preview",
+    response_model=AutonomousTemplateDeletePreview,
+)
+def autonomous_sequence_delete_template_preview(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import preview_sequence_template_delete
+    from services.retell_agents import RetellAgentsError, get_agent_prompt
+
+    plan = preview_sequence_template_delete(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    agent_name = None
+    agent_id = plan.get("retell_agent_id")
+    if agent_id:
+        try:
+            prompt = get_agent_prompt(str(agent_id))
+            agent_name = str(prompt.get("agent_name") or "").strip() or None
+        except RetellAgentsError:
+            agent_name = None
+    return AutonomousTemplateDeletePreview(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        display_name=str(plan["display_name"]),
+        run_count=int(plan["run_count"]),
+        retell_agent_id=str(agent_id) if agent_id else None,
+        retell_agent_name=agent_name,
+        retell_will_delete=bool(plan["retell_will_delete"]),
+        retell_skip_reason=plan.get("retell_skip_reason"),
+    )
+
+
+@app.delete(
+    "/api/autonomous/sequences/templates/{template_id}",
+    response_model=AutonomousTemplateDeleteResponse,
+)
+def autonomous_sequence_delete_template(
+    template_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_sequence_template_db
+    from services.retell_agents import RetellAgentsError, delete_agent
+
+    plan = delete_sequence_template_db(db, template_id)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Template not found")
+    db.commit()
+
+    warnings: list[str] = []
+    retell_deleted = False
+    agent_id = str(plan.get("retell_agent_id") or "").strip() or None
+    if plan.get("retell_will_delete") and agent_id:
+        try:
+            delete_agent(agent_id)
+            retell_deleted = True
+        except RetellAgentsError as e:
+            warnings.append(f"Database records were deleted, but Retell cleanup failed: {e.detail}")
+    elif plan.get("retell_skip_reason"):
+        warnings.append(str(plan["retell_skip_reason"]))
+
+    return AutonomousTemplateDeleteResponse(
+        template_id=int(plan["template_id"]),
+        sequence_type=str(plan["sequence_type"]),
+        deleted_runs=int(plan.get("deleted_runs") or 0),
+        retell_deleted=retell_deleted,
+        retell_agent_id=agent_id,
+        warnings=warnings,
+    )
 
 
 @app.post(
@@ -9423,6 +12276,28 @@ def autonomous_sequence_update_template_step(
     db.commit()
     db.refresh(step)
     return _autonomous_template_step_response(step)
+
+
+@app.delete("/api/autonomous/sequences/templates/{template_id}/steps/{step_id}")
+def autonomous_sequence_delete_template_step(
+    template_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    step = (
+        db.query(AutonomousSequenceTemplateStep)
+        .filter(
+            AutonomousSequenceTemplateStep.id == step_id,
+            AutonomousSequenceTemplateStep.template_id == template_id,
+        )
+        .first()
+    )
+    if not step:
+        raise HTTPException(status_code=404, detail="Template step not found")
+    db.delete(step)
+    db.commit()
+    return {"ok": True, "id": step_id}
 
 
 @app.get("/api/autonomous/sequences/runs")
@@ -9587,6 +12462,53 @@ def autonomous_sequence_patch_step_schedules(
     return _autonomous_run_detail(db, run)
 
 
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/export-action")
+def autonomous_sequence_export_step_action(
+    run_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import export_step_action
+
+    try:
+        return export_step_action(db, run_id, step_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/execute-now")
+def autonomous_sequence_execute_step_now(
+    run_id: int,
+    step_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import execute_step_now
+
+    try:
+        return execute_step_now(db, run_id, step_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/autonomous/sequences/runs/{run_id}/steps/{step_id}/mark-dispatched")
+def autonomous_sequence_mark_step_dispatched(
+    run_id: int,
+    step_id: int,
+    body: AutonomousSequenceStepDispatchMarkRequest,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import mark_step_dispatched
+
+    try:
+        run = mark_step_dispatched(db, run_id, step_id, body.success, body.summary)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return _autonomous_run_detail(db, run)
+
+
 @app.post(
     "/api/autonomous/sequences/inbound",
     dependencies=[Depends(verify_autonomous_inbound_secret)],
@@ -9674,6 +12596,19 @@ def update_offer(
         db_offer.contracted_rate = offer_update.contracted_rate
     if offer_update.offer_rate is not None:
         db_offer.offer_rate = offer_update.offer_rate
+    # C&I electricity time-of-use rates
+    if offer_update.current_peak_rate is not None:
+        db_offer.current_peak_rate = offer_update.current_peak_rate
+    if offer_update.current_shoulder_rate is not None:
+        db_offer.current_shoulder_rate = offer_update.current_shoulder_rate
+    if offer_update.current_offpeak_rate is not None:
+        db_offer.current_offpeak_rate = offer_update.current_offpeak_rate
+    if offer_update.new_peak_rate is not None:
+        db_offer.new_peak_rate = offer_update.new_peak_rate
+    if offer_update.new_shoulder_rate is not None:
+        db_offer.new_shoulder_rate = offer_update.new_shoulder_rate
+    if offer_update.new_offpeak_rate is not None:
+        db_offer.new_offpeak_rate = offer_update.new_offpeak_rate
     if offer_update.external_record_id is not None:
         db_offer.external_record_id = offer_update.external_record_id
     if offer_update.document_link is not None:
@@ -10465,3 +13400,202 @@ def offers_summary(
         "lost": lost,
         "win_rate": win_rate,
     }
+
+
+# === Base 2 comparison defaults (editable offer/benchmark rates for /base-2) ===
+# Single JSON config stored in the app_config table (same DB as everything else).
+# Auth: request header X-Base2-Admin-Key must equal env BASE2_DEFAULTS_WRITE_SECRET.
+
+BASE2_DEFAULTS_KEY = "base2_comparison_defaults"
+BASE2_DEFAULTS_SEED = {
+    "version": 1,
+    "updatedAt": "1970-01-01T00:00:00.000Z",
+    "electricity": {
+        "ci": {"nsw": {"peak": 10, "shoulder": 10, "offPeak": 12},
+               "other": {"peak": 9, "offPeak": 7, "shoulderDefault": 9,
+                         "shoulderWhenSameAsOffPeak": 7, "shoulderSameAsOffPeakTolerance": 0.01},
+               "meterAnnual": 600, "vasAnnual": 300, "dailySupply": 0, "demandCharge": 0},
+        "sme": {"discountFactor": 0.95, "peakRateDefault": 24.5, "offPeakRateDefault": 18.0,
+                "shoulderRateDefault": 20.0, "meteringAnnual": 700.0,
+                "dailySupplyDefault": 1.5, "demandChargeDefault": 12.0},
+    },
+    "gas": {"tiers": [{"minGj": 1000, "benchmarkPerGj": 17.1},
+                      {"minGj": 10000, "benchmarkPerGj": 15},
+                      {"minGj": 30000, "benchmarkPerGj": 13.9}],
+            "ciComparisonPerGj": 17.8, "commissionPerGj": 3.0, "dailySupplyDefault": 1.2,
+            "smeEnergyShare": 0.75, "discountFactor": 0.95},
+    "oil": {"comparisonPerL": 3.30},
+    "waste": {"discountFactor": 0.95},
+    "cleaning": {"discountFactor": 0.95},
+}
+
+
+def _base2_ensure_table(conn):
+    from sqlalchemy import text as _t
+    conn.execute(_t(
+        "CREATE TABLE IF NOT EXISTS app_config "
+        "(key TEXT PRIMARY KEY, value TEXT, generation TEXT, updated_at TEXT)"
+    ))
+
+
+def _base2_check_key(x_base2_admin_key):
+    secret = (os.getenv("BASE2_DEFAULTS_WRITE_SECRET") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="BASE2_DEFAULTS_WRITE_SECRET not configured")
+    if (x_base2_admin_key or "").strip() != secret:
+        raise HTTPException(status_code=401, detail="Invalid admin key")
+
+
+class Base2DefaultsPut(BaseModel):
+    defaults: dict
+    generation: Optional[str] = None
+    updatedBy: Optional[str] = None
+
+
+@app.get("/api/base2-comparison-defaults")
+def get_base2_comparison_defaults(
+    x_base2_admin_key: Optional[str] = Header(None, alias="X-Base2-Admin-Key"),
+):
+    _base2_check_key(x_base2_admin_key)
+    from sqlalchemy import text as _t
+    from database import engine
+    with engine.begin() as conn:
+        _base2_ensure_table(conn)
+        row = conn.execute(
+            _t("SELECT value, generation FROM app_config WHERE key = :k"),
+            {"k": BASE2_DEFAULTS_KEY},
+        ).fetchone()
+    if not row:
+        return {"defaults": BASE2_DEFAULTS_SEED, "generation": None}
+    return {"defaults": json.loads(row[0]), "generation": row[1]}
+
+
+@app.put("/api/base2-comparison-defaults")
+def put_base2_comparison_defaults(
+    body: Base2DefaultsPut,
+    x_base2_admin_key: Optional[str] = Header(None, alias="X-Base2-Admin-Key"),
+):
+    _base2_check_key(x_base2_admin_key)
+    from sqlalchemy import text as _t
+    from database import engine
+    from datetime import datetime, timezone
+    with engine.begin() as conn:
+        _base2_ensure_table(conn)
+        row = conn.execute(
+            _t("SELECT value, generation FROM app_config WHERE key = :k"),
+            {"k": BASE2_DEFAULTS_KEY},
+        ).fetchone()
+        current_gen = row[1] if row else None
+        if (body.generation or None) != (current_gen or None):
+            raise HTTPException(status_code=409, detail="stale generation - reload and retry")
+        new_gen = str(int(current_gen) + 1) if (current_gen and str(current_gen).isdigit()) else "1"
+        defaults = dict(body.defaults or {})
+        try:
+            defaults["version"] = int(defaults.get("version", 0)) + 1
+        except Exception:
+            defaults["version"] = 1
+        defaults["updatedAt"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        if body.updatedBy:
+            defaults["updatedBy"] = body.updatedBy
+        value = json.dumps(defaults)
+        if row:
+            conn.execute(
+                _t("UPDATE app_config SET value=:v, generation=:g, updated_at=:u WHERE key=:k"),
+                {"v": value, "g": new_gen, "u": defaults["updatedAt"], "k": BASE2_DEFAULTS_KEY},
+            )
+        else:
+            conn.execute(
+                _t("INSERT INTO app_config (key, value, generation, updated_at) "
+                   "VALUES (:k, :v, :g, :u)"),
+                {"k": BASE2_DEFAULTS_KEY, "v": value, "g": new_gen, "u": defaults["updatedAt"]},
+            )
+    return {"defaults": defaults, "generation": new_gen}
+
+
+# --- B4 climate report push (activity_record.v1 -> aces-climate-api) ---
+from services.prograde_b4_client import push_report_to_b4, B4PushError
+
+
+@app.post("/api/climate/entities/{entity_id}/commit-to-b4")
+def commit_entity_to_b4(
+    entity_id: str,
+    period: str = Query("FY26"),
+    commit: bool = Query(False, description="lock the report to defensible"),
+    jurisdiction: Optional[str] = Query(None, description="state for electricity factor, e.g. VIC"),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """Forward this entity's staged activity to B4 and return the computed report."""
+    # B4 requires the audit actor to be a permitted (acesolutions.com.au) identity.
+    # Service-key / proxy calls arrive as a synthetic internal address, so stamp a real,
+    # identifiable platform service identity for those; keep a real user email if present.
+    actor = (user_info.get("email") or "").strip()
+    if not actor.endswith("@acesolutions.com.au"):
+        actor = "prograde-platform@acesolutions.com.au"
+    try:
+        return push_report_to_b4(
+            db, entity_id, period,
+            commit=commit, jurisdiction=jurisdiction,
+            user_email=actor,
+        )
+    except B4PushError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# --- MAINTENANCE: rebuild staged activity for ONE entity (purge + re-stage with fixed ETL) ---
+@app.post("/api/climate/entities/{entity_id}/rebuild-staged")
+def rebuild_staged_activity(
+    entity_id: str,
+    period: str = Query("FY26"),
+    confirm: bool = Query(False, description="true = purge + re-stage; false = dry-run"),
+    max_records: int = Query(1000),
+    user_info: dict = Depends(verify_roster_access),
+    db: Session = Depends(get_db),
+):
+    """MAINTENANCE (entity-scoped): clear this entity's staged climate_activity_records and
+    re-stage from Airtable using the current ETL (which now filters to the reporting FY).
+    Dry-run unless confirm=true. Reuses the per-client sync's fetch/transform/upsert."""
+    from models import ClimateActivityRecord
+    manifest = build_entity_activity_manifest(db, entity_id, period_label=period)
+    sites = manifest.get("sites", []) if isinstance(manifest, dict) else []
+    period_start, period_end = default_fy_period(period)
+    existing = db.query(ClimateActivityRecord).filter(ClimateActivityRecord.entity_id == entity_id).count()
+    if not confirm:
+        return {"entity_id": entity_id, "period": period, "dry_run": True,
+                "existing_staged_rows": existing, "sites_to_restage": len(sites)}
+    deleted = (db.query(ClimateActivityRecord)
+               .filter(ClimateActivityRecord.entity_id == entity_id)
+               .delete(synchronize_session=False))
+    db.commit()
+    staged = 0
+    skipped = 0
+    per_site = []
+    for s in sites:
+        ut = s.get("utility_type")
+        ident = s.get("identifier")
+        member_client_id = s.get("member_aces_client_id")
+        loa_id = s.get("member_loa_record_id")
+        if not ut or not ident:
+            continue
+        payload = airtable_client.get_utility_invoice_rows_by_identifier(ut, ident, max_records=max_records)
+        rows = payload.get("rows", []) if isinstance(payload, dict) else []
+        ctx = EtlContext(entity_id=entity_id, client_id=member_client_id, loa_client_id=loa_id,
+                         site_id=str(ident).strip(), utility_type=ut,
+                         period_start=period_start, period_end=period_end)
+        results, _diag = transform_invoice_rows(rows, ctx)
+        s_staged = 0
+        s_skipped = 0
+        for res in results:
+            if res.skipped:
+                s_skipped += 1
+                continue
+            upsert_activity_record(db, record_id=res.record_id, client_id=member_client_id,
+                                   body=res.body, source_utility_type=ut, source_row_id=res.source_row_id,
+                                   status=res.status)
+            s_staged += 1
+        staged += s_staged
+        skipped += s_skipped
+        per_site.append({"site": ident, "utility_type": ut, "invoices": len(rows),
+                         "staged": s_staged, "skipped": s_skipped})
+    return {"entity_id": entity_id, "period": period, "dry_run": False,
+            "deleted": int(deleted or 0), "staged": staged, "skipped": skipped, "per_site": per_site}

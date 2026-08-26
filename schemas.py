@@ -239,6 +239,7 @@ class ClientLinkFromLoaRequest(BaseModel):
     primary_contact_email: Optional[str] = None
     gdrive_folder_url: Optional[str] = None
     client_id: Optional[int] = None
+    reassign: bool = False
 
 
 class ClientResponse(BaseModel):
@@ -517,6 +518,13 @@ class OfferCreate(BaseModel):
     # Optional explicit pipeline stage when creating offers manually.
     pipeline_stage: Optional[OfferPipelineStage] = None
     estimated_value: Optional[int] = None
+    # C&I electricity time-of-use rates (c/kWh) — optional at creation, also settable via PATCH.
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -537,6 +545,13 @@ class OfferUpdate(BaseModel):
     energy_charge_pct: Optional[float] = None
     contracted_rate: Optional[float] = None
     offer_rate: Optional[float] = None
+    # C&I electricity time-of-use rates (c/kWh)
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
 
@@ -560,6 +575,13 @@ class OfferResponse(BaseModel):
     energy_charge_pct: Optional[float] = None
     contracted_rate: Optional[float] = None
     offer_rate: Optional[float] = None
+    # C&I electricity time-of-use rates (c/kWh)
+    current_peak_rate: Optional[float] = None
+    current_shoulder_rate: Optional[float] = None
+    current_offpeak_rate: Optional[float] = None
+    new_peak_rate: Optional[float] = None
+    new_shoulder_rate: Optional[float] = None
+    new_offpeak_rate: Optional[float] = None
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
@@ -811,6 +833,8 @@ class TestimonialResponse(BaseModel):
     testimonial_type: Optional[str] = None
     testimonial_solution_type_id: Optional[str] = None
     testimonial_savings: Optional[str] = None
+    video_long_file_id: Optional[str] = None
+    video_short_file_id: Optional[str] = None
     source: Optional[str] = "crm"  # crm | sheet
     created_at: datetime
     updated_at: datetime
@@ -830,6 +854,80 @@ class TestimonialUpdate(BaseModel):
     invoice_number: Optional[str] = None
     file_id: Optional[str] = None
     file_name: Optional[str] = None
+    testimonial_type: Optional[str] = None
+    testimonial_solution_type_id: Optional[str] = None
+    video_long_file_id: Optional[str] = None
+    video_short_file_id: Optional[str] = None
+
+
+# --- Marketing videos (CZA video library) ---
+
+MARKETING_VIDEO_STATUSES = ("draft", "qa_pending", "approved", "published")
+
+
+class MarketingVideoResponse(BaseModel):
+    id: int
+    slug: str
+    kind: str
+    variant: str
+    file_id: str
+    file_name: str
+    preview_url: Optional[str] = None
+    web_view_link: Optional[str] = None
+    crm_solution_type_id: Optional[str] = None
+    testimonial_id: Optional[int] = None
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    status: str
+    source_doc_file_id: Optional[str] = None
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class MarketingVideoUpdate(BaseModel):
+    status: Optional[str] = None
+    crm_solution_type_id: Optional[str] = None
+    testimonial_id: Optional[int] = None
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    notes: Optional[str] = None
+    source_doc_file_id: Optional[str] = None
+
+
+class MarketingVideoPublishPackRequest(BaseModel):
+    slug: str
+    kind: str = "marketing"
+    business_name: Optional[str] = None
+    client_id: Optional[int] = None
+    testimonial_id: Optional[int] = None
+    crm_solution_type_id: Optional[str] = None
+    status: str = "qa_pending"
+    qa_review_path: Optional[str] = None
+    tool_output_zip_path: Optional[str] = None
+    render_job_id: Optional[str] = None
+    variants: Optional[List[str]] = None  # default long + 30s
+
+
+class VideoRegistryResponse(BaseModel):
+    version: str
+    source: Optional[str] = None
+    entries: List[Dict[str, Any]] = []
 
 
 class TestimonialCheckApprovedResponse(BaseModel):
@@ -883,7 +981,7 @@ class AutonomousSequenceStartRequest(BaseModel):
     client_id: Optional[int] = None
     crm_activity_id: Optional[int] = None
     anchor_at: datetime
-    timezone: str = "Australia/Brisbane"  # Ignored for scheduling; sequences always use fixed AEST (Brisbane)
+    timezone: Optional[str] = None
     # Accept either naming from webhook payloads.
     email_id: Optional[str] = None
     email_ID: Optional[str] = None
@@ -918,13 +1016,22 @@ class AutonomousSequenceTemplateBase(BaseModel):
     sequence_type: str
     display_name: str
     description: Optional[str] = None
-    timezone: str = "Australia/Brisbane"
+    timezone: str = "Australia/Melbourne"
     is_active: bool = True
     is_restartable: bool = True
+    signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
+    # Offer validity: "none" (never mention one), "retailer_date" (only a date a human
+    # supplied), or "fixed_days" (anchor + validity_days). Default preserves prior
+    # behaviour, which was a hardcoded 7 days.
+    validity_mode: str = "fixed_days"
+    validity_days: int = 7
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
     steps: List[AutonomousSequenceTemplateStepCreate] = []
+    copy_from_sequence_type: Optional[str] = None
+    duplicate_retell: bool = False
 
 
 class AutonomousSequenceTemplateUpdate(BaseModel):
@@ -933,6 +1040,11 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     timezone: Optional[str] = None
     is_active: Optional[bool] = None
     is_restartable: Optional[bool] = None
+    signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
+    sequence_type: Optional[str] = None
+    validity_mode: Optional[str] = None
+    validity_days: Optional[int] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -975,6 +1087,10 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     timezone: str
     is_active: bool = True
     is_restartable: bool = True
+    signature_html: Optional[str] = None
+    extra_context: Optional[str] = None
+    validity_mode: str = "fixed_days"
+    validity_days: int = 7
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
@@ -1026,7 +1142,7 @@ class AutonomousSequenceRunResponse(BaseModel):
     run_status: str
     stop_reason: Optional[str] = None
     anchor_at: datetime
-    timezone: str
+    timezone: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     business_name: Optional[str] = None
@@ -1062,6 +1178,11 @@ class AutonomousSequenceStepsSchedulePatchRequest(BaseModel):
     updates: List[AutonomousSequenceStepScheduleItem]
 
 
+class AutonomousSequenceStepDispatchMarkRequest(BaseModel):
+    success: bool = True
+    summary: Optional[str] = None
+
+
 class AutonomousSequenceRunListItem(BaseModel):
     id: int
     offer_id: int
@@ -1090,3 +1211,104 @@ class AutonomousSequenceInboundRequest(BaseModel):
     intent: Optional[str] = None
     sentiment_negative: bool = False
     agreement_signed: bool = False
+
+
+class RetellAgentListItem(BaseModel):
+    agent_id: str
+    agent_name: str
+    channel: str = "voice"
+
+
+class RetellVoiceListItem(BaseModel):
+    voice_id: str
+    voice_name: str
+    gender: Optional[str] = None
+    accent: Optional[str] = None
+    provider: Optional[str] = None
+
+
+class RetellAgentPromptResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    response_engine_type: Optional[str] = None
+    llm_id: Optional[str] = None
+    llm_version: Optional[Any] = None
+    is_published: Optional[bool] = None
+    llm_is_published: Optional[bool] = None
+    prompt_editable: bool = False
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+    voice_id: Optional[str] = None
+    language: Optional[str] = None
+    voice_speed: Optional[float] = None
+    voice_temperature: Optional[float] = None
+    responsiveness: Optional[float] = None
+    interruption_sensitivity: Optional[float] = None
+    enable_backchannel: Optional[bool] = None
+    max_call_duration_ms: Optional[int] = None
+    end_call_after_silence_ms: Optional[int] = None
+    voicemail_action: Optional[str] = None
+    llm_model: Optional[str] = None
+
+
+class RetellAgentPromptUpdate(BaseModel):
+    general_prompt: Optional[str] = None
+    begin_message: Optional[str] = None
+    voice_id: Optional[str] = None
+    language: Optional[str] = None
+    voice_speed: Optional[float] = None
+    voice_temperature: Optional[float] = None
+    responsiveness: Optional[float] = None
+    interruption_sensitivity: Optional[float] = None
+    enable_backchannel: Optional[bool] = None
+    max_call_duration_ms: Optional[int] = None
+    end_call_after_silence_ms: Optional[int] = None
+    voicemail_action: Optional[str] = None
+    llm_model: Optional[str] = None
+
+    @field_validator("general_prompt", "begin_message", "voice_id", "language", "voicemail_action", "llm_model")
+    @classmethod
+    def _strip_optional(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        return v.strip() if isinstance(v, str) else v
+
+
+class RetellAgentDuplicateResponse(BaseModel):
+    agent_id: str
+    agent_name: str
+    llm_id: Optional[str] = None
+    source_agent_id: Optional[str] = None
+
+
+class AutonomousFlowSuggestion(BaseModel):
+    sequence_type: str
+    display_name: str
+    source: str
+    copy_hint: Optional[str] = None
+    has_template: bool = False
+    copy_hint_available: bool = False
+
+
+class AutonomousTemplateSuggestionsResponse(BaseModel):
+    uncovered_flows: List[AutonomousFlowSuggestion] = []
+
+
+class AutonomousTemplateDeletePreview(BaseModel):
+    template_id: int
+    sequence_type: str
+    display_name: str
+    run_count: int
+    retell_agent_id: Optional[str] = None
+    retell_agent_name: Optional[str] = None
+    retell_will_delete: bool = False
+    retell_skip_reason: Optional[str] = None
+
+
+class AutonomousTemplateDeleteResponse(BaseModel):
+    template_id: int
+    sequence_type: str
+    deleted_runs: int
+    retell_deleted: bool = False
+    retell_agent_id: Optional[str] = None
+    warnings: List[str] = []

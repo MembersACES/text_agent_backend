@@ -296,12 +296,22 @@ def list_activity_records(
 
 
 def activity_record_to_summary(row: ClimateActivityRecord) -> dict:
+    # Surface scope_3_category + ETL classification flags (e.g. oil_class:catN) from the
+    # stored body so the Prograde UI / audit can see how each line was routed.
+    _body = {}
+    try:
+        _body = json.loads(row.body_json) if row.body_json else {}
+    except Exception:
+        _body = {}
+    _dq = _body.get("data_quality") or {}
     return {
         "record_id": row.record_id,
         "entity_id": row.entity_id,
         "site_id": row.site_id,
         "activity_type": row.activity_type,
         "scope": row.scope,
+        "scope_3_category": _body.get("scope_3_category"),
+        "flags": _dq.get("flags") or [],
         "quantity": row.quantity,
         "unit": row.unit,
         "status": row.status,

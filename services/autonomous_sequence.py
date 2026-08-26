@@ -7,7 +7,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,7 @@ from models import (
     AutonomousSequenceTemplate,
     AutonomousSequenceTemplateStep,
     Offer,
+    OfferActivity,
 )
 
 def _is_postgresql(bind) -> bool:
@@ -48,19 +51,165 @@ def _set_run_validity_date_if_supported(db: Session, run_id: int, validity: date
     """Persist validity_date when the DB column exists (safe across mixed env schemas)."""
     if not validity:
         return
-    insp = inspect(db.bind)
-    tables = _reflect_table_names(insp, db.bind)
+    # Use the Session's connection so reflection does not checkout a second pooled
+    # connection mid-transaction (breaks SQLite :memory: / StaticPool tests).
+    conn = db.connection()
+    insp = inspect(conn)
+    tables = _reflect_table_names(insp, conn)
     if "autonomous_sequence_runs" not in tables:
         return
-    skw = _inspector_schema_kw(db.bind)
+    skw = _inspector_schema_kw(conn)
     cols = [str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_runs", **skw)]
     if "validity_date" not in cols:
         return
-    runs_tbl = _qualified_table(db.bind, "autonomous_sequence_runs")
+    runs_tbl = _qualified_table(conn, "autonomous_sequence_runs")
     db.execute(
         text(f"UPDATE {runs_tbl} SET validity_date = :validity_date WHERE id = :run_id"),
         {"validity_date": validity, "run_id": run_id},
     )
+
+
+# --- Offer validity configuration -------------------------------------------
+# Validity used to be a hardcoded "anchor + 7 days" in five places. That meant the
+# software invented a deadline the retailer never set, and a restart silently moved
+# a deadline the client had already been given. Mode + days now live on the sequence
+# template. Columns are read defensively: if the migration has not run, callers get
+# ("fixed_days", 7) and behaviour is identical to before.
+
+VALIDITY_MODE_NONE = "none"           # never mention validity
+VALIDITY_MODE_FIXED_DAYS = "fixed_days"  # anchor + N days (our review window)
+VALIDITY_MODE_RETAILER = "retailer_date"  # only a date a human supplied; never invented
+VALIDITY_MODES = (VALIDITY_MODE_NONE, VALIDITY_MODE_FIXED_DAYS, VALIDITY_MODE_RETAILER)
+
+DEFAULT_VALIDITY_MODE = VALIDITY_MODE_FIXED_DAYS
+DEFAULT_VALIDITY_DAYS = 7
+
+
+def _template_validity_columns_present(conn) -> bool:
+    insp = inspect(conn)
+    tables = _reflect_table_names(insp, conn)
+    if "autonomous_sequence_templates" not in tables:
+        return False
+    skw = _inspector_schema_kw(conn)
+    cols = {str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_templates", **skw)}
+    return "validity_mode" in cols and "validity_days" in cols
+
+
+def get_template_validity_config(db: Session, template: Optional[Any]) -> tuple[str, int]:
+    """Return (mode, days) for a template, defaulting to today's behaviour."""
+    if template is None or getattr(template, "id", None) is None:
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    try:
+        conn = db.connection()
+        if not _template_validity_columns_present(conn):
+            return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+        tbl = _qualified_table(conn, "autonomous_sequence_templates")
+        row = db.execute(
+            text(f"SELECT validity_mode, validity_days FROM {tbl} WHERE id = :tid"),
+            {"tid": int(template.id)},
+        ).first()
+    except Exception:  # noqa: BLE001 - never let config lookup break a send
+        logger.warning("Validity config lookup failed; using defaults", exc_info=True)
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    if not row:
+        return DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+    mode = str(row[0] or "").strip() or DEFAULT_VALIDITY_MODE
+    if mode not in VALIDITY_MODES:
+        mode = DEFAULT_VALIDITY_MODE
+    try:
+        days = int(row[1]) if row[1] is not None else DEFAULT_VALIDITY_DAYS
+    except (TypeError, ValueError):
+        days = DEFAULT_VALIDITY_DAYS
+    if days < 1:
+        days = DEFAULT_VALIDITY_DAYS
+    return mode, days
+
+
+def set_template_validity_config(
+    db: Session, template_id: int, mode: Optional[str], days: Optional[int]
+) -> None:
+    """Persist validity config when the columns exist (no-op before the migration)."""
+    if mode is None and days is None:
+        return
+    conn = db.connection()
+    if not _template_validity_columns_present(conn):
+        logger.warning(
+            "autonomous_sequence_templates.validity_mode/validity_days missing - "
+            "run migrations/add_template_validity_config.sql"
+        )
+        return
+    tbl = _qualified_table(conn, "autonomous_sequence_templates")
+    sets, params = [], {"tid": int(template_id)}
+    if mode is not None:
+        clean = str(mode).strip()
+        if clean not in VALIDITY_MODES:
+            raise ValueError(f"validity_mode must be one of {VALIDITY_MODES}")
+        sets.append("validity_mode = :mode")
+        params["mode"] = clean
+    if days is not None:
+        n = int(days)
+        if n < 1 or n > 365:
+            raise ValueError("validity_days must be between 1 and 365")
+        sets.append("validity_days = :days")
+        params["days"] = n
+    db.execute(text(f"UPDATE {tbl} SET {', '.join(sets)} WHERE id = :tid"), params)
+
+
+def clear_validity_context(context: dict[str, Any]) -> None:
+    """Strip every validity key and tell the agent not to mention one."""
+    for key in (
+        "offer_validity_date",
+        "offer_valid_until",
+        "offer_validity_days",
+        "offer_validity_label",
+        "validity_date",
+        "offer_validity",
+    ):
+        context.pop(key, None)
+    context["omit_validity"] = True
+
+
+def apply_validity_to_context(
+    context: dict[str, Any],
+    anchor_utc: datetime,
+    mode: str,
+    days: int,
+    schedule_zi: ZoneInfo,
+    explicit_date: Optional[date] = None,
+) -> Optional[date]:
+    """Single place that decides an offer validity date. Returns the local date, or None.
+
+    - none          -> no validity at all
+    - retailer_date -> only an explicitly supplied date; never invents one
+    - fixed_days    -> anchor + N days (previous behaviour, N was hardcoded 7)
+    """
+    if mode == VALIDITY_MODE_NONE:
+        clear_validity_context(context)
+        return None
+
+    if explicit_date is None and mode == VALIDITY_MODE_RETAILER:
+        # No human-supplied retailer expiry: say nothing rather than manufacture one.
+        logger.info("validity_mode=retailer_date but no date supplied - omitting validity")
+        clear_validity_context(context)
+        return None
+
+    if explicit_date is not None:
+        valid_local = datetime(
+            explicit_date.year, explicit_date.month, explicit_date.day, 12, 0, 0, tzinfo=schedule_zi
+        )
+    else:
+        valid_local = (anchor_utc + timedelta(days=int(days))).astimezone(schedule_zi)
+
+    valid_date = valid_local.date()
+    context.pop("omit_validity", None)
+    context["offer_validity_date"] = valid_date.isoformat()
+    context["offer_valid_until"] = valid_local.astimezone(timezone.utc).isoformat()
+    context["validity_date"] = valid_local.strftime("%d/%m/%Y") + " (12pm)"
+    if explicit_date is not None:
+        context.pop("offer_validity_days", None)
+    else:
+        context["offer_validity_days"] = int(days)
+    return valid_date
 
 
 def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
@@ -87,6 +236,173 @@ def delete_autonomous_sequence_run(db: Session, run_id: int) -> bool:
     db.commit()
     return True
 
+
+def _type_row_retell(db: Session, sequence_type: str) -> tuple[str, bool]:
+    """Return (retell_agent_id, was_copied_from_another_sequence)."""
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return "", False
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    skw = _inspector_schema_kw(bind)
+    cols = {str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_type", **skw)}
+    select_cols = ["retell_agent_id"]
+    if "retell_agent_copied" in cols:
+        select_cols.append("retell_agent_copied")
+    row = db.execute(
+        text(f"SELECT {', '.join(select_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": sequence_type},
+    ).mappings().first()
+    if not row:
+        return "", False
+    agent_id = str(row.get("retell_agent_id") or "").strip()
+    copied = False
+    if "retell_agent_copied" in row:
+        raw = row.get("retell_agent_copied")
+        copied = raw in (1, True, "1", "true", "TRUE")
+    return agent_id, copied
+
+
+def _retell_agent_used_elsewhere(db: Session, agent_id: str, sequence_type: str) -> list[str]:
+    """Other sequence_type keys that still point at this Retell agent."""
+    agent_id = (agent_id or "").strip()
+    if not agent_id:
+        return []
+    others: list[str] = []
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        rows = db.execute(
+            text(
+                f"SELECT sequence_type FROM {ast_tbl} "
+                "WHERE COALESCE(TRIM(retell_agent_id), '') = :aid AND sequence_type <> :st"
+            ),
+            {"aid": agent_id, "st": sequence_type},
+        ).all()
+        others.extend(str(r[0]) for r in rows if r and r[0])
+    step_rows = (
+        db.query(AutonomousSequenceTemplate.sequence_type)
+        .join(
+            AutonomousSequenceTemplateStep,
+            AutonomousSequenceTemplateStep.template_id == AutonomousSequenceTemplate.id,
+        )
+        .filter(
+            AutonomousSequenceTemplateStep.retell_agent_id == agent_id,
+            AutonomousSequenceTemplate.sequence_type != sequence_type,
+        )
+        .distinct()
+        .all()
+    )
+    others.extend(str(r[0]) for r in step_rows if r and r[0])
+    seen: list[str] = []
+    for key in others:
+        if key not in seen:
+            seen.append(key)
+    return seen
+
+
+def preview_sequence_template_delete(db: Session, template_id: int) -> Optional[dict[str, Any]]:
+    template = (
+        db.query(AutonomousSequenceTemplate)
+        .options(joinedload(AutonomousSequenceTemplate.steps))
+        .filter(AutonomousSequenceTemplate.id == template_id)
+        .first()
+    )
+    if not template:
+        return None
+    seq_type = str(template.sequence_type)
+    run_count = (
+        db.query(AutonomousSequenceRun)
+        .filter(AutonomousSequenceRun.sequence_type == seq_type)
+        .count()
+    )
+    type_agent, copied = _type_row_retell(db, seq_type)
+    step_agents = {
+        str(s.retell_agent_id).strip()
+        for s in template.steps
+        if (s.retell_agent_id or "").strip()
+    }
+    agent_id = type_agent or next(iter(step_agents), "")
+    others = _retell_agent_used_elsewhere(db, agent_id, seq_type) if agent_id else []
+    skip_reason = None
+    will_delete = False
+    if not agent_id:
+        skip_reason = "No Retell agent is linked on this sequence."
+    elif copied:
+        skip_reason = (
+            "This sequence still points at a shared default Retell agent, so that agent will not be deleted."
+        )
+    elif others:
+        skip_reason = (
+            "This Retell agent is also used by: "
+            + ", ".join(others)
+            + ". It will be unlinked here, not deleted."
+        )
+    else:
+        will_delete = True
+    return {
+        "template_id": template.id,
+        "sequence_type": seq_type,
+        "display_name": template.display_name,
+        "run_count": int(run_count),
+        "retell_agent_id": agent_id or None,
+        "retell_will_delete": will_delete,
+        "retell_skip_reason": skip_reason,
+    }
+
+
+def delete_sequence_template_db(db: Session, template_id: int) -> Optional[dict[str, Any]]:
+    """Delete template, type row, and all runs of this sequence_type. Does not commit."""
+    plan = preview_sequence_template_delete(db, template_id)
+    if not plan:
+        return None
+    seq_type = plan["sequence_type"]
+    run_ids = [
+        int(row[0])
+        for row in db.query(AutonomousSequenceRun.id)
+        .filter(AutonomousSequenceRun.sequence_type == seq_type)
+        .all()
+    ]
+    if run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        insp = inspect(db.bind)
+        tables = _reflect_table_names(insp, db.bind)
+        if "autonomous_sequence_context" in tables:
+            ctx_tbl = _qualified_table(db.bind, "autonomous_sequence_context")
+            for rid in run_ids:
+                db.execute(
+                    text(f"DELETE FROM {ctx_tbl} WHERE run_id = :run_id"),
+                    {"run_id": rid},
+                )
+        db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id.in_(run_ids)).delete(
+            synchronize_session=False
+        )
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        db.execute(
+            text(f"DELETE FROM {ast_tbl} WHERE sequence_type = :st"),
+            {"st": seq_type},
+        )
+    template = db.query(AutonomousSequenceTemplate).filter(
+        AutonomousSequenceTemplate.id == template_id
+    ).first()
+    if template:
+        db.delete(template)
+    plan["deleted_runs"] = len(run_ids)
+    return plan
+
+
 logger = logging.getLogger(__name__)
 
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
@@ -105,10 +421,53 @@ SOLAR_ENGAGEMENT_SIGNATURE_HTML = """<p style="margin-bottom:0;"><strong>Amelia 
 <span style="color:#666;">Customer Success Manager (CSM) – Implementation: Connects onboarding directly to future success.</span></p>
 <p style="margin-top:16px; margin-bottom:0;"><strong>Carbon Zero Australasia</strong><br>
 Australian Circular Economy Solutions Division<br>
-Direct: 1300 938 638<br>
+Direct: 0468 050 399<br>
 Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">business@acesolutions.com.au</a><br>
 470 St Kilda Road, Melbourne VIC 3004<br>
 Ph: 1300 849 908 | Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
+
+# Default for gas / electricity follow-ups. LLM already writes "Kind regards," — do not repeat it.
+ACES_TEAM_FOLLOWUP_SIGNATURE_HTML = """<p style="margin-bottom:0;"><strong>The Team</strong><br>
+Australian Circular Economy Solutions</p>
+<p style="margin-top:16px; margin-bottom:0;"><strong>Carbon Zero Australasia</strong><br>
+Australian Circular Economy Solutions Division<br>
+Direct: 0468 050 399<br>
+Email: <a href="mailto:business@acesolutions.com.au" style="color:#1a73e8;">business@acesolutions.com.au</a><br>
+470 St Kilda Road, Melbourne VIC 3004<br>
+Website: <a href="https://acesolutions.com.au" style="color:#1a73e8;">acesolutions.com.au</a></p>"""
+
+
+def default_signature_html_for_type(sequence_type: str) -> str:
+    if "solar" in (sequence_type or "").lower():
+        return SOLAR_ENGAGEMENT_SIGNATURE_HTML
+    return ACES_TEAM_FOLLOWUP_SIGNATURE_HTML
+
+
+def _resolve_signature_html(
+    sequence_type: str,
+    template: Optional[AutonomousSequenceTemplate],
+    context: Optional[dict[str, Any]],
+) -> str:
+    existing = str((context or {}).get("signature_html") or "").strip()
+    if existing:
+        return existing
+    tpl_sig = str(getattr(template, "signature_html", None) or "").strip() if template else ""
+    if tpl_sig:
+        return tpl_sig
+    return default_signature_html_for_type(sequence_type)
+
+
+def _resolve_extra_context(
+    template: Optional[AutonomousSequenceTemplate],
+    context: Optional[dict[str, Any]],
+) -> str:
+    existing = str((context or {}).get("extra_context") or "").strip()
+    if existing:
+        return existing
+    if template is None:
+        return ""
+    return str(getattr(template, "extra_context", None) or "").strip()
+
 
 SOLAR_ENGAGEMENT_SYSTEM_PROMPT = """You write follow-up emails for ACES Solar Panel Cleaning engagement forms.
 
@@ -139,9 +498,8 @@ SOLAR_ENGAGEMENT_STEP_PROMPTS: tuple[str, str, str] = (
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
 
-# All autonomous step times are computed in fixed Australian Eastern Standard Time (UTC+10, no DST).
-# IANA zone Australia/Brisbane matches AEST year-round (unlike Sydney/Melbourne).
-AUTONOMOUS_SCHEDULE_TZ = "Australia/Brisbane"
+# Default when run/template do not supply an IANA zone. Scheduling is per-run via resolve_schedule_tz.
+AUTONOMOUS_SCHEDULE_TZ = "Australia/Melbourne"
 
 
 def _utc_now_naive() -> datetime:
@@ -152,6 +510,22 @@ def _to_utc_naive(dt: datetime) -> datetime:
     if dt.tzinfo is not None:
         return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
+
+
+def resolve_schedule_tz(
+    run: Optional[AutonomousSequenceRun] = None,
+    template: Optional[AutonomousSequenceTemplate] = None,
+) -> ZoneInfo:
+    """First present of run.timezone → template.timezone → Australia/Melbourne."""
+    for raw in (
+        run.timezone if run is not None else None,
+        template.timezone if template is not None else None,
+        AUTONOMOUS_SCHEDULE_TZ,
+    ):
+        name = (str(raw).strip() if raw is not None else "")
+        if name:
+            return ZoneInfo(name)
+    return ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
 
 
 def next_business_day(d: date) -> date:
@@ -231,12 +605,15 @@ def _plan_template_times(
     return plan
 
 
-def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
+def plan_solar_engagement_form_times(
+    anchor: datetime,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime]]:
     """
     Three follow-up emails after the client has already received the engagement form (n8n send).
-    Email 1 at +2 business days, email 2 at +4, email 3 at +6 — all 09:00 AEST. Returns UTC-naive.
+    Email 1 at +2 business days, email 2 at +4, email 3 at +6 — all 09:00 local. Returns UTC-naive.
     """
-    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+    tz = ZoneInfo(timezone_name)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=timezone.utc)
     base_date = a.astimezone(tz).date()
     out: list[tuple[int, str, datetime]] = []
@@ -253,9 +630,12 @@ def plan_solar_engagement_form_times(anchor: datetime) -> list[tuple[int, str, d
     return out
 
 
-def plan_gas_base2_followup_times(anchor: datetime) -> list[tuple[int, str, datetime]]:
-    """Returns (day_number, channel, scheduled_at UTC naive). Always uses AEST (Australia/Brisbane)."""
-    tz = ZoneInfo(AUTONOMOUS_SCHEDULE_TZ)
+def plan_gas_base2_followup_times(
+    anchor: datetime,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime]]:
+    """Returns (day_number, channel, scheduled_at UTC naive) in the given IANA zone."""
+    tz = ZoneInfo(timezone_name)
     a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
     local = a.astimezone(tz)
     base_date = local.date()
@@ -316,6 +696,30 @@ def _merge_context(db: Session, run: AutonomousSequenceRun, extra: dict[str, Any
     update_run_context(db, run, base)
 
 
+def _to_e164_au(value: Any) -> Optional[str]:
+    """Turn AU local numbers into E.164 so Twilio/Retell can dial them.
+
+    0401941385 → +61401941385
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = "".join(c for c in text if c.isdigit())
+    if not digits:
+        return None
+    if text.startswith("+"):
+        return "+" + digits
+    if digits.startswith("61") and len(digits) >= 11:
+        return "+" + digits
+    if digits.startswith("0") and len(digits) >= 9:
+        return "+61" + digits[1:]
+    if len(digits) == 9 and digits.startswith("4"):
+        return "+61" + digits
+    return "+" + digits
+
+
 def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]:
     def _norm(value: Any) -> Optional[str]:
         if value is None:
@@ -326,7 +730,7 @@ def _context_contact_fields(context: dict[str, Any]) -> dict[str, Optional[str]]
     return {
         # Accept both historical `email_ID` and snake_case `email_id`.
         "email_ID": _norm(context.get("email_ID") or context.get("email_id")),
-        "contact_phone": _norm(context.get("contact_phone")),
+        "contact_phone": _to_e164_au(context.get("contact_phone")),
         "contact_name": _norm(context.get("contact_name")),
         "contact_email": _norm(context.get("contact_email")),
     }
@@ -344,6 +748,7 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
     {
         "gas_base2_followup_v1",
         "ci_electricity_base2_followup_v1",
+        "ci_electricity_offer",
     }
 )
 
@@ -424,6 +829,85 @@ def ensure_autonomous_sequence_type_row(db: Session, sequence_type: str) -> bool
     return True
 
 
+_SEQUENCE_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def _copy_autonomous_sequence_type_row(db: Session, old_type: str, new_type: str) -> None:
+    """Insert `new_type` as a copy of `old_type` in autonomous_sequence_type (no-op if table missing)."""
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    skw = _inspector_schema_kw(bind)
+    cols = [str(c.get("name") or "") for c in insp.get_columns("autonomous_sequence_type", **skw)]
+    if "sequence_type" not in cols:
+        return
+    exists_new = db.execute(
+        text(f"SELECT 1 FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": new_type},
+    ).first()
+    if exists_new:
+        return
+    src = db.execute(
+        text(f"SELECT * FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": old_type},
+    ).mappings().first()
+    if src is None:
+        ensure_autonomous_sequence_type_row(db, new_type)
+        return
+    copy_cols = [c for c in cols if c != "sequence_type" and c.isidentifier()]
+    insert_cols = ["sequence_type"] + copy_cols
+    params: dict[str, Any] = {"sequence_type": new_type}
+    for col in copy_cols:
+        params[col] = src.get(col)
+    cols_sql = ", ".join(insert_cols)
+    vals_sql = ", ".join(f":{c}" for c in insert_cols)
+    db.execute(text(f"INSERT INTO {ast_tbl} ({cols_sql}) VALUES ({vals_sql})"), params)
+
+
+def rename_sequence_template_type(
+    db: Session,
+    template: AutonomousSequenceTemplate,
+    new_type: str,
+) -> None:
+    """Rename template.sequence_type and cascade to runs + type-prompt row."""
+    old = str(template.sequence_type or "").strip()
+    new = (new_type or "").strip()
+    if not old or new == old:
+        return
+    if not _SEQUENCE_TYPE_RE.match(new):
+        raise ValueError(
+            "Call key must start with a letter or number and use only letters, numbers, dots, underscores, or hyphens (max 80)."
+        )
+    clash = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(
+            AutonomousSequenceTemplate.sequence_type == new,
+            AutonomousSequenceTemplate.id != template.id,
+        )
+        .first()
+    )
+    if clash:
+        raise ValueError(f"Call key already in use: {new}")
+    _copy_autonomous_sequence_type_row(db, old, new)
+    db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.sequence_type == old).update(
+        {AutonomousSequenceRun.sequence_type: new},
+        synchronize_session=False,
+    )
+    template.sequence_type = new
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        db.execute(
+            text(f"DELETE FROM {ast_tbl} WHERE sequence_type = :st"),
+            {"st": old},
+        )
+
+
 def ensure_default_sequence_templates(db: Session) -> None:
     """Seed default templates if missing (idempotent)."""
     defaults = [
@@ -437,6 +921,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "sequence_type": "ci_electricity_base2_followup_v1",
             "display_name": "C&I Electricity Base 2 Follow-up v1",
             "description": "Default Base 2 cadence for C&I electricity offers.",
+            "is_restartable": 1,
+        },
+        {
+            "sequence_type": "ci_electricity_offer",
+            "display_name": "C&I Electricity Offer",
+            "description": "Utility Invoice Info C&I electricity offer comparison follow-up.",
             "is_restartable": 1,
         },
         {
@@ -716,6 +1206,7 @@ def _prepare_email_context(
     run: AutonomousSequenceRun,
     step: AutonomousSequenceStep,
     ctx: dict[str, Any],
+    template: Optional[AutonomousSequenceTemplate] = None,
 ) -> dict[str, Any]:
     out = dict(ctx)
     out["sequence_type"] = run.sequence_type
@@ -739,8 +1230,11 @@ def _prepare_email_context(
         out.pop("offer_valid_until", None)
         out.pop("offer_validity_days", None)
         out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
-        out.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
-        out.setdefault("use_html_signature", True)
+    out["signature_html"] = _resolve_signature_html(run.sequence_type, template, out)
+    out["use_html_signature"] = True
+    extra = _resolve_extra_context(template, out)
+    if extra:
+        out["extra_context"] = extra
     return out
 
 
@@ -756,7 +1250,7 @@ def get_sequence_template_by_type(db: Session, sequence_type: str) -> Optional[A
 def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dict[str, Any]]:
     """
     Start a new Base-2 follow-up run for the same offer/type as a finished run, reusing stored
-    context and client/activity IDs. Anchor is current time in AEST (Australia/Brisbane).
+    context and client/activity IDs. Anchor is current time in the resolved schedule timezone.
     If an active run already exists for that offer+type, returns that run with reused_existing=True.
     """
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
@@ -787,19 +1281,34 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
     )
     reused_existing = existing is not None
 
-    anchor_at = datetime.now(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
+    schedule_zi = resolve_schedule_tz(run, tpl)
+    anchor_at = datetime.now(schedule_zi)
     ctx = _parse_context(run)
-    # Restart should refresh offer validity window from the new anchor.
+    # Restart refreshes the validity window from the new anchor, using the template's
+    # configured mode/days rather than a hardcoded 7. A restart previously moved a
+    # deadline the client had already been told, with no record that it changed.
     if anchor_at.tzinfo is None:
         anchor_utc = anchor_at.replace(tzinfo=timezone.utc)
     else:
         anchor_utc = anchor_at.astimezone(timezone.utc)
-    valid_until_utc = anchor_utc + timedelta(days=7)
-    valid_until_local = valid_until_utc.astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
     ctx["offer_generated_at"] = anchor_utc.isoformat()
-    ctx["offer_valid_until"] = valid_until_utc.isoformat()
-    ctx["offer_validity_date"] = valid_until_local.date().isoformat()
-    ctx["offer_validity_days"] = 7
+    _restart_template = get_sequence_template_by_type(db, run.sequence_type)
+    _restart_mode, _restart_days = get_template_validity_config(db, _restart_template)
+    _previous_validity = str(ctx.get("offer_validity_date") or "").strip()
+    _restart_explicit: Optional[date] = None
+    if _restart_mode == VALIDITY_MODE_RETAILER and _previous_validity:
+        try:
+            _restart_explicit = date.fromisoformat(_previous_validity[:10])
+        except ValueError:
+            _restart_explicit = None
+    apply_validity_to_context(
+        ctx, anchor_utc, _restart_mode, _restart_days, schedule_zi, _restart_explicit
+    )
+    if _previous_validity and ctx.get("offer_validity_date") != _previous_validity:
+        logger.info(
+            "Restart moved offer validity for run %s: %s -> %s",
+            getattr(run, "id", "?"), _previous_validity, ctx.get("offer_validity_date"),
+        )
     client_id = run.client_id if run.client_id is not None else offer.client_id
 
     out = start_gas_base2_sequence(
@@ -809,7 +1318,7 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
         client_id=client_id,
         crm_activity_id=run.crm_activity_id,
         anchor_at=anchor_at,
-        tz=AUTONOMOUS_SCHEDULE_TZ,
+        tz=schedule_zi.key,
         context=ctx,
     )
 
@@ -850,8 +1359,11 @@ def manual_stop_run(db: Session, run_id: int) -> Optional[AutonomousSequenceRun]
 
 
 def update_run_context(db: Session, run: AutonomousSequenceRun, context: dict[str, Any]) -> None:
-    run.context_json = json.dumps(context) if context else None
-    contact_fields = _context_contact_fields(context or {})
+    payload = dict(context or {})
+    contact_fields = _context_contact_fields(payload)
+    if contact_fields["contact_phone"]:
+        payload["contact_phone"] = contact_fields["contact_phone"]
+    run.context_json = json.dumps(payload) if payload else None
     run.email_ID = contact_fields["email_ID"]
     run.contact_phone = contact_fields["contact_phone"]
     run.contact_name = contact_fields["contact_name"]
@@ -924,10 +1436,10 @@ def start_gas_base2_sequence(
     client_id: Optional[int],
     crm_activity_id: Optional[int],
     anchor_at: datetime,
-    tz: str,
+    tz: Optional[str],
     context: dict[str, Any],
 ) -> AutonomousSequenceRun:
-    """tz is accepted for API compatibility but ignored; schedules always use AUTONOMOUS_SCHEDULE_TZ (AEST)."""
+    """Store request timezone (or NULL); schedule via resolve_schedule_tz(run, template)."""
     existing = (
         db.query(AutonomousSequenceRun)
         .filter(
@@ -937,9 +1449,25 @@ def start_gas_base2_sequence(
         )
         .first()
     )
+    dashboard_test = bool((context or {}).get("dashboard_test"))
     if existing:
+        if dashboard_test:
+            raise ValueError(
+                f"This offer already has a running sequence (run #{existing.id}). "
+                "Open that run, or pick a different offer. A test uses the offer for comparison "
+                "data only — it does not copy the offer."
+            )
         logger.warning("Active autonomous run already exists offer_id=%s type=%s", offer_id, sequence_type)
         return existing
+
+    template = get_sequence_template_by_type(db, sequence_type)
+    # Explicit request only — do not inject Melbourne (or template) before resolve_schedule_tz.
+    request_tz = (tz or "").strip() or None
+    schedule_zi = resolve_schedule_tz(
+        SimpleNamespace(timezone=request_tz),
+        template,
+    )
+    schedule_tz_name = schedule_zi.key
 
     anchor_utc = _to_utc_naive(anchor_at)
     context_payload = dict(context or {})
@@ -952,7 +1480,6 @@ def start_gas_base2_sequence(
         context_payload.setdefault("omit_validity", True)
         context_payload.setdefault("omit_document_links", True)
         context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
-        context_payload.setdefault("signature_html", SOLAR_ENGAGEMENT_SIGNATURE_HTML)
     else:
         validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
         if validity_raw:
@@ -960,17 +1487,23 @@ def start_gas_base2_sequence(
                 run_validity_date = date.fromisoformat(validity_raw[:10])
             except ValueError:
                 logger.warning("Invalid offer_validity_date in context: %r", validity_raw)
-        if run_validity_date is None:
-            anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
-            run_validity_date = (
-                (anchor_aware_utc + timedelta(days=7))
-                .astimezone(ZoneInfo(AUTONOMOUS_SCHEDULE_TZ))
-                .date()
-            )
-            context_payload.setdefault("offer_validity_date", run_validity_date.isoformat())
+        _mode, _days = get_template_validity_config(db, template)
+        anchor_aware_utc = anchor_utc.replace(tzinfo=timezone.utc)
+        run_validity_date = apply_validity_to_context(
+            context_payload, anchor_aware_utc, _mode, _days, schedule_zi, run_validity_date
+        )
 
-    _ = tz  # caller may pass client timezone; scheduling is always AEST
+    context_payload["signature_html"] = _resolve_signature_html(
+        sequence_type, template, context_payload
+    )
+    context_payload["use_html_signature"] = True
+    extra = _resolve_extra_context(template, context_payload)
+    if extra:
+        context_payload["extra_context"] = extra
+
     contact_fields = _context_contact_fields(context_payload)
+    if contact_fields["contact_phone"]:
+        context_payload["contact_phone"] = contact_fields["contact_phone"]
     run = AutonomousSequenceRun(
         sequence_type=sequence_type,
         offer_id=offer_id,
@@ -978,7 +1511,7 @@ def start_gas_base2_sequence(
         crm_activity_id=crm_activity_id,
         run_status="running",
         anchor_at=anchor_utc,
-        timezone=AUTONOMOUS_SCHEDULE_TZ,
+        timezone=schedule_tz_name,
         context_json=json.dumps(context_payload) if context_payload else None,
         email_ID=contact_fields["email_ID"],
         contact_phone=contact_fields["contact_phone"],
@@ -987,22 +1520,29 @@ def start_gas_base2_sequence(
     )
     db.add(run)
     db.flush()
+
     if run_validity_date is not None:
         _set_run_validity_date_if_supported(db, run.id, run_validity_date)
 
-    template = get_sequence_template_by_type(db, sequence_type)
     if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
-        fallback_plan = plan_solar_engagement_form_times(anchor_at)
+        fallback_plan = plan_solar_engagement_form_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
     elif template and bool(template.is_active):
         plan = _plan_template_times(
             anchor_at,
             template.steps,
-            timezone_name=template.timezone or AUTONOMOUS_SCHEDULE_TZ,
+            timezone_name=schedule_tz_name,
         )
     else:
-        fallback_plan = plan_gas_base2_followup_times(anchor_at)
+        fallback_plan = plan_gas_base2_followup_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
+
+    if dashboard_test and plan:
+        # Production Day 1 is the next business day, so a test started today is not due yet.
+        # Shift the whole cadence so the first step is due immediately.
+        first_at = plan[0][2]
+        delta = _utc_now_naive() - first_at
+        plan = [(d, c, at + delta, p, r) for d, c, at, p, r in plan]
 
     ctx_retell_agent_id = context_payload.get("retell_agent_id")
 
@@ -1373,41 +1913,8 @@ def execute_due_steps_sync(db: Session) -> int:
             step.started_at = now
             db.flush()
 
-            ctx = _parse_context(run)
-            ctx["offer_id"] = run.offer_id
-            ctx["run_id"] = run.id
-            template = get_sequence_template_by_type(db, run.sequence_type)
-            if template:
-                by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
-                t_step = by_idx.get(int(step.step_index))
-                if t_step and t_step.prompt_text:
-                    ctx["step_prompt"] = t_step.prompt_text
-
             try:
-                if step.channel == "email":
-                    email_ctx = _prepare_email_context(run, step, ctx)
-                    out = _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
-                elif step.channel == "sms":
-                    out = _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
-                elif step.channel == "voice_call":
-                    out = _voice_retell_placeholder(
-                        run.offer_id,
-                        run.id,
-                        step.id,
-                        step.retell_agent_id,
-                        ctx,
-                    )
-                elif step.channel == "engagement_form_generation":
-                    ctx.setdefault(
-                        "engagement_form_type",
-                        SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE,
-                    )
-                    out = _execute_engagement_form_generation(
-                        db, run.offer_id, run.id, step.id, ctx
-                    )
-                else:
-                    out = {"ok": False, "error": "unknown_channel", "channel": step.channel}
-
+                out = _send_one_step(db, run, step)
                 step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
@@ -1448,3 +1955,358 @@ def execute_due_steps_sync(db: Session) -> int:
             db.commit()
 
     return executed
+
+
+def _send_one_step(db: Session, run: AutonomousSequenceRun, step: AutonomousSequenceStep) -> dict[str, Any]:
+    ctx = _parse_context(run)
+    ctx["offer_id"] = run.offer_id
+    ctx["run_id"] = run.id
+    e164 = _to_e164_au(ctx.get("contact_phone") or run.contact_phone)
+    if e164:
+        ctx["contact_phone"] = e164
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    if template:
+        by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
+        t_step = by_idx.get(int(step.step_index))
+        if t_step and t_step.prompt_text:
+            ctx["step_prompt"] = t_step.prompt_text
+    if step.channel == "email":
+        email_ctx = _prepare_email_context(run, step, ctx, template)
+        return _send_email_placeholder(run.offer_id, run.id, step.id, email_ctx)
+    if step.channel == "sms":
+        return _send_sms_placeholder(run.offer_id, run.id, step.id, ctx)
+    if step.channel == "voice_call":
+        return _voice_retell_placeholder(
+            run.offer_id,
+            run.id,
+            step.id,
+            step.retell_agent_id,
+            ctx,
+        )
+    if step.channel == "engagement_form_generation":
+        ctx.setdefault("engagement_form_type", SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE)
+        return _execute_engagement_form_generation(db, run.offer_id, run.id, step.id, ctx)
+    return {"ok": False, "error": "unknown_channel", "channel": step.channel}
+
+
+def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
+    """Send one step immediately from this API's database, ignoring scheduled_at."""
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    if run.run_status != "running":
+        raise ValueError(f"Run is {run.run_status}, not running")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    if step.step_status == "to_start":
+        step.step_status = "ready"
+        db.flush()
+    if step.step_status != "ready":
+        raise ValueError(f"Step is {step.step_status}, not ready")
+
+    now = _utc_now_naive()
+    step.started_at = now
+    db.flush()
+    try:
+        out = _send_one_step(db, run, step)
+    except Exception as e:
+        step.step_status = "error"
+        step.last_outcome_summary = str(e)[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": str(e), "channel": step.channel},
+        )
+        db.commit()
+        raise
+    if out.get("mode") == "placeholder":
+        step.step_status = "ready"
+        step.started_at = None
+        db.commit()
+        raise ValueError(
+            "This API cannot actually send this step (email/SMS webhook or Retell key missing), "
+            "and the send worker could not see the step in its database."
+        )
+    if out.get("ok") is False:
+        step.step_status = "error"
+        step.last_outcome_summary = json.dumps(out)[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": out, "channel": step.channel},
+        )
+        db.commit()
+        raise ValueError(str(out.get("error") or "Send failed"))
+
+    step.step_status = "executed"
+    step.completed_at = _utc_now_naive()
+    step.last_outcome_summary = json.dumps(out)[:4000]
+    _log_event(
+        db,
+        run.id,
+        "step_executed",
+        step_id=step.id,
+        payload={"channel": step.channel, "result": out},
+    )
+    pending = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == run.id,
+            AutonomousSequenceStep.id != step.id,
+            AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
+        )
+        .count()
+    )
+    if pending == 0 and run.run_status == "running":
+        run.run_status = "completed"
+        run.stop_reason = None
+        _log_event(db, run.id, "run_completed", payload={})
+    db.commit()
+    db.refresh(run)
+    return {"ok": True, "run_id": run.id, "step_id": step.id, "result": out}
+
+
+def _load_type_prompts(db: Session, sequence_type: str) -> dict[str, str]:
+    out = {
+        "retell_agent_id": "",
+        "email_system_prompt": "",
+        "email_example": "",
+        "sms_system_prompt": "",
+        "sms_example": "",
+    }
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" not in tables:
+        return out
+    ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+    cols = {
+        str(c.get("name") or "")
+        for c in insp.get_columns("autonomous_sequence_type", **_inspector_schema_kw(bind))
+    }
+    wanted = [k for k in out if k in cols]
+    if not wanted:
+        return out
+    row = (
+        db.execute(
+            text(f"SELECT {', '.join(wanted)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+            {"st": sequence_type},
+        )
+        .mappings()
+        .first()
+    )
+    if not row:
+        return out
+    for key in out:
+        raw = row.get(key)
+        if raw:
+            out[key] = str(raw)
+    return out
+
+
+def _activity_meta(db: Session, run: AutonomousSequenceRun) -> dict[str, Any]:
+    if not run.crm_activity_id:
+        return {}
+    activity = db.get(OfferActivity, run.crm_activity_id)
+    if not activity or activity.metadata_ is None:
+        return {}
+    raw = activity.metadata_
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _flatten_worker_variables(ctx: dict[str, Any], activity_meta: dict[str, Any]) -> dict[str, str]:
+    flat: dict[str, Any] = {}
+    snap = ctx.get("comparison_snapshot")
+    if isinstance(snap, dict):
+        for key, value in snap.items():
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            flat[key] = value
+    for key, value in ctx.items():
+        if key in ("comparison_snapshot", "signature_html"):
+            continue
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        flat[key] = value
+    for key, value in activity_meta.items():
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        flat[key] = value
+    label = str(flat.get("offer_validity_label") or "").strip()
+    if label:
+        flat["validity_date"] = label
+    out = {str(k): str(v) for k, v in flat.items()}
+    converted = _to_e164_au(out.get("contact_phone"))
+    if converted:
+        out["contact_phone"] = converted
+    return out
+
+
+def _jsonable_context(ctx: dict[str, Any], activity_meta: dict[str, Any]) -> dict[str, Any]:
+    merged = {**ctx, **activity_meta}
+    try:
+        return json.loads(json.dumps(merged, default=str))
+    except (TypeError, ValueError):
+        return {str(k): str(v) for k, v in merged.items() if v is not None}
+
+
+def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
+    """Build a worker Action payload from this API's database (the one the dashboard reads)."""
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    if run.run_status != "running":
+        raise ValueError(f"Run is {run.run_status}, not running")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    if step.step_status == "to_start":
+        step.step_status = "ready"
+        db.flush()
+    if step.step_status != "ready":
+        raise ValueError(f"Step is {step.step_status}, not ready")
+
+    ctx = _parse_context(run)
+    ctx["offer_id"] = run.offer_id
+    ctx["run_id"] = run.id
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    extra = _resolve_extra_context(template, ctx)
+    if extra:
+        ctx["extra_context"] = extra
+    if template:
+        by_idx = {int(ts.step_index): ts for ts in template.steps if bool(ts.is_active)}
+        t_step = by_idx.get(int(step.step_index))
+        if t_step and t_step.prompt_text:
+            ctx["step_prompt"] = t_step.prompt_text
+    prompts = _load_type_prompts(db, run.sequence_type)
+    activity_meta = _activity_meta(db, run)
+    channel = (step.channel or "").strip()
+    email = str(ctx.get("contact_email") or run.contact_email or "").strip()
+    phone = _to_e164_au(ctx.get("contact_phone") or run.contact_phone) or ""
+
+    if channel == "email":
+        if not email:
+            raise ValueError("No contact email on this run")
+        email_ctx = _prepare_email_context(run, step, ctx, template)
+        payload = {
+            "to": email,
+            "email_id": str(run.email_ID or email_ctx.get("email_ID") or email_ctx.get("email_id") or ""),
+            "context": _jsonable_context(email_ctx, activity_meta),
+            "system_prompt": prompts["email_system_prompt"],
+            "example": prompts["email_example"],
+        }
+        action_type = "email"
+    elif channel == "sms":
+        if not phone:
+            raise ValueError("No contact phone on this run")
+        payload = {
+            "to": phone,
+            "context": _jsonable_context(ctx, activity_meta),
+            "system_prompt": prompts["sms_system_prompt"],
+            "example": prompts["sms_example"],
+        }
+        action_type = "sms"
+    elif channel == "voice_call":
+        if not phone:
+            raise ValueError("No contact phone on this run")
+        payload = {
+            "to": phone,
+            "agent_id": step.retell_agent_id or prompts["retell_agent_id"],
+            "dynamic_variables": _flatten_worker_variables(ctx, activity_meta),
+        }
+        action_type = "phone_call"
+    else:
+        raise ValueError(f"Channel {channel!r} cannot be sent via the worker")
+
+    return {
+        "action_type": action_type,
+        "step_id": step.id,
+        "run_id": run.id,
+        "payload": payload,
+        "channel": channel,
+    }
+
+
+def mark_step_dispatched(
+    db: Session,
+    run_id: int,
+    step_id: int,
+    success: bool,
+    summary: Optional[str] = None,
+) -> AutonomousSequenceRun:
+    run = (
+        db.query(AutonomousSequenceRun)
+        .options(joinedload(AutonomousSequenceRun.steps))
+        .filter(AutonomousSequenceRun.id == run_id)
+        .first()
+    )
+    if not run:
+        raise ValueError("Run not found")
+    step = next((s for s in run.steps if s.id == step_id), None)
+    if step is None:
+        raise ValueError("Step not found on this run")
+    now = _utc_now_naive()
+    if success:
+        step.step_status = "executed"
+        step.started_at = step.started_at or now
+        step.completed_at = now
+        if summary:
+            step.last_outcome_summary = summary[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_executed",
+            step_id=step.id,
+            payload={"channel": step.channel, "result": summary},
+        )
+    else:
+        step.step_status = "error"
+        step.completed_at = now
+        if summary:
+            step.last_outcome_summary = summary[:4000]
+        _log_event(
+            db,
+            run.id,
+            "step_failed",
+            step_id=step.id,
+            payload={"error": summary, "channel": step.channel},
+        )
+    db.flush()
+    pending = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == run.id,
+            AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
+        )
+        .count()
+    )
+    if success and pending == 0 and run.run_status == "running":
+        run.run_status = "completed"
+        run.stop_reason = None
+        _log_event(db, run.id, "run_completed", payload={})
+    db.commit()
+    db.refresh(run)
+    return run

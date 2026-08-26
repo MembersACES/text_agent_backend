@@ -18,3 +18,4 @@ apscheduler
 pytz
 pypdf
 reportlab
+pillow
