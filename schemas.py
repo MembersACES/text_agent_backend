@@ -1045,6 +1045,7 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     sequence_type: Optional[str] = None
     validity_mode: Optional[str] = None
     validity_days: Optional[int] = None
+    linked_flow_keys: Optional[List[str]] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1091,6 +1092,7 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     extra_context: Optional[str] = None
     validity_mode: str = "fixed_days"
     validity_days: int = 7
+    linked_flow_keys: List[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
