@@ -1021,6 +1021,11 @@ class AutonomousSequenceTemplateBase(BaseModel):
     is_restartable: bool = True
     signature_html: Optional[str] = None
     extra_context: Optional[str] = None
+    # Offer validity: "none" (never mention one), "retailer_date" (only a date a human
+    # supplied), or "fixed_days" (anchor + validity_days). Default preserves prior
+    # behaviour, which was a hardcoded 7 days.
+    validity_mode: str = "fixed_days"
+    validity_days: int = 7
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
@@ -1038,6 +1043,8 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     signature_html: Optional[str] = None
     extra_context: Optional[str] = None
     sequence_type: Optional[str] = None
+    validity_mode: Optional[str] = None
+    validity_days: Optional[int] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1082,6 +1089,8 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     is_restartable: bool = True
     signature_html: Optional[str] = None
     extra_context: Optional[str] = None
+    validity_mode: str = "fixed_days"
+    validity_days: int = 7
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
