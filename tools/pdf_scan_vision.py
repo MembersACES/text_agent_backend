@@ -18,7 +18,60 @@ VISION_TIMEOUT_SECONDS = 90.0
 OPENAI_VISION_MODEL = "gpt-4o"
 
 
+def _pymupdf_module():
+    try:
+        import pymupdf
+
+        return pymupdf
+    except ImportError:
+        import fitz as pymupdf
+
+        return pymupdf
+
+
+def pdf_words(pdf_bytes: bytes) -> list[tuple[float, float, float, float, str]]:
+    """Word boxes as (x0, y0, x1, y1, text). Empty if pymupdf cannot open the PDF."""
+    try:
+        pymupdf = _pymupdf_module()
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        logger.warning("pdf_words open failed: %s", e)
+        return []
+    out: list[tuple[float, float, float, float, str]] = []
+    try:
+        for page in doc:
+            for word in page.get_text("words"):
+                text = str(word[4] or "").strip()
+                if text:
+                    out.append((float(word[0]), float(word[1]), float(word[2]), float(word[3]), text))
+    except Exception as e:
+        logger.warning("pdf_words extract failed: %s", e)
+        return []
+    finally:
+        doc.close()
+    return out
+
+
+def _pdf_to_text_pymupdf(pdf_bytes: bytes) -> str:
+    try:
+        pymupdf = _pymupdf_module()
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return ""
+    try:
+        parts = [(page.get_text("text") or "") for page in doc]
+    except Exception as e:
+        logger.warning("pymupdf text extract failed: %s", e)
+        return ""
+    finally:
+        doc.close()
+    return "\n".join(parts)
+
+
 def pdf_to_text(pdf_bytes: bytes) -> str:
+    pymupdf_text = _pdf_to_text_pymupdf(pdf_bytes)
+    if len(pymupdf_text.strip()) >= 40:
+        return pymupdf_text
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(pdf_bytes))
