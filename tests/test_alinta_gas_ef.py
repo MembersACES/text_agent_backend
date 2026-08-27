@@ -32,9 +32,6 @@ def _extract(**overrides):
         "min_cpq_gj": "15200",
         "min_cpq_pct": "80",
         "mdq_gj": "65",
-        "retail_service_charge": "1.99",
-        "overrun_rate": "10.00",
-        "excess_cpq_price": "2.00",
         "is_signed": "true",
         "signed_date": "15/10/2026",
     }
@@ -64,8 +61,6 @@ def _sheet_lookup():
                         "maq_gj": 15200,
                         "maq_pct": 80,
                         "mdq_gj_per_day": 65,
-                        "overrun_rate_per_gj": 10.0,
-                        "excess_cpq_rate_per_gj": 2.0,
                     }
                 ],
             }
@@ -158,13 +153,6 @@ def test_commission_never_comes_from_sheet():
     assert draft["fields"]["commission_per_gj"]["estimated"] is True
 
 
-def test_retail_service_charge_defaults():
-    extract = _extract(retail_service_charge="")
-    draft = compose_alinta_gas_draft(extract, {"match_kind": "none", "contracts": []})
-    assert draft["fields"]["retail_service_charge"]["value"] == "1.99"
-    assert draft["fields"]["retail_service_charge"]["source"] == "default"
-
-
 def test_send_requires_loa_and_commission():
     draft = compose_alinta_gas_draft(_extract(commission_per_gj=""), {"match_kind": "none", "contracts": []})
     errors = required_send_errors(draft)
@@ -200,6 +188,17 @@ def test_email_html_includes_alice_fornrg_signature():
     assert "FORNRG Pty Ltd" in html
     assert "1300 938 638" in html
     assert "http://www.fornrg.com/" in html
+
+
+def test_email_omits_contract_only_charges():
+    html = build_email_html(compose_alinta_gas_draft(_extract(), _sheet_lookup()))
+    assert "Overrun" not in html
+    assert "Retail Service Charge" not in html
+    assert "Excess CPQ" not in html
+    draft = compose_alinta_gas_draft(_extract(), _sheet_lookup())
+    assert "overrun_rate" not in draft["fields"]
+    assert "retail_service_charge" not in draft["fields"]
+    assert "excess_cpq_price" not in draft["fields"]
 
 
 def test_sanitize_drops_egb_and_label_junk():

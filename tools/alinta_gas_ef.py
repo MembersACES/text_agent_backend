@@ -25,7 +25,6 @@ INVOICE_API_PROCESS_EF_URL = (
     os.getenv("ACES_INVOICE_API_PROCESS_EF_URL")
     or "https://aces-invoice-api-672026052958.australia-southeast2.run.app/v1/ef/process-ef"
 )
-DEFAULT_RETAIL_SERVICE_CHARGE = "1.99"
 DEFAULT_MIN_CPQ_PCT = 80.0
 
 EXTRACT_KEYS: tuple[str, ...] = (
@@ -44,9 +43,6 @@ EXTRACT_KEYS: tuple[str, ...] = (
     "min_cpq_gj",
     "min_cpq_pct",
     "mdq_gj",
-    "retail_service_charge",
-    "overrun_rate",
-    "excess_cpq_price",
     "is_signed",
     "signed_date",
 )
@@ -61,8 +57,7 @@ Do not read down the label column as if it were values.
 Return a JSON object with exactly these keys (use "" if not present; never invent):
 company_name, acn_abn, address, tel, contact_name, email, mirn,
 start_date, end_date, price_per_gj, commission_per_gj, cpq_gj, min_cpq_gj,
-min_cpq_pct, mdq_gj, retail_service_charge, overrun_rate, excess_cpq_price,
-is_signed, signed_date.
+min_cpq_pct, mdq_gj, is_signed, signed_date.
 
 Rules:
 - company_name is the MEMBER on the Company Name row (the customer).
@@ -84,8 +79,8 @@ Rules:
 - cpq_gj / min_cpq_gj / min_cpq_pct / mdq_gj: only if the form actually has
   Contract Period Quantity / CPQ / MDQ. Load Flex is NOT min_cpq_pct — leave
   those keys empty if the form has no CPQ/MDQ fields.
-- retail_service_charge is $/MIRN/day if shown.
-- overrun_rate and excess_cpq_price are $/GJ.
+- Do not extract retail service charge, overrun rate, or excess CPQ — those
+  are not on an Agreement Request.
 - is_signed: "true" if there is a handwritten or digital signature, else "false".
 - contact_name, email, tel: the customer contact, not Alinta / ACES / EGB.
 """
@@ -479,9 +474,6 @@ def _parse_ef_text(text: str) -> dict[str, str]:
     )
     out["cpq_gj"] = after("Contract Period Quantity")
     out["mdq_gj"] = after("Maximum Daily Quantity") or after("MDQ")
-    out["retail_service_charge"] = after("Retail Service Charge")
-    out["overrun_rate"] = after("Overrun")
-    out["excess_cpq_price"] = after("Excess CPQ")
     return out
 
 
@@ -700,14 +692,6 @@ def compose_alinta_gas_draft(
             min_cpq = _field(_fmt_qty(cpq_num * (pct_num / 100.0)), "estimated", estimated=True)
 
     mdq = commercial(period.get("mdq_gj_per_day"), extract.get("mdq_gj"), qty=True)
-    overrun = commercial(period.get("overrun_rate_per_gj"), extract.get("overrun_rate"), money=True)
-    excess = commercial(period.get("excess_cpq_rate_per_gj"), extract.get("excess_cpq_price"), money=True)
-
-    rsc_raw = extract.get("retail_service_charge")
-    if _clean(rsc_raw):
-        rsc = _field(_clean(rsc_raw).replace("$", ""), "ef")
-    else:
-        rsc = _field(DEFAULT_RETAIL_SERVICE_CHARGE, "default")
 
     request_kind = "Retention" if found else "Acquisition"
     loa_file_id = drive_file_id(biz.get("loa_link"))
@@ -727,9 +711,6 @@ def compose_alinta_gas_draft(
         "min_cpq_gj": min_cpq,
         "min_cpq_pct": min_pct,
         "mdq_gj": mdq,
-        "retail_service_charge": rsc,
-        "overrun_rate": overrun,
-        "excess_cpq_price": excess,
     }
     estimated = any(item.get("estimated") for item in fields.values())
     return {
@@ -788,9 +769,6 @@ def apply_flat_overrides(draft: dict[str, Any], overrides: dict[str, Any]) -> di
                 "min_cpq_gj",
                 "min_cpq_pct",
                 "mdq_gj",
-                "retail_service_charge",
-                "overrun_rate",
-                "excess_cpq_price",
             }:
                 fields[key] = _field(value, "manual")
             continue
@@ -850,10 +828,7 @@ def build_email_html(draft: dict[str, Any]) -> str:
   Contract Period Quantity (GJ) {_val(draft, "cpq_gj")}<br>
   Minimum Contract Period Quantity (GJ) {_val(draft, "min_cpq_gj")}<br>
   Minimum Contract Period Quantity (%of CPQ) {_val(draft, "min_cpq_pct")}<br>
-  Contract Maximum Daily Quantity (GJ) {_val(draft, "mdq_gj")}<br>
-  Retail Service Charge ($/ MIRN/ Day) {_val(draft, "retail_service_charge")}<br>
-  Overrun Rate ($/GJ) {_val(draft, "overrun_rate")}<br>
-  Excess CPQ Price ($/GJ) {_val(draft, "excess_cpq_price")}</p>
+  Contract Maximum Daily Quantity (GJ) {_val(draft, "mdq_gj")}</p>
   <p>Attached are both the LOA &amp; the signed engagement form.</p>
   <p>Kind regards,</p>
   <p>Alice</p>
