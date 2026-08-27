@@ -12,7 +12,7 @@ from typing import Any, Optional
 import requests
 
 from tools.bne_gas_contracts import lookup_bne_gas_contract, normalize_mrin, parse_sheet_number
-from tools.pdf_scan_vision import collect_page_images, pdf_to_text, vision_extract_fields
+from tools.pdf_scan_vision import collect_page_images, pdf_to_text, pdf_words, vision_extract_fields
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ INVOICE_API_PROCESS_EF_URL = (
     os.getenv("ACES_INVOICE_API_PROCESS_EF_URL")
     or "https://aces-invoice-api-672026052958.australia-southeast2.run.app/v1/ef/process-ef"
 )
-DEFAULT_RETAIL_SERVICE_CHARGE = "1.99"
 DEFAULT_MIN_CPQ_PCT = 80.0
 
 EXTRACT_KEYS: tuple[str, ...] = (
@@ -44,9 +43,6 @@ EXTRACT_KEYS: tuple[str, ...] = (
     "min_cpq_gj",
     "min_cpq_pct",
     "mdq_gj",
-    "retail_service_charge",
-    "overrun_rate",
-    "excess_cpq_price",
     "is_signed",
     "signed_date",
 )
@@ -54,16 +50,25 @@ EXTRACT_KEYS: tuple[str, ...] = (
 _VISION_PROMPT = """Extract fields from this Alinta Energy C&I gas engagement form / agreement.
 The PDF is often a scan of a signed paper copy. Read printed text AND handwriting.
 
+This ACES "Engagement Form - Gas Agreement" is a two-column form:
+LEFT / label column is field names; RIGHT / value column is the answers.
+Do not read down the label column as if it were values.
+
 Return a JSON object with exactly these keys (use "" if not present; never invent):
 company_name, acn_abn, address, tel, contact_name, email, mirn,
 start_date, end_date, price_per_gj, commission_per_gj, cpq_gj, min_cpq_gj,
-min_cpq_pct, mdq_gj, retail_service_charge, overrun_rate, excess_cpq_price,
-is_signed, signed_date.
+min_cpq_pct, mdq_gj, is_signed, signed_date.
 
 Rules:
-- company_name is the customer / member, never Alinta Energy / ACES / Carbon Zero / EGB.
-- mirn: digits only (Meter Installation Registration Number / MIRN / MRIN / DPI).
-- acn_abn: digits only (11-digit ABN or 9-digit ACN).
+- company_name is the MEMBER on the Company Name row (the customer).
+  NEVER use Environmental Global Benefits, EGB, EGB Executive, ACES, Carbon Zero,
+  FORNRG, or Alinta Energy — those are us / the retailer, usually in the header
+  or the "Distributed By" / "Contact" rows above Company Name.
+- mirn: digits only from the MIRN field (typically 10–11 digits). Not the ABN.
+- acn_abn: digits only from the ACN/ABN row (11-digit ABN or 9-digit ACN).
+- email must contain @. Service Order Request Date is NOT the email.
+- contact_name is the member Contact Name row, not "Distributed By" / EGB Executive.
+- address is the member Address row, not the words Tel / Contact / Company.
 - Dates: keep as written (prefer D/M/YYYY). If Start Date or End Date is TBC, TBA, TBD, or blank, return that exactly (e.g. "TBC"). Never invent a calendar date.
 - price_per_gj is the energy / Period 1 Rate ($/GJ), numbers only (e.g. 14.70).
 - commission_per_gj is the broker / ACES / EGB commission in $/GJ.
@@ -71,11 +76,11 @@ Rules:
   "Distributor Rebate: $X per GJ" (the rate is in the LABEL; the value cell may
   say "Included"). In that case commission_per_gj is X (e.g. 3), never "Included"
   and never the Period 1 Rate. Also accept Brokerage, Rebate, Commission.
-- cpq_gj is Contract Period Quantity in GJ. min_cpq_gj is the minimum CPQ in GJ.
-- min_cpq_pct is the minimum as a percent of CPQ (e.g. 80).
-- mdq_gj is Maximum Daily Quantity in GJ.
-- retail_service_charge is $/MIRN/day if shown.
-- overrun_rate and excess_cpq_price are $/GJ.
+- cpq_gj / min_cpq_gj / min_cpq_pct / mdq_gj: only if the form actually has
+  Contract Period Quantity / CPQ / MDQ. Load Flex is NOT min_cpq_pct — leave
+  those keys empty if the form has no CPQ/MDQ fields.
+- Do not extract retail service charge, overrun rate, or excess CPQ — those
+  are not on an Agreement Request.
 - is_signed: "true" if there is a handwritten or digital signature, else "false".
 - contact_name, email, tel: the customer contact, not Alinta / ACES / EGB.
 """
@@ -95,6 +100,34 @@ _COMMISSION_AMOUNT_RE = re.compile(
 )
 _NOT_A_RATE = frozenset({"included", "yes", "y", "true", "na", "n/a", "-"})
 MAX_COMMISSION_PER_GJ = 50.0
+_BROKER_COMPANY_RE = re.compile(
+    r"^(environmental\s+global\s+benefits|egb(?:\s+executive)?|"
+    r"aces(?:\s+carbon\s+zero)?|carbon\s+zero(?:\s+australasia)?|"
+    r"fornrg(?:\s+pty\s+ltd)?|alinta(?:\s+energy)?)$",
+    re.I,
+)
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_JUNK_FIELD_RE = re.compile(
+    r"^(tel|contact|company|email|address|name|date|mirn|acn|abn|acn/abn)([:\s].*)?$",
+    re.I,
+)
+_CPQ_LABEL_RE = re.compile(
+    r"contract\s+period\s+quantity|\bcpq\b|maximum\s+daily\s+quantity|\bmdq\b",
+    re.I,
+)
+_LAYOUT_LABEL_KEYS: tuple[tuple[str, str], ...] = (
+    ("company name", "company_name"),
+    ("acn/abn", "acn_abn"),
+    ("address", "address"),
+    ("contact name", "contact_name"),
+    ("start date", "start_date"),
+    ("end date", "end_date"),
+    ("period 1 rate", "price_per_gj"),
+    ("distributor rebate", "commission_per_gj"),
+    ("email", "email"),
+    ("mirn", "mirn"),
+    ("tel", "tel"),
+)
 
 
 def mirn_from_filename(filename: str) -> str:
@@ -237,13 +270,188 @@ def _empty_extract() -> dict[str, str]:
     return {key: "" for key in EXTRACT_KEYS}
 
 
+def _is_broker_company(value: Any) -> bool:
+    return bool(_BROKER_COMPANY_RE.match(_clean(value)))
+
+
+def _plausible_mirn(value: Any) -> bool:
+    digits = normalize_mrin(value)
+    return 10 <= len(digits) <= 11
+
+
+def _cluster_word_rows(
+    words: list[tuple[float, float, float, float, str]],
+    axis: str,
+    thresh: float = 12.0,
+) -> list[list[tuple[float, float, float, float, str]]]:
+    index = 0 if axis == "x" else 1
+    ordered = sorted(words, key=lambda word: word[index])
+    rows: list[list[tuple[float, float, float, float, str]]] = []
+    current: list[tuple[float, float, float, float, str]] = []
+    current_key: float | None = None
+    for word in ordered:
+        val = word[index]
+        if current_key is None or abs(val - current_key) <= thresh:
+            current.append(word)
+            current_key = sum(item[index] for item in current) / len(current)
+        else:
+            rows.append(current)
+            current = [word]
+            current_key = val
+    if current:
+        rows.append(current)
+    return rows
+
+
+def _split_label_value(
+    row: list[tuple[float, float, float, float, str]],
+    value_axis: str,
+) -> tuple[str, str]:
+    """Split a row of words into (label, value) at the largest gap on value_axis."""
+    coord = 1 if value_axis == "y" else 0
+    # Landscape ACES forms are often stored rotated: labels at high Y, values at low Y.
+    reverse = value_axis == "y"
+    ordered = sorted(row, key=lambda word: (-word[coord] if reverse else word[coord]))
+    if len(ordered) == 1:
+        return _clean(ordered[0][4]), ""
+    best_i = 0
+    best_gap = -1.0
+    for i in range(len(ordered) - 1):
+        gap = abs(ordered[i][coord] - ordered[i + 1][coord])
+        if gap > best_gap:
+            best_gap = gap
+            best_i = i
+    if best_gap < 80:
+        joined = " ".join(word[4] for word in ordered)
+        return _clean(joined), ""
+    label_words = ordered[: best_i + 1]
+    value_words = ordered[best_i + 1 :]
+    if reverse:
+        label = " ".join(word[4] for word in sorted(label_words, key=lambda w: -w[1]))
+        value = " ".join(word[4] for word in sorted(value_words, key=lambda w: -w[1]))
+    else:
+        label = " ".join(word[4] for word in label_words)
+        value = " ".join(word[4] for word in value_words)
+    return _clean(label), _clean(value)
+
+
+def _pairs_from_words(
+    words: list[tuple[float, float, float, float, str]],
+    axis: str,
+    value_axis: str,
+) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for row in _cluster_word_rows(words, axis=axis):
+        if not row:
+            continue
+        label, value = _split_label_value(row, value_axis=value_axis)
+        if label:
+            pairs.append((label, value))
+    return pairs
+
+
+def _key_for_layout_label(label: str) -> str:
+    folded = re.sub(r"\s+", " ", label.lower()).rstrip(":# $")
+    for needle, key in _LAYOUT_LABEL_KEYS:
+        if folded == needle or folded.startswith(f"{needle} ") or folded.startswith(f"{needle}:"):
+            return key
+    if "company" in folded and "name" in folded and "contact" not in folded:
+        return "company_name"
+    return ""
+
+
+def _extract_from_pairs(pairs: list[tuple[str, str]]) -> dict[str, str]:
+    out = _empty_extract()
+    extra_for_commission: list[str] = []
+    for label, value in pairs:
+        key = _key_for_layout_label(label)
+        extra_for_commission.append(f"{label} {value}")
+        if not key:
+            continue
+        if key == "commission_per_gj":
+            out[key] = normalize_commission_per_gj(value, extra_text=f"{label} {value}")
+            continue
+        if key == "mirn":
+            digits = normalize_mrin(value)
+            if _plausible_mirn(digits):
+                out[key] = digits
+            continue
+        if key == "acn_abn":
+            out[key] = _digits(value)
+            continue
+        if key in {"start_date", "end_date"}:
+            out[key] = _fmt_date(value)
+            continue
+        if not out.get(key):
+            out[key] = _clean(value)
+    if not out.get("commission_per_gj"):
+        out["commission_per_gj"] = normalize_commission_per_gj(
+            "", extra_text=" ".join(extra_for_commission)
+        )
+    return out
+
+
+def _score_layout_extract(extract: dict[str, str]) -> int:
+    score = 0
+    if extract.get("email") and _EMAIL_RE.match(extract["email"]):
+        score += 3
+    if _plausible_mirn(extract.get("mirn")):
+        score += 3
+    company = _clean(extract.get("company_name"))
+    if company and not _is_broker_company(company):
+        score += 2
+    if len(_digits(extract.get("acn_abn"))) in {9, 11}:
+        score += 1
+    if extract.get("contact_name"):
+        score += 1
+    if extract.get("address") and not _JUNK_FIELD_RE.match(extract["address"]):
+        score += 1
+    return score
+
+
+def extract_from_pdf_layout(pdf_bytes: bytes) -> dict[str, str]:
+    words = pdf_words(pdf_bytes)
+    if len(words) < 20:
+        return _empty_extract()
+    rotated = _extract_from_pairs(_pairs_from_words(words, axis="x", value_axis="y"))
+    normal = _extract_from_pairs(_pairs_from_words(words, axis="y", value_axis="x"))
+    if _score_layout_extract(rotated) >= _score_layout_extract(normal):
+        return rotated
+    return normal
+
+
+def _sanitize_extract(extract: dict[str, str], text: str = "") -> dict[str, str]:
+    out = dict(extract)
+    if _is_broker_company(out.get("company_name")):
+        out["company_name"] = ""
+    if _JUNK_FIELD_RE.match(_clean(out.get("company_name"))):
+        out["company_name"] = ""
+    if _JUNK_FIELD_RE.match(_clean(out.get("address"))):
+        out["address"] = ""
+    if _JUNK_FIELD_RE.match(_clean(out.get("tel"))):
+        out["tel"] = ""
+    if _JUNK_FIELD_RE.match(_clean(out.get("contact_name"))) or _is_broker_company(
+        out.get("contact_name")
+    ):
+        out["contact_name"] = ""
+    email = _clean(out.get("email"))
+    if email and not _EMAIL_RE.match(email):
+        out["email"] = ""
+    if out.get("mirn") and not _plausible_mirn(out.get("mirn")):
+        out["mirn"] = ""
+    if not _CPQ_LABEL_RE.search(text or ""):
+        for key in ("cpq_gj", "min_cpq_gj", "min_cpq_pct", "mdq_gj"):
+            out[key] = ""
+    return out
+
+
 def _parse_ef_text(text: str) -> dict[str, str]:
     out = _empty_extract()
     if not text or len(text.strip()) < 20:
         return out
 
     def after(label: str) -> str:
-        match = re.search(rf"{label}\s*[:#]\s*(.+)", text, re.I)
+        match = re.search(rf"{re.escape(label)}[ \t]*[:#][ \t]*(.+)", text, re.I)
         if not match:
             return ""
         return _clean(match.group(1).split("\n")[0])
@@ -252,7 +460,7 @@ def _parse_ef_text(text: str) -> dict[str, str]:
     out["acn_abn"] = _digits(after("ABN") or after("ACN") or after("ACN/ABN"))
     out["address"] = after("Address") or after("Site Address") or after("Supply Address")
     out["tel"] = after("Tel") or after("Telephone") or after("Phone")
-    out["contact_name"] = after("Contact Name") or after("Contact")
+    out["contact_name"] = after("Contact Name")
     out["email"] = after("Email")
     mirn_match = re.search(r"(?:MIRN|MRIN|DPI)\s*[:#]?\s*([0-9 ]{8,16})", text, re.I)
     if mirn_match:
@@ -264,11 +472,8 @@ def _parse_ef_text(text: str) -> dict[str, str]:
         after("Commission") or after("Distributor Rebate") or after("Rebate"),
         extra_text=text,
     )
-    out["cpq_gj"] = after("Contract Period Quantity") or after("CPQ")
+    out["cpq_gj"] = after("Contract Period Quantity")
     out["mdq_gj"] = after("Maximum Daily Quantity") or after("MDQ")
-    out["retail_service_charge"] = after("Retail Service Charge")
-    out["overrun_rate"] = after("Overrun")
-    out["excess_cpq_price"] = after("Excess CPQ")
     return out
 
 
@@ -291,8 +496,15 @@ def extract_alinta_gas_ef(pdf_bytes: bytes, filename: str = "") -> dict[str, Any
         warnings.append(f"Embedded PDF text could not be read: {e}")
 
     text = (text or "").replace("\u00a0", " ")
+    layout = extract_from_pdf_layout(pdf_bytes)
+    extract = _merge_extract(extract, layout)
+    if layout.get("company_name") or layout.get("mirn"):
+        warnings.append("Read member fields from the form layout (not the EGB header).")
+
     if len(text.strip()) >= 40:
-        extract = _parse_ef_text(text)
+        extract = _merge_extract(extract, _parse_ef_text(text))
+
+    extract = _sanitize_extract(extract, text)
 
     hint_mirn = mirn_from_filename(filename)
     if hint_mirn and not extract.get("mirn"):
@@ -330,7 +542,9 @@ def extract_alinta_gas_ef(pdf_bytes: bytes, filename: str = "") -> dict[str, Any
                     str(scan.get(key) or "") for key in EXTRACT_KEYS
                 ),
             )
+            cleaned = _sanitize_extract(cleaned, text)
             extract = _merge_extract(extract, cleaned)
+            extract = _sanitize_extract(extract, text)
             warnings.append("Read from scanned pages, including handwriting.")
         elif not extract.get("company_name"):
             warnings.append(
@@ -352,6 +566,7 @@ def extract_alinta_gas_ef(pdf_bytes: bytes, filename: str = "") -> dict[str, Any
     )
     extract["is_signed"] = "true" if _parse_bool(extract.get("is_signed")) or extract.get("signed_date") else extract.get("is_signed") or ""
     extract["mirn"] = normalize_mrin(extract.get("mirn"))
+    extract = _sanitize_extract(extract, text)
     return {"extract": extract, "extraction_warnings": warnings}
 
 
@@ -454,7 +669,7 @@ def compose_alinta_gas_draft(
     )
 
     price = commercial(
-        period.get("energy_rate_per_gj") or period.get("energy_rate_display"),
+        None,
         extract.get("price_per_gj"),
         money=True,
     )
@@ -477,14 +692,6 @@ def compose_alinta_gas_draft(
             min_cpq = _field(_fmt_qty(cpq_num * (pct_num / 100.0)), "estimated", estimated=True)
 
     mdq = commercial(period.get("mdq_gj_per_day"), extract.get("mdq_gj"), qty=True)
-    overrun = commercial(period.get("overrun_rate_per_gj"), extract.get("overrun_rate"), money=True)
-    excess = commercial(period.get("excess_cpq_rate_per_gj"), extract.get("excess_cpq_price"), money=True)
-
-    rsc_raw = extract.get("retail_service_charge")
-    if _clean(rsc_raw):
-        rsc = _field(_clean(rsc_raw).replace("$", ""), "ef")
-    else:
-        rsc = _field(DEFAULT_RETAIL_SERVICE_CHARGE, "default")
 
     request_kind = "Retention" if found else "Acquisition"
     loa_file_id = drive_file_id(biz.get("loa_link"))
@@ -504,9 +711,6 @@ def compose_alinta_gas_draft(
         "min_cpq_gj": min_cpq,
         "min_cpq_pct": min_pct,
         "mdq_gj": mdq,
-        "retail_service_charge": rsc,
-        "overrun_rate": overrun,
-        "excess_cpq_price": excess,
     }
     estimated = any(item.get("estimated") for item in fields.values())
     return {
@@ -565,9 +769,6 @@ def apply_flat_overrides(draft: dict[str, Any], overrides: dict[str, Any]) -> di
                 "min_cpq_gj",
                 "min_cpq_pct",
                 "mdq_gj",
-                "retail_service_charge",
-                "overrun_rate",
-                "excess_cpq_price",
             }:
                 fields[key] = _field(value, "manual")
             continue
@@ -627,10 +828,7 @@ def build_email_html(draft: dict[str, Any]) -> str:
   Contract Period Quantity (GJ) {_val(draft, "cpq_gj")}<br>
   Minimum Contract Period Quantity (GJ) {_val(draft, "min_cpq_gj")}<br>
   Minimum Contract Period Quantity (%of CPQ) {_val(draft, "min_cpq_pct")}<br>
-  Contract Maximum Daily Quantity (GJ) {_val(draft, "mdq_gj")}<br>
-  Retail Service Charge ($/ MIRN/ Day) {_val(draft, "retail_service_charge")}<br>
-  Overrun Rate ($/GJ) {_val(draft, "overrun_rate")}<br>
-  Excess CPQ Price ($/GJ) {_val(draft, "excess_cpq_price")}</p>
+  Contract Maximum Daily Quantity (GJ) {_val(draft, "mdq_gj")}</p>
   <p>Attached are both the LOA &amp; the signed engagement form.</p>
   <p>Kind regards,</p>
   <p>Alice</p>

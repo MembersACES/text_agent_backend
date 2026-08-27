@@ -1,9 +1,11 @@
 from tools.alinta_gas_ef import (
     _parse_ef_text,
+    _sanitize_extract,
     apply_flat_overrides,
     build_email_html,
     build_email_subject,
     compose_alinta_gas_draft,
+    extract_alinta_gas_ef,
     flatten_draft_fields,
     gas_ef_folder_id,
     mirn_from_filename,
@@ -30,9 +32,6 @@ def _extract(**overrides):
         "min_cpq_gj": "15200",
         "min_cpq_pct": "80",
         "mdq_gj": "65",
-        "retail_service_charge": "1.99",
-        "overrun_rate": "10.00",
-        "excess_cpq_price": "2.00",
         "is_signed": "true",
         "signed_date": "15/10/2026",
     }
@@ -62,8 +61,6 @@ def _sheet_lookup():
                         "maq_gj": 15200,
                         "maq_pct": 80,
                         "mdq_gj_per_day": 65,
-                        "overrun_rate_per_gj": 10.0,
-                        "excess_cpq_rate_per_gj": 2.0,
                     }
                 ],
             }
@@ -77,10 +74,11 @@ def test_mirn_from_filename():
 
 
 def test_sheet_hit_is_retention_and_uses_sheet_schedule():
-    draft = compose_alinta_gas_draft(_extract(price_per_gj="99.99"), _sheet_lookup())
+    draft = compose_alinta_gas_draft(_extract(price_per_gj="15.90"), _sheet_lookup())
     assert draft["request_kind"] == "Retention"
-    assert draft["fields"]["price_per_gj"]["source"] == "sheet"
-    assert draft["fields"]["price_per_gj"]["value"].startswith("$14.70")
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+    assert draft["fields"]["price_per_gj"]["value"].startswith("$15.90")
+    assert draft["fields"]["cpq_gj"]["source"] == "sheet"
     assert draft["fields"]["cpq_gj"]["value"] == "19,000"
     assert draft["fields"]["min_cpq_gj"]["value"] == "15,200"
     assert draft["fields"]["company_name"]["source"] == "ef"
@@ -95,7 +93,20 @@ def test_period_dates_come_from_ef_not_sheet():
     assert draft["fields"]["start_date"]["value"] == "TBC"
     assert draft["fields"]["end_date"]["value"] == "TBC"
     assert draft["fields"]["start_date"]["source"] == "ef"
-    assert draft["fields"]["price_per_gj"]["source"] == "sheet"
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+
+
+def test_price_comes_from_ef_not_sheet():
+    draft = compose_alinta_gas_draft(_extract(price_per_gj="15.90"), _sheet_lookup())
+    assert draft["fields"]["price_per_gj"]["value"].startswith("$15.90")
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+    assert draft["fields"]["cpq_gj"]["source"] == "sheet"
+
+
+def test_empty_ef_price_is_not_filled_from_sheet():
+    draft = compose_alinta_gas_draft(_extract(price_per_gj=""), _sheet_lookup())
+    assert draft["fields"]["price_per_gj"]["value"] == ""
+    assert draft["fields"]["price_per_gj"]["source"] == "missing"
 
 
 def test_empty_ef_dates_are_not_filled_from_sheet():
@@ -142,13 +153,6 @@ def test_commission_never_comes_from_sheet():
     assert draft["fields"]["commission_per_gj"]["estimated"] is True
 
 
-def test_retail_service_charge_defaults():
-    extract = _extract(retail_service_charge="")
-    draft = compose_alinta_gas_draft(extract, {"match_kind": "none", "contracts": []})
-    assert draft["fields"]["retail_service_charge"]["value"] == "1.99"
-    assert draft["fields"]["retail_service_charge"]["source"] == "default"
-
-
 def test_send_requires_loa_and_commission():
     draft = compose_alinta_gas_draft(_extract(commission_per_gj=""), {"match_kind": "none", "contracts": []})
     errors = required_send_errors(draft)
@@ -184,3 +188,79 @@ def test_email_html_includes_alice_fornrg_signature():
     assert "FORNRG Pty Ltd" in html
     assert "1300 938 638" in html
     assert "http://www.fornrg.com/" in html
+
+
+def test_email_omits_contract_only_charges():
+    html = build_email_html(compose_alinta_gas_draft(_extract(), _sheet_lookup()))
+    assert "Overrun" not in html
+    assert "Retail Service Charge" not in html
+    assert "Excess CPQ" not in html
+    draft = compose_alinta_gas_draft(_extract(), _sheet_lookup())
+    assert "overrun_rate" not in draft["fields"]
+    assert "retail_service_charge" not in draft["fields"]
+    assert "excess_cpq_price" not in draft["fields"]
+
+
+def test_sanitize_drops_egb_and_label_junk():
+    cleaned = _sanitize_extract(
+        {
+            "company_name": "Environmental Global Benefits",
+            "address": "Tel:Contact",
+            "tel": "Contact",
+            "contact_name": "Company",
+            "email": "27/08/2026",
+            "mirn": "5324563544",
+            "min_cpq_pct": "20%",
+            "acn_abn": "732126029",
+        },
+        text="Distributor Rebate: $3.3 per GJ\nLoad Flex: 20%",
+    )
+    assert cleaned["company_name"] == ""
+    assert cleaned["address"] == ""
+    assert cleaned["tel"] == ""
+    assert cleaned["contact_name"] == ""
+    assert cleaned["email"] == ""
+    assert cleaned["min_cpq_pct"] == ""
+    assert cleaned["mirn"] == "5324563544"
+
+
+def test_sanitize_keeps_member_identity():
+    cleaned = _sanitize_extract(
+        {
+            "company_name": "Frankston RSL Sub Branch Inc",
+            "address": "Lot 1 183 CRANBOURNE Road FRANKSTON VIC 3199",
+            "tel": "8792 4400",
+            "contact_name": "Brett Rowlands",
+            "email": "browlands@frankstonrsl.com.au",
+            "mirn": "53215687544",
+            "min_cpq_pct": "20",
+        },
+        text="Load Flex: 20%\nMIRN: 53215687544",
+    )
+    assert cleaned["company_name"] == "Frankston RSL Sub Branch Inc"
+    assert cleaned["email"] == "browlands@frankstonrsl.com.au"
+    assert cleaned["mirn"] == "53215687544"
+    assert cleaned["min_cpq_pct"] == ""
+
+
+def test_frankston_aces_gas_ef_layout():
+    from pathlib import Path
+
+    path = Path(r"c:\Users\morga\Downloads\698ecc52-e8aa-481d-a6d8-9bc659f75d2d (1).pdf")
+    if not path.exists():
+        return
+    result = extract_alinta_gas_ef(path.read_bytes(), filename=path.name)
+    extract = result["extract"]
+    assert "Frankston" in extract["company_name"]
+    assert "Environmental Global" not in extract["company_name"]
+    assert extract["mirn"] == "53215687544"
+    assert extract["email"] == "browlands@frankstonrsl.com.au"
+    assert extract["contact_name"] == "Brett Rowlands"
+    assert "CRANBOURNE" in extract["address"].upper()
+    assert extract["acn_abn"] == "12643054953"
+    assert "15.90" in extract["price_per_gj"] or extract["price_per_gj"] == "15.90"
+    assert extract["commission_per_gj"] in {"3.3", "3.30"}
+    assert extract["start_date"] in {"1/1/2028", "01/01/2028"}
+    assert extract["end_date"] in {"31/12/2029"}
+    assert extract["min_cpq_pct"] == ""
+    assert not any("scanned pages" in w.lower() for w in result["extraction_warnings"])
