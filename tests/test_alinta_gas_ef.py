@@ -1,9 +1,11 @@
 from tools.alinta_gas_ef import (
     _parse_ef_text,
+    _sanitize_extract,
     apply_flat_overrides,
     build_email_html,
     build_email_subject,
     compose_alinta_gas_draft,
+    extract_alinta_gas_ef,
     flatten_draft_fields,
     gas_ef_folder_id,
     mirn_from_filename,
@@ -184,3 +186,68 @@ def test_email_html_includes_alice_fornrg_signature():
     assert "FORNRG Pty Ltd" in html
     assert "1300 938 638" in html
     assert "http://www.fornrg.com/" in html
+
+
+def test_sanitize_drops_egb_and_label_junk():
+    cleaned = _sanitize_extract(
+        {
+            "company_name": "Environmental Global Benefits",
+            "address": "Tel:Contact",
+            "tel": "Contact",
+            "contact_name": "Company",
+            "email": "27/08/2026",
+            "mirn": "5324563544",
+            "min_cpq_pct": "20%",
+            "acn_abn": "732126029",
+        },
+        text="Distributor Rebate: $3.3 per GJ\nLoad Flex: 20%",
+    )
+    assert cleaned["company_name"] == ""
+    assert cleaned["address"] == ""
+    assert cleaned["tel"] == ""
+    assert cleaned["contact_name"] == ""
+    assert cleaned["email"] == ""
+    assert cleaned["min_cpq_pct"] == ""
+    assert cleaned["mirn"] == "5324563544"
+
+
+def test_sanitize_keeps_member_identity():
+    cleaned = _sanitize_extract(
+        {
+            "company_name": "Frankston RSL Sub Branch Inc",
+            "address": "Lot 1 183 CRANBOURNE Road FRANKSTON VIC 3199",
+            "tel": "8792 4400",
+            "contact_name": "Brett Rowlands",
+            "email": "browlands@frankstonrsl.com.au",
+            "mirn": "53215687544",
+            "min_cpq_pct": "20",
+        },
+        text="Load Flex: 20%\nMIRN: 53215687544",
+    )
+    assert cleaned["company_name"] == "Frankston RSL Sub Branch Inc"
+    assert cleaned["email"] == "browlands@frankstonrsl.com.au"
+    assert cleaned["mirn"] == "53215687544"
+    assert cleaned["min_cpq_pct"] == ""
+
+
+def test_frankston_aces_gas_ef_layout():
+    from pathlib import Path
+
+    path = Path(r"c:\Users\morga\Downloads\698ecc52-e8aa-481d-a6d8-9bc659f75d2d (1).pdf")
+    if not path.exists():
+        return
+    result = extract_alinta_gas_ef(path.read_bytes(), filename=path.name)
+    extract = result["extract"]
+    assert "Frankston" in extract["company_name"]
+    assert "Environmental Global" not in extract["company_name"]
+    assert extract["mirn"] == "53215687544"
+    assert extract["email"] == "browlands@frankstonrsl.com.au"
+    assert extract["contact_name"] == "Brett Rowlands"
+    assert "CRANBOURNE" in extract["address"].upper()
+    assert extract["acn_abn"] == "12643054953"
+    assert "15.90" in extract["price_per_gj"] or extract["price_per_gj"] == "15.90"
+    assert extract["commission_per_gj"] in {"3.3", "3.30"}
+    assert extract["start_date"] in {"1/1/2028", "01/01/2028"}
+    assert extract["end_date"] in {"31/12/2029"}
+    assert extract["min_cpq_pct"] == ""
+    assert not any("scanned pages" in w.lower() for w in result["extraction_warnings"])
