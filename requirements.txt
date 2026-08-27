@@ -19,3 +19,4 @@ pytz
 pypdf
 reportlab
 pillow
+pymupdf
