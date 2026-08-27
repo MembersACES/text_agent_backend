@@ -59,6 +59,7 @@ class OfferActivityType(str, Enum):
     ENGAGEMENT_FORM = "engagement_form"
     ENGAGEMENT_FORM_SIGNED = "engagement_form_signed"
     CONTRACT_REQUESTED = "contract_requested"
+    ALINTA_AGREEMENT_REQUESTED = "alinta_agreement_requested"
     CONTRACT_RECEIVED = "contract_received"
     CONTRACT_SENT_FOR_SIGNING = "contract_sent_for_signing"
     CONTRACT_SIGNED_LODGED = "contract_signed_lodged"

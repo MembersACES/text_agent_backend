@@ -62,6 +62,13 @@ from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
 from tools.bne_gas_contracts import lookup_bne_gas_contract
+from tools.alinta_gas_ef import (
+    apply_flat_overrides,
+    build_email_html,
+    build_email_subject,
+    build_extract_response,
+    send_alinta_gas_agreement,
+)
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
@@ -2154,6 +2161,146 @@ def get_base2_ci_gas_energy_reference(
         result.get("median_energy_share"),
         result.get("message"),
     )
+    return result
+
+
+@app.post("/api/alinta-gas-agreement/extract")
+async def alinta_gas_agreement_extract(
+    file: UploadFile = File(...),
+    business_name: Optional[str] = Form(None),
+    mrin: Optional[str] = Form(None),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "alinta-gas-agreement/extract file=%s business=%r mrin=%r user=%s",
+        file.filename,
+        business_name,
+        mrin,
+        user_info.get("email") if isinstance(user_info, dict) else None,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if file.filename and not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    return build_extract_response(
+        contents,
+        filename=file.filename or "",
+        business_name=(business_name or "").strip(),
+        query_mrin=(mrin or "").strip(),
+    )
+
+
+@app.post("/api/alinta-gas-agreement/send")
+async def alinta_gas_agreement_send(
+    file: UploadFile = File(...),
+    draft_json: str = Form(...),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    logging.info(
+        "alinta-gas-agreement/send file=%s user=%s",
+        file.filename,
+        email,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        payload = json.loads(draft_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="draft_json is not valid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="draft_json must be an object")
+
+    draft = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
+    overrides = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    if overrides:
+        draft = apply_flat_overrides(draft, overrides)
+    if payload.get("request_kind"):
+        draft = apply_flat_overrides(draft, {"request_kind": payload.get("request_kind")})
+    if payload.get("loa_file_id") and not draft.get("loa_file_id"):
+        draft["loa_file_id"] = payload.get("loa_file_id")
+    if payload.get("gdrive_folder_url") and not draft.get("gdrive_folder_url"):
+        draft["gdrive_folder_url"] = payload.get("gdrive_folder_url")
+
+    company = ""
+    fields = draft.get("fields") or {}
+    company_field = fields.get("company_name")
+    if isinstance(company_field, dict):
+        company = str(company_field.get("value") or "").strip()
+    elif company_field:
+        company = str(company_field).strip()
+    if not company:
+        company = str(payload.get("business_name") or "").strip()
+
+    client = None
+    raw_client_id = payload.get("client_id") or payload.get("clientId")
+    if raw_client_id not in (None, ""):
+        try:
+            client = db.query(Client).filter(Client.id == int(raw_client_id)).first()
+        except (TypeError, ValueError):
+            client = None
+    if client is None and company:
+        client = db.query(Client).filter(Client.business_name == company).first()
+    if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
+        draft["gdrive_folder_url"] = client.gdrive_folder_url
+
+    result = send_alinta_gas_agreement(
+        draft,
+        pdf_bytes=contents,
+        filename=file.filename or "",
+        user_email=email,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
+
+    try:
+        if client:
+            offer = get_or_create_offer_for_activity(
+                db,
+                client.id,
+                company or client.business_name,
+                "C&I Gas",
+                created_by=email,
+                utility_type_identifier="Alinta C&I Gas agreement request",
+            )
+            doc_link = result.get("client_folder_url") or None
+            meta = {
+                "source": "alinta_gas_agreement_request",
+                "email_subject": result.get("email_subject"),
+                "recipient": result.get("recipient"),
+                "request_kind": draft.get("request_kind"),
+                "mirn": ((fields.get("mirn") or {}) if isinstance(fields.get("mirn"), dict) else {}).get("value")
+                or payload.get("mrin"),
+                "agreement_type": result.get("agreement_type"),
+            }
+            if not result.get("lodge_error"):
+                create_offer_activity(
+                    db,
+                    offer=offer,
+                    client=client,
+                    activity_type=OfferActivityType.ENGAGEMENT_FORM_SIGNED,
+                    document_link=doc_link,
+                    metadata=meta,
+                    created_by=email,
+                )
+            create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.ALINTA_AGREEMENT_REQUESTED,
+                document_link=doc_link,
+                metadata=meta,
+                created_by=email,
+            )
+    except Exception as act_e:
+        logging.warning("Failed to log alinta gas agreement activity: %s", act_e)
+
+    result["email_subject"] = result.get("email_subject") or build_email_subject(draft)
+    result["email_html_content"] = build_email_html(draft)
+    result["user_email"] = email
     return result
 
 
