@@ -677,7 +677,7 @@ def compose_alinta_gas_draft(
     )
 
     price = commercial(
-        period.get("energy_rate_per_gj") or period.get("energy_rate_display"),
+        None,
         extract.get("price_per_gj"),
         money=True,
     )

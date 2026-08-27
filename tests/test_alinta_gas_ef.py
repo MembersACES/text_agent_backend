@@ -79,10 +79,11 @@ def test_mirn_from_filename():
 
 
 def test_sheet_hit_is_retention_and_uses_sheet_schedule():
-    draft = compose_alinta_gas_draft(_extract(price_per_gj="99.99"), _sheet_lookup())
+    draft = compose_alinta_gas_draft(_extract(price_per_gj="15.90"), _sheet_lookup())
     assert draft["request_kind"] == "Retention"
-    assert draft["fields"]["price_per_gj"]["source"] == "sheet"
-    assert draft["fields"]["price_per_gj"]["value"].startswith("$14.70")
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+    assert draft["fields"]["price_per_gj"]["value"].startswith("$15.90")
+    assert draft["fields"]["cpq_gj"]["source"] == "sheet"
     assert draft["fields"]["cpq_gj"]["value"] == "19,000"
     assert draft["fields"]["min_cpq_gj"]["value"] == "15,200"
     assert draft["fields"]["company_name"]["source"] == "ef"
@@ -97,7 +98,20 @@ def test_period_dates_come_from_ef_not_sheet():
     assert draft["fields"]["start_date"]["value"] == "TBC"
     assert draft["fields"]["end_date"]["value"] == "TBC"
     assert draft["fields"]["start_date"]["source"] == "ef"
-    assert draft["fields"]["price_per_gj"]["source"] == "sheet"
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+
+
+def test_price_comes_from_ef_not_sheet():
+    draft = compose_alinta_gas_draft(_extract(price_per_gj="15.90"), _sheet_lookup())
+    assert draft["fields"]["price_per_gj"]["value"].startswith("$15.90")
+    assert draft["fields"]["price_per_gj"]["source"] == "ef"
+    assert draft["fields"]["cpq_gj"]["source"] == "sheet"
+
+
+def test_empty_ef_price_is_not_filled_from_sheet():
+    draft = compose_alinta_gas_draft(_extract(price_per_gj=""), _sheet_lookup())
+    assert draft["fields"]["price_per_gj"]["value"] == ""
+    assert draft["fields"]["price_per_gj"]["source"] == "missing"
 
 
 def test_empty_ef_dates_are_not_filled_from_sheet():
