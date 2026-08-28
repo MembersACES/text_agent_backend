@@ -12,6 +12,7 @@ from googleapiclient.errors import HttpError
 
 from tools.member_folder_drive import (
     MemberFolderDriveError,
+    find_or_create_folder,
     upload_bytes_to_folder,
     _user_drive_service,
 )
@@ -371,6 +372,7 @@ def mimetype_for_filename(filename: str, content_type: Optional[str] = None) -> 
 
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
 _MAX_FILENAME_LEN = 180
+_MAX_FOLDER_NAME_LEN = 120
 
 
 def resolve_upload_filename(original: str, override: Optional[str] = None) -> str:
@@ -387,6 +389,12 @@ def resolve_upload_filename(original: str, override: Optional[str] = None) -> st
     if orig_ext and not new_ext:
         cleaned = f"{cleaned}{orig_ext}"
     return cleaned[:_MAX_FILENAME_LEN]
+
+
+def resolve_supplier_folder_name(name: str) -> str:
+    cleaned = _INVALID_FILENAME.sub("-", (name or "").strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .-")
+    return cleaned[:_MAX_FOLDER_NAME_LEN]
 
 
 def _normalize_file(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -448,6 +456,98 @@ def list_supplier_folders() -> Tuple[Optional[Dict[str, Any]], Optional[str], in
         "parent_folder_id": parent_id,
         "parent_folder_url": drive_folder_url(parent_id),
         "suppliers": suppliers,
+    }, None, 200
+
+
+def _supplier_row(fid: str, name: str, folder_url: str, modified_time: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "id": fid,
+        "name": name,
+        "folder_id": fid,
+        "folder_url": folder_url,
+        "category": classify_supplier(name).value,
+        "modified_time": modified_time,
+    }
+
+
+def create_supplier_folder(
+    name: str,
+    *,
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    folder_name = resolve_supplier_folder_name(name)
+    if not folder_name:
+        return None, "missing_name", 400
+
+    drive, err = _drive_or_error()
+    if err:
+        return None, err, 503
+
+    parent_id, parent_err = _discover_parent_id(drive)
+    if parent_err or not parent_id:
+        return None, parent_err or _not_configured_message(), 503
+
+    folders, list_err = _list_children(drive, parent_id, folders_only=True)
+    if list_err:
+        if list_err == "folder_not_found":
+            return None, (
+                "Supplier Folders was not found, or the service account cannot access it. "
+                "Share 005-Suppliers → Supplier Folders with the service account."
+            ), 502
+        return None, list_err.replace("drive_error:", "Google Drive error: "), 502
+
+    wanted = folder_name.lower()
+    for item in folders:
+        existing_name = (item.get("name") or "").strip()
+        fid = item.get("id")
+        if fid and existing_name.lower() == wanted:
+            return {
+                **_supplier_row(
+                    str(fid),
+                    existing_name,
+                    item.get("webViewLink") or drive_folder_url(str(fid)),
+                    item.get("modifiedTime"),
+                ),
+                "created": False,
+            }, None, 200
+
+    token = (user_access_token or "").strip() or None
+
+    def _create(service: Any) -> Tuple[str, bool]:
+        return find_or_create_folder(parent_id, folder_name, drive=service)
+
+    try:
+        folder_id, created = _create(drive)
+    except MemberFolderDriveError as e:
+        if token:
+            logger.info("Supplier folder create retrying as signed-in user name=%r", folder_name)
+            try:
+                folder_id, created = _create(_user_drive_service(token))
+            except MemberFolderDriveError as user_err:
+                logger.warning("Supplier folder create failed: %s", user_err.message)
+                return None, user_err.message, user_err.status_code
+        else:
+            logger.warning("Supplier folder create failed: %s", e.message)
+            return None, e.message, e.status_code
+    except HttpError as e:
+        if is_sa_quota_error(e):
+            if token:
+                try:
+                    folder_id, created = _create(_user_drive_service(token))
+                except MemberFolderDriveError as user_err:
+                    return None, user_err.message, user_err.status_code
+            else:
+                return None, (
+                    "Google blocked the folder create: the service account has no My Drive storage. "
+                    "Re-auth Google in the dashboard so the folder can be created as you, "
+                    "or move Supplier Folders into a Shared Drive."
+                ), 502
+        else:
+            return None, f"Google Drive error: {getattr(e, 'reason', e)}", 502
+
+    return {
+        **_supplier_row(folder_id, folder_name, drive_folder_url(folder_id)),
+        "created": created,
     }, None, 200
 
 
