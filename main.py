@@ -174,6 +174,7 @@ from tools.distributor_folders import (
     upload_distributor_document,
 )
 from tools.supplier_folders import (
+    create_supplier_folder,
     list_supplier_documents,
     list_supplier_folders,
     upload_supplier_document,
@@ -4612,6 +4613,31 @@ def suppliers_list(user_info: dict = Depends(verify_google_token)):
     _ = user_info
     payload, err, status = list_supplier_folders()
     if err:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.post("/api/suppliers")
+async def suppliers_create(
+    user_info: dict = Depends(verify_google_token),
+    name: str = Form(...),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Create a new supplier folder under 005-Suppliers → Supplier Folders."""
+    logging.info(
+        "suppliers/create name=%r user=%s has_user_drive_token=%s",
+        name,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    payload, err, status = create_supplier_folder(
+        name,
+        user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+    )
+    if err:
+        if err == "missing_name":
+            raise HTTPException(status_code=400, detail="Supplier name is required")
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
     return payload
 

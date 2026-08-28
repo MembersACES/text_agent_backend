@@ -7,6 +7,7 @@ from tools.supplier_folders import (
     classify_supplier,
     file_type_from_mime,
     mimetype_for_filename,
+    resolve_supplier_folder_name,
     resolve_upload_filename,
 )
 
@@ -78,3 +79,11 @@ def test_resolve_upload_filename():
     assert resolve_upload_filename(r"C:\tmp\form.docx", "Rates") == "Rates.docx"
     assert resolve_upload_filename("a.pdf", 'bad:name?.pdf') == "bad-name-.pdf"
     assert resolve_upload_filename("a.pdf", "   ") == "a.pdf"
+
+
+def test_resolve_supplier_folder_name():
+    assert resolve_supplier_folder_name("Visy") == "Visy"
+    assert resolve_supplier_folder_name("  Plus ES  ") == "Plus ES"
+    assert resolve_supplier_folder_name("bad:name?") == "bad-name"
+    assert resolve_supplier_folder_name("   ") == ""
+    assert resolve_supplier_folder_name("A / B") == "A - B"
