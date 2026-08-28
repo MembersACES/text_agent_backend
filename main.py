@@ -168,6 +168,11 @@ from tools.resources_drive_videos import (
     list_resources_folder_videos,
 )
 from tools.plus_es_dma import get_plus_es_dma_folder_id, list_plus_es_dma_pdfs
+from tools.supplier_folders import (
+    list_supplier_documents,
+    list_supplier_folders,
+    upload_supplier_document,
+)
 from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
@@ -4522,6 +4527,78 @@ def get_plus_es_dma_pdfs(user_info: dict = Depends(verify_google_token)):
         "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "pdfs": pdfs,
     }
+
+
+@app.get("/api/suppliers")
+def suppliers_list(user_info: dict = Depends(verify_google_token)):
+    """List supplier folders under 005-Suppliers → Supplier Folders (service account)."""
+    _ = user_info
+    payload, err, status = list_supplier_folders()
+    if err:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.get("/api/suppliers/{folder_id}/files")
+def suppliers_files(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+):
+    """List files and subfolders in a supplier folder or any nested folder under it."""
+    _ = user_info
+    payload, err, status = list_supplier_documents(folder_id)
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.post("/api/suppliers/{folder_id}/files")
+async def suppliers_upload(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+    filename: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Upload a document into a supplier folder or a nested folder under it."""
+    logging.info(
+        "suppliers/upload folder=%s file=%s user=%s has_user_drive_token=%s",
+        folder_id,
+        file.filename,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    contents = await file.read()
+    payload, err, status = upload_supplier_document(
+        folder_id,
+        contents,
+        file.filename or "upload.bin",
+        content_type=file.content_type,
+        display_name=filename.strip() or None,
+        user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+    )
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "empty_file":
+            raise HTTPException(status_code=400, detail="Empty file")
+        if err == "file_too_large":
+            raise HTTPException(status_code=400, detail="File is larger than 50 MB")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
 
 
 def _verify_video_write_auth(authorization: str) -> None:
