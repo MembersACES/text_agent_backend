@@ -20,3 +20,4 @@ pypdf
 reportlab
 pillow
 pymupdf
+openpyxl
