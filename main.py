@@ -154,6 +154,14 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.new_revenue import (
+    log_invoice_to_sheets as log_new_revenue_invoice_to_sheets,
+    get_invoice_history as get_new_revenue_invoice_history,
+    update_invoice_status as update_new_revenue_invoice_status,
+    update_invoice_file_id as update_new_revenue_invoice_file_id,
+    get_next_sequential_invoice_number as get_next_new_revenue_invoice_number,
+    resolve_upload_folder_id as resolve_new_revenue_upload_folder_id,
+)
 from tools.solar_cleaning_quote import generate_solar_cleaning_quote, preview_solar_quote_extract
 from services.vinyl_wrap_spec import generate_vinyl_wrap_spec_payload
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
@@ -188,6 +196,7 @@ from tools.testimonial_solution_content import (
     resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
+from tools.dma_contract_details import file_dma_contract_details
 
 # Database imports
 from database import get_db, init_db
@@ -717,6 +726,37 @@ class EOIGenerationRequest(DocumentGenerationRequest):
 
 class EngagementFormGenerationRequest(DocumentGenerationRequest):
     engagement_form_type: str
+
+class DmaContractDetailsRequest(BaseModel):
+    nmi: str
+    business: str = ""
+    business_name: str = ""
+    abn: str = ""
+    postal_address: str = ""
+    main_address: str = ""
+    site_address: str = ""
+    frmp: str = ""
+    retailer: str = ""
+    contact: str = ""
+    contact_name: str = ""
+    position: str = ""
+    telephone: str = ""
+    contact_number: str = ""
+    email: str = ""
+    meter: str = ""
+    dma_price: str = ""
+    vas: str = ""
+    vas_price: str = ""
+    start_date: str = ""
+    dma_start_date: str = ""
+    end_date: str = ""
+    dma_end_date: str = ""
+    engagement_form_link: str = ""
+    client_folder_url: str = ""
+    offer_id: Optional[int] = None
+    client_id: Optional[int] = None
+    row_number: Optional[int] = None
+
 
 class UtilityInfoRequest(BaseModel):
     business_name: str
@@ -6990,6 +7030,35 @@ def generate_engagement_form_endpoint(
         logging.error(f"Error generating Engagement Form for {request.business_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating Engagement Form: {str(e)}")
 
+@app.post("/api/dma/contract-details")
+def dma_contract_details_endpoint(
+    request: DmaContractDetailsRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Fill the DMA contract-details spreadsheet and file it next to the engagement form."""
+    payload = request.model_dump()
+    logging.info(
+        "DMA contract details request nmi=%s business=%s offer_id=%s has_user_drive_token=%s",
+        request.nmi,
+        request.business or request.business_name,
+        request.offer_id,
+        bool((x_google_access_token or "").strip()),
+    )
+    try:
+        result = file_dma_contract_details(
+            payload,
+            db=db,
+            user_access_token=(x_google_access_token or "").strip() or None,
+        )
+        if isinstance(result, dict):
+            result["user_email"] = user_info.get("email")
+        return result
+    except Exception as e:
+        logging.exception("DMA contract details failed for nmi=%s", request.nmi)
+        return {"status": "error", "message": str(e)}
+
 @app.post("/api/generate-ghg-offer")
 def generate_ghg_offer_endpoint(
     request: DocumentGenerationRequest,
@@ -8420,6 +8489,285 @@ async def upload_invoice_pdf_endpoint(
         logging.error(f"Error uploading PDF: {str(e)}")
         logging.exception(e)
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+def _new_revenue_auth(authorization: str, request_data: dict, allow_access_token: bool = False) -> dict:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    if token == os.getenv("BACKEND_API_KEY", "test-key"):
+        return {"email": request_data.get("user_email", "api_user@example.com")}
+    if allow_access_token:
+        return {"email": request_data.get("user_email", "unknown@example.com")}
+    try:
+        return verify_google_token(authorization)
+    except Exception as exc:
+        logging.error("Token verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+
+@app.post("/api/new-revenue/log")
+async def log_new_revenue_invoice_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    request_data = await request.json()
+    user_info = _new_revenue_auth(authorization, request_data)
+    invoice_file_id = request_data.get("invoice_file_id", "") or request_data.get("file_id", "")
+    invoice_data = {
+        "invoice_number": request_data.get("invoice_number"),
+        "business_name": request_data.get("business_name"),
+        "business_abn": request_data.get("business_abn", ""),
+        "contact_name": request_data.get("contact_name", ""),
+        "contact_email": request_data.get("contact_email", ""),
+        "invoice_date": request_data.get("invoice_date"),
+        "due_date": request_data.get("due_date"),
+        "line_items": request_data.get("line_items", []),
+        "subtotal": request_data.get("subtotal", 0),
+        "total_gst": request_data.get("total_gst", 0),
+        "total_amount": request_data.get("total_amount", 0),
+        "status": request_data.get("status", "Generated"),
+        "created_at": request_data.get("created_at"),
+        "invoice_file_id": invoice_file_id,
+    }
+    result = log_new_revenue_invoice_to_sheets(invoice_data)
+    result["user_email"] = user_info.get("email")
+    try:
+        business_name = invoice_data.get("business_name") or ""
+        if business_name:
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=business_name,
+                external_business_id=None,
+                primary_contact_email=invoice_data.get("contact_email") or None,
+                gdrive_folder_url=None,
+            )
+            if client:
+                offer = get_or_create_offer_for_activity(
+                    db=db,
+                    client_id=client.id,
+                    business_name=client.business_name,
+                    utility_type="new_revenue",
+                    created_by=user_info.get("email"),
+                    utility_type_identifier="Discrepancy / New Revenue Invoice",
+                    identifier=invoice_data.get("invoice_number"),
+                )
+                create_offer_activity(
+                    db=db,
+                    offer=offer,
+                    client=client,
+                    activity_type=OfferActivityType.NEW_REVENUE_INVOICE,
+                    document_link=None,
+                    external_id=None,
+                    metadata={
+                        "source": "new_revenue",
+                        "invoice_number": invoice_data.get("invoice_number"),
+                        "total_amount": invoice_data.get("total_amount"),
+                        "due_date": invoice_data.get("due_date"),
+                        "line_items": invoice_data.get("line_items", []),
+                        "invoice_file_id": invoice_data.get("invoice_file_id"),
+                    },
+                    created_by=user_info.get("email"),
+                )
+    except Exception as exc:
+        logging.error(
+            "Failed to create CRM activity for new revenue invoice %s: %s",
+            invoice_data.get("invoice_number"),
+            exc,
+        )
+    return result
+
+
+@app.post("/api/new-revenue/history")
+async def get_new_revenue_history_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    user_info = _new_revenue_auth(authorization, request_data)
+    result = get_new_revenue_invoice_history(request_data.get("business_name") or "")
+    result["user_email"] = user_info.get("email")
+    return result
+
+
+@app.post("/api/new-revenue/next-invoice-number")
+async def get_new_revenue_next_invoice_number_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    return {"invoice_number": get_next_new_revenue_invoice_number()}
+
+
+@app.patch("/api/new-revenue/status")
+async def update_new_revenue_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(status_code=400, detail="business_name, invoice_number and status are required")
+    result = update_new_revenue_invoice_status(business_name, invoice_number, status)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Failed to update status")
+    return result
+
+
+@app.patch("/api/new-revenue/file-id")
+async def update_new_revenue_file_id_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    file_id = (request_data.get("file_id") or request_data.get("invoice_file_id") or "").strip()
+    if not business_name or not invoice_number or not file_id:
+        raise HTTPException(status_code=400, detail="business_name, invoice_number and file_id are required")
+    result = update_new_revenue_invoice_file_id(business_name, invoice_number, file_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Failed to update file_id")
+    return result
+
+
+@app.post("/api/new-revenue/upload-pdf")
+async def upload_new_revenue_pdf_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Same path as 1st Month Savings: n8n file-upload webhook → Drive → file_id."""
+    import base64
+    import uuid
+    from tools.n8n_file_upload import UPLOAD_TYPE_NEW_REVENUE, upload_file_via_n8n
+    from tools.one_month_savings import oms_upload_fail, oms_upload_http_detail, oms_upload_log
+
+    request_data = await request.json()
+    request_id = (request_data.get("request_id") or "").strip() or str(uuid.uuid4())
+    user_info = _new_revenue_auth(authorization, request_data, allow_access_token=True)
+    pdf_base64 = request_data.get("pdf_base64")
+    filename = request_data.get("filename")
+    invoice_number = request_data.get("invoice_number")
+    business_name = request_data.get("business_name") or ""
+    if not pdf_base64 or not filename:
+        raise HTTPException(
+            status_code=400,
+            detail=oms_upload_http_detail(
+                error_code="MISSING_FIELDS",
+                message="Missing required fields: pdf_base64 and filename",
+                request_id=request_id,
+            ),
+        )
+
+    pdf_bytes = base64.b64decode(pdf_base64)
+    folder_id = resolve_new_revenue_upload_folder_id()
+    if not folder_id:
+        oms_upload_fail(
+            request_id=request_id,
+            invoice_number=invoice_number,
+            path="config",
+            error_code="FOLDER_NOT_CONFIGURED",
+            message="NEW_REVENUE_DRIVE_FOLDER_ID / ONE_MONTH_SAVINGS_DRIVE_FOLDER_ID not configured",
+            http_status=500,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=oms_upload_http_detail(
+                error_code="FOLDER_NOT_CONFIGURED",
+                message="Invoice storage folder ID not configured",
+                request_id=request_id,
+            ),
+        )
+
+    extra_form: Dict[str, str] = {}
+    if invoice_number:
+        extra_form["invoice_number"] = str(invoice_number).strip()
+    for key in (
+        "due_date",
+        "invoice_date",
+        "status",
+        "subtotal",
+        "total_gst",
+        "total_amount",
+        "solution",
+        "savings_amount",
+        "gst",
+        "total_invoice",
+        "line_items",
+        "gross_amount",
+        "fee_percent",
+        "fee_amount",
+    ):
+        val = request_data.get(key)
+        if val is not None and str(val).strip() != "":
+            extra_form[key] = str(val).strip()
+    if "savings_amount" not in extra_form and extra_form.get("fee_amount"):
+        extra_form["savings_amount"] = extra_form["fee_amount"]
+
+    oms_upload_log(
+        logging.INFO,
+        "n8n upload start",
+        request_id=request_id,
+        invoice_number=invoice_number,
+        stage="n8n",
+        business=business_name,
+        folder_id=folder_id,
+        upload_type=UPLOAD_TYPE_NEW_REVENUE,
+    )
+
+    n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
+        file_bytes=pdf_bytes,
+        filename=filename,
+        upload_type=UPLOAD_TYPE_NEW_REVENUE,
+        business_name=business_name,
+        drive_folder=folder_id,
+        content_type="application/pdf",
+        request_id=request_id,
+        requested_by=user_info.get("email"),
+        extra_form=extra_form,
+    )
+
+    if not n8n_ok:
+        error_code = n8n_result.get("error_code") or "N8N_UPLOAD_FAILED"
+        error_msg = n8n_result.get("message") or "Invoice upload workflow failed."
+        remediation = (
+            "Check n8n workflow 'file-upload' Switch has a rule for upload_type=new_revenue_invoice "
+            "(copy the 1st Month Savings Drive upload branch, different folder/sheet)."
+        )
+        oms_upload_fail(
+            request_id=request_id,
+            invoice_number=invoice_number,
+            path="n8n",
+            error_code=error_code,
+            message=error_msg,
+            remediation=remediation,
+            http_status=n8n_status,
+            folder_id=folder_id,
+        )
+        raise HTTPException(
+            status_code=502 if n8n_status >= 500 else 403,
+            detail=oms_upload_http_detail(
+                error_code=error_code,
+                message=error_msg,
+                request_id=request_id,
+                remediation=remediation,
+                folder_id=folder_id,
+            ),
+        )
+
+    file_id = n8n_result.get("file_id")
+    return {
+        "success": True,
+        "file_id": file_id,
+        "file_url": n8n_result.get("file_url") or f"https://drive.google.com/file/d/{file_id}/view",
+        "request_id": request_id,
+    }
 
 
 class SolarCleaningQuoteGenerateRequest(BaseModel):

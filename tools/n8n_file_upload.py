@@ -4,6 +4,7 @@ Unified n8n webhook for Drive file uploads (testimonials + 1st month savings inv
 n8n Switch node should branch on `upload_type`:
   - testimonial
   - one_month_savings_invoice
+  - new_revenue_invoice
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ N8N_FILE_UPLOAD_WEBHOOK = os.getenv(
 
 UPLOAD_TYPE_TESTIMONIAL = "testimonial"
 UPLOAD_TYPE_ONE_MONTH_SAVINGS = "one_month_savings_invoice"
+UPLOAD_TYPE_NEW_REVENUE = "new_revenue_invoice"
 
 FILE_UPLOAD_LOG_PREFIX = "[FILE_UPLOAD]"
 

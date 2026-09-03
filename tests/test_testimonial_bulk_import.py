@@ -28,9 +28,17 @@ def test_new_types_are_allowlisted():
         assert "Describe the challenge" not in challenge
 
 
+def test_association_endorsement_is_allowlisted():
+    assert "association_endorsement" in ALL_SOLUTION_TYPE_IDS
+    challenge = DEFAULT_CONTENT["association_endorsement"]["key_challenge_of_solution"]
+    assert "Describe the challenge" not in challenge
+    assert "sub-branch" in challenge.lower()
+
+
 def test_folder_maps_to_expected_types():
     cases = {
         "SERVICE /Frankston RSL minimalist Testimonial 04.06.png": "client_endorsement",
+        "Association /RSL Victoria testimonial - Association Endorsement.docx": "association_endorsement",
         "GHG/Darebin RSL minimalist ghg roadmap 04.06.png": "ghg_roadmap",
         "Solar Review /Healesville RSL Solar Review.png": "solar_review",
         "Gas Discrepancy /Copy of Testimonial_-_Frankston_RSL_-_Gas_Discrepancy_Recovery.docx": "gas_discrepancy",
@@ -71,6 +79,7 @@ def test_aaa_suffixes():
     assert type_from_aaa_filename("Frankston RSL testimonial - Gas Billing Discrepancy Recovery.docx") == "gas_discrepancy"
     assert type_from_aaa_filename("Cheltenham RSL testimonial - GHG Roadmap and Cooking Oil.docx") == "ghg_roadmap"
     assert type_from_aaa_filename("Longbeach RSL testimonial - Client Endorsement.docx") == "client_endorsement"
+    assert type_from_aaa_filename("RSL Victoria testimonial - Association Endorsement.docx") == "association_endorsement"
     assert type_from_aaa_filename("Healesville RSL testimonial - Solar Review.docx") == "solar_review"
     assert type_from_aaa_filename("Swin Alumni (Geelong & Surfcoast Laundry) testimonial - Gas Billing Discrepancy Recovery.docx") == "gas_discrepancy"
 
@@ -80,6 +89,7 @@ def test_member_hints():
     assert "Healesville" in member_hint_from_filename("Healesville RSL Solar Review.png")
     assert "Darebin" in member_hint_from_filename("Testimonial - Solar Panel Cleaning - Darebin RSL Sub Branch Inc.pdf")
     assert "swin" in member_hint_from_filename("Testimonial - SWIN ALUMNI PTY LTD (1).pdf").lower()
+    assert "Victoria" in member_hint_from_filename("RSL Victoria testimonial - Association Endorsement.docx")
 
 
 def test_prefers_aaa_word_over_png_and_copy_of():
