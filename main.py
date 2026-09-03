@@ -1754,12 +1754,18 @@ async def site_photos_upload(
     files: List[UploadFile] = File(default=[]),
     business_name: str = Form(""),
     gdrive_url: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+    photo_names: List[str] = Form(default=[]),
 ):
+    names = photo_names if isinstance(photo_names, list) else ([photo_names] if photo_names else [])
+    user_drive_token = (google_access_token or x_google_access_token or "").strip()
     logging.info(
-        "site-photos/upload business_name=%r count=%s user=%s",
+        "site-photos/upload business_name=%r count=%s user=%s has_user_drive_token=%s",
         business_name,
         len(files or []),
         user_info.get("email"),
+        bool(user_drive_token),
     )
     payloads: list[tuple[str, str, bytes]] = []
     for upload in files or []:
@@ -1776,6 +1782,8 @@ async def site_photos_upload(
             gdrive_url,
             payloads,
             business_name=business_name,
+            user_access_token=user_drive_token,
+            display_names=names,
         )
     except SitePhotosError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e

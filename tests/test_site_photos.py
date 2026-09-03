@@ -3,12 +3,14 @@
 from unittest.mock import MagicMock
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from tools.site_photos import (
     SitePhotosError,
     is_allowed_image,
     is_site_photos_folder_name,
     list_site_photos,
+    photo_drive_filename,
     prefixed_filename,
     upload_site_photos,
 )
@@ -34,6 +36,19 @@ def test_prefixed_filename():
     assert prefixed_filename("Acme Pty Ltd", "IMG_1.jpg") == "Acme Pty Ltd - IMG_1.jpg"
     assert prefixed_filename("Acme Pty Ltd", "Acme Pty Ltd - IMG_1.jpg") == "Acme Pty Ltd - IMG_1.jpg"
     assert prefixed_filename("", "IMG_1.jpg") == "IMG_1.jpg"
+
+
+def test_photo_drive_filename_uses_display_name_and_original_ext():
+    assert photo_drive_filename("Acme Pty Ltd", "IMG_1.jpg", "Meter board") == (
+        "Acme Pty Ltd - Meter board.jpg"
+    )
+    assert photo_drive_filename("Acme Pty Ltd", "IMG_1.jpg", "Meter board.png") == (
+        "Acme Pty Ltd - Meter board.jpg"
+    )
+    assert photo_drive_filename("Acme Pty Ltd", "IMG_1.jpg", "") == "Acme Pty Ltd - IMG_1.jpg"
+    assert photo_drive_filename("Acme Pty Ltd", "IMG_1.jpg", "bad:name") == (
+        "Acme Pty Ltd - bad_name.jpg"
+    )
 
 
 def _drive_mock(
@@ -154,3 +169,64 @@ def test_upload_rejects_non_image():
             drive=drive,
         )
     assert exc.value.status_code == 400
+
+
+def test_upload_uses_display_name():
+    drive = _drive_mock(exact_folders=[{"id": "sitePhotosFolder1", "name": "Site Photos"}])
+    result = upload_site_photos(
+        "https://drive.google.com/drive/folders/parentFolderId123",
+        [("IMG_99.jpg", "image/jpeg", b"fakepngbytes")],
+        business_name="Acme Pty Ltd",
+        drive=drive,
+        display_names=["Meter board"],
+    )
+    assert result["files"][0]["name"] == "Acme Pty Ltd - Meter board.jpg"
+
+
+def test_upload_retries_as_user_on_sa_quota(monkeypatch):
+    quota = HttpError(
+        MagicMock(status=403, reason="Service Accounts do not have storage quota."),
+        b"{}",
+    )
+    sa_drive = MagicMock()
+    sa_files = MagicMock()
+    sa_drive.files.return_value = sa_files
+
+    def sa_list(**kwargs):
+        mock = MagicMock()
+        mock.execute.return_value = {
+            "files": [{"id": "sitePhotosFolder1", "name": "Site Photos"}],
+        }
+        return mock
+
+    def sa_create(**kwargs):
+        raise quota
+
+    sa_files.list.side_effect = sa_list
+    sa_files.create.side_effect = sa_create
+    sa_files.get.return_value.execute.return_value = {
+        "id": "sitePhotosFolder1",
+        "driveId": "shared1",
+    }
+
+    user_drive = _drive_mock(
+        exact_folders=[{"id": "sitePhotosFolder1", "name": "Site Photos"}],
+        uploaded=[
+            {
+                "id": "photo1",
+                "name": "Acme Pty Ltd - IMG_99.jpg",
+                "mimeType": "image/jpeg",
+                "webViewLink": "https://drive.google.com/file/d/photo1/view",
+            }
+        ],
+    )
+    monkeypatch.setattr("tools.site_photos._user_drive_service", lambda token: user_drive)
+
+    result = upload_site_photos(
+        "https://drive.google.com/drive/folders/parentFolderId123",
+        [("IMG_99.jpg", "image/jpeg", b"bytes")],
+        business_name="Acme Pty Ltd",
+        drive=sa_drive,
+        user_access_token="ya29.user",
+    )
+    assert result["files"][0]["id"] == "photo1"

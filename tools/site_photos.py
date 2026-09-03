@@ -12,7 +12,7 @@ from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 
 from tools.one_month_savings import extract_folder_id_from_url, get_drive_service
-from tools.share_folder import drive_file_url, drive_folder_url
+from tools.share_folder import drive_file_url, drive_folder_url, is_sa_quota_error
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,25 @@ def prefixed_filename(business_name: str, original_name: str) -> str:
     return f"{expected}{filename}"
 
 
+def photo_drive_filename(
+    business_name: str,
+    original_name: str,
+    display_name: str = "",
+) -> str:
+    original = safe_filename(original_name)
+    ext = Path(original).suffix
+    if ext.lower() not in EXT_TO_MIME:
+        ext = ext or ".jpg"
+    label = (display_name or "").strip()
+    if label:
+        label_path = Path(label)
+        if label_path.suffix.lower() in EXT_TO_MIME:
+            label = label_path.stem
+        label = re.sub(r'[\\/:*?"<>|]+', "_", label).strip(" .") or Path(original).stem
+        return prefixed_filename(business_name, f"{label}{ext}")
+    return prefixed_filename(business_name, original)
+
+
 def resolve_image_mime(filename: str, content_type: str) -> str:
     mime = (content_type or "").split(";")[0].strip().lower()
     if mime in ALLOWED_MIME_TYPES:
@@ -113,11 +132,33 @@ def _escape_drive_query(value: str) -> str:
 
 
 def _drive_error_message(exc: HttpError) -> str:
+    if is_sa_quota_error(exc):
+        return (
+            "Google blocked the upload: the service account has no My Drive storage. "
+            "Re-auth Google in the dashboard so the photo can be uploaded as you, "
+            "or move the member folder into a Shared Drive."
+        )
     reason = getattr(exc, "reason", None) or str(exc)
     code = getattr(exc, "status_code", None)
     if code:
         return f"Drive API {code}: {reason}"
     return f"Drive API error: {reason}"
+
+
+def _user_drive_service(access_token: str) -> Any:
+    from google.oauth2.credentials import Credentials as UserCredentials
+    from googleapiclient.discovery import build
+
+    creds = UserCredentials(token=(access_token or "").strip())
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _retry_as_user(exc: HttpError, user_access_token: str, action: str) -> Any | None:
+    token = (user_access_token or "").strip()
+    if token and is_sa_quota_error(exc):
+        logger.info("[site_photos] SA quota on %s; retrying as signed-in user", action)
+        return _user_drive_service(token)
+    return None
 
 
 def _require_drive(drive: Any | None) -> Any:
@@ -199,26 +240,41 @@ def find_site_photos_folder_id(drive: Any, parent_id: str) -> Optional[str]:
     return None
 
 
-def get_or_create_site_photos_folder(drive: Any, parent_id: str) -> tuple[str, bool]:
+def get_or_create_site_photos_folder(
+    drive: Any,
+    parent_id: str,
+    user_access_token: str = "",
+) -> tuple[str, bool]:
     existing = find_site_photos_folder_id(drive, parent_id)
     if existing:
         return existing, False
-    created = (
-        drive.files()
-        .create(
-            body={
-                "name": CANONICAL_FOLDER_NAME,
-                "mimeType": FOLDER_MIME,
-                "parents": [parent_id],
-            },
-            fields="id",
-            supportsAllDrives=True,
+
+    def _create(svc: Any) -> str:
+        created = (
+            svc.files()
+            .create(
+                body={
+                    "name": CANONICAL_FOLDER_NAME,
+                    "mimeType": FOLDER_MIME,
+                    "parents": [parent_id],
+                },
+                fields="id",
+                supportsAllDrives=True,
+            )
+            .execute()
         )
-        .execute()
-    )
-    folder_id = created.get("id")
-    if not isinstance(folder_id, str) or not folder_id.strip():
-        raise SitePhotosError("Drive created a folder but returned no id.", status_code=502)
+        folder_id = created.get("id")
+        if not isinstance(folder_id, str) or not folder_id.strip():
+            raise SitePhotosError("Drive created a folder but returned no id.", status_code=502)
+        return folder_id
+
+    try:
+        folder_id = _create(drive)
+    except HttpError as e:
+        user_drive = _retry_as_user(e, user_access_token, "create folder")
+        if user_drive is None:
+            raise
+        folder_id = _create(user_drive)
     logger.info("[site_photos] created folder id=%s parent=%s", folder_id, parent_id)
     return folder_id, True
 
@@ -332,17 +388,27 @@ def _upload_image(
     content: bytes,
     mime_type: str,
     drive_id: Optional[str],
+    user_access_token: str = "",
 ) -> dict[str, Any]:
-    media = MediaIoBaseUpload(BytesIO(content), mimetype=mime_type, resumable=True)
-    create_params: dict[str, Any] = {
-        "body": {"name": filename, "parents": [folder_id]},
-        "media_body": media,
-        "fields": "id,name,mimeType,webViewLink,thumbnailLink,createdTime,modifiedTime",
-        "supportsAllDrives": True,
-    }
-    if drive_id:
-        create_params["driveId"] = drive_id
-    created = drive.files().create(**create_params).execute()
+    def _create(svc: Any) -> dict[str, Any]:
+        media = MediaIoBaseUpload(BytesIO(content), mimetype=mime_type, resumable=True)
+        create_params: dict[str, Any] = {
+            "body": {"name": filename, "parents": [folder_id]},
+            "media_body": media,
+            "fields": "id,name,mimeType,webViewLink,thumbnailLink,createdTime,modifiedTime",
+            "supportsAllDrives": True,
+        }
+        if drive_id:
+            create_params["driveId"] = drive_id
+        return svc.files().create(**create_params).execute()
+
+    try:
+        created = _create(drive)
+    except HttpError as e:
+        user_drive = _retry_as_user(e, user_access_token, "upload file")
+        if user_drive is None:
+            raise
+        created = _create(user_drive)
     serialized = _serialize_photo(created)
     if not serialized:
         fid = created.get("id")
@@ -365,6 +431,8 @@ def upload_site_photos(
     files: list[tuple[str, str, bytes]],
     business_name: str = "",
     drive: Any | None = None,
+    user_access_token: str = "",
+    display_names: list[str] | None = None,
 ) -> dict[str, Any]:
     if not files:
         raise SitePhotosError("No files were provided.", status_code=400)
@@ -374,10 +442,15 @@ def upload_site_photos(
             status_code=400,
         )
 
+    labels = list(display_names or [])
     parent_id = _require_parent_id(gdrive_url)
     service = _require_drive(drive)
     try:
-        folder_id, created = get_or_create_site_photos_folder(service, parent_id)
+        folder_id, created = get_or_create_site_photos_folder(
+            service,
+            parent_id,
+            user_access_token,
+        )
     except HttpError as e:
         raise SitePhotosError(_drive_error_message(e), status_code=502) from e
 
@@ -385,8 +458,9 @@ def upload_site_photos(
     uploaded: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for original_name, content_type, content in files:
-        filename = prefixed_filename(business_name, original_name)
+    for index, (original_name, content_type, content) in enumerate(files):
+        display_name = labels[index] if index < len(labels) else ""
+        filename = photo_drive_filename(business_name, original_name, display_name)
         mime_type = resolve_image_mime(original_name, content_type)
         if not mime_type:
             errors.append(
@@ -409,7 +483,15 @@ def upload_site_photos(
             continue
         try:
             uploaded.append(
-                _upload_image(service, folder_id, filename, content, mime_type, drive_id)
+                _upload_image(
+                    service,
+                    folder_id,
+                    filename,
+                    content,
+                    mime_type,
+                    drive_id,
+                    user_access_token,
+                )
             )
         except HttpError as e:
             errors.append({"name": filename, "error": _drive_error_message(e)})
