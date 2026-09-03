@@ -6,10 +6,14 @@ copied into Postgres.
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 from typing import Any, Optional
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
 RETELL_LLM_TYPE = "retell-llm"
@@ -43,10 +47,19 @@ def _headers() -> dict[str, str]:
 
 def _message_from_body(body: Any, fallback: str) -> str:
     if isinstance(body, dict):
-        for key in ("message", "detail", "error"):
+        for key in ("message", "detail", "error", "error_message", "msg"):
             val = body.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip()
+        # Retell sometimes nests the reason, or returns a validation list. Without
+        # this the caller got a bare "Retell returned 400." with no way to tell
+        # what it objected to — which cost a full afternoon on 3 Sep.
+        for key in ("error", "detail", "errors"):
+            val = body.get(key)
+            if isinstance(val, (dict, list)) and val:
+                return f"{fallback} Retell said: {json.dumps(val)[:400]}"
+        if body:
+            return f"{fallback} Retell body: {json.dumps(body)[:400]}"
     if isinstance(body, str) and body.strip():
         return body.strip()[:500]
     return fallback
@@ -166,10 +179,19 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
             if "is_published" in llm:
                 llm_is_published = bool(llm.get("is_published"))
 
+    # Retell stores this as {"type": "prompt"|"static_sentence"|"hang_up", "text": ...}.
+    # This used to read voicemail["action"], which does not exist, so it always came
+    # back None and the dashboard rendered its default ("Hang up") for agents that
+    # were in fact leaving a message. Read the real key, fall back to "action" only
+    # for whatever older shape that line was written for.
     voicemail = agent.get("voicemail_option")
     voicemail_action: Optional[str] = None
     if isinstance(voicemail, dict):
-        voicemail_action = str(voicemail.get("action") or "").strip() or None
+        vtype = str(voicemail.get("type") or voicemail.get("action") or "").strip().lower()
+        if vtype in ("hang_up", "hangup", "hang up"):
+            voicemail_action = "hang up"
+        elif vtype:
+            voicemail_action = "leave a message"
     elif isinstance(voicemail, str) and voicemail.strip():
         voicemail_action = voicemail.strip()
 
@@ -276,10 +298,20 @@ def update_agent_prompt(
         agent_patch["max_call_duration_ms"] = max_call_duration_ms
     if end_call_after_silence_ms is not None:
         agent_patch["end_call_after_silence_ms"] = end_call_after_silence_ms
+    # Deliberately NOT written. This sent {"action": "<string>"} and Retell answers
+    # 400, which surfaced to the dashboard as a bare 502 Bad Gateway and blocked
+    # EVERY save on this screen, prompt edits included. Retell wants
+    # {"type": ..., "text": ...}; the dashboard only has a single free-text field,
+    # so it cannot express that yet. Until it can, the voicemail setting is edited
+    # in Retell directly and a save here leaves it untouched rather than breaking.
     if voicemail_action is not None:
-        action = voicemail_action.strip().lower()
-        if action:
-            agent_patch["voicemail_option"] = {"action": action}
+        logger.warning(
+            "Ignoring voicemail_action=%r for agent %s: Retell expects "
+            "{type, text} and this endpoint cannot build it yet. Edit voicemail "
+            "in Retell directly. Everything else in this request still saved.",
+            voicemail_action,
+            agent_id,
+        )
 
     if agent_patch:
         _request("PATCH", f"/update-agent/{agent_id}", json_body=agent_patch)
