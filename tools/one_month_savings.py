@@ -390,6 +390,8 @@ def upload_file_to_drive(
             mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         elif filename.lower().endswith(".doc"):
             mimetype = "application/msword"
+        elif filename.lower().endswith(".xlsx"):
+            mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     try:
         logger.info(f"Uploading file '{filename}' (mimetype={mimetype}) to folder {folder_id}")
         if not drive_service:

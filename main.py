@@ -196,6 +196,7 @@ from tools.testimonial_solution_content import (
     resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
+from tools.dma_contract_details import file_dma_contract_details
 
 # Database imports
 from database import get_db, init_db
@@ -725,6 +726,37 @@ class EOIGenerationRequest(DocumentGenerationRequest):
 
 class EngagementFormGenerationRequest(DocumentGenerationRequest):
     engagement_form_type: str
+
+class DmaContractDetailsRequest(BaseModel):
+    nmi: str
+    business: str = ""
+    business_name: str = ""
+    abn: str = ""
+    postal_address: str = ""
+    main_address: str = ""
+    site_address: str = ""
+    frmp: str = ""
+    retailer: str = ""
+    contact: str = ""
+    contact_name: str = ""
+    position: str = ""
+    telephone: str = ""
+    contact_number: str = ""
+    email: str = ""
+    meter: str = ""
+    dma_price: str = ""
+    vas: str = ""
+    vas_price: str = ""
+    start_date: str = ""
+    dma_start_date: str = ""
+    end_date: str = ""
+    dma_end_date: str = ""
+    engagement_form_link: str = ""
+    client_folder_url: str = ""
+    offer_id: Optional[int] = None
+    client_id: Optional[int] = None
+    row_number: Optional[int] = None
+
 
 class UtilityInfoRequest(BaseModel):
     business_name: str
@@ -6997,6 +7029,35 @@ def generate_engagement_form_endpoint(
     except Exception as e:
         logging.error(f"Error generating Engagement Form for {request.business_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating Engagement Form: {str(e)}")
+
+@app.post("/api/dma/contract-details")
+def dma_contract_details_endpoint(
+    request: DmaContractDetailsRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Fill the DMA contract-details spreadsheet and file it next to the engagement form."""
+    payload = request.model_dump()
+    logging.info(
+        "DMA contract details request nmi=%s business=%s offer_id=%s has_user_drive_token=%s",
+        request.nmi,
+        request.business or request.business_name,
+        request.offer_id,
+        bool((x_google_access_token or "").strip()),
+    )
+    try:
+        result = file_dma_contract_details(
+            payload,
+            db=db,
+            user_access_token=(x_google_access_token or "").strip() or None,
+        )
+        if isinstance(result, dict):
+            result["user_email"] = user_info.get("email")
+        return result
+    except Exception as e:
+        logging.exception("DMA contract details failed for nmi=%s", request.nmi)
+        return {"status": "error", "message": str(e)}
 
 @app.post("/api/generate-ghg-offer")
 def generate_ghg_offer_endpoint(
