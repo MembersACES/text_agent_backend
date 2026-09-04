@@ -322,11 +322,11 @@ def update_agent_prompt(
     if not llm_patch and not agent_patch:
         raise RetellAgentsError(400, "No Retell fields to update.")
 
-    updated = publish_agent(agent_id)
-    return updated
+    publish_agent(agent_id)
+    return get_agent_prompt(agent_id)
 
 
-def publish_agent(agent_id: str) -> dict[str, Any]:
+def publish_agent(agent_id: str) -> bool:
     """Make the agent's current draft the live version.
 
     Retell keeps every write as a DRAFT. A PATCH to /update-agent or
@@ -341,33 +341,37 @@ def publish_agent(agent_id: str) -> dict[str, Any]:
     did not. Instead it logs loudly and reports is_published on the way out, so
     the caller can see the difference between "saved and live" and "saved only".
     """
-    current = get_agent_prompt(agent_id)
-    version = current.get("version")
-    if version is None:
-        logger.error(
-            "Cannot publish agent %s: Retell returned no version. The change is "
-            "SAVED AS A DRAFT and will not be heard on any call until it is "
-            "published in Retell.",
-            agent_id,
-        )
-        return current
     try:
+        version = get_agent_prompt(agent_id).get("version")
+        if version is None:
+            logger.error(
+                "Cannot publish agent %s: Retell returned no version. The change is "
+                "SAVED AS A DRAFT and will not be heard on any call until it is "
+                "published in Retell.",
+                agent_id,
+            )
+            return False
         _request(
             "POST",
             f"/publish-agent-version/{agent_id}",
             json_body={"version": int(version)},
         )
-    except RetellAgentsError as e:
+        logger.info("Published agent %s version %s", agent_id, version)
+        return True
+    except Exception as e:  # noqa: BLE001
+        # EVERYTHING here is best-effort. The save has already gone through by the
+        # time this runs, so any exception escaping would tell the dashboard the
+        # edit failed when it did not — which is exactly what happened on the
+        # first deploy of this function: get_agent_prompt sat outside the guard,
+        # so one bad response from Retell turned a successful save into an error
+        # on screen. Log it, report the failure as False, never raise.
         logger.error(
-            "Agent %s saved but NOT published (version %s): %s. It will not be "
-            "heard on any call until it is published in Retell.",
+            "Agent %s saved but NOT published: %s. It will not be heard on any "
+            "call until it is published in Retell.",
             agent_id,
-            version,
-            e.detail,
+            e,
         )
-        return current
-    logger.info("Published agent %s version %s", agent_id, version)
-    return get_agent_prompt(agent_id)
+        return False
 
 
 _LLM_OMIT = {
