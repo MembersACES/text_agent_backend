@@ -163,12 +163,23 @@ def _engine(agent: dict[str, Any]) -> dict[str, Any]:
     return engine if isinstance(engine, dict) else {}
 
 
-def get_agent_prompt(agent_id: str) -> dict[str, Any]:
+def get_agent_prompt(agent_id: str, version: Optional[int] = None) -> dict[str, Any]:
+    """Read an agent, optionally at a specific version.
+
+    Retell versions the agent AND the LLM behind it, and every request its own
+    dashboard makes carries ?version=N. Reading and writing without a version
+    lands on the published version, which is frozen — that is the whole reason
+    "Cannot update published LLM" happened.
+    """
     agent_id = (agent_id or "").strip()
     if not agent_id:
         raise RetellAgentsError(400, "agent_id is required")
 
-    agent = _request("GET", f"/get-agent/{agent_id}")
+    agent = _request(
+        "GET",
+        f"/get-agent/{agent_id}",
+        params={"version": int(version)} if version is not None else None,
+    )
     if not isinstance(agent, dict):
         raise RetellAgentsError(502, "Unexpected Retell get-agent response.")
 
@@ -183,7 +194,11 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
     llm_is_published: Optional[bool] = None
 
     if engine_type == RETELL_LLM_TYPE and llm_id:
-        llm = _request("GET", f"/get-retell-llm/{llm_id}")
+        llm = _request(
+            "GET",
+            f"/get-retell-llm/{llm_id}",
+            params={"version": int(llm_version)} if llm_version is not None else None,
+        )
         if isinstance(llm, dict):
             gp = llm.get("general_prompt")
             bm = llm.get("begin_message")
@@ -262,6 +277,50 @@ def list_voices() -> list[dict[str, Any]]:
     return out
 
 
+def _editable_draft(agent_id: str) -> dict[str, Any]:
+    """The agent as a DRAFT we are allowed to write to.
+
+    Publishing freezes a version. Retell's own UI never trips over this because
+    on publish it ticks "Auto Create a New Draft" — the 201 you see in its
+    network log is POST /create-agent-version, which forks the published version
+    into an editable one and moves both the agent and its LLM to version N+1.
+
+    Doing it here, at the START of every save rather than after publishing, makes
+    it self-healing: if a draft already exists we use it, and if the last publish
+    left none we make one now. A failed draft creation costs one save, not every
+    future save.
+    """
+    current = get_agent_prompt(agent_id)
+    if not current.get("is_published"):
+        return current
+
+    base = current.get("version")
+    if base is None:
+        logger.warning(
+            "Agent %s reports published with no version — writing without a draft, "
+            "which Retell may refuse.",
+            agent_id,
+        )
+        return current
+
+    created = _request(
+        "POST",
+        f"/create-agent-version/{agent_id}",
+        json_body={"base_version": int(base)},
+    )
+    new_version = created.get("version") if isinstance(created, dict) else None
+    if new_version is None:
+        logger.error(
+            "Created a draft for agent %s from v%s but Retell returned no version; "
+            "falling back to the unversioned read.",
+            agent_id,
+            base,
+        )
+        return current
+    logger.info("Agent %s v%s is published; created draft v%s", agent_id, base, new_version)
+    return get_agent_prompt(agent_id, int(new_version))
+
+
 def update_agent_prompt(
     agent_id: str,
     general_prompt: Optional[str] = None,
@@ -278,7 +337,9 @@ def update_agent_prompt(
     voicemail_action: Optional[str] = None,
     llm_model: Optional[str] = None,
 ) -> dict[str, Any]:
-    current = get_agent_prompt(agent_id)
+    current = _editable_draft(agent_id)
+    agent_version = current.get("version")
+    llm_version = current.get("llm_version")
     llm_id = str(current.get("llm_id") or "").strip()
     llm_patch: dict[str, Any] = {}
     if general_prompt is not None:
@@ -295,7 +356,12 @@ def update_agent_prompt(
                 f"This Retell agent uses response engine {engine_type!r}, which is not a "
                 "Retell LLM. Prompt text cannot be edited here.",
             )
-        _request("PATCH", f"/update-retell-llm/{llm_id}", json_body=llm_patch)
+        _request(
+            "PATCH",
+            f"/update-retell-llm/{llm_id}",
+            json_body=llm_patch,
+            params={"version": int(llm_version)} if llm_version is not None else None,
+        )
 
     agent_patch: dict[str, Any] = {}
     if voice_id is not None:
@@ -332,22 +398,24 @@ def update_agent_prompt(
         )
 
     if agent_patch:
-        _request("PATCH", f"/update-agent/{agent_id}", json_body=agent_patch)
+        _request(
+            "PATCH",
+            f"/update-agent/{agent_id}",
+            json_body=agent_patch,
+            params={"version": int(agent_version)} if agent_version is not None else None,
+        )
 
     if not llm_patch and not agent_patch:
         raise RetellAgentsError(400, "No Retell fields to update.")
 
-    # NOT publishing here. Publishing an agent locks its LLM: Retell then answers
-    # "Cannot update published LLM" (400) to every later PATCH, so auto-publishing
-    # on save traded a working save for a broken one — every edit after the first
-    # failed. Reverted 4 Sep 2026 within the hour. publish_agent() is kept for a
-    # deliberate, explicit publish once we understand Retell's version model well
-    # enough to edit a draft after publishing; until then a change is published by
-    # hand in Retell.
+    # Safe to publish now, which it was not this morning: _editable_draft() forks a
+    # new draft on the next save, so freezing this version no longer blocks editing.
+    if agent_version is not None:
+        publish_agent(agent_id, int(agent_version))
     return get_agent_prompt(agent_id)
 
 
-def publish_agent(agent_id: str) -> bool:
+def publish_agent(agent_id: str, version: Optional[int] = None) -> bool:
     """Make the agent's current draft the live version.
 
     Retell keeps every write as a DRAFT. A PATCH to /update-agent or
@@ -363,7 +431,8 @@ def publish_agent(agent_id: str) -> bool:
     the caller can see the difference between "saved and live" and "saved only".
     """
     try:
-        version = get_agent_prompt(agent_id).get("version")
+        if version is None:
+            version = get_agent_prompt(agent_id).get("version")
         if version is None:
             logger.error(
                 "Cannot publish agent %s: Retell returned no version. The change is "
