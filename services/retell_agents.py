@@ -79,6 +79,21 @@ def _request(method: str, path: str, json_body: Optional[dict] = None, params: O
     except Exception:
         body = r.text
 
+    if r.status_code >= 400:
+        # Retell says exactly which field it objected to, and until now that
+        # sentence only ever reached the browser as a 281-byte 502 body. The log
+        # showed "400 Bad Request" and nothing else, which is how the 3 Sep
+        # voicemail_action fault cost an afternoon. Log the body, and the keys we
+        # sent, every time.
+        logger.error(
+            "Retell %s %s -> %s. Sent keys: %s. Retell said: %s",
+            method,
+            path,
+            r.status_code,
+            sorted((json_body or {}).keys()),
+            (r.text or "")[:600],
+        )
+
     if r.status_code == 401:
         raise RetellAgentsError(502, "Retell rejected the API key (401). Check RETELL_API_KEY.")
     if r.status_code == 404:
@@ -322,11 +337,17 @@ def update_agent_prompt(
     if not llm_patch and not agent_patch:
         raise RetellAgentsError(400, "No Retell fields to update.")
 
-    updated = publish_agent(agent_id)
-    return updated
+    # NOT publishing here. Publishing an agent locks its LLM: Retell then answers
+    # "Cannot update published LLM" (400) to every later PATCH, so auto-publishing
+    # on save traded a working save for a broken one — every edit after the first
+    # failed. Reverted 4 Sep 2026 within the hour. publish_agent() is kept for a
+    # deliberate, explicit publish once we understand Retell's version model well
+    # enough to edit a draft after publishing; until then a change is published by
+    # hand in Retell.
+    return get_agent_prompt(agent_id)
 
 
-def publish_agent(agent_id: str) -> dict[str, Any]:
+def publish_agent(agent_id: str) -> bool:
     """Make the agent's current draft the live version.
 
     Retell keeps every write as a DRAFT. A PATCH to /update-agent or
@@ -341,33 +362,37 @@ def publish_agent(agent_id: str) -> dict[str, Any]:
     did not. Instead it logs loudly and reports is_published on the way out, so
     the caller can see the difference between "saved and live" and "saved only".
     """
-    current = get_agent_prompt(agent_id)
-    version = current.get("version")
-    if version is None:
-        logger.error(
-            "Cannot publish agent %s: Retell returned no version. The change is "
-            "SAVED AS A DRAFT and will not be heard on any call until it is "
-            "published in Retell.",
-            agent_id,
-        )
-        return current
     try:
+        version = get_agent_prompt(agent_id).get("version")
+        if version is None:
+            logger.error(
+                "Cannot publish agent %s: Retell returned no version. The change is "
+                "SAVED AS A DRAFT and will not be heard on any call until it is "
+                "published in Retell.",
+                agent_id,
+            )
+            return False
         _request(
             "POST",
             f"/publish-agent-version/{agent_id}",
             json_body={"version": int(version)},
         )
-    except RetellAgentsError as e:
+        logger.info("Published agent %s version %s", agent_id, version)
+        return True
+    except Exception as e:  # noqa: BLE001
+        # EVERYTHING here is best-effort. The save has already gone through by the
+        # time this runs, so any exception escaping would tell the dashboard the
+        # edit failed when it did not — which is exactly what happened on the
+        # first deploy of this function: get_agent_prompt sat outside the guard,
+        # so one bad response from Retell turned a successful save into an error
+        # on screen. Log it, report the failure as False, never raise.
         logger.error(
-            "Agent %s saved but NOT published (version %s): %s. It will not be "
-            "heard on any call until it is published in Retell.",
+            "Agent %s saved but NOT published: %s. It will not be heard on any "
+            "call until it is published in Retell.",
             agent_id,
-            version,
-            e.detail,
+            e,
         )
-        return current
-    logger.info("Published agent %s version %s", agent_id, version)
-    return get_agent_prompt(agent_id)
+        return False
 
 
 _LLM_OMIT = {
