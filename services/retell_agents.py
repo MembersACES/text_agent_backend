@@ -201,6 +201,9 @@ def get_agent_prompt(agent_id: str) -> dict[str, Any]:
         "response_engine_type": engine_type or None,
         "llm_id": llm_id or None,
         "llm_version": llm_version,
+        # The agent's OWN version, which is what /publish-agent-version needs.
+        # This was missing, so nothing could publish even if it wanted to.
+        "version": agent.get("version"),
         "is_published": bool(agent.get("is_published")) if "is_published" in agent else None,
         "llm_is_published": llm_is_published,
         "prompt_editable": engine_type == RETELL_LLM_TYPE and bool(llm_id),
@@ -318,6 +321,52 @@ def update_agent_prompt(
 
     if not llm_patch and not agent_patch:
         raise RetellAgentsError(400, "No Retell fields to update.")
+
+    updated = publish_agent(agent_id)
+    return updated
+
+
+def publish_agent(agent_id: str) -> dict[str, Any]:
+    """Make the agent's current draft the live version.
+
+    Retell keeps every write as a DRAFT. A PATCH to /update-agent or
+    /update-retell-llm changes nothing a caller will ever hear until the draft
+    version is published, and until 4 Sep 2026 nothing in any of our repos did
+    that. The consequence was a fortnight of fixes that looked applied, were
+    verified against the draft the API returns, and were never served: John
+    spent a morning testing last week's agent because of it.
+
+    Failure here is deliberately NOT fatal. The save has already happened by the
+    time this runs, so raising would tell the dashboard the edit failed when it
+    did not. Instead it logs loudly and reports is_published on the way out, so
+    the caller can see the difference between "saved and live" and "saved only".
+    """
+    current = get_agent_prompt(agent_id)
+    version = current.get("version")
+    if version is None:
+        logger.error(
+            "Cannot publish agent %s: Retell returned no version. The change is "
+            "SAVED AS A DRAFT and will not be heard on any call until it is "
+            "published in Retell.",
+            agent_id,
+        )
+        return current
+    try:
+        _request(
+            "POST",
+            f"/publish-agent-version/{agent_id}",
+            json_body={"version": int(version)},
+        )
+    except RetellAgentsError as e:
+        logger.error(
+            "Agent %s saved but NOT published (version %s): %s. It will not be "
+            "heard on any call until it is published in Retell.",
+            agent_id,
+            version,
+            e.detail,
+        )
+        return current
+    logger.info("Published agent %s version %s", agent_id, version)
     return get_agent_prompt(agent_id)
 
 
