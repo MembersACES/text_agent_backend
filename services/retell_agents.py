@@ -79,6 +79,21 @@ def _request(method: str, path: str, json_body: Optional[dict] = None, params: O
     except Exception:
         body = r.text
 
+    if r.status_code >= 400:
+        # Retell says exactly which field it objected to, and until now that
+        # sentence only ever reached the browser as a 281-byte 502 body. The log
+        # showed "400 Bad Request" and nothing else, which is how the 3 Sep
+        # voicemail_action fault cost an afternoon. Log the body, and the keys we
+        # sent, every time.
+        logger.error(
+            "Retell %s %s -> %s. Sent keys: %s. Retell said: %s",
+            method,
+            path,
+            r.status_code,
+            sorted((json_body or {}).keys()),
+            (r.text or "")[:600],
+        )
+
     if r.status_code == 401:
         raise RetellAgentsError(502, "Retell rejected the API key (401). Check RETELL_API_KEY.")
     if r.status_code == 404:
@@ -322,7 +337,13 @@ def update_agent_prompt(
     if not llm_patch and not agent_patch:
         raise RetellAgentsError(400, "No Retell fields to update.")
 
-    publish_agent(agent_id)
+    # NOT publishing here. Publishing an agent locks its LLM: Retell then answers
+    # "Cannot update published LLM" (400) to every later PATCH, so auto-publishing
+    # on save traded a working save for a broken one — every edit after the first
+    # failed. Reverted 4 Sep 2026 within the hour. publish_agent() is kept for a
+    # deliberate, explicit publish once we understand Retell's version model well
+    # enough to edit a draft after publishing; until then a change is published by
+    # hand in Retell.
     return get_agent_prompt(agent_id)
 
 
