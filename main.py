@@ -49,6 +49,7 @@ from tools.business_info import get_business_information, get_base1_landing_resp
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.drive_file_metadata import get_drive_file_times
 from tools.share_folder import ShareFolderError, get_share_folder_status, share_member_folder
+from tools.site_photos import SitePhotosError, list_site_photos, upload_site_photos
 from tools.member_folder_drive import MemberFolderDriveError
 from services.member_folder import (
     create_distributor_folder,
@@ -1723,6 +1724,68 @@ def share_folder(
             sender_email=str(user_info.get("email") or ""),
         )
     except ShareFolderError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+class SitePhotosListRequest(BaseModel):
+    business_name: str = ""
+    gdrive_url: str = ""
+
+
+@app.post("/api/members/site-photos/list")
+def site_photos_list(
+    request: SitePhotosListRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "site-photos/list business_name=%r user=%s",
+        request.business_name,
+        user_info.get("email"),
+    )
+    try:
+        return list_site_photos(request.gdrive_url)
+    except SitePhotosError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/members/site-photos/upload")
+async def site_photos_upload(
+    user_info: dict = Depends(verify_google_token),
+    files: List[UploadFile] = File(default=[]),
+    business_name: str = Form(""),
+    gdrive_url: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+    photo_names: List[str] = Form(default=[]),
+):
+    names = photo_names if isinstance(photo_names, list) else ([photo_names] if photo_names else [])
+    user_drive_token = (google_access_token or x_google_access_token or "").strip()
+    logging.info(
+        "site-photos/upload business_name=%r count=%s user=%s has_user_drive_token=%s",
+        business_name,
+        len(files or []),
+        user_info.get("email"),
+        bool(user_drive_token),
+    )
+    payloads: list[tuple[str, str, bytes]] = []
+    for upload in files or []:
+        contents = await upload.read()
+        payloads.append(
+            (
+                upload.filename or "photo.jpg",
+                upload.content_type or "",
+                contents,
+            )
+        )
+    try:
+        return upload_site_photos(
+            gdrive_url,
+            payloads,
+            business_name=business_name,
+            user_access_token=user_drive_token,
+            display_names=names,
+        )
+    except SitePhotosError as e:
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 

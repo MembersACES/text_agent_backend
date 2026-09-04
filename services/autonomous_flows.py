@@ -30,6 +30,12 @@ SEQUENCE_FLOW_CATALOG: list[dict[str, str]] = [
         "copy_hint": "gas_base2_followup_v1",
     },
     {
+        "sequence_type": "future_gas_base2_followup_v1",
+        "display_name": "Future Contract Gas Base 2 Follow-up",
+        "source": "Base 2 — Future Contract gas comparison",
+        "copy_hint": "gas_base2_followup_v1",
+    },
+    {
         "sequence_type": "sme_electricity_base2_followup_v1",
         "display_name": "SME Electricity Base 2 Follow-up",
         "source": "Base 2 — SME Electricity comparison",

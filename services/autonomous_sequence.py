@@ -645,6 +645,41 @@ def ensure_weekday(d: date) -> date:
     return n
 
 
+# Nobody rings a business at nine at night. Weekends were already skipped by
+# ensure_weekday, but the hour was never checked at all: John scheduled a voice
+# step for 9pm on 3 Sep and the system accepted it without comment.
+CONTACT_HOUR_START = 8   # 08:00 local — earliest we will contact anyone
+CONTACT_HOUR_END = 18    # 18:00 local — after this, roll to the next morning
+
+
+def clamp_to_contact_hours(dt: datetime, *, timezone_name: str = AUTONOMOUS_SCHEDULE_TZ) -> datetime:
+    """Move a scheduled time inside 08:00-18:00 on a weekday, in local time.
+
+    Before 08:00  -> 08:00 the same day.
+    At/after 18:00 -> 08:00 the next business day.
+    Weekend       -> 08:00 the next business day.
+
+    Returned in the same shape it arrived: tz-aware in, tz-aware out.
+    """
+    tz = ZoneInfo(timezone_name)
+    naive_in = dt.tzinfo is None
+    local = (dt.replace(tzinfo=tz) if naive_in else dt).astimezone(tz)
+
+    if local.hour >= CONTACT_HOUR_END:
+        local = datetime.combine(
+            next_business_day(local.date()), time(CONTACT_HOUR_START, 0), tzinfo=tz
+        )
+    elif local.hour < CONTACT_HOUR_START:
+        local = local.replace(hour=CONTACT_HOUR_START, minute=0, second=0, microsecond=0)
+
+    if local.weekday() >= 5:
+        local = datetime.combine(
+            ensure_weekday(local.date()), time(CONTACT_HOUR_START, 0), tzinfo=tz
+        )
+
+    return local.replace(tzinfo=None) if naive_in else local
+
+
 def add_business_days(start: date, business_days: int) -> date:
     """Advance `start` by `business_days` Mon–Fri days (weekends skipped)."""
     if business_days <= 0:
@@ -696,6 +731,8 @@ def _plan_template_times(
         target_date = ensure_weekday(target_date)
         hh, mm = _parse_local_time_hhmm(s.send_time_local)
         local_dt = datetime.combine(target_date, time(hh, mm), tzinfo=tz)
+        # A template with a bad send_time_local must not put a call at 9pm.
+        local_dt = clamp_to_contact_hours(local_dt, timezone_name=timezone_name)
         plan.append(
             (
                 int(s.day_number),
@@ -1519,7 +1556,15 @@ def update_step_schedules(
             raise ValueError(
                 f"Step {sid} is {step.step_status!r}; only ready or to_start can be rescheduled"
             )
-        step.scheduled_at = _to_utc_naive(at)
+        # Same guard as run creation. The dashboard lets a user type any time,
+        # so this is the only place it cannot be bypassed.
+        clamped = clamp_to_contact_hours(at)
+        if clamped != at:
+            logger.info(
+                "Step %d rescheduled outside contact hours (%s) - moved to %s",
+                sid, at.isoformat(), clamped.isoformat(),
+            )
+        step.scheduled_at = _to_utc_naive(clamped)
     run.updated_at = _utc_now_naive()
     _log_event(
         db,
