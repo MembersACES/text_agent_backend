@@ -585,6 +585,7 @@ class OfferResponse(BaseModel):
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
+    campaign_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     # Read-only: true when the linked client is already in Won or ExistingClient.
@@ -1026,6 +1027,9 @@ class AutonomousSequenceTemplateBase(BaseModel):
     # behaviour, which was a hardcoded 7 days.
     validity_mode: str = "fixed_days"
     validity_days: int = 7
+    stop_on: Optional[List[str]] = None
+    ack_template_signed: Optional[Dict[str, str]] = None
+    ack_template_invoice: Optional[Dict[str, str]] = None
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
@@ -1046,6 +1050,9 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     validity_mode: Optional[str] = None
     validity_days: Optional[int] = None
     linked_flow_keys: Optional[List[str]] = None
+    stop_on: Optional[List[str]] = None
+    ack_template_signed: Optional[Dict[str, str]] = None
+    ack_template_invoice: Optional[Dict[str, str]] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1093,6 +1100,9 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     validity_mode: str = "fixed_days"
     validity_days: int = 7
     linked_flow_keys: List[str] = Field(default_factory=list)
+    stop_on: List[str] = Field(default_factory=list)
+    ack_template_signed: Optional[Dict[str, str]] = None
+    ack_template_invoice: Optional[Dict[str, str]] = None
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
@@ -1154,6 +1164,7 @@ class AutonomousSequenceRunResponse(BaseModel):
     contact_email: Optional[str] = None
     context: Dict[str, Any] = {}
     steps: List[AutonomousSequenceStepResponse] = []
+    ack_draft: Optional[Dict[str, Any]] = None
 
     @field_serializer("anchor_at", "created_at", "updated_at")
     def serialize_run_dt(self, dt: datetime, _info):
@@ -1213,6 +1224,7 @@ class AutonomousSequenceInboundRequest(BaseModel):
     intent: Optional[str] = None
     sentiment_negative: bool = False
     agreement_signed: bool = False
+    invoice_received: bool = False
 
 
 class RetellAgentListItem(BaseModel):

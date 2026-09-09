@@ -168,6 +168,7 @@ class Offer(Base):
     created_by = Column(String(255), nullable=True)
     external_record_id = Column(String(255), nullable=True)
     document_link = Column(Text, nullable=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -492,6 +493,9 @@ class AutonomousSequenceTemplate(Base):
     is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     signature_html = Column(Text, nullable=True)
     extra_context = Column(Text, nullable=True)
+    stop_on = Column(Text, nullable=True)
+    ack_template_signed = Column(Text, nullable=True)
+    ack_template_invoice = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -591,3 +595,68 @@ class ClimateIngestRun(Base):
     status = Column(String(32), nullable=False, default="completed")
     diagnostics_json = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    sequence_type = Column(String(80), nullable=False)
+    status = Column(String(32), nullable=False, default="draft")
+    first_touch_subject = Column(Text, nullable=True)
+    first_touch_html = Column(Text, nullable=True)
+    first_touch_text = Column(Text, nullable=True)
+    merge_field_map = Column(Text, nullable=True)
+    provenance_note = Column(Text, nullable=True)
+    daily_cap = Column(Integer, nullable=True)
+    send_window_start = Column(String(5), nullable=True)
+    send_window_end = Column(String(5), nullable=True)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    rows = relationship("CampaignRow", back_populates="campaign", cascade="all, delete-orphan")
+
+
+class CampaignRow(Base):
+    __tablename__ = "campaign_rows"
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    merge_json = Column(Text, nullable=False)
+    intelligence_json = Column(Text, nullable=True)
+    recipient_key = Column(String(255), nullable=True, index=True)
+    row_status = Column(String(32), nullable=False, default="pending")
+    suppression_reason = Column(String(64), nullable=True)
+    run_id = Column(Integer, nullable=True)
+    offer_id = Column(Integer, nullable=True)
+    human_only = Column(Integer, nullable=False, default=0)
+    human_only_reason = Column(String(255), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+
+    campaign = relationship("Campaign", back_populates="rows")
+
+
+class CampaignEvent(Base):
+    __tablename__ = "campaign_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    actor = Column(String(255), nullable=True)
+    to_email = Column(String(255), nullable=True)
+    row_id = Column(Integer, nullable=True)
+    payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class Suppression(Base):
+    __tablename__ = "suppressions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    reason = Column(String(64), nullable=False)
+    source = Column(String(64), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
