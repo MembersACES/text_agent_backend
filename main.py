@@ -759,6 +759,7 @@ class DmaContractDetailsRequest(BaseModel):
     client_id: Optional[int] = None
     row_number: Optional[int] = None
 
+
 class UtilityInfoRequest(BaseModel):
     business_name: str
     service_type: str

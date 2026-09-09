@@ -659,3 +659,4 @@ class Suppression(Base):
     reason = Column(String(64), nullable=False)
     source = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
