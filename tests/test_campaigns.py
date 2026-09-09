@@ -168,7 +168,7 @@ def test_sanitiser_strips_script_and_javascript_href():
     assert "Hi" in cleaned
 
 
-def test_ready_requires_test_send_and_provenance():
+def test_ready_requires_test_send():
     db = _db()
     campaign = _draft_with_rows(db, n=1)
     try:
@@ -183,7 +183,7 @@ def test_ready_requires_test_send_and_provenance():
     assert campaign.status == "ready"
 
 
-def test_ready_rejected_without_provenance():
+def test_ready_does_not_require_provenance():
     db = _db()
     campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
     replace_rows(
@@ -200,11 +200,12 @@ def test_ready_rejected_without_provenance():
         "a@b.com",
     )
     db.refresh(campaign)
-    try:
-        patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
-        raise AssertionError("expected provenance failure")
-    except CampaignError as exc:
-        assert "provenance" in str(exc).lower()
+    row = db.query(CampaignRow).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    campaign = patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    assert campaign.status == "ready"
+    assert not (campaign.provenance_note or "").strip()
 
 
 def test_token_validation_rejects_held_back_field():
