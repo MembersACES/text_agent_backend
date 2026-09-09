@@ -11627,6 +11627,7 @@ def list_offers(
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
+    include_campaign_stubs: Optional[bool] = Query(False, description="If true, include offers created by a campaign start"),
     limit: Optional[int] = Query(None, description="Max number of offers to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of offers to skip (use with limit)"),
     db: Session = Depends(get_db),
@@ -11670,6 +11671,8 @@ def list_offers(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    if not include_campaign_stubs:
+        query = query.filter(Offer.campaign_id.is_(None))
     ordered = query.order_by(Offer.created_at.desc())
     if limit is not None or offset is not None:
         total = ordered.count()
@@ -11731,6 +11734,7 @@ def export_offers_csv(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    query = query.filter(Offer.campaign_id.is_(None))
     offers = query.order_by(Offer.created_at.desc()).all()
     rows_data = [_offer_to_response(db, o).model_dump(mode="json") for o in offers]
     if not rows_data:
@@ -14342,3 +14346,8 @@ def rebuild_staged_activity(
                          "staged": s_staged, "skipped": s_skipped})
     return {"entity_id": entity_id, "period": period, "dry_run": False,
             "deleted": int(deleted or 0), "staged": staged, "skipped": skipped, "per_site": per_site}
+
+
+from campaign_routes import register_campaign_routes
+
+register_campaign_routes(app, get_current_user_with_db)

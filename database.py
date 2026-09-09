@@ -371,3 +371,15 @@ def init_db():
                 logging.info("✅ Added autonomous_sequence_templates.extra_context column")
     except Exception as e:
         logging.warning("Could not ensure autonomous_sequence_templates.signature_html column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "offers" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("offers")]
+            if "campaign_id" not in cols:
+                logging.info("Adding missing offers.campaign_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE offers ADD COLUMN campaign_id INTEGER"))
+                logging.info("✅ Added offers.campaign_id column")
+    except Exception as e:
+        logging.warning("Could not ensure offers.campaign_id column: %s", e)

@@ -585,6 +585,7 @@ class OfferResponse(BaseModel):
     created_by: Optional[str] = None
     external_record_id: Optional[str] = None
     document_link: Optional[str] = None
+    campaign_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     # Read-only: true when the linked client is already in Won or ExistingClient.
