@@ -285,6 +285,7 @@ from schemas import (
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
     RetellAgentListItem,
+    RetellCallListItem,
     RetellAgentPromptResponse,
     RetellAgentPromptUpdate,
     RetellVoiceListItem,
@@ -12574,6 +12575,46 @@ def autonomous_sequence_patch_type_prompts(
     db.execute(update_sql, params)
     db.commit()
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get(
+    "/api/autonomous/sequences/runs/{run_id}/calls",
+    response_model=List[RetellCallListItem],
+)
+def autonomous_run_call_history(
+    run_id: int,
+    limit: int = 50,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Every Retell call this run has placed, newest first.
+
+    Recovered from Retell by the run_id the worker stamps into each call's
+    metadata, so it works over calls already made and needs no column on the
+    steps table. That column is still worth adding later, to tie a call to the
+    specific step that placed it rather than to the run as a whole.
+    """
+    from services.retell_calls import list_calls_for_run
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return list_calls_for_run(run_id, min(max(limit, 1), 200))
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/calls/{call_id}", response_model=RetellCallListItem)
+def autonomous_retell_get_call(
+    call_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """One call in full, for the transcript and recording view."""
+    from services.retell_calls import get_call
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return get_call(call_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
 @app.get("/api/autonomous/retell/voices", response_model=List[RetellVoiceListItem])

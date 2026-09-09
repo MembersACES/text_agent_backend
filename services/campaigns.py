@@ -339,8 +339,6 @@ def _ready_gate(db: Session, campaign: Campaign) -> None:
         raise CampaignError("A subject is required before a campaign can go ready")
     if not body:
         raise CampaignError("A body is required before a campaign can go ready")
-    if not (campaign.provenance_note or "").strip():
-        raise CampaignError("A provenance note is required before a campaign can go ready")
     mapping = _map(campaign)
     allowed = mapped_keys(mapping)
     if not allowed:
@@ -391,7 +389,6 @@ def _test_send_count(db: Session, campaign_id: int) -> int:
 def render_first_touch(campaign: Campaign, merge: dict[str, str], test: bool) -> tuple[str, str, str]:
     subject_t, _ = render_template(campaign.first_touch_subject or "", merge)
     html_t, _ = render_template(campaign.first_touch_html or "", merge)
-    html_t = append_unsubscribe(html_t, merge.get("contact_email") or "", campaign.id)
     text_t = html_to_plain_text(html_t)
     if test:
         subject_t = f"[TEST] {subject_t}"
@@ -569,17 +566,6 @@ def verify_unsubscribe_token(token: str) -> tuple[str, int]:
     if not hmac.compare_digest(expected, sig):
         raise CampaignError("Invalid unsubscribe token", 400)
     return email, int(campaign_id_s)
-
-
-def append_unsubscribe(html: str, email: str, campaign_id: int) -> str:
-    url = unsubscribe_url(email, campaign_id)
-    block = (
-        '<p style="font-size:12px;color:#666;">If you would prefer not to receive these emails, '
-        f'<a href="{url}">unsubscribe here</a>.</p>'
-    )
-    if "</div>" in (html or ""):
-        return html.replace("</div>", block + "</div>", 1)
-    return (html or "") + block
 
 
 def apply_unsubscribe(db: Session, token: str) -> dict[str, Any]:

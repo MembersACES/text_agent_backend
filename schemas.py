@@ -1233,6 +1233,30 @@ class RetellAgentListItem(BaseModel):
     channel: str = "voice"
 
 
+class RetellCallListItem(BaseModel):
+    """One Retell call, flattened for the dashboard's call history."""
+
+    call_id: str
+    agent_id: str
+    agent_name: Optional[str] = None
+    agent_version: Optional[int] = None
+    run_id: Optional[int] = None
+    direction: str = ""
+    from_number: str = ""
+    to_number: str = ""
+    call_status: str = ""
+    disconnection_reason: Optional[str] = None
+    start_timestamp: Optional[int] = None
+    end_timestamp: Optional[int] = None
+    duration_ms: Optional[int] = None
+    combined_cost: Optional[float] = None
+    in_voicemail: bool = False
+    user_sentiment: Optional[str] = None
+    call_summary: Optional[str] = None
+    recording_url: Optional[str] = None
+    transcript: Optional[str] = None
+
+
 class RetellVoiceListItem(BaseModel):
     voice_id: str
     voice_name: str
