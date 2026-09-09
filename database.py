@@ -371,3 +371,42 @@ def init_db():
                 logging.info("✅ Added autonomous_sequence_templates.extra_context column")
     except Exception as e:
         logging.warning("Could not ensure autonomous_sequence_templates.signature_html column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "autonomous_sequence_templates" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("autonomous_sequence_templates")]
+            with engine.begin() as conn:
+                if "stop_on" not in cols:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN stop_on TEXT"))
+                    logging.info("✅ Added autonomous_sequence_templates.stop_on column")
+                if "ack_template_signed" not in cols:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN ack_template_signed TEXT"))
+                    logging.info("✅ Added autonomous_sequence_templates.ack_template_signed column")
+                if "ack_template_invoice" not in cols:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN ack_template_invoice TEXT"))
+                    logging.info("✅ Added autonomous_sequence_templates.ack_template_invoice column")
+                conn.execute(
+                    text(
+                        "UPDATE autonomous_sequence_templates SET stop_on = :stop "
+                        "WHERE sequence_type = :seq AND (stop_on IS NULL OR TRIM(stop_on) = '')"
+                    ),
+                    {
+                        "stop": '["invoice_received","negative_sentiment_stop"]',
+                        "seq": "gci_outbound_v1",
+                    },
+                )
+    except Exception as e:
+        logging.warning("Could not ensure autonomous_sequence_templates.stop_on columns: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "offers" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("offers")]
+            if "campaign_id" not in cols:
+                logging.info("Adding missing offers.campaign_id column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE offers ADD COLUMN campaign_id INTEGER"))
+                logging.info("✅ Added offers.campaign_id column")
+    except Exception as e:
+        logging.warning("Could not ensure offers.campaign_id column: %s", e)

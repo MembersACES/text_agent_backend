@@ -59,6 +59,7 @@ class OfferActivityType(str, Enum):
     ENGAGEMENT_FORM = "engagement_form"
     ENGAGEMENT_FORM_SIGNED = "engagement_form_signed"
     CONTRACT_REQUESTED = "contract_requested"
+    ALINTA_AGREEMENT_REQUESTED = "alinta_agreement_requested"
     CONTRACT_RECEIVED = "contract_received"
     CONTRACT_SENT_FOR_SIGNING = "contract_sent_for_signing"
     CONTRACT_SIGNED_LODGED = "contract_signed_lodged"
@@ -76,6 +77,7 @@ class OfferActivityType(str, Enum):
     # Member CRM Documents tab / drive filing (no pipeline side effects; not on Strategy WIP)
     MEMBER_DOCUMENT_UPLOAD = "member_document_upload"
     ONE_MONTH_SAVINGS_INVOICE = "one_month_savings_invoice"
+    NEW_REVENUE_INVOICE = "new_revenue_invoice"
     # ACES solar panel cleaning quote (Docs/PDF + email via n8n)
     SOLAR_CLEANING_QUOTE_GENERATED = "solar_cleaning_quote_generated"
     SOLAR_CLEANING_QUOTE_SENT = "solar_cleaning_quote_sent"

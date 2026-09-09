@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import io
-import json
 import logging
 import os
 import re
@@ -13,6 +10,11 @@ from typing import Any, Optional
 from googleapiclient.errors import HttpError
 
 from tools.member_folder_drive import _user_drive_service
+from tools.pdf_scan_vision import (
+    collect_page_images,
+    pdf_to_text,
+    vision_extract_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +25,6 @@ DISTRIBUTOR_MASTER_SHEET_ID = os.getenv(
 DISTRIBUTOR_MASTER_TAB = os.getenv("DISTRIBUTOR_MASTER_TAB", "Sheet1")
 
 FOLDER_NAME_PREFIX = "A - "
-_SCAN_IMAGE_MIN_BYTES = 80_000
-_SCAN_MAX_PAGES = 6
 _VISION_KEYS = (
     "distributor_business",
     "trading_as",
@@ -99,114 +99,16 @@ SHEET_COLUMNS: list[str] = [
 ]
 
 
-def _pdf_to_text(pdf_bytes: bytes) -> str:
-    from pypdf import PdfReader
-
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    parts: list[str] = []
-    for page in reader.pages:
-        t = page.extract_text()
-        if t:
-            parts.append(t)
-    return "\n".join(parts)
-
-
-def _pdf_page_images(pdf_bytes: bytes) -> list[bytes]:
-    """Full-page scan JPEGs/PNGs embedded in the PDF (typical of signed scans)."""
-    from pypdf import PdfReader
-
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-    except Exception:
-        return []
-    out: list[bytes] = []
-    for page in reader.pages:
-        try:
-            images = list(page.images)
-        except Exception:
-            images = []
-        for im in images:
-            data = getattr(im, "data", None) or b""
-            if len(data) >= _SCAN_IMAGE_MIN_BYTES:
-                out.append(data)
-        if len(out) >= _SCAN_MAX_PAGES:
-            break
-    return out[:_SCAN_MAX_PAGES]
-
-
-def _jpeg_for_vision(image_bytes: bytes) -> bytes:
-    from PIL import Image
-
-    im = Image.open(io.BytesIO(image_bytes))
-    if im.mode != "RGB":
-        im = im.convert("RGB")
-    width, height = im.size
-    max_edge = 2048
-    longest = max(width, height)
-    if longest > max_edge:
-        scale = max_edge / longest
-        im = im.resize((int(width * scale), int(height * scale)), Image.Resampling.LANCZOS)
-    buf = io.BytesIO()
-    im.save(buf, format="JPEG", quality=90, optimize=True)
-    return buf.getvalue()
-
-
 def _extract_from_page_images(pdf_bytes: bytes) -> dict[str, str]:
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    images = _pdf_page_images(pdf_bytes)
-    if not api_key or not images:
+    images = collect_page_images(pdf_bytes)
+    if not images:
         return {}
-    import httpx
-
-    parts: list[dict[str, Any]] = [{"type": "text", "text": _VISION_PROMPT}]
-    for raw in images:
-        try:
-            jpeg = _jpeg_for_vision(raw)
-        except Exception as e:
-            logger.warning("distributor scan image could not be prepared: %s", e)
-            continue
-        b64 = base64.b64encode(jpeg).decode("ascii")
-        parts.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"},
-            }
-        )
-    if len(parts) < 2:
-        return {}
-    try:
-        response = httpx.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o",
-                "temperature": 0,
-                "response_format": {"type": "json_object"},
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You extract structured fields from scanned contracts. JSON only.",
-                    },
-                    {"role": "user", "content": parts},
-                ],
-            },
-            timeout=90.0,
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-    except Exception as e:
-        logger.warning("distributor scan vision extract failed: %s", e)
-        return {}
-    if not isinstance(parsed, dict):
+    parsed = vision_extract_fields(images, _VISION_PROMPT, _VISION_KEYS)
+    if not parsed:
         return {}
     out: dict[str, str] = {}
     for key in _VISION_KEYS:
-        value = parsed.get(key)
-        out[key] = _clean("" if value is None else str(value))
+        out[key] = _clean(parsed.get(key) or "")
     if out.get("abn"):
         out["abn"] = re.sub(r"\D", "", out["abn"])
     if out.get("acn"):
@@ -323,7 +225,7 @@ def extract_distribution_agreement(pdf_bytes: bytes) -> dict[str, Any]:
     """Best-effort field extraction from the CZAS distribution agreement PDF."""
     warnings: list[str] = []
     try:
-        text = _pdf_to_text(pdf_bytes)
+        text = pdf_to_text(pdf_bytes)
     except Exception as e:
         logger.warning("distributor PDF text extract failed: %s", e)
         text = ""
@@ -334,7 +236,7 @@ def extract_distribution_agreement(pdf_bytes: bytes) -> dict[str, Any]:
     if len(text.strip()) >= 40:
         parsed = _parse_agreement_text(text)
 
-    images = _pdf_page_images(pdf_bytes)
+    images = collect_page_images(pdf_bytes)
     missing_handwritten = not (
         parsed.get("abn") and parsed.get("contact_name") and parsed.get("signed_date")
     )

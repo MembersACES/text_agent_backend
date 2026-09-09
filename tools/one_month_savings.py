@@ -390,6 +390,8 @@ def upload_file_to_drive(
             mimetype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         elif filename.lower().endswith(".doc"):
             mimetype = "application/msword"
+        elif filename.lower().endswith(".xlsx"):
+            mimetype = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     try:
         logger.info(f"Uploading file '{filename}' (mimetype={mimetype}) to folder {folder_id}")
         if not drive_service:
@@ -1723,86 +1725,16 @@ def get_next_invoice_number() -> str:
 
 def get_next_sequential_invoice_number(business_name: Optional[str] = None) -> str:
     """
-    Get the next sequential invoice number by checking existing invoices from Google Sheets.
-    Reads all invoices to find the highest number globally (not per business).
-    
-    Args:
-        business_name: Optional (not used for sequential numbering, but kept for API compatibility)
-        
-    Returns:
-        Next invoice number in format RA####
+    Next EGB invoice number (RA####), shared with discrepancy / new revenue.
+    Uses Bank Rec + tracking sheets. ``business_name`` is unused (API compatibility).
     """
     try:
-        max_number = 0
-        
-        if not SHEET_ID:
-            logger.warning("SHEET_ID not configured, using fallback numbering")
-            # Fallback: try to get from n8n if available
-            if business_name:
-                history = _get_invoice_history_via_n8n(business_name)
-                invoices = history.get("invoices", [])
-                for invoice in invoices:
-                    inv_num = invoice.get("invoice_number", "")
-                    match = re.search(r'RA(\d+)', inv_num)
-                    if match:
-                        num = int(match.group(1))
-                        max_number = max(max_number, num)
-        else:
-            # Get Google Sheets service
-            service = get_sheets_service()
-            if service:
-                # Read all invoice numbers from column F (index 5)
-                # Sheet structure: A=Member, B=Solution, C=Savings Amount, D=GST, E=Total Invoice, F=Invoice Number, G=Due Date
-                logger.info("Reading all invoice numbers from column F to find the highest")
-                result = service.spreadsheets().values().get(
-                    spreadsheetId=SHEET_ID,
-                    range=f"{SHEET_NAME}!F2:F"  # Read all invoice numbers from column F
-                ).execute()
-                
-                values = result.get('values', [])
-                logger.info(f"Found {len(values)} rows with invoice numbers")
-                
-                # Extract numbers from all invoice numbers
-                unique_invoice_numbers = set()
-                for row in values:
-                    if row and len(row) > 0:
-                        inv_num = str(row[0]).strip()
-                        if inv_num:
-                            unique_invoice_numbers.add(inv_num)
-                            match = re.search(r'RA(\d+)', inv_num)
-                            if match:
-                                num = int(match.group(1))
-                                max_number = max(max_number, num)
-                                logger.info(f"Found invoice number: {inv_num} -> number: {num}")
-                
-                logger.info(f"Unique invoice numbers found: {len(unique_invoice_numbers)}")
-                logger.info(f"Highest invoice number: {max_number}")
-            else:
-                logger.warning("Could not create Google Sheets service, using fallback")
-                if business_name:
-                    history = _get_invoice_history_via_n8n(business_name)
-                    invoices = history.get("invoices", [])
-                    for invoice in invoices:
-                        inv_num = invoice.get("invoice_number", "")
-                        match = re.search(r'RA(\d+)', inv_num)
-                        if match:
-                            num = int(match.group(1))
-                            max_number = max(max_number, num)
-        
-        # Always increment by 1
-        next_number = max_number + 1
-        
-        # Ensure it's at least 1000 (for 4-digit numbers)
-        if next_number < 1000:
-            next_number = 1000
-        
-        invoice_number = f"RA{next_number:04d}"
-        logger.info(f"Generated sequential invoice number: {invoice_number} (previous max: {max_number})")
-        return invoice_number
-        
+        from tools.egb_invoice_number import get_next_ra_invoice_number
+
+        _ = business_name
+        return get_next_ra_invoice_number()
     except Exception as e:
         logger.error(f"Error generating sequential invoice number: {str(e)}")
-        # Fallback
         import random
         number = random.randint(1000, 9999)
         return f"RA{number}"

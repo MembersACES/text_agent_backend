@@ -114,6 +114,8 @@ def test_save_override_updates_custom_type():
 
 def test_sheet_labels_map_to_solution_type_ids():
     assert solution_type_id_from_label("Client Endorsement") == "client_endorsement"
+    assert solution_type_id_from_label("Association Endorsement") == "association_endorsement"
+    assert solution_type_id_from_label("association_endorsement") == "association_endorsement"
     assert solution_type_id_from_label("C&I Gas Reviews") == "ci_gas"
     assert solution_type_id_from_label("Oil / Resource Recovery") == "resource_recovery"
     assert solution_type_id_from_label("CDS (Container Deposit Scheme)") == "cds"

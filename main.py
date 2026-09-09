@@ -49,6 +49,7 @@ from tools.business_info import get_business_information, get_base1_landing_resp
 from tools.member_documents import get_eoi_ids, get_member_wip
 from tools.drive_file_metadata import get_drive_file_times
 from tools.share_folder import ShareFolderError, get_share_folder_status, share_member_folder
+from tools.site_photos import SitePhotosError, list_site_photos, upload_site_photos
 from tools.member_folder_drive import MemberFolderDriveError
 from services.member_folder import (
     create_distributor_folder,
@@ -62,6 +63,13 @@ from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
 from tools.bne_gas_contracts import lookup_bne_gas_contract
+from tools.alinta_gas_ef import (
+    apply_flat_overrides,
+    build_email_html,
+    build_email_subject,
+    build_extract_response,
+    send_alinta_gas_agreement,
+)
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
@@ -147,6 +155,14 @@ from tools.one_month_savings import (
     get_drive_service,
 )
 from tools.one_month_savings_calculation import calculate_one_month_savings
+from tools.new_revenue import (
+    log_invoice_to_sheets as log_new_revenue_invoice_to_sheets,
+    get_invoice_history as get_new_revenue_invoice_history,
+    update_invoice_status as update_new_revenue_invoice_status,
+    update_invoice_file_id as update_new_revenue_invoice_file_id,
+    get_next_sequential_invoice_number as get_next_new_revenue_invoice_number,
+    resolve_upload_folder_id as resolve_new_revenue_upload_folder_id,
+)
 from tools.solar_cleaning_quote import generate_solar_cleaning_quote, preview_solar_quote_extract
 from services.vinyl_wrap_spec import generate_vinyl_wrap_spec_payload
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
@@ -161,6 +177,17 @@ from tools.resources_drive_videos import (
     list_resources_folder_videos,
 )
 from tools.plus_es_dma import get_plus_es_dma_folder_id, list_plus_es_dma_pdfs
+from tools.distributor_folders import (
+    list_distributor_documents,
+    list_distributor_folders,
+    upload_distributor_document,
+)
+from tools.supplier_folders import (
+    create_supplier_folder,
+    list_supplier_documents,
+    list_supplier_folders,
+    upload_supplier_document,
+)
 from tools.testimonial_solution_content import (
     get_merged_content,
     save_override,
@@ -170,6 +197,7 @@ from tools.testimonial_solution_content import (
     resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
+from tools.dma_contract_details import file_dma_contract_details
 
 # Database imports
 from database import get_db, init_db
@@ -257,6 +285,7 @@ from schemas import (
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
     RetellAgentListItem,
+    RetellCallListItem,
     RetellAgentPromptResponse,
     RetellAgentPromptUpdate,
     RetellVoiceListItem,
@@ -699,6 +728,36 @@ class EOIGenerationRequest(DocumentGenerationRequest):
 
 class EngagementFormGenerationRequest(DocumentGenerationRequest):
     engagement_form_type: str
+
+class DmaContractDetailsRequest(BaseModel):
+    nmi: str
+    business: str = ""
+    business_name: str = ""
+    abn: str = ""
+    postal_address: str = ""
+    main_address: str = ""
+    site_address: str = ""
+    frmp: str = ""
+    retailer: str = ""
+    contact: str = ""
+    contact_name: str = ""
+    position: str = ""
+    telephone: str = ""
+    contact_number: str = ""
+    email: str = ""
+    meter: str = ""
+    dma_price: str = ""
+    vas: str = ""
+    vas_price: str = ""
+    start_date: str = ""
+    dma_start_date: str = ""
+    end_date: str = ""
+    dma_end_date: str = ""
+    engagement_form_link: str = ""
+    client_folder_url: str = ""
+    offer_id: Optional[int] = None
+    client_id: Optional[int] = None
+    row_number: Optional[int] = None
 
 class UtilityInfoRequest(BaseModel):
     business_name: str
@@ -1668,6 +1727,68 @@ def share_folder(
         raise HTTPException(status_code=e.status_code, detail=e.message) from e
 
 
+class SitePhotosListRequest(BaseModel):
+    business_name: str = ""
+    gdrive_url: str = ""
+
+
+@app.post("/api/members/site-photos/list")
+def site_photos_list(
+    request: SitePhotosListRequest,
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "site-photos/list business_name=%r user=%s",
+        request.business_name,
+        user_info.get("email"),
+    )
+    try:
+        return list_site_photos(request.gdrive_url)
+    except SitePhotosError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
+@app.post("/api/members/site-photos/upload")
+async def site_photos_upload(
+    user_info: dict = Depends(verify_google_token),
+    files: List[UploadFile] = File(default=[]),
+    business_name: str = Form(""),
+    gdrive_url: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+    photo_names: List[str] = Form(default=[]),
+):
+    names = photo_names if isinstance(photo_names, list) else ([photo_names] if photo_names else [])
+    user_drive_token = (google_access_token or x_google_access_token or "").strip()
+    logging.info(
+        "site-photos/upload business_name=%r count=%s user=%s has_user_drive_token=%s",
+        business_name,
+        len(files or []),
+        user_info.get("email"),
+        bool(user_drive_token),
+    )
+    payloads: list[tuple[str, str, bytes]] = []
+    for upload in files or []:
+        contents = await upload.read()
+        payloads.append(
+            (
+                upload.filename or "photo.jpg",
+                upload.content_type or "",
+                contents,
+            )
+        )
+    try:
+        return upload_site_photos(
+            gdrive_url,
+            payloads,
+            business_name=business_name,
+            user_access_token=user_drive_token,
+            display_names=names,
+        )
+    except SitePhotosError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message) from e
+
+
 @app.post("/api/loa-business-details")
 def loa_business_details(user_info: dict = Depends(verify_google_token)):
     logging.info("loa-business-details request user=%s", user_info.get("email"))
@@ -1766,6 +1887,78 @@ def distributors_list(
         )
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
+
+
+@app.get("/api/distributors/drive")
+def distributors_drive_list(user_info: dict = Depends(verify_google_token)):
+    """List distributor folders under 003-Distributors (service account)."""
+    _ = user_info
+    payload, err, status = list_distributor_folders()
+    if err:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.get("/api/distributors/drive/{folder_id}/files")
+def distributors_drive_files(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+):
+    """List files and subfolders in a distributor folder or any nested folder under it."""
+    _ = user_info
+    payload, err, status = list_distributor_documents(folder_id)
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "distributor_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under 003-Distributors.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.post("/api/distributors/drive/{folder_id}/files")
+async def distributors_drive_upload(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+    filename: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Upload a document into a distributor folder or a nested folder under it."""
+    logging.info(
+        "distributors/drive/upload folder=%s file=%s user=%s has_user_drive_token=%s",
+        folder_id,
+        file.filename,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    contents = await file.read()
+    payload, err, status = upload_distributor_document(
+        folder_id,
+        contents,
+        file.filename or "upload.bin",
+        content_type=file.content_type,
+        display_name=filename.strip() or None,
+        user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+    )
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "empty_file":
+            raise HTTPException(status_code=400, detail="Empty file")
+        if err == "file_too_large":
+            raise HTTPException(status_code=400, detail="File is larger than 50 MB")
+        if err == "distributor_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under 003-Distributors.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
 
 
 @app.post("/api/distributors/create")
@@ -2154,6 +2347,146 @@ def get_base2_ci_gas_energy_reference(
         result.get("median_energy_share"),
         result.get("message"),
     )
+    return result
+
+
+@app.post("/api/alinta-gas-agreement/extract")
+async def alinta_gas_agreement_extract(
+    file: UploadFile = File(...),
+    business_name: Optional[str] = Form(None),
+    mrin: Optional[str] = Form(None),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "alinta-gas-agreement/extract file=%s business=%r mrin=%r user=%s",
+        file.filename,
+        business_name,
+        mrin,
+        user_info.get("email") if isinstance(user_info, dict) else None,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if file.filename and not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    return build_extract_response(
+        contents,
+        filename=file.filename or "",
+        business_name=(business_name or "").strip(),
+        query_mrin=(mrin or "").strip(),
+    )
+
+
+@app.post("/api/alinta-gas-agreement/send")
+async def alinta_gas_agreement_send(
+    file: UploadFile = File(...),
+    draft_json: str = Form(...),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    logging.info(
+        "alinta-gas-agreement/send file=%s user=%s",
+        file.filename,
+        email,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        payload = json.loads(draft_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="draft_json is not valid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="draft_json must be an object")
+
+    draft = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
+    overrides = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    if overrides:
+        draft = apply_flat_overrides(draft, overrides)
+    if payload.get("request_kind"):
+        draft = apply_flat_overrides(draft, {"request_kind": payload.get("request_kind")})
+    if payload.get("loa_file_id") and not draft.get("loa_file_id"):
+        draft["loa_file_id"] = payload.get("loa_file_id")
+    if payload.get("gdrive_folder_url") and not draft.get("gdrive_folder_url"):
+        draft["gdrive_folder_url"] = payload.get("gdrive_folder_url")
+
+    company = ""
+    fields = draft.get("fields") or {}
+    company_field = fields.get("company_name")
+    if isinstance(company_field, dict):
+        company = str(company_field.get("value") or "").strip()
+    elif company_field:
+        company = str(company_field).strip()
+    if not company:
+        company = str(payload.get("business_name") or "").strip()
+
+    client = None
+    raw_client_id = payload.get("client_id") or payload.get("clientId")
+    if raw_client_id not in (None, ""):
+        try:
+            client = db.query(Client).filter(Client.id == int(raw_client_id)).first()
+        except (TypeError, ValueError):
+            client = None
+    if client is None and company:
+        client = db.query(Client).filter(Client.business_name == company).first()
+    if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
+        draft["gdrive_folder_url"] = client.gdrive_folder_url
+
+    result = send_alinta_gas_agreement(
+        draft,
+        pdf_bytes=contents,
+        filename=file.filename or "",
+        user_email=email,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
+
+    try:
+        if client:
+            offer = get_or_create_offer_for_activity(
+                db,
+                client.id,
+                company or client.business_name,
+                "C&I Gas",
+                created_by=email,
+                utility_type_identifier="Alinta C&I Gas agreement request",
+            )
+            doc_link = result.get("client_folder_url") or None
+            meta = {
+                "source": "alinta_gas_agreement_request",
+                "email_subject": result.get("email_subject"),
+                "recipient": result.get("recipient"),
+                "request_kind": draft.get("request_kind"),
+                "mirn": ((fields.get("mirn") or {}) if isinstance(fields.get("mirn"), dict) else {}).get("value")
+                or payload.get("mrin"),
+                "agreement_type": result.get("agreement_type"),
+            }
+            if not result.get("lodge_error"):
+                create_offer_activity(
+                    db,
+                    offer=offer,
+                    client=client,
+                    activity_type=OfferActivityType.ENGAGEMENT_FORM_SIGNED,
+                    document_link=doc_link,
+                    metadata=meta,
+                    created_by=email,
+                )
+            create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.ALINTA_AGREEMENT_REQUESTED,
+                document_link=doc_link,
+                metadata=meta,
+                created_by=email,
+            )
+    except Exception as act_e:
+        logging.warning("Failed to log alinta gas agreement activity: %s", act_e)
+
+    result["email_subject"] = result.get("email_subject") or build_email_subject(draft)
+    result["email_html_content"] = build_email_html(draft)
+    result["user_email"] = email
     return result
 
 
@@ -4375,6 +4708,103 @@ def get_plus_es_dma_pdfs(user_info: dict = Depends(verify_google_token)):
         "folder_url": f"https://drive.google.com/drive/folders/{folder_id}",
         "pdfs": pdfs,
     }
+
+
+@app.get("/api/suppliers")
+def suppliers_list(user_info: dict = Depends(verify_google_token)):
+    """List supplier folders under 005-Suppliers → Supplier Folders (service account)."""
+    _ = user_info
+    payload, err, status = list_supplier_folders()
+    if err:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.post("/api/suppliers")
+async def suppliers_create(
+    user_info: dict = Depends(verify_google_token),
+    name: str = Form(...),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Create a new supplier folder under 005-Suppliers → Supplier Folders."""
+    logging.info(
+        "suppliers/create name=%r user=%s has_user_drive_token=%s",
+        name,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    payload, err, status = create_supplier_folder(
+        name,
+        user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+    )
+    if err:
+        if err == "missing_name":
+            raise HTTPException(status_code=400, detail="Supplier name is required")
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.get("/api/suppliers/{folder_id}/files")
+def suppliers_files(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+):
+    """List files and subfolders in a supplier folder or any nested folder under it."""
+    _ = user_info
+    payload, err, status = list_supplier_documents(folder_id)
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.post("/api/suppliers/{folder_id}/files")
+async def suppliers_upload(
+    folder_id: str,
+    user_info: dict = Depends(verify_google_token),
+    file: UploadFile = File(...),
+    filename: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Upload a document into a supplier folder or a nested folder under it."""
+    logging.info(
+        "suppliers/upload folder=%s file=%s user=%s has_user_drive_token=%s",
+        folder_id,
+        file.filename,
+        user_info.get("email"),
+        bool((google_access_token or x_google_access_token or "").strip()),
+    )
+    contents = await file.read()
+    payload, err, status = upload_supplier_document(
+        folder_id,
+        contents,
+        file.filename or "upload.bin",
+        content_type=file.content_type,
+        display_name=filename.strip() or None,
+        user_access_token=(google_access_token or x_google_access_token or "").strip() or None,
+    )
+    if err:
+        if err == "missing_folder_id":
+            raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "empty_file":
+            raise HTTPException(status_code=400, detail="Empty file")
+        if err == "file_too_large":
+            raise HTTPException(status_code=400, detail="File is larger than 50 MB")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
 
 
 def _verify_video_write_auth(authorization: str) -> None:
@@ -6663,6 +7093,35 @@ def generate_engagement_form_endpoint(
         logging.error(f"Error generating Engagement Form for {request.business_name}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error generating Engagement Form: {str(e)}")
 
+@app.post("/api/dma/contract-details")
+def dma_contract_details_endpoint(
+    request: DmaContractDetailsRequest,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    """Fill the DMA contract-details spreadsheet and file it next to the engagement form."""
+    payload = request.model_dump()
+    logging.info(
+        "DMA contract details request nmi=%s business=%s offer_id=%s has_user_drive_token=%s",
+        request.nmi,
+        request.business or request.business_name,
+        request.offer_id,
+        bool((x_google_access_token or "").strip()),
+    )
+    try:
+        result = file_dma_contract_details(
+            payload,
+            db=db,
+            user_access_token=(x_google_access_token or "").strip() or None,
+        )
+        if isinstance(result, dict):
+            result["user_email"] = user_info.get("email")
+        return result
+    except Exception as e:
+        logging.exception("DMA contract details failed for nmi=%s", request.nmi)
+        return {"status": "error", "message": str(e)}
+
 @app.post("/api/generate-ghg-offer")
 def generate_ghg_offer_endpoint(
     request: DocumentGenerationRequest,
@@ -8093,6 +8552,285 @@ async def upload_invoice_pdf_endpoint(
         logging.error(f"Error uploading PDF: {str(e)}")
         logging.exception(e)
         raise HTTPException(status_code=500, detail=f"Error uploading PDF: {str(e)}")
+
+
+def _new_revenue_auth(authorization: str, request_data: dict, allow_access_token: bool = False) -> dict:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    if token == os.getenv("BACKEND_API_KEY", "test-key"):
+        return {"email": request_data.get("user_email", "api_user@example.com")}
+    if allow_access_token:
+        return {"email": request_data.get("user_email", "unknown@example.com")}
+    try:
+        return verify_google_token(authorization)
+    except Exception as exc:
+        logging.error("Token verification failed: %s", exc)
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+
+@app.post("/api/new-revenue/log")
+async def log_new_revenue_invoice_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    request_data = await request.json()
+    user_info = _new_revenue_auth(authorization, request_data)
+    invoice_file_id = request_data.get("invoice_file_id", "") or request_data.get("file_id", "")
+    invoice_data = {
+        "invoice_number": request_data.get("invoice_number"),
+        "business_name": request_data.get("business_name"),
+        "business_abn": request_data.get("business_abn", ""),
+        "contact_name": request_data.get("contact_name", ""),
+        "contact_email": request_data.get("contact_email", ""),
+        "invoice_date": request_data.get("invoice_date"),
+        "due_date": request_data.get("due_date"),
+        "line_items": request_data.get("line_items", []),
+        "subtotal": request_data.get("subtotal", 0),
+        "total_gst": request_data.get("total_gst", 0),
+        "total_amount": request_data.get("total_amount", 0),
+        "status": request_data.get("status", "Generated"),
+        "created_at": request_data.get("created_at"),
+        "invoice_file_id": invoice_file_id,
+    }
+    result = log_new_revenue_invoice_to_sheets(invoice_data)
+    result["user_email"] = user_info.get("email")
+    try:
+        business_name = invoice_data.get("business_name") or ""
+        if business_name:
+            client = upsert_client_from_business_info(
+                db=db,
+                business_name=business_name,
+                external_business_id=None,
+                primary_contact_email=invoice_data.get("contact_email") or None,
+                gdrive_folder_url=None,
+            )
+            if client:
+                offer = get_or_create_offer_for_activity(
+                    db=db,
+                    client_id=client.id,
+                    business_name=client.business_name,
+                    utility_type="new_revenue",
+                    created_by=user_info.get("email"),
+                    utility_type_identifier="Discrepancy / New Revenue Invoice",
+                    identifier=invoice_data.get("invoice_number"),
+                )
+                create_offer_activity(
+                    db=db,
+                    offer=offer,
+                    client=client,
+                    activity_type=OfferActivityType.NEW_REVENUE_INVOICE,
+                    document_link=None,
+                    external_id=None,
+                    metadata={
+                        "source": "new_revenue",
+                        "invoice_number": invoice_data.get("invoice_number"),
+                        "total_amount": invoice_data.get("total_amount"),
+                        "due_date": invoice_data.get("due_date"),
+                        "line_items": invoice_data.get("line_items", []),
+                        "invoice_file_id": invoice_data.get("invoice_file_id"),
+                    },
+                    created_by=user_info.get("email"),
+                )
+    except Exception as exc:
+        logging.error(
+            "Failed to create CRM activity for new revenue invoice %s: %s",
+            invoice_data.get("invoice_number"),
+            exc,
+        )
+    return result
+
+
+@app.post("/api/new-revenue/history")
+async def get_new_revenue_history_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    user_info = _new_revenue_auth(authorization, request_data)
+    result = get_new_revenue_invoice_history(request_data.get("business_name") or "")
+    result["user_email"] = user_info.get("email")
+    return result
+
+
+@app.post("/api/new-revenue/next-invoice-number")
+async def get_new_revenue_next_invoice_number_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    return {"invoice_number": get_next_new_revenue_invoice_number()}
+
+
+@app.patch("/api/new-revenue/status")
+async def update_new_revenue_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(status_code=400, detail="business_name, invoice_number and status are required")
+    result = update_new_revenue_invoice_status(business_name, invoice_number, status)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Failed to update status")
+    return result
+
+
+@app.patch("/api/new-revenue/file-id")
+async def update_new_revenue_file_id_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    request_data = await request.json()
+    _new_revenue_auth(authorization, request_data)
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    file_id = (request_data.get("file_id") or request_data.get("invoice_file_id") or "").strip()
+    if not business_name or not invoice_number or not file_id:
+        raise HTTPException(status_code=400, detail="business_name, invoice_number and file_id are required")
+    result = update_new_revenue_invoice_file_id(business_name, invoice_number, file_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "Failed to update file_id")
+    return result
+
+
+@app.post("/api/new-revenue/upload-pdf")
+async def upload_new_revenue_pdf_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Same path as 1st Month Savings: n8n file-upload webhook → Drive → file_id."""
+    import base64
+    import uuid
+    from tools.n8n_file_upload import UPLOAD_TYPE_NEW_REVENUE, upload_file_via_n8n
+    from tools.one_month_savings import oms_upload_fail, oms_upload_http_detail, oms_upload_log
+
+    request_data = await request.json()
+    request_id = (request_data.get("request_id") or "").strip() or str(uuid.uuid4())
+    user_info = _new_revenue_auth(authorization, request_data, allow_access_token=True)
+    pdf_base64 = request_data.get("pdf_base64")
+    filename = request_data.get("filename")
+    invoice_number = request_data.get("invoice_number")
+    business_name = request_data.get("business_name") or ""
+    if not pdf_base64 or not filename:
+        raise HTTPException(
+            status_code=400,
+            detail=oms_upload_http_detail(
+                error_code="MISSING_FIELDS",
+                message="Missing required fields: pdf_base64 and filename",
+                request_id=request_id,
+            ),
+        )
+
+    pdf_bytes = base64.b64decode(pdf_base64)
+    folder_id = resolve_new_revenue_upload_folder_id()
+    if not folder_id:
+        oms_upload_fail(
+            request_id=request_id,
+            invoice_number=invoice_number,
+            path="config",
+            error_code="FOLDER_NOT_CONFIGURED",
+            message="NEW_REVENUE_DRIVE_FOLDER_ID / ONE_MONTH_SAVINGS_DRIVE_FOLDER_ID not configured",
+            http_status=500,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=oms_upload_http_detail(
+                error_code="FOLDER_NOT_CONFIGURED",
+                message="Invoice storage folder ID not configured",
+                request_id=request_id,
+            ),
+        )
+
+    extra_form: Dict[str, str] = {}
+    if invoice_number:
+        extra_form["invoice_number"] = str(invoice_number).strip()
+    for key in (
+        "due_date",
+        "invoice_date",
+        "status",
+        "subtotal",
+        "total_gst",
+        "total_amount",
+        "solution",
+        "savings_amount",
+        "gst",
+        "total_invoice",
+        "line_items",
+        "gross_amount",
+        "fee_percent",
+        "fee_amount",
+    ):
+        val = request_data.get(key)
+        if val is not None and str(val).strip() != "":
+            extra_form[key] = str(val).strip()
+    if "savings_amount" not in extra_form and extra_form.get("fee_amount"):
+        extra_form["savings_amount"] = extra_form["fee_amount"]
+
+    oms_upload_log(
+        logging.INFO,
+        "n8n upload start",
+        request_id=request_id,
+        invoice_number=invoice_number,
+        stage="n8n",
+        business=business_name,
+        folder_id=folder_id,
+        upload_type=UPLOAD_TYPE_NEW_REVENUE,
+    )
+
+    n8n_result, n8n_ok, n8n_status = upload_file_via_n8n(
+        file_bytes=pdf_bytes,
+        filename=filename,
+        upload_type=UPLOAD_TYPE_NEW_REVENUE,
+        business_name=business_name,
+        drive_folder=folder_id,
+        content_type="application/pdf",
+        request_id=request_id,
+        requested_by=user_info.get("email"),
+        extra_form=extra_form,
+    )
+
+    if not n8n_ok:
+        error_code = n8n_result.get("error_code") or "N8N_UPLOAD_FAILED"
+        error_msg = n8n_result.get("message") or "Invoice upload workflow failed."
+        remediation = (
+            "Check n8n workflow 'file-upload' Switch has a rule for upload_type=new_revenue_invoice "
+            "(copy the 1st Month Savings Drive upload branch, different folder/sheet)."
+        )
+        oms_upload_fail(
+            request_id=request_id,
+            invoice_number=invoice_number,
+            path="n8n",
+            error_code=error_code,
+            message=error_msg,
+            remediation=remediation,
+            http_status=n8n_status,
+            folder_id=folder_id,
+        )
+        raise HTTPException(
+            status_code=502 if n8n_status >= 500 else 403,
+            detail=oms_upload_http_detail(
+                error_code=error_code,
+                message=error_msg,
+                request_id=request_id,
+                remediation=remediation,
+                folder_id=folder_id,
+            ),
+        )
+
+    file_id = n8n_result.get("file_id")
+    return {
+        "success": True,
+        "file_id": file_id,
+        "file_url": n8n_result.get("file_url") or f"https://drive.google.com/file/d/{file_id}/view",
+        "request_id": request_id,
+    }
 
 
 class SolarCleaningQuoteGenerateRequest(BaseModel):
@@ -10889,6 +11627,7 @@ def list_offers(
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
+    include_campaign_stubs: Optional[bool] = Query(False, description="If true, include offers created by a campaign start"),
     limit: Optional[int] = Query(None, description="Max number of offers to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of offers to skip (use with limit)"),
     db: Session = Depends(get_db),
@@ -10932,6 +11671,8 @@ def list_offers(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    if not include_campaign_stubs:
+        query = query.filter(Offer.campaign_id.is_(None))
     ordered = query.order_by(Offer.created_at.desc())
     if limit is not None or offset is not None:
         total = ordered.count()
@@ -10993,6 +11734,7 @@ def export_offers_csv(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    query = query.filter(Offer.campaign_id.is_(None))
     offers = query.order_by(Offer.created_at.desc()).all()
     rows_data = [_offer_to_response(db, o).model_dump(mode="json") for o in offers]
     if not rows_data:
@@ -11463,7 +12205,7 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
 
 
 def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunResponse:
-    from services.autonomous_sequence import _parse_context
+    from services.autonomous_sequence import _parse_context, latest_ack_draft
 
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
@@ -11485,6 +12227,7 @@ def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> Autonomou
         contact_email=run.contact_email,
         context=_parse_context(run),
         steps=[AutonomousSequenceStepResponse.model_validate(s) for s in steps],
+        ack_draft=latest_ack_draft(db, run.id),
     )
 
 
@@ -11495,13 +12238,16 @@ def autonomous_sequence_start(
     user_data: dict = Depends(get_current_user_with_db),
 ):
     from services.autonomous_sequence import (
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        apply_validity_to_context,
         ensure_autonomous_sequence_type_row,
         get_sequence_template_by_type,
+        get_template_validity_config,
         start_gas_base2_sequence,
     )
 
-    sequence_type = (body.sequence_type or "").strip()
-    if not sequence_type:
+    requested_type = (body.sequence_type or "").strip()
+    if not requested_type:
         raise HTTPException(status_code=400, detail="sequence_type is required")
 
     sequence_context = dict(body.context or {})
@@ -11522,24 +12268,19 @@ def autonomous_sequence_start(
     else:
         anchor_utc = anchor_dt.astimezone(timezone.utc)
 
-    from services.autonomous_sequence import (
-        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
-        apply_validity_to_context,
-        get_template_validity_config,
-    )
-
-    template = get_sequence_template_by_type(db, sequence_type)
+    template = get_sequence_template_by_type(db, requested_type)
     if not template:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Unsupported sequence_type (template not found): {sequence_type!r}. "
+                f"Unsupported sequence_type (template not found): {requested_type!r}. "
                 "Create it under Autonomous Agent \u2192 Sequence templates, or check the mono key under the display name."
             ),
         )
+    sequence_type = str(template.sequence_type)
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if sequence_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if requested_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
         incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
         if not incoming_validity:
             # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
@@ -11582,7 +12323,7 @@ def autonomous_sequence_start(
     if not bool(template.is_active):
         raise HTTPException(
             status_code=400,
-            detail=f"Sequence template is inactive: {sequence_type!r}. Enable Active and Save template.",
+            detail=f"Sequence template is inactive: {requested_type!r}. Enable Active and Save template.",
         )
     offer = db.query(Offer).filter(Offer.id == body.offer_id).first()
     if not offer:
@@ -11646,13 +12387,18 @@ def _autonomous_template_response(
         DEFAULT_VALIDITY_DAYS,
         DEFAULT_VALIDITY_MODE,
         default_signature_html_for_type,
+        get_template_linked_flow_keys,
+        get_template_stop_on,
         get_template_validity_config,
+        parse_ack_template,
     )
 
     if db is not None:
         validity_mode, validity_days = get_template_validity_config(db, template)
+        linked_flow_keys = get_template_linked_flow_keys(db, template)
     else:
         validity_mode, validity_days = DEFAULT_VALIDITY_MODE, DEFAULT_VALIDITY_DAYS
+        linked_flow_keys = []
 
     steps_sorted = sorted(template.steps, key=lambda s: s.step_index)
     return AutonomousSequenceTemplateResponse.model_validate(
@@ -11669,6 +12415,10 @@ def _autonomous_template_response(
             "extra_context": str(getattr(template, "extra_context", None) or "").strip() or None,
             "validity_mode": validity_mode,
             "validity_days": validity_days,
+            "linked_flow_keys": linked_flow_keys,
+            "stop_on": get_template_stop_on(template),
+            "ack_template_signed": parse_ack_template(getattr(template, "ack_template_signed", None)),
+            "ack_template_invoice": parse_ack_template(getattr(template, "ack_template_invoice", None)),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -11826,6 +12576,46 @@ def autonomous_sequence_patch_type_prompts(
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
 
 
+@app.get(
+    "/api/autonomous/sequences/runs/{run_id}/calls",
+    response_model=List[RetellCallListItem],
+)
+def autonomous_run_call_history(
+    run_id: int,
+    limit: int = 50,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Every Retell call this run has placed, newest first.
+
+    Recovered from Retell by the run_id the worker stamps into each call's
+    metadata, so it works over calls already made and needs no column on the
+    steps table. That column is still worth adding later, to tie a call to the
+    specific step that placed it rather than to the run as a whole.
+    """
+    from services.retell_calls import list_calls_for_run
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return list_calls_for_run(run_id, min(max(limit, 1), 200))
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/calls/{call_id}", response_model=RetellCallListItem)
+def autonomous_retell_get_call(
+    call_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """One call in full, for the transcript and recording view."""
+    from services.retell_calls import get_call
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return get_call(call_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
 @app.get("/api/autonomous/retell/voices", response_model=List[RetellVoiceListItem])
 def autonomous_retell_list_voices(
     user_data: dict = Depends(get_current_user_with_db),
@@ -11910,12 +12700,12 @@ def autonomous_sequence_template_suggestions(
 ):
     """Comparisons / flows that do not yet have an autonomous sequence template."""
     from services.autonomous_flows import uncovered_flows
+    from services.autonomous_sequence import get_template_linked_flow_keys
 
-    existing = {
-        str(t.sequence_type).strip()
-        for t in db.query(AutonomousSequenceTemplate.sequence_type).all()
-        if t.sequence_type
-    }
+    rows = db.query(AutonomousSequenceTemplate).all()
+    existing = {str(t.sequence_type).strip() for t in rows if t.sequence_type}
+    for t in rows:
+        existing.update(get_template_linked_flow_keys(db, t))
     return AutonomousTemplateSuggestionsResponse(uncovered_flows=uncovered_flows(existing))
 
 
@@ -12000,6 +12790,17 @@ def autonomous_sequence_create_template(
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
 
+    from services.autonomous_sequence import dump_ack_template, get_template_stop_on, GCI_SEQUENCE_TYPE, GCI_STOP_ON
+
+    if body.stop_on is not None:
+        stop_on_value = json.dumps(body.stop_on)
+    elif source is not None:
+        stop_on_value = json.dumps(get_template_stop_on(source))
+    elif seq_type == GCI_SEQUENCE_TYPE:
+        stop_on_value = json.dumps(list(GCI_STOP_ON))
+    else:
+        stop_on_value = None
+
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
@@ -12013,6 +12814,11 @@ def autonomous_sequence_create_template(
         extra_context=(body.extra_context or "").strip()
         or ((getattr(source, "extra_context", None) or "").strip() if source else "")
         or None,
+        stop_on=stop_on_value,
+        ack_template_signed=dump_ack_template(body.ack_template_signed)
+        or (getattr(source, "ack_template_signed", None) if source else None),
+        ack_template_invoice=dump_ack_template(body.ack_template_invoice)
+        or (getattr(source, "ack_template_invoice", None) if source else None),
     )
     db.add(template)
     db.flush()
@@ -12126,6 +12932,18 @@ def autonomous_sequence_update_template(
             set_template_validity_config(db, template.id, body.validity_mode, body.validity_days)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    if body.linked_flow_keys is not None:
+        from services.autonomous_sequence import set_template_linked_flow_keys
+        set_template_linked_flow_keys(db, template.id, body.linked_flow_keys)
+    if body.stop_on is not None:
+        from services.autonomous_sequence import parse_stop_on
+        template.stop_on = json.dumps(parse_stop_on(body.stop_on))
+    if body.ack_template_signed is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_signed = dump_ack_template(body.ack_template_signed)
+    if body.ack_template_invoice is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_invoice = dump_ack_template(body.ack_template_invoice)
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template, db)
@@ -13599,3 +14417,8 @@ def rebuild_staged_activity(
                          "staged": s_staged, "skipped": s_skipped})
     return {"entity_id": entity_id, "period": period, "dry_run": False,
             "deleted": int(deleted or 0), "staged": staged, "skipped": skipped, "per_site": per_site}
+
+
+from campaign_routes import register_campaign_routes
+
+register_campaign_routes(app, get_current_user_with_db)

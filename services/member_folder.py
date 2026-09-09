@@ -24,6 +24,7 @@ from tools.distributor_agreement import (
     extract_distribution_agreement,
     update_distributor_drive_cells,
 )
+from tools.distributor_folders import DOCUMENTS_FOLDER_NAME
 from tools.member_folder_drive import (
     DISTRIBUTORS_FOLDER_ID,
     MEMBERS_B_FOLDER_ID,
@@ -651,6 +652,15 @@ def create_distributor_folder(
     details["drive_folder_id"] = drive_info["folder_id"]
     details["drive_folder_url"] = drive_info["folder_url"]
 
+    documents_folder_id = drive_info["folder_id"]
+    documents_folder_url = drive_info["folder_url"]
+    try:
+        docs_id, _ = find_or_create_folder(drive_info["folder_id"], DOCUMENTS_FOLDER_NAME)
+        documents_folder_id = docs_id
+        documents_folder_url = drive_folder_url(docs_id)
+    except MemberFolderDriveError as e:
+        warnings.append(f"Could not create {DOCUMENTS_FOLDER_NAME}: {e.message}")
+
     safe_name = (pdf_filename or "Distribution Agreement.pdf").strip() or "Distribution Agreement.pdf"
     if not safe_name.lower().endswith(".pdf"):
         safe_name = f"{safe_name}.pdf"
@@ -661,7 +671,7 @@ def create_distributor_folder(
         uploaded = upload_bytes_to_folder(
             pdf_bytes,
             upload_name,
-            drive_info["folder_id"],
+            documents_folder_id,
             user_access_token=user_access_token,
         )
     except MemberFolderDriveError as e:
@@ -711,6 +721,8 @@ def create_distributor_folder(
         },
         "agreement_file_id": uploaded.get("id"),
         "agreement_file_url": details["agreement_file_url"],
+        "documents_folder_id": documents_folder_id,
+        "documents_folder_url": documents_folder_url,
         "sheet_row": details_to_sheet_row(details),
         **drive_info,
         "details": details,

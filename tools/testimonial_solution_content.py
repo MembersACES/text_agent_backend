@@ -49,6 +49,7 @@ EXTRA_SOLUTION_TYPES: Dict[str, str] = {
     "dma": "Direct Metering Agreement",
     "solar_panel_cleaning": "Solar Panel Cleaning",
     "client_endorsement": "Client Endorsement",
+    "association_endorsement": "Association Endorsement",
     "ghg_roadmap": "GHG Roadmap",
     "solar_review": "Solar Review",
     "gas_discrepancy": "Gas Discrepancy Recovery",
@@ -435,6 +436,33 @@ DEFAULT_CONTENT["client_endorsement"].update({
     ),
     "esg_scope_for_solution": "SCOPE 3",
     "sdg_impact_for_solution": "SDG 8, 12, 17",
+})
+
+DEFAULT_CONTENT["association_endorsement"].update({
+    "key_outcome_metrics": "Network energy outcomes, ongoing invoice support",
+    "key_challenge_of_solution": (
+        "Sub-branches were dealing with electricity and gas in isolation, with no shared "
+        "programme and no one checking invoices after the contract was signed."
+    ),
+    "key_approach_of_solution": (
+        "The ACES team ran group electricity and gas reviews across the network, validated "
+        "invoices, resolved billing discrepancies, and stayed engaged after the paperwork was signed."
+    ),
+    "key_outcome_of_solution": (
+        "Participating sub-branches secured rates, and the association had a partner still "
+        "accountable after signing — not a one-off tender."
+    ),
+    "key_outcome_dotpoints_1": "Group electricity and gas reviews across the sub-branch network.",
+    "key_outcome_dotpoints_2": "Invoice validation and resolution of billing discrepancies.",
+    "key_outcome_dotpoints_3": "Ongoing monitoring and support after the contract was signed.",
+    "key_outcome_dotpoints_4": "Outcomes visible across participating sub-branches.",
+    "key_outcome_dotpoints_5": "A single partner for the association, not a one-off tender.",
+    "conclusion": (
+        "Association endorsement is a network reference: the peak body standing behind the "
+        "programme, not a single-site saving."
+    ),
+    "esg_scope_for_solution": "SCOPE 2, 3",
+    "sdg_impact_for_solution": "SDG 7, 12, 17",
 })
 
 DEFAULT_CONTENT["ghg_roadmap"].update({

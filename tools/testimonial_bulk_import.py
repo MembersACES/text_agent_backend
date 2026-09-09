@@ -28,6 +28,7 @@ FOLDER_TO_TYPE: dict[str, str] = {
     "cleaning robot": "automated_cleaning_robot",
     "solar cleaning": "solar_panel_cleaning",
     "service": "client_endorsement",
+    "association": "association_endorsement",
     "ghg": "ghg_roadmap",
     "solar review": "solar_review",
     "gas discrepancy": "gas_discrepancy",
@@ -46,6 +47,7 @@ AAA_SUFFIX_TO_TYPE: tuple[tuple[str, str], ...] = (
     ("gas contract review", "ci_gas"),
     ("solar panel cleaning", "solar_panel_cleaning"),
     ("cooking oil review", "resource_recovery"),
+    ("association endorsement", "association_endorsement"),
     ("client endorsement", "client_endorsement"),
     ("solar review", "solar_review"),
 )
@@ -62,6 +64,7 @@ _TYPE_PHRASES = tuple(
             "gas contract review",
             "solar panel cleaning",
             "cooking oil review",
+            "association endorsement",
             "client endorsement",
             "ghg roadmap and cooking oil",
             "ghg roadmap",
