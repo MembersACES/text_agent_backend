@@ -12205,7 +12205,7 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
 
 
 def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunResponse:
-    from services.autonomous_sequence import _parse_context
+    from services.autonomous_sequence import _parse_context, latest_ack_draft
 
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
@@ -12227,6 +12227,7 @@ def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> Autonomou
         contact_email=run.contact_email,
         context=_parse_context(run),
         steps=[AutonomousSequenceStepResponse.model_validate(s) for s in steps],
+        ack_draft=latest_ack_draft(db, run.id),
     )
 
 
@@ -12387,7 +12388,9 @@ def _autonomous_template_response(
         DEFAULT_VALIDITY_MODE,
         default_signature_html_for_type,
         get_template_linked_flow_keys,
+        get_template_stop_on,
         get_template_validity_config,
+        parse_ack_template,
     )
 
     if db is not None:
@@ -12413,6 +12416,9 @@ def _autonomous_template_response(
             "validity_mode": validity_mode,
             "validity_days": validity_days,
             "linked_flow_keys": linked_flow_keys,
+            "stop_on": get_template_stop_on(template),
+            "ack_template_signed": parse_ack_template(getattr(template, "ack_template_signed", None)),
+            "ack_template_invoice": parse_ack_template(getattr(template, "ack_template_invoice", None)),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -12744,6 +12750,17 @@ def autonomous_sequence_create_template(
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
 
+    from services.autonomous_sequence import dump_ack_template, get_template_stop_on, GCI_SEQUENCE_TYPE, GCI_STOP_ON
+
+    if body.stop_on is not None:
+        stop_on_value = json.dumps(body.stop_on)
+    elif source is not None:
+        stop_on_value = json.dumps(get_template_stop_on(source))
+    elif seq_type == GCI_SEQUENCE_TYPE:
+        stop_on_value = json.dumps(list(GCI_STOP_ON))
+    else:
+        stop_on_value = None
+
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
@@ -12757,6 +12774,11 @@ def autonomous_sequence_create_template(
         extra_context=(body.extra_context or "").strip()
         or ((getattr(source, "extra_context", None) or "").strip() if source else "")
         or None,
+        stop_on=stop_on_value,
+        ack_template_signed=dump_ack_template(body.ack_template_signed)
+        or (getattr(source, "ack_template_signed", None) if source else None),
+        ack_template_invoice=dump_ack_template(body.ack_template_invoice)
+        or (getattr(source, "ack_template_invoice", None) if source else None),
     )
     db.add(template)
     db.flush()
@@ -12873,6 +12895,15 @@ def autonomous_sequence_update_template(
     if body.linked_flow_keys is not None:
         from services.autonomous_sequence import set_template_linked_flow_keys
         set_template_linked_flow_keys(db, template.id, body.linked_flow_keys)
+    if body.stop_on is not None:
+        from services.autonomous_sequence import parse_stop_on
+        template.stop_on = json.dumps(parse_stop_on(body.stop_on))
+    if body.ack_template_signed is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_signed = dump_ack_template(body.ack_template_signed)
+    if body.ack_template_invoice is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_invoice = dump_ack_template(body.ack_template_invoice)
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template, db)

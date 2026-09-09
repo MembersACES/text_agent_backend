@@ -493,6 +493,9 @@ class AutonomousSequenceTemplate(Base):
     is_restartable = Column(Integer, nullable=False, default=1)  # SQLite boolean as 0/1
     signature_html = Column(Text, nullable=True)
     extra_context = Column(Text, nullable=True)
+    stop_on = Column(Text, nullable=True)
+    ack_template_signed = Column(Text, nullable=True)
+    ack_template_invoice = Column(Text, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
