@@ -258,6 +258,164 @@ def set_template_linked_flow_keys(db: Session, template_id: int, keys: list[str]
     return clean
 
 
+DEFAULT_STOP_ON = ["agreement_signed", "negative_sentiment_stop"]
+GCI_SEQUENCE_TYPE = "gci_outbound_v1"
+GCI_STOP_ON = ["invoice_received", "negative_sentiment_stop"]
+ACK_DRAFT_REASONS = frozenset({"agreement_signed", "invoice_received"})
+
+
+def parse_stop_on(raw: Any) -> list[str]:
+    if raw is None:
+        return list(DEFAULT_STOP_ON)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return list(DEFAULT_STOP_ON)
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return list(DEFAULT_STOP_ON)
+    if not isinstance(raw, list):
+        return list(DEFAULT_STOP_ON)
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def parse_ack_template(raw: Any) -> Optional[dict[str, str]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return None
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    subject = str(raw.get("subject") or "").strip()
+    html = str(raw.get("html") or "").strip()
+    if not subject and not html:
+        return None
+    return {"subject": subject, "html": html}
+
+
+def dump_ack_template(value: Optional[dict[str, str]]) -> Optional[str]:
+    parsed = parse_ack_template(value)
+    if not parsed:
+        return None
+    return json.dumps(parsed)
+
+
+def get_template_stop_on(template: Optional[Any]) -> list[str]:
+    if template is None:
+        return list(DEFAULT_STOP_ON)
+    seq = str(getattr(template, "sequence_type", "") or "")
+    raw = getattr(template, "stop_on", None)
+    if raw in (None, "") and seq == GCI_SEQUENCE_TYPE:
+        return list(GCI_STOP_ON)
+    return parse_stop_on(raw)
+
+
+def stop_reason_honoured(stop_on: list[str], reason: str) -> bool:
+    if reason == "negative_sentiment_stop":
+        return True
+    return reason in {item.lower() for item in stop_on}
+
+
+def _maybe_draft_ack(db: Session, run: AutonomousSequenceRun, reason: str) -> None:
+    if reason not in ACK_DRAFT_REASONS:
+        return
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    raw = None
+    if template is not None:
+        match reason:
+            case "agreement_signed":
+                raw = getattr(template, "ack_template_signed", None)
+            case "invoice_received":
+                raw = getattr(template, "ack_template_invoice", None)
+            case _:
+                raw = None
+    parsed = parse_ack_template(raw)
+    if not parsed:
+        logger.warning(
+            "No ack_template for %s on run_id=%s sequence_type=%s — skipping draft",
+            reason,
+            run.id,
+            run.sequence_type,
+        )
+        return
+    from services.merge_template import html_to_plain_text, render_template
+
+    ctx: dict[str, Any] = {}
+    try:
+        ctx = json.loads(run.context_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        ctx = {}
+    merge: dict[str, str] = {}
+    if isinstance(ctx, dict):
+        for key, value in ctx.items():
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            text = str(value).strip()
+            if text:
+                merge[str(key)] = text
+    if run.contact_name:
+        merge.setdefault("contact_name", run.contact_name)
+        merge.setdefault("first_name", run.contact_name.split()[0])
+    if run.contact_email:
+        merge.setdefault("contact_email", run.contact_email)
+    subject, _ = render_template(parsed.get("subject") or "", merge)
+    html, _ = render_template(parsed.get("html") or "", merge)
+    text_body = html_to_plain_text(html)
+    thread_id = str(run.email_ID or merge.get("email_ID") or merge.get("email_id") or "").strip()
+    webhook = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
+    if not webhook:
+        logger.warning("Ack draft skipped — N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL is not set run_id=%s", run.id)
+        return
+    payload = {
+        "action": "draft",
+        "to": merge.get("contact_email") or run.contact_email or "",
+        "subject": subject,
+        "body_html": html,
+        "body_text": text_body,
+        "email_id": thread_id,
+        "message_id": thread_id,
+    }
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(webhook, json=payload)
+        response.raise_for_status()
+    _log_event(
+        db,
+        run.id,
+        "ack_drafted",
+        payload={"run_id": run.id, "stop_reason": reason, "thread_id": thread_id, "email_id": thread_id},
+    )
+
+
+def latest_ack_draft(db: Session, run_id: int) -> Optional[dict[str, Any]]:
+    ev = (
+        db.query(AutonomousSequenceEvent)
+        .filter(
+            AutonomousSequenceEvent.run_id == run_id,
+            AutonomousSequenceEvent.event_type == "ack_drafted",
+        )
+        .order_by(AutonomousSequenceEvent.id.desc())
+        .first()
+    )
+    if not ev:
+        return None
+    try:
+        payload = json.loads(ev.payload_json or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    thread_id = str(payload.get("thread_id") or payload.get("email_id") or "").strip() or None
+    return {
+        "stop_reason": str(payload.get("stop_reason") or ""),
+        "thread_id": thread_id,
+    }
+
+
 def clear_validity_context(context: dict[str, Any]) -> None:
     """Strip every validity key and tell the agent not to mention one."""
     for key in (
@@ -1744,13 +1902,35 @@ def start_gas_base2_sequence(
 def apply_inbound(db: Session, run: AutonomousSequenceRun, payload: dict[str, Any]) -> AutonomousSequenceRun:
     intent = (payload.get("intent") or "").lower()
     sentiment_negative = bool(payload.get("sentiment_negative"))
+    template = get_sequence_template_by_type(db, run.sequence_type)
+    stop_on = get_template_stop_on(template)
 
     _log_event(db, run.id, "inbound_message", payload=payload)
 
-    if intent == "agreement_signed" or payload.get("agreement_signed"):
+    signed = intent == "agreement_signed" or bool(payload.get("agreement_signed"))
+    invoice = intent == "invoice_received" or bool(payload.get("invoice_received"))
+
+    if signed and stop_reason_honoured(stop_on, "agreement_signed"):
+        try:
+            _maybe_draft_ack(db, run, "agreement_signed")
+        except Exception:
+            logger.exception("Ack draft failed for run_id=%s — stopping anyway", run.id)
         _log_event(db, run.id, "inbound_agreement_signed", payload=payload)
         run.run_status = "stopped"
         run.stop_reason = "agreement_signed"
+        skip_remaining_steps(db, run.id)
+        db.commit()
+        db.refresh(run)
+        return run
+
+    if invoice and stop_reason_honoured(stop_on, "invoice_received"):
+        try:
+            _maybe_draft_ack(db, run, "invoice_received")
+        except Exception:
+            logger.exception("Ack draft failed for run_id=%s — stopping anyway", run.id)
+        _log_event(db, run.id, "inbound_invoice_received", payload=payload)
+        run.run_status = "stopped"
+        run.stop_reason = "invoice_received"
         skip_remaining_steps(db, run.id)
         db.commit()
         db.refresh(run)

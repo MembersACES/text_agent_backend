@@ -285,6 +285,7 @@ from schemas import (
     AutonomousSequenceTemplateStepUpdate,
     AutonomousSequenceTemplateUpdate,
     RetellAgentListItem,
+    RetellCallListItem,
     RetellAgentPromptResponse,
     RetellAgentPromptUpdate,
     RetellVoiceListItem,
@@ -11627,6 +11628,7 @@ def list_offers(
     created_after: Optional[str] = Query(None, description="Filter offers created on or after date (YYYY-MM-DD)"),
     created_before: Optional[str] = Query(None, description="Filter offers created on or before date (YYYY-MM-DD)"),
     mine: Optional[bool] = Query(None, description="If true, only offers whose linked client has owner_email = current user"),
+    include_campaign_stubs: Optional[bool] = Query(False, description="If true, include offers created by a campaign start"),
     limit: Optional[int] = Query(None, description="Max number of offers to return (enables paginated response with total)"),
     offset: Optional[int] = Query(None, description="Number of offers to skip (use with limit)"),
     db: Session = Depends(get_db),
@@ -11670,6 +11672,8 @@ def list_offers(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    if not include_campaign_stubs:
+        query = query.filter(Offer.campaign_id.is_(None))
     ordered = query.order_by(Offer.created_at.desc())
     if limit is not None or offset is not None:
         total = ordered.count()
@@ -11731,6 +11735,7 @@ def export_offers_csv(
             query = query.filter(Offer.created_at < end_inclusive)
         except ValueError:
             pass
+    query = query.filter(Offer.campaign_id.is_(None))
     offers = query.order_by(Offer.created_at.desc()).all()
     rows_data = [_offer_to_response(db, o).model_dump(mode="json") for o in offers]
     if not rows_data:
@@ -12201,7 +12206,7 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
 
 
 def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunResponse:
-    from services.autonomous_sequence import _parse_context
+    from services.autonomous_sequence import _parse_context, latest_ack_draft
 
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
@@ -12223,6 +12228,7 @@ def _autonomous_run_detail(db: Session, run: AutonomousSequenceRun) -> Autonomou
         contact_email=run.contact_email,
         context=_parse_context(run),
         steps=[AutonomousSequenceStepResponse.model_validate(s) for s in steps],
+        ack_draft=latest_ack_draft(db, run.id),
     )
 
 
@@ -12383,7 +12389,9 @@ def _autonomous_template_response(
         DEFAULT_VALIDITY_MODE,
         default_signature_html_for_type,
         get_template_linked_flow_keys,
+        get_template_stop_on,
         get_template_validity_config,
+        parse_ack_template,
     )
 
     if db is not None:
@@ -12409,6 +12417,9 @@ def _autonomous_template_response(
             "validity_mode": validity_mode,
             "validity_days": validity_days,
             "linked_flow_keys": linked_flow_keys,
+            "stop_on": get_template_stop_on(template),
+            "ack_template_signed": parse_ack_template(getattr(template, "ack_template_signed", None)),
+            "ack_template_invoice": parse_ack_template(getattr(template, "ack_template_invoice", None)),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -12564,6 +12575,46 @@ def autonomous_sequence_patch_type_prompts(
     db.execute(update_sql, params)
     db.commit()
     return autonomous_sequence_get_type_prompts(sequence_type=sequence_type, db=db, user_data=user_data)
+
+
+@app.get(
+    "/api/autonomous/sequences/runs/{run_id}/calls",
+    response_model=List[RetellCallListItem],
+)
+def autonomous_run_call_history(
+    run_id: int,
+    limit: int = 50,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Every Retell call this run has placed, newest first.
+
+    Recovered from Retell by the run_id the worker stamps into each call's
+    metadata, so it works over calls already made and needs no column on the
+    steps table. That column is still worth adding later, to tie a call to the
+    specific step that placed it rather than to the run as a whole.
+    """
+    from services.retell_calls import list_calls_for_run
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return list_calls_for_run(run_id, min(max(limit, 1), 200))
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+@app.get("/api/autonomous/retell/calls/{call_id}", response_model=RetellCallListItem)
+def autonomous_retell_get_call(
+    call_id: str,
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """One call in full, for the transcript and recording view."""
+    from services.retell_calls import get_call
+    from services.retell_agents import RetellAgentsError
+
+    try:
+        return get_call(call_id)
+    except RetellAgentsError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
 @app.get("/api/autonomous/retell/voices", response_model=List[RetellVoiceListItem])
@@ -12740,6 +12791,17 @@ def autonomous_sequence_create_template(
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
 
+    from services.autonomous_sequence import dump_ack_template, get_template_stop_on, GCI_SEQUENCE_TYPE, GCI_STOP_ON
+
+    if body.stop_on is not None:
+        stop_on_value = json.dumps(body.stop_on)
+    elif source is not None:
+        stop_on_value = json.dumps(get_template_stop_on(source))
+    elif seq_type == GCI_SEQUENCE_TYPE:
+        stop_on_value = json.dumps(list(GCI_STOP_ON))
+    else:
+        stop_on_value = None
+
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
         display_name=body.display_name.strip() or seq_type,
@@ -12753,6 +12815,11 @@ def autonomous_sequence_create_template(
         extra_context=(body.extra_context or "").strip()
         or ((getattr(source, "extra_context", None) or "").strip() if source else "")
         or None,
+        stop_on=stop_on_value,
+        ack_template_signed=dump_ack_template(body.ack_template_signed)
+        or (getattr(source, "ack_template_signed", None) if source else None),
+        ack_template_invoice=dump_ack_template(body.ack_template_invoice)
+        or (getattr(source, "ack_template_invoice", None) if source else None),
     )
     db.add(template)
     db.flush()
@@ -12869,6 +12936,15 @@ def autonomous_sequence_update_template(
     if body.linked_flow_keys is not None:
         from services.autonomous_sequence import set_template_linked_flow_keys
         set_template_linked_flow_keys(db, template.id, body.linked_flow_keys)
+    if body.stop_on is not None:
+        from services.autonomous_sequence import parse_stop_on
+        template.stop_on = json.dumps(parse_stop_on(body.stop_on))
+    if body.ack_template_signed is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_signed = dump_ack_template(body.ack_template_signed)
+    if body.ack_template_invoice is not None:
+        from services.autonomous_sequence import dump_ack_template
+        template.ack_template_invoice = dump_ack_template(body.ack_template_invoice)
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template, db)
@@ -14342,3 +14418,8 @@ def rebuild_staged_activity(
                          "staged": s_staged, "skipped": s_skipped})
     return {"entity_id": entity_id, "period": period, "dry_run": False,
             "deleted": int(deleted or 0), "staged": staged, "skipped": skipped, "per_site": per_site}
+
+
+from campaign_routes import register_campaign_routes
+
+register_campaign_routes(app, get_current_user_with_db)
