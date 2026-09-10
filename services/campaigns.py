@@ -9,7 +9,9 @@ import hmac
 import hashlib
 import base64
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any, Optional
+from urllib.parse import quote, urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -41,18 +43,10 @@ from services.merge_template import (
 logger = logging.getLogger(__name__)
 
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
-UNSUBSCRIBE_SECRET = (
-    os.getenv("CAMPAIGN_UNSUBSCRIBE_SECRET")
-    or os.getenv("NEXTAUTH_SECRET")
-    or os.getenv("BACKEND_API_KEY")
-    or "campaign-unsubscribe-dev"
-)
-PUBLIC_API_BASE = (
-    os.getenv("PUBLIC_API_BASE_URL")
-    or os.getenv("BACKEND_API_URL")
-    or os.getenv("NEXTAUTH_URL")
-    or ""
-).rstrip("/")
+DEV_UNSUBSCRIBE_SECRET = "campaign-unsubscribe-dev"
+LOCAL_DEV_ENVIRONMENTS = frozenset({"development", "dev", "local"})
+TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled"})
+UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
 MELBOURNE = ZoneInfo("Australia/Melbourne")
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
@@ -78,6 +72,94 @@ class CampaignError(ValueError):
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
+
+
+def is_local_dev(environment: str | None = None) -> bool:
+    if os.getenv("K_SERVICE"):
+        return False
+    env = (
+        environment
+        if environment is not None
+        else (os.getenv("ENVIRONMENT") or "development")
+    ).strip().lower()
+    return env in LOCAL_DEV_ENVIRONMENTS
+
+
+def unsubscribe_secret() -> str:
+    return (
+        os.getenv("CAMPAIGN_UNSUBSCRIBE_SECRET")
+        or os.getenv("NEXTAUTH_SECRET")
+        or os.getenv("BACKEND_API_KEY")
+        or DEV_UNSUBSCRIBE_SECRET
+    )
+
+
+def public_api_base() -> str:
+    return (
+        os.getenv("PUBLIC_API_BASE_URL")
+        or os.getenv("BACKEND_API_URL")
+        or os.getenv("NEXTAUTH_URL")
+        or ""
+    ).rstrip("/")
+
+
+def _is_absolute_http_url(value: str) -> bool:
+    parsed = urlparse((value or "").strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def assert_campaign_unsubscribe_config(environment: str | None = None) -> None:
+    """Raise outside local dev when unsubscribe signing/base URL is not production-safe."""
+    if is_local_dev(environment):
+        return
+    secret = (os.getenv("CAMPAIGN_UNSUBSCRIBE_SECRET") or "").strip()
+    if not secret or secret == DEV_UNSUBSCRIBE_SECRET:
+        raise RuntimeError(
+            "CAMPAIGN_UNSUBSCRIBE_SECRET must be set to a non-default value outside local dev"
+        )
+    base = (os.getenv("PUBLIC_API_BASE_URL") or "").strip()
+    if not _is_absolute_http_url(base):
+        raise RuntimeError(
+            "PUBLIC_API_BASE_URL must be an absolute http(s) URL outside local dev"
+        )
+
+
+def assert_campaign_can_send() -> None:
+    """Block ready/send unless unsubscribe links can be signed as absolute http(s) URLs."""
+    if not is_local_dev():
+        try:
+            assert_campaign_unsubscribe_config()
+        except RuntimeError as exc:
+            raise CampaignError(str(exc), 500) from exc
+        return
+    if not _is_absolute_http_url(public_api_base()):
+        raise CampaignError(
+            "PUBLIC_API_BASE_URL must be an absolute http(s) URL before a campaign can send",
+            500,
+        )
+
+
+def append_unsubscribe_footer(html: str, text: str, url: str) -> tuple[str, str]:
+    safe_url = escape(url, quote=True)
+    html_footer = (
+        f'<p style="font-size:12px;color:#666;margin-top:24px;">'
+        f"{escape(UNSUBSCRIBE_FOOTER_INTRO)} "
+        f'<a href="{safe_url}">{escape(url)}</a></p>'
+    )
+    text_footer = f"\n\n{UNSUBSCRIBE_FOOTER_INTRO} {url}"
+    return (html or "") + html_footer, (text or "").rstrip() + text_footer
+
+
+def unsubscribe_confirm_html(email: str, token: str) -> str:
+    action = "/api/autonomous/campaigns/unsubscribe?token=" + quote(token, safe="")
+    return (
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Unsubscribe</title></head>"
+        "<body style=\"font-family:sans-serif;max-width:32rem;margin:2rem auto;color:#222;\">"
+        f"<p>Unsubscribe <strong>{escape(email)}</strong> from these emails?</p>"
+        f"<form method=\"post\" action=\"{escape(action, quote=True)}\">"
+        "<button type=\"submit\">Unsubscribe</button>"
+        "</form></body></html>"
+    )
 
 
 def _now() -> datetime:
@@ -333,6 +415,7 @@ def set_human_only(db: Session, campaign: Campaign, row_id: int, human_only: boo
 
 
 def _ready_gate(db: Session, campaign: Campaign) -> None:
+    assert_campaign_can_send()
     subject = (campaign.first_touch_subject or "").strip()
     body = (campaign.first_touch_html or "").strip()
     if not subject:
@@ -441,7 +524,9 @@ def send_first_touch_email(
 ) -> dict[str, Any]:
     if not test and suppressed(db, to):
         raise CampaignError("That address is on the suppression list", 409)
+    assert_campaign_can_send()
     unsub = unsubscribe_url(to, campaign.id)
+    html, text = append_unsubscribe_footer(html, text, unsub)
     payload = {
         "channel": "email",
         "to": to,
@@ -540,19 +625,19 @@ def add_suppression(db: Session, email: str, reason: str, source: str) -> Suppre
 
 def unsubscribe_url(email: str, campaign_id: int) -> str:
     token = sign_unsubscribe_token(email, campaign_id)
-    base = PUBLIC_API_BASE or ""
+    base = public_api_base()
     return f"{base}/api/autonomous/campaigns/unsubscribe?token={token}"
 
 
 def sign_unsubscribe_token(email: str, campaign_id: int) -> str:
     payload = f"{(email or '').strip().lower()}|{int(campaign_id)}"
-    sig = hmac.new(UNSUBSCRIBE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(unsubscribe_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
     raw = f"{payload}|{sig}".encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def verify_unsubscribe_token(token: str) -> tuple[str, int]:
-    padded = token + "=" * (-len(token) % 4)
+    padded = (token or "") + "=" * (-len(token or "") % 4)
     try:
         raw = base64.urlsafe_b64decode(padded.encode()).decode()
     except Exception as exc:
@@ -562,7 +647,7 @@ def verify_unsubscribe_token(token: str) -> tuple[str, int]:
         raise CampaignError("Invalid unsubscribe token", 400)
     email, campaign_id_s, sig = parts
     payload = f"{email}|{campaign_id_s}"
-    expected = hmac.new(UNSUBSCRIBE_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    expected = hmac.new(unsubscribe_secret().encode(), payload.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, sig):
         raise CampaignError("Invalid unsubscribe token", 400)
     return email, int(campaign_id_s)
@@ -574,7 +659,7 @@ def apply_unsubscribe(db: Session, token: str) -> dict[str, Any]:
     runs = (
         db.query(AutonomousSequenceRun)
         .filter(
-            AutonomousSequenceRun.run_status == "running",
+            ~AutonomousSequenceRun.run_status.in_(TERMINAL_RUN_STATUSES),
             func.lower(AutonomousSequenceRun.contact_email) == email,
         )
         .all()
