@@ -262,6 +262,9 @@ DEFAULT_STOP_ON = ["agreement_signed", "negative_sentiment_stop"]
 GCI_SEQUENCE_TYPE = "gci_outbound_v1"
 GCI_STOP_ON = ["invoice_received", "negative_sentiment_stop"]
 ACK_DRAFT_REASONS = frozenset({"agreement_signed", "invoice_received"})
+FIGURES_MODE_COMPARISON = "comparison"
+FIGURES_MODE_NONE = "none"
+DEFAULT_FIGURES_MODE = FIGURES_MODE_COMPARISON
 
 
 def parse_stop_on(raw: Any) -> list[str]:
@@ -315,6 +318,19 @@ def get_template_stop_on(template: Optional[Any]) -> list[str]:
     if raw in (None, "") and seq == GCI_SEQUENCE_TYPE:
         return list(GCI_STOP_ON)
     return parse_stop_on(raw)
+
+
+def parse_figures_mode(raw: Any) -> str:
+    text = str(getattr(raw, "value", raw) or "").strip().lower()
+    if text == FIGURES_MODE_NONE:
+        return FIGURES_MODE_NONE
+    return FIGURES_MODE_COMPARISON
+
+
+def get_template_figures_mode(template: Optional[Any]) -> str:
+    if template is None:
+        return DEFAULT_FIGURES_MODE
+    return parse_figures_mode(getattr(template, "figures_mode", None))
 
 
 def stop_reason_honoured(stop_on: list[str], reason: str) -> bool:
@@ -2421,9 +2437,8 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
 def _load_type_prompts(db: Session, sequence_type: str) -> dict[str, str]:
     out = {
         "retell_agent_id": "",
-        "email_system_prompt": "",
+        "system_prompt": "",
         "email_example": "",
-        "sms_system_prompt": "",
         "sms_example": "",
     }
     bind = db.bind
@@ -2436,12 +2451,15 @@ def _load_type_prompts(db: Session, sequence_type: str) -> dict[str, str]:
         str(c.get("name") or "")
         for c in insp.get_columns("autonomous_sequence_type", **_inspector_schema_kw(bind))
     }
-    wanted = [k for k in out if k in cols]
-    if not wanted:
+    select_cols: list[str] = []
+    for col in ("retell_agent_id", "system_prompt", "email_example", "sms_example", "email_system_prompt"):
+        if col in cols and col not in select_cols:
+            select_cols.append(col)
+    if not select_cols:
         return out
     row = (
         db.execute(
-            text(f"SELECT {', '.join(wanted)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+            text(f"SELECT {', '.join(select_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
             {"st": sequence_type},
         )
         .mappings()
@@ -2449,10 +2467,10 @@ def _load_type_prompts(db: Session, sequence_type: str) -> dict[str, str]:
     )
     if not row:
         return out
-    for key in out:
-        raw = row.get(key)
-        if raw:
-            out[key] = str(raw)
+    out["retell_agent_id"] = str(row.get("retell_agent_id") or "")
+    out["system_prompt"] = str(row.get("system_prompt") or row.get("email_system_prompt") or "")
+    out["email_example"] = str(row.get("email_example") or "")
+    out["sms_example"] = str(row.get("sms_example") or "")
     return out
 
 
@@ -2557,8 +2575,9 @@ def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]
             "to": email,
             "email_id": str(run.email_ID or email_ctx.get("email_ID") or email_ctx.get("email_id") or ""),
             "context": _jsonable_context(email_ctx, activity_meta),
-            "system_prompt": prompts["email_system_prompt"],
+            "system_prompt": prompts["system_prompt"],
             "example": prompts["email_example"],
+            "figures_mode": get_template_figures_mode(template),
         }
         action_type = "email"
     elif channel == "sms":
@@ -2567,7 +2586,7 @@ def export_step_action(db: Session, run_id: int, step_id: int) -> dict[str, Any]
         payload = {
             "to": phone,
             "context": _jsonable_context(ctx, activity_meta),
-            "system_prompt": prompts["sms_system_prompt"],
+            "system_prompt": prompts["system_prompt"],
             "example": prompts["sms_example"],
         }
         action_type = "sms"
