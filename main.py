@@ -12388,6 +12388,7 @@ def _autonomous_template_response(
         DEFAULT_VALIDITY_DAYS,
         DEFAULT_VALIDITY_MODE,
         default_signature_html_for_type,
+        get_template_figures_mode,
         get_template_linked_flow_keys,
         get_template_stop_on,
         get_template_validity_config,
@@ -12420,6 +12421,7 @@ def _autonomous_template_response(
             "stop_on": get_template_stop_on(template),
             "ack_template_signed": parse_ack_template(getattr(template, "ack_template_signed", None)),
             "ack_template_invoice": parse_ack_template(getattr(template, "ack_template_invoice", None)),
+            "figures_mode": get_template_figures_mode(template),
             "created_at": template.created_at,
             "updated_at": template.updated_at,
             "steps": [_autonomous_template_step_response(s) for s in steps_sorted],
@@ -12791,7 +12793,16 @@ def autonomous_sequence_create_template(
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
 
-    from services.autonomous_sequence import dump_ack_template, get_template_stop_on, GCI_SEQUENCE_TYPE, GCI_STOP_ON
+    from services.autonomous_sequence import (
+        dump_ack_template,
+        get_template_figures_mode,
+        get_template_stop_on,
+        parse_figures_mode,
+        DEFAULT_FIGURES_MODE,
+        FIGURES_MODE_NONE,
+        GCI_SEQUENCE_TYPE,
+        GCI_STOP_ON,
+    )
 
     if body.stop_on is not None:
         stop_on_value = json.dumps(body.stop_on)
@@ -12801,6 +12812,15 @@ def autonomous_sequence_create_template(
         stop_on_value = json.dumps(list(GCI_STOP_ON))
     else:
         stop_on_value = None
+
+    if body.figures_mode is not None:
+        figures_mode_value = parse_figures_mode(body.figures_mode)
+    elif source is not None:
+        figures_mode_value = get_template_figures_mode(source)
+    elif seq_type == GCI_SEQUENCE_TYPE:
+        figures_mode_value = FIGURES_MODE_NONE
+    else:
+        figures_mode_value = DEFAULT_FIGURES_MODE
 
     template = AutonomousSequenceTemplate(
         sequence_type=seq_type,
@@ -12820,6 +12840,7 @@ def autonomous_sequence_create_template(
         or (getattr(source, "ack_template_signed", None) if source else None),
         ack_template_invoice=dump_ack_template(body.ack_template_invoice)
         or (getattr(source, "ack_template_invoice", None) if source else None),
+        figures_mode=figures_mode_value,
     )
     db.add(template)
     db.flush()
@@ -12945,6 +12966,9 @@ def autonomous_sequence_update_template(
     if body.ack_template_invoice is not None:
         from services.autonomous_sequence import dump_ack_template
         template.ack_template_invoice = dump_ack_template(body.ack_template_invoice)
+    if body.figures_mode is not None:
+        from services.autonomous_sequence import parse_figures_mode
+        template.figures_mode = parse_figures_mode(body.figures_mode)
     db.commit()
     db.refresh(template)
     return _autonomous_template_response(template, db)

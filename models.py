@@ -496,6 +496,7 @@ class AutonomousSequenceTemplate(Base):
     stop_on = Column(Text, nullable=True)
     ack_template_signed = Column(Text, nullable=True)
     ack_template_invoice = Column(Text, nullable=True)
+    figures_mode = Column(String(32), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

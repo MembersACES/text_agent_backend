@@ -401,6 +401,50 @@ def init_db():
 
     try:
         insp = inspect(engine)
+        if "autonomous_sequence_type" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("autonomous_sequence_type")]
+            with engine.begin() as conn:
+                if "system_prompt" not in cols:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_type ADD COLUMN system_prompt TEXT"))
+                    logging.info("✅ Added autonomous_sequence_type.system_prompt column")
+                if "email_system_prompt" in cols:
+                    conn.execute(
+                        text(
+                            "UPDATE autonomous_sequence_type SET system_prompt = email_system_prompt "
+                            "WHERE (system_prompt IS NULL OR TRIM(system_prompt) = '') "
+                            "AND email_system_prompt IS NOT NULL AND TRIM(email_system_prompt) <> ''"
+                        )
+                    )
+    except Exception as e:
+        logging.warning("Could not ensure autonomous_sequence_type.system_prompt column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "autonomous_sequence_templates" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("autonomous_sequence_templates")]
+            with engine.begin() as conn:
+                if "figures_mode" not in cols:
+                    conn.execute(text("ALTER TABLE autonomous_sequence_templates ADD COLUMN figures_mode VARCHAR(32)"))
+                    logging.info("✅ Added autonomous_sequence_templates.figures_mode column")
+                conn.execute(
+                    text(
+                        "UPDATE autonomous_sequence_templates SET figures_mode = :none "
+                        "WHERE sequence_type = :seq AND (figures_mode IS NULL OR TRIM(figures_mode) = '')"
+                    ),
+                    {"none": "none", "seq": "gci_outbound_v1"},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE autonomous_sequence_templates SET figures_mode = :comparison "
+                        "WHERE figures_mode IS NULL OR TRIM(figures_mode) = ''"
+                    ),
+                    {"comparison": "comparison"},
+                )
+    except Exception as e:
+        logging.warning("Could not ensure autonomous_sequence_templates.figures_mode column: %s", e)
+
+    try:
+        insp = inspect(engine)
         if "offers" in (insp.get_table_names() or []):
             cols = [c["name"] for c in insp.get_columns("offers")]
             if "campaign_id" not in cols:
