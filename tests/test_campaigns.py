@@ -2,12 +2,17 @@
 
 import json
 from datetime import datetime, timezone
+from html import escape
 
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from database import Base
+from campaign_routes import register_campaign_routes
+from database import Base, get_db
 from models import (
     AutonomousSequenceRun,
     AutonomousSequenceStep,
@@ -20,17 +25,30 @@ from models import (
 )
 from services.campaigns import (
     CampaignError,
+    DEV_UNSUBSCRIBE_SECRET,
     FIGURE_COLUMNS,
     add_suppression,
+    assert_campaign_unsubscribe_config,
     create_campaign,
     extract_email_id_from_webhook_response,
-    patch_campaign,
-    replace_rows,
-    set_human_only,
-    start_campaign,
     fire_test_send,
+    patch_campaign,
+    render_first_touch,
+    replace_rows,
+    send_first_touch_email,
+    set_human_only,
+    sign_unsubscribe_token,
+    start_campaign,
 )
 from services.merge_template import sanitize_html, split_row
+
+
+@pytest.fixture(autouse=True)
+def _unsubscribe_env(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    monkeypatch.setenv("CAMPAIGN_UNSUBSCRIBE_SECRET", "test-campaign-unsub-secret")
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://api.example.test")
 
 
 def _db():
@@ -465,3 +483,124 @@ def test_complete_first_email_step_is_step_index_zero():
     assert steps[0].step_status == "completed"
     assert steps[1].channel == "email"
     assert steps[1].step_status in {"ready", "to_start"}
+
+
+def _campaign_client(session):
+    app = FastAPI()
+
+    def override_db():
+        yield session
+
+    def fake_user():
+        return {"idinfo": {"email": "a@b.com"}}
+
+    register_campaign_routes(app, fake_user)
+    app.dependency_overrides[get_db] = override_db
+    return TestClient(app)
+
+
+def _live_run(db, email: str, status: str = "running"):
+    offer = Offer(business_name="Acme", status="autonomous_agent_trigger")
+    db.add(offer)
+    db.flush()
+    run = AutonomousSequenceRun(
+        sequence_type="gci_outbound_v1",
+        offer_id=offer.id,
+        run_status=status,
+        contact_email=email,
+        anchor_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def test_dispatched_first_touch_contains_absolute_unsubscribe_link():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    row = db.query(CampaignRow).first()
+    merge = json.loads(row.merge_json)
+    subject, html, text = render_first_touch(campaign, merge, test=False)
+    result = send_first_touch_email(
+        db=db,
+        to="ada@example.com",
+        subject=subject,
+        html=html,
+        text=text,
+        campaign=campaign,
+        row=row,
+        test=True,
+    )
+    payload = result["payload"]
+    unsub = payload["unsubscribe_url"]
+    assert unsub.startswith("https://api.example.test/api/autonomous/campaigns/unsubscribe?token=")
+    assert unsub in payload["body_html"]
+    assert unsub in payload["body_text"]
+    assert f'<a href="{escape(unsub, quote=True)}">' in payload["body_html"]
+    assert "unsubscribe from these emails at any time" in payload["body_html"].lower()
+    assert "unsubscribe from these emails at any time" in payload["body_text"].lower()
+    assert "{{unsubscribe_url}}" not in payload["body_html"]
+    assert "{{unsubscribe_url}}" not in payload["body_text"]
+
+
+def test_unsubscribe_get_does_not_write_suppression():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    token = sign_unsubscribe_token("ada@example.com", campaign.id)
+    client = _campaign_client(db)
+    res = client.get("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    assert res.status_code == 200
+    assert "ada@example.com" in res.text
+    assert "Unsubscribe" in res.text
+    assert "<form" in res.text.lower()
+    assert 'method="post"' in res.text.lower()
+    assert db.query(Suppression).count() == 0
+
+
+def test_unsubscribe_post_writes_suppression_and_stops_live_run():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    running = _live_run(db, "ada@example.com", "running")
+    queued = _live_run(db, "ada@example.com", "queued")
+    finished = _live_run(db, "ada@example.com", "completed")
+    token = sign_unsubscribe_token("ada@example.com", campaign.id)
+    client = _campaign_client(db)
+    res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    assert res.status_code == 200
+    assert db.query(Suppression).count() == 1
+    db.refresh(running)
+    db.refresh(queued)
+    db.refresh(finished)
+    assert running.run_status == "stopped"
+    assert running.stop_reason == "unsubscribed"
+    assert queued.run_status == "stopped"
+    assert queued.stop_reason == "unsubscribed"
+    assert finished.run_status == "completed"
+
+
+def test_forged_unsubscribe_token_rejected_on_get_and_post():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    valid = sign_unsubscribe_token("ada@example.com", campaign.id)
+    forged = "not-a-valid-token"
+    tampered = valid[:-1] + ("A" if valid[-1:] != "A" else "B")
+    client = _campaign_client(db)
+    for token in (forged, tampered):
+        get_res = client.get("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+        post_res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+        assert get_res.status_code == 400
+        assert post_res.status_code == 400
+    assert db.query(Suppression).count() == 0
+
+
+def test_startup_raises_when_secret_is_dev_default_outside_local_dev(monkeypatch):
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("CAMPAIGN_UNSUBSCRIBE_SECRET", DEV_UNSUBSCRIBE_SECRET)
+    monkeypatch.setenv("PUBLIC_API_BASE_URL", "https://api.example.test")
+    monkeypatch.delenv("K_SERVICE", raising=False)
+    try:
+        assert_campaign_unsubscribe_config()
+        raise AssertionError("expected startup config to raise")
+    except RuntimeError as exc:
+        assert "CAMPAIGN_UNSUBSCRIBE_SECRET" in str(exc)

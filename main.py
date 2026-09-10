@@ -387,6 +387,9 @@ def on_startup() -> None:
     """
     global _autonomous_scheduler
     init_db()
+    from services.campaigns import assert_campaign_unsubscribe_config
+
+    assert_campaign_unsubscribe_config()
     try:
         from database import SessionLocal
         from services.autonomous_sequence import ensure_default_sequence_templates

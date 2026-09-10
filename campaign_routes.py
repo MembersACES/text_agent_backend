@@ -25,6 +25,8 @@ from services.campaigns import (
     set_human_only,
     start_campaign,
     fire_test_send,
+    unsubscribe_confirm_html,
+    verify_unsubscribe_token,
 )
 
 
@@ -85,15 +87,12 @@ def register_campaign_routes(app, get_current_user_with_db):
         return [campaign_to_dict(c, db) for c in list_campaigns(db)]
 
     @app.get("/api/autonomous/campaigns/unsubscribe")
-    def unsubscribe_get(token: str, db: Session = Depends(get_db)):
+    def unsubscribe_get(token: str):
         try:
-            result = apply_unsubscribe(db, token)
+            email, _campaign_id = verify_unsubscribe_token(token)
         except CampaignError as exc:
             _raise(exc)
-        return HTMLResponse(
-            "<p>You have been unsubscribed. You will not receive further emails from this campaign.</p>",
-            status_code=200,
-        ) if result else None
+        return HTMLResponse(unsubscribe_confirm_html(email, token), status_code=200)
 
     @app.post("/api/autonomous/campaigns/unsubscribe")
     def unsubscribe_post(request: Request, token: Optional[str] = None, db: Session = Depends(get_db)):
