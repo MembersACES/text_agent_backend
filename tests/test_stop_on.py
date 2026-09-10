@@ -12,7 +12,9 @@ from services.autonomous_sequence import (
     DEFAULT_STOP_ON,
     GCI_STOP_ON,
     apply_inbound,
+    get_template_figures_mode,
     get_template_stop_on,
+    parse_figures_mode,
     parse_stop_on,
 )
 
@@ -91,3 +93,35 @@ def test_gci_inbound_stops_on_invoice_received_without_draft_when_template_null(
     assert out.run_status == "stopped"
     assert out.stop_reason == "invoice_received"
     assert "No ack_template" in caplog.text
+
+
+def test_figures_mode_defaults_to_comparison() -> None:
+    assert parse_figures_mode(None) == "comparison"
+    assert parse_figures_mode("") == "comparison"
+    assert parse_figures_mode("none") == "none"
+    db = _db()
+    template = AutonomousSequenceTemplate(
+        sequence_type="gas_base2_followup_v1",
+        display_name="Gas",
+        timezone="Australia/Melbourne",
+        is_active=1,
+        is_restartable=1,
+    )
+    db.add(template)
+    db.commit()
+    assert get_template_figures_mode(template) == "comparison"
+
+
+def test_gci_figures_mode_none_is_read_from_the_column() -> None:
+    db = _db()
+    template = AutonomousSequenceTemplate(
+        sequence_type="gci_outbound_v1",
+        display_name="GCI",
+        timezone="Australia/Melbourne",
+        is_active=1,
+        is_restartable=1,
+        figures_mode="none",
+    )
+    db.add(template)
+    db.commit()
+    assert get_template_figures_mode(template) == "none"

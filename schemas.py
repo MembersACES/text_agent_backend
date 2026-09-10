@@ -1030,6 +1030,7 @@ class AutonomousSequenceTemplateBase(BaseModel):
     stop_on: Optional[List[str]] = None
     ack_template_signed: Optional[Dict[str, str]] = None
     ack_template_invoice: Optional[Dict[str, str]] = None
+    figures_mode: str = "comparison"
 
 
 class AutonomousSequenceTemplateCreate(AutonomousSequenceTemplateBase):
@@ -1053,6 +1054,7 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     stop_on: Optional[List[str]] = None
     ack_template_signed: Optional[Dict[str, str]] = None
     ack_template_invoice: Optional[Dict[str, str]] = None
+    figures_mode: Optional[str] = None
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
@@ -1103,6 +1105,7 @@ class AutonomousSequenceTemplateResponse(BaseModel):
     stop_on: List[str] = Field(default_factory=list)
     ack_template_signed: Optional[Dict[str, str]] = None
     ack_template_invoice: Optional[Dict[str, str]] = None
+    figures_mode: str = "comparison"
     created_at: datetime
     updated_at: datetime
     steps: List[AutonomousSequenceTemplateStepResponse] = []
