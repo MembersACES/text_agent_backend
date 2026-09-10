@@ -14,7 +14,7 @@ from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import inspect, text
+from sqlalchemy import func, inspect, text
 from sqlalchemy.orm import Session, joinedload
 
 from models import (
@@ -361,7 +361,7 @@ def _maybe_draft_ack(db: Session, run: AutonomousSequenceRun, reason: str) -> No
             run.sequence_type,
         )
         return
-    from services.merge_template import html_to_plain_text, render_template
+    from services.merge_template import extract_tokens, html_to_plain_text, render_template
 
     ctx: dict[str, Any] = {}
     try:
@@ -381,8 +381,29 @@ def _maybe_draft_ack(db: Session, run: AutonomousSequenceRun, reason: str) -> No
         merge.setdefault("first_name", run.contact_name.split()[0])
     if run.contact_email:
         merge.setdefault("contact_email", run.contact_email)
+    offer = (
+        db.query(Offer).filter(Offer.id == run.offer_id).first()
+        if getattr(run, "offer_id", None)
+        else None
+    )
+    offer_name = str(getattr(offer, "business_name", None) or "").strip()
+    if offer_name:
+        merge.setdefault("company_name", offer_name)
+        merge.setdefault("business_name", offer_name)
     subject, _ = render_template(parsed.get("subject") or "", merge)
     html, _ = render_template(parsed.get("html") or "", merge)
+    leftover: list[str] = []
+    seen: set[str] = set()
+    for token in extract_tokens(subject) + extract_tokens(html):
+        if token not in seen:
+            seen.add(token)
+            leftover.append(token)
+    if leftover:
+        logger.warning(
+            "Ack draft has unresolved merge tokens %s on run_id=%s",
+            leftover,
+            run.id,
+        )
     text_body = html_to_plain_text(html)
     thread_id = str(run.email_ID or merge.get("email_ID") or merge.get("email_id") or "").strip()
     webhook = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
@@ -401,35 +422,109 @@ def _maybe_draft_ack(db: Session, run: AutonomousSequenceRun, reason: str) -> No
     with httpx.Client(timeout=30.0) as client:
         response = client.post(webhook, json=payload)
         response.raise_for_status()
+    draft_id, n8n_thread_id = parse_n8n_draft_response(response, run.id)
+    stored_thread_id = n8n_thread_id or thread_id
     _log_event(
         db,
         run.id,
         "ack_drafted",
-        payload={"run_id": run.id, "stop_reason": reason, "thread_id": thread_id, "email_id": thread_id},
+        payload={
+            "run_id": run.id,
+            "stop_reason": reason,
+            "thread_id": stored_thread_id,
+            "email_id": thread_id,
+            "draft_id": draft_id,
+            "subject": subject,
+            "body_html": html,
+        },
     )
 
 
-def latest_ack_draft(db: Session, run_id: int) -> Optional[dict[str, Any]]:
-    ev = (
-        db.query(AutonomousSequenceEvent)
-        .filter(
-            AutonomousSequenceEvent.run_id == run_id,
-            AutonomousSequenceEvent.event_type == "ack_drafted",
-        )
-        .order_by(AutonomousSequenceEvent.id.desc())
-        .first()
-    )
-    if not ev:
-        return None
+def parse_n8n_draft_response(response: Any, run_id: Any = None) -> tuple[Optional[str], Optional[str]]:
+    """Read draft_id / thread_id from n8n. Missing ids are a warning, never an error."""
     try:
-        payload = json.loads(ev.payload_json or "{}")
-    except json.JSONDecodeError:
+        body = response.json()
+    except Exception:
+        logger.warning(
+            "Ack draft n8n response was not JSON; Gmail draft id not captured run_id=%s",
+            run_id,
+        )
+        return None, None
+    if not isinstance(body, dict):
+        logger.warning(
+            "Ack draft n8n response was not an object; Gmail draft id not captured run_id=%s",
+            run_id,
+        )
+        return None, None
+    draft_id = str(body.get("draft_id") or "").strip() or None
+    thread_id = str(body.get("thread_id") or "").strip() or None
+    if not draft_id:
+        logger.warning(
+            "Ack draft n8n response missing draft_id run_id=%s",
+            run_id,
+        )
+    return draft_id, thread_id
+
+
+def _ack_draft_from_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
         payload = {}
     thread_id = str(payload.get("thread_id") or payload.get("email_id") or "").strip() or None
+    draft_id = str(payload.get("draft_id") or "").strip() or None
+    subject = str(payload.get("subject") or "").strip() or None
+    body_html = payload.get("body_html")
+    body_html_text = str(body_html) if body_html is not None else None
     return {
         "stop_reason": str(payload.get("stop_reason") or ""),
         "thread_id": thread_id,
+        "draft_id": draft_id,
+        "subject": subject,
+        "body_html": body_html_text,
     }
+
+
+def latest_ack_draft(db: Session, run_id: int) -> Optional[dict[str, Any]]:
+    return latest_ack_drafts_for_runs(db, [run_id]).get(run_id)
+
+
+def latest_ack_drafts_for_runs(db: Session, run_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Latest ack_drafted payload per run. One grouped query, not one per row."""
+    if not run_ids:
+        return {}
+    max_ids = (
+        db.query(
+            AutonomousSequenceEvent.run_id,
+            func.max(AutonomousSequenceEvent.id).label("max_id"),
+        )
+        .filter(
+            AutonomousSequenceEvent.run_id.in_(run_ids),
+            AutonomousSequenceEvent.event_type == "ack_drafted",
+        )
+        .group_by(AutonomousSequenceEvent.run_id)
+        .subquery()
+    )
+    rows = (
+        db.query(AutonomousSequenceEvent)
+        .join(max_ids, AutonomousSequenceEvent.id == max_ids.c.max_id)
+        .all()
+    )
+    out: dict[int, dict[str, Any]] = {}
+    for ev in rows:
+        try:
+            payload = json.loads(ev.payload_json or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        out[ev.run_id] = _ack_draft_from_payload(payload)
+    return out
+
+
+def count_runs_with_ack_draft(db: Session) -> int:
+    return (
+        db.query(func.count(func.distinct(AutonomousSequenceEvent.run_id)))
+        .filter(AutonomousSequenceEvent.event_type == "ack_drafted")
+        .scalar()
+        or 0
+    )
 
 
 def clear_validity_context(context: dict[str, Any]) -> None:
