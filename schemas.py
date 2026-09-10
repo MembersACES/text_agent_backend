@@ -1211,6 +1211,8 @@ class AutonomousSequenceRunListItem(BaseModel):
     next_step_at: Optional[datetime] = None
     steps_done: int = 0
     steps_total: int = 0
+    ack_draft_pending: bool = False
+    ack_draft_thread_id: Optional[str] = None
 
     @field_serializer("anchor_at", "next_step_at")
     def serialize_item_dt(self, dt: Optional[datetime], _info):

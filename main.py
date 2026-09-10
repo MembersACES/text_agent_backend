@@ -12170,7 +12170,11 @@ def verify_autonomous_inbound_secret(
         raise HTTPException(status_code=401, detail="Invalid X-Autonomous-Inbound-Secret")
 
 
-def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> AutonomousSequenceRunListItem:
+def _autonomous_list_item(
+    db: Session,
+    run: AutonomousSequenceRun,
+    ack_draft: Optional[dict] = None,
+) -> AutonomousSequenceRunListItem:
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
     business_name = offer.business_name if offer else None
@@ -12202,6 +12206,8 @@ def _autonomous_list_item(db: Session, run: AutonomousSequenceRun) -> Autonomous
         next_step_at=next_at,
         steps_done=done,
         steps_total=len(steps),
+        ack_draft_pending=ack_draft is not None,
+        ack_draft_thread_id=(ack_draft or {}).get("thread_id"),
     )
 
 
@@ -13172,8 +13178,20 @@ def autonomous_sequence_list_runs(
         .limit(limit)
         .all()
     )
-    items = [_autonomous_list_item(db, r).model_dump(mode="json") for r in runs]
-    return JSONResponse(content={"items": items, "total": total})
+    from services.autonomous_sequence import count_runs_with_ack_draft, latest_ack_drafts_for_runs
+
+    ack_by_run = latest_ack_drafts_for_runs(db, [r.id for r in runs])
+    items = [
+        _autonomous_list_item(db, r, ack_by_run.get(r.id)).model_dump(mode="json")
+        for r in runs
+    ]
+    return JSONResponse(
+        content={
+            "items": items,
+            "total": total,
+            "ack_draft_pending_count": count_runs_with_ack_draft(db),
+        }
+    )
 
 
 @app.get("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
