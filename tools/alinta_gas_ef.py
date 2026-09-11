@@ -20,6 +20,66 @@ N8N_QUOTE_WEBHOOK_URL = "https://membersaces.app.n8n.cloud/webhook/supplier-quot
 N8N_EMAIL_SUPPLIER_URL = "https://membersaces.app.n8n.cloud/webhook/email-supplier"
 N8N_AGREEMENT_TYPE = "alinta_agreement_request"
 TEST_RECIPIENT_EMAIL = "data.quote@fornrg.com"
+
+
+def alinta_recipient_email() -> str:
+    try:
+        from services.operational_emails import emails_csv, get_recipient_by_key, with_db
+
+        row = with_db(lambda db: get_recipient_by_key(db, "alinta_gas", "default"))
+        if row:
+            return emails_csv(row)
+    except Exception as e:
+        logger.warning("alinta recipient lookup failed: %s", e)
+    return TEST_RECIPIENT_EMAIL
+
+
+def _alinta_merge_values(draft: dict[str, Any]) -> dict[str, str]:
+    company = _val(draft, "company_name")
+    mirn = _val(draft, "mirn")
+    kind = _clean(draft.get("request_kind") or "Retention")
+    request_kind_html = (
+        "<p>Please note this is a retention account.</p>"
+        if kind.lower() == "retention"
+        else "<p>Please note this is an acquisition account.</p>"
+    )
+    price = _val(draft, "price_per_gj")
+    if price and not price.startswith("$"):
+        price = f"${price}"
+    commission = _val(draft, "commission_per_gj")
+    if commission and not commission.startswith("$"):
+        commission = f"${commission}"
+    return {
+        "company_name": company,
+        "mirn": mirn,
+        "request_kind": kind,
+        "request_kind_html": request_kind_html,
+        "acn_abn": _val(draft, "acn_abn"),
+        "address": _val(draft, "address"),
+        "tel": _val(draft, "tel"),
+        "contact_name": _val(draft, "contact_name"),
+        "email": _val(draft, "email"),
+        "start_date": _val(draft, "start_date"),
+        "end_date": _val(draft, "end_date"),
+        "price_per_gj": price,
+        "commission_per_gj": commission,
+        "cpq_gj": _val(draft, "cpq_gj"),
+        "min_cpq_gj": _val(draft, "min_cpq_gj"),
+        "min_cpq_pct": _val(draft, "min_cpq_pct"),
+        "mdq_gj": _val(draft, "mdq_gj"),
+    }
+
+
+def _alinta_db_template() -> tuple[str, str] | None:
+    try:
+        from services.operational_emails import load_template_content, with_db
+
+        return with_db(lambda db: load_template_content(db, "alinta_gas.default"))
+    except Exception as e:
+        logger.warning("alinta template lookup failed: %s", e)
+        return None
+
+
 DEFAULT_GAS_EF_FOLDER_ID = "1rSZIYdEsPviuyC4xmwOuPqI8gte8hpHA"
 INVOICE_API_PROCESS_EF_URL = (
     os.getenv("ACES_INVOICE_API_PROCESS_EF_URL")
@@ -781,28 +841,31 @@ def apply_flat_overrides(draft: dict[str, Any], overrides: dict[str, Any]) -> di
 
 
 def build_email_subject(draft: dict[str, Any]) -> str:
-    company = _val(draft, "company_name") or "Member"
-    mirn = _val(draft, "mirn")
-    cpq = _val(draft, "cpq_gj") or "—"
-    kind = _clean(draft.get("request_kind") or "Retention")
+    values = _alinta_merge_values(draft)
+    loaded = _alinta_db_template()
+    if loaded:
+        from services.operational_emails import render_tokens
+
+        return render_tokens(loaded[0], values).strip()
+    company = values["company_name"] or "Member"
+    mirn = values["mirn"]
+    cpq = values["cpq_gj"] or "—"
+    kind = values["request_kind"]
     return f"Agreement Request: G-C&I (GJ) {cpq} {kind} {company} MIRN {mirn}".strip()
 
 
 def build_email_html(draft: dict[str, Any]) -> str:
-    company = _val(draft, "company_name")
-    mirn = _val(draft, "mirn")
-    kind = _clean(draft.get("request_kind") or "Retention")
-    retention_line = (
-        "<p>Please note this is a retention account.</p>"
-        if kind.lower() == "retention"
-        else "<p>Please note this is an acquisition account.</p>"
-    )
-    price = _val(draft, "price_per_gj")
-    if price and not price.startswith("$"):
-        price = f"${price}"
-    commission = _val(draft, "commission_per_gj")
-    if commission and not commission.startswith("$"):
-        commission = f"${commission}"
+    values = _alinta_merge_values(draft)
+    loaded = _alinta_db_template()
+    if loaded:
+        from services.operational_emails import render_tokens
+
+        return render_tokens(loaded[1], values)
+    company = values["company_name"]
+    mirn = values["mirn"]
+    retention_line = values["request_kind_html"]
+    price = values["price_per_gj"]
+    commission = values["commission_per_gj"]
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -814,21 +877,21 @@ def build_email_html(draft: dict[str, Any]) -> str:
   <p>This is an Agreement Request for our member, {company} (MIRN {mirn}).</p>
   {retention_line}
   <p>Company Name: {company}</p>
-  <p>ACN/ABN:{_val(draft, "acn_abn")}<br>
-  Address: {_val(draft, "address")}<br>
-  Tel: {_val(draft, "tel")}<br>
-  Contact Name: {_val(draft, "contact_name")}<br>
-  Email: {_val(draft, "email")}</p>
+  <p>ACN/ABN:{values["acn_abn"]}<br>
+  Address: {values["address"]}<br>
+  Tel: {values["tel"]}<br>
+  Contact Name: {values["contact_name"]}<br>
+  Email: {values["email"]}</p>
   <p>Period</p>
-  <p>Start date:{_val(draft, "start_date")}<br>
-  End date: {_val(draft, "end_date")}<br>
+  <p>Start date:{values["start_date"]}<br>
+  End date: {values["end_date"]}<br>
   Price per GJ: {price}<br>
   Commission: {commission}</p>
   <p>Conditions:<br>
-  Contract Period Quantity (GJ) {_val(draft, "cpq_gj")}<br>
-  Minimum Contract Period Quantity (GJ) {_val(draft, "min_cpq_gj")}<br>
-  Minimum Contract Period Quantity (%of CPQ) {_val(draft, "min_cpq_pct")}<br>
-  Contract Maximum Daily Quantity (GJ) {_val(draft, "mdq_gj")}</p>
+  Contract Period Quantity (GJ) {values["cpq_gj"]}<br>
+  Minimum Contract Period Quantity (GJ) {values["min_cpq_gj"]}<br>
+  Minimum Contract Period Quantity (%of CPQ) {values["min_cpq_pct"]}<br>
+  Contract Maximum Daily Quantity (GJ) {values["mdq_gj"]}</p>
   <p>Attached are both the LOA &amp; the signed engagement form.</p>
   <p>Kind regards,</p>
   <p>Alice</p>
@@ -928,6 +991,7 @@ def send_alinta_gas_agreement(
 
     subject = build_email_subject(draft)
     html = build_email_html(draft)
+    recipient = alinta_recipient_email()
     company = _val(draft, "company_name")
     mirn = _val(draft, "mirn")
     uploaded_name = filename or f"Signed Alinta EF {company} MIRN {mirn}.pdf"
@@ -949,7 +1013,7 @@ def send_alinta_gas_agreement(
         "business_name": f"{company} MIRN: {mirn}",
         "contract_type": "Alinta C&I Gas",
         "agreement_type": N8N_AGREEMENT_TYPE,
-        "supplier_email": TEST_RECIPIENT_EMAIL,
+        "supplier_email": recipient,
         "resolved_supplier_name": "Data Quote",
         "email_subject": subject,
         "email_html_content": html,
@@ -1000,7 +1064,7 @@ def send_alinta_gas_agreement(
         }
 
     notes: list[str] = [
-        f"Agreement request sent to {TEST_RECIPIENT_EMAIL} with the EF"
+        f"Agreement request sent to {recipient} with the EF"
         + (" and LOA attached." if loa_bytes else " attached (LOA download failed)."),
         f"Subject: {subject}",
     ]
@@ -1020,7 +1084,7 @@ def send_alinta_gas_agreement(
         "ok": True,
         "message": "\n".join(notes),
         "email_subject": subject,
-        "recipient": TEST_RECIPIENT_EMAIL,
+        "recipient": recipient,
         "loa_file_id": draft.get("loa_file_id"),
         "client_folder_url": client_folder_url or None,
         "client_folder_id": client_folder_id or None,
@@ -1090,5 +1154,5 @@ def build_extract_response(
         "draft": draft,
         "email_subject": subject,
         "email_html_content": html,
-        "recipient": TEST_RECIPIENT_EMAIL,
+        "recipient": alinta_recipient_email(),
     }
