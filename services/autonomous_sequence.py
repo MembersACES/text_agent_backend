@@ -286,6 +286,8 @@ def parse_stop_on(raw: Any) -> list[str]:
 def parse_ack_template(raw: Any) -> Optional[dict[str, str]]:
     if raw is None:
         return None
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump()
     if isinstance(raw, str):
         text = raw.strip()
         if not text:
@@ -297,13 +299,13 @@ def parse_ack_template(raw: Any) -> Optional[dict[str, str]]:
     if not isinstance(raw, dict):
         return None
     subject = str(raw.get("subject") or "").strip()
-    html = str(raw.get("html") or "").strip()
+    html = str(raw.get("html") or raw.get("body") or "").strip()
     if not subject and not html:
         return None
     return {"subject": subject, "html": html}
 
 
-def dump_ack_template(value: Optional[dict[str, str]]) -> Optional[str]:
+def dump_ack_template(value: Any) -> Optional[str]:
     parsed = parse_ack_template(value)
     if not parsed:
         return None
@@ -391,7 +393,7 @@ def _maybe_draft_ack(db: Session, run: AutonomousSequenceRun, reason: str) -> No
         merge.setdefault("company_name", offer_name)
         merge.setdefault("business_name", offer_name)
     subject, _ = render_template(parsed.get("subject") or "", merge)
-    html, _ = render_template(parsed.get("html") or "", merge)
+    html, _ = render_template(parsed.get("html") or parsed.get("body") or "", merge)
     leftover: list[str] = []
     seen: set[str] = set()
     for token in extract_tokens(subject) + extract_tokens(html):

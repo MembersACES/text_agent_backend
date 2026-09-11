@@ -15,8 +15,10 @@ from services.campaigns import (
     campaign_to_dict,
     create_campaign,
     delete_campaign,
+    delete_suppression,
     get_campaign,
     list_campaigns,
+    list_suppressions,
     pause_campaign,
     patch_campaign,
     replace_rows,
@@ -26,6 +28,7 @@ from services.campaigns import (
     start_campaign,
     fire_test_send,
     unsubscribe_confirm_html,
+    unsubscribe_done_html,
     verify_unsubscribe_token,
 )
 
@@ -98,7 +101,23 @@ def register_campaign_routes(app, get_current_user_with_db):
     def unsubscribe_post(request: Request, token: Optional[str] = None, db: Session = Depends(get_db)):
         value = token or request.query_params.get("token") or ""
         try:
-            apply_unsubscribe(db, value)
+            result = apply_unsubscribe(db, value)
+        except CampaignError as exc:
+            _raise(exc)
+        return HTMLResponse(unsubscribe_done_html(result["email"]), status_code=200)
+
+    @app.get("/api/autonomous/campaigns/suppressions")
+    def suppressions_list(db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
+        return list_suppressions(db)
+
+    @app.delete("/api/autonomous/campaigns/suppressions/{suppression_id}")
+    def suppressions_delete(
+        suppression_id: int,
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user_with_db),
+    ):
+        try:
+            delete_suppression(db, suppression_id)
         except CampaignError as exc:
             _raise(exc)
         return {"ok": True}
