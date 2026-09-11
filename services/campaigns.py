@@ -47,6 +47,8 @@ DEV_UNSUBSCRIBE_SECRET = "campaign-unsubscribe-dev"
 LOCAL_DEV_ENVIRONMENTS = frozenset({"development", "dev", "local"})
 TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled"})
 UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
+UNSUBSCRIBE_LINK_TEXT = "Unsubscribe"
+WORDMARK = "Carbon Zero Australasia"
 MELBOURNE = ZoneInfo("Australia/Melbourne")
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
@@ -144,22 +146,59 @@ def append_unsubscribe_footer(html: str, text: str, url: str) -> tuple[str, str]
     html_footer = (
         f'<p style="font-size:12px;color:#666;margin-top:24px;">'
         f"{escape(UNSUBSCRIBE_FOOTER_INTRO)} "
-        f'<a href="{safe_url}">{escape(url)}</a></p>'
+        f'<a href="{safe_url}">{escape(UNSUBSCRIBE_LINK_TEXT)}</a></p>'
     )
     text_footer = f"\n\n{UNSUBSCRIBE_FOOTER_INTRO} {url}"
     return (html or "") + html_footer, (text or "").rstrip() + text_footer
 
 
-def unsubscribe_confirm_html(email: str, token: str) -> str:
-    action = "/api/autonomous/campaigns/unsubscribe?token=" + quote(token, safe="")
+def unsubscribe_action_url(token: str) -> str:
+    path = "/api/autonomous/campaigns/unsubscribe?token=" + quote(token, safe="")
+    base = public_api_base()
+    if _is_absolute_http_url(base):
+        return f"{base}{path}"
+    return path
+
+
+def _unsubscribe_page(title: str, inner: str) -> str:
     return (
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Unsubscribe</title></head>"
-        "<body style=\"font-family:sans-serif;max-width:32rem;margin:2rem auto;color:#222;\">"
-        f"<p>Unsubscribe <strong>{escape(email)}</strong> from these emails?</p>"
-        f"<form method=\"post\" action=\"{escape(action, quote=True)}\">"
-        "<button type=\"submit\">Unsubscribe</button>"
-        "</form></body></html>"
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{escape(title)}</title></head>"
+        "<body style=\"margin:0;background:#f4f4f5;color:#18181b;"
+        "font-family:Arial,Helvetica,sans-serif;\">"
+        "<div style=\"min-height:100vh;display:flex;align-items:center;justify-content:center;"
+        "padding:24px;box-sizing:border-box;\">"
+        "<div style=\"width:100%;max-width:28rem;background:#fff;border:1px solid #e4e4e7;"
+        "border-radius:16px;padding:32px 28px;text-align:center;box-sizing:border-box;\">"
+        f"<p style=\"margin:0 0 16px;font-size:13px;letter-spacing:.08em;text-transform:uppercase;"
+        f"color:#5750F1;font-weight:700;\">{escape(WORDMARK)}</p>"
+        f"{inner}"
+        "</div></div></body></html>"
     )
+
+
+def unsubscribe_confirm_html(email: str, token: str) -> str:
+    action = unsubscribe_action_url(token)
+    inner = (
+        f"<p style=\"margin:0 0 24px;font-size:16px;line-height:1.5;\">"
+        f"Unsubscribe <strong>{escape(email)}</strong> from these emails?</p>"
+        f"<form method=\"post\" action=\"{escape(action, quote=True)}\">"
+        "<button type=\"submit\" style=\"appearance:none;border:0;border-radius:999px;"
+        "background:#5750F1;color:#fff;font-size:14px;font-weight:700;padding:10px 22px;"
+        "cursor:pointer;\">Unsubscribe</button>"
+        "</form>"
+    )
+    return _unsubscribe_page("Unsubscribe", inner)
+
+
+def unsubscribe_done_html(email: str) -> str:
+    inner = (
+        f"<p style=\"margin:0;font-size:16px;line-height:1.5;\">"
+        f"{escape(email)} has been unsubscribed. You will not receive further emails "
+        "from this campaign.</p>"
+    )
+    return _unsubscribe_page("Unsubscribed", inner)
 
 
 def _now() -> datetime:
@@ -352,22 +391,27 @@ def replace_rows(
     groups: dict[str, list[dict[str, str]]] = {}
     stored = 0
     blank_keys = 0
+    suppressed_emails: list[str] = []
     for cells in rows:
         merge, intelligence = split_row(headers, cells, mapping)
         # Guard: never persist a client-supplied merge blob. If one was sent, ignore it.
         _ = client_merge_json
         key = recipient_key_from_merge(merge)
+        blocked = bool(key and suppressed(db, key))
         db.add(
             CampaignRow(
                 campaign_id=campaign.id,
                 merge_json=_json(merge),
                 intelligence_json=_json(intelligence),
                 recipient_key=key,
-                row_status="pending",
+                row_status="suppressed" if blocked else "pending",
+                suppression_reason="unsubscribed" if blocked else None,
                 human_only=0,
             )
         )
         stored += 1
+        if blocked and key:
+            suppressed_emails.append(key)
         if key:
             groups.setdefault(key, []).append(merge)
         else:
@@ -389,12 +433,14 @@ def replace_rows(
         if differing:
             conflicts.append({"email": email, "count": len(members), "differing_keys": differing})
 
+    unique_suppressed = list(dict.fromkeys(suppressed_emails))
     return {
         "rows": stored,
         "unique_recipients": len(groups) + blank_keys,
         "groups_with_conflicts": conflicts,
-        "pending": stored,
+        "pending": stored - len(suppressed_emails),
         "human_only": 0,
+        "suppressed_addresses": unique_suppressed,
     }
 
 
@@ -432,6 +478,17 @@ def _ready_gate(db: Session, campaign: Campaign) -> None:
         .count()
     )
     if pending < 1:
+        blocked = (
+            db.query(CampaignRow)
+            .filter(
+                CampaignRow.campaign_id == campaign.id,
+                CampaignRow.row_status == "suppressed",
+            )
+            .all()
+        )
+        emails = [r.recipient_key for r in blocked if r.recipient_key]
+        if emails:
+            raise CampaignError(_unsubscribed_message(emails), 409)
         raise CampaignError("At least one pending sendable row is required before a campaign can go ready")
     unknown = validate_template(subject, allowed) + validate_template(body, allowed)
     if unknown:
@@ -523,7 +580,7 @@ def send_first_touch_email(
     test: bool,
 ) -> dict[str, Any]:
     if not test and suppressed(db, to):
-        raise CampaignError("That address is on the suppression list", 409)
+        raise CampaignError(f"{to} has unsubscribed", 409)
     assert_campaign_can_send()
     unsub = unsubscribe_url(to, campaign.id)
     html, text = append_unsubscribe_footer(html, text, unsub)
@@ -611,6 +668,15 @@ def suppressed(db: Session, email: str) -> bool:
     return db.query(Suppression).filter(Suppression.email == key).first() is not None
 
 
+def _unsubscribed_message(emails: list[str]) -> str:
+    unique = list(dict.fromkeys(e.strip().lower() for e in emails if e and e.strip()))
+    if not unique:
+        return "An address on this list has unsubscribed"
+    if len(unique) == 1:
+        return f"{unique[0]} has unsubscribed"
+    return "These addresses have unsubscribed: " + ", ".join(unique)
+
+
 def add_suppression(db: Session, email: str, reason: str, source: str) -> Suppression:
     key = (email or "").strip().lower()
     existing = db.query(Suppression).filter(Suppression.email == key).first()
@@ -621,6 +687,28 @@ def add_suppression(db: Session, email: str, reason: str, source: str) -> Suppre
     db.commit()
     db.refresh(row)
     return row
+
+
+def list_suppressions(db: Session) -> list[dict[str, Any]]:
+    rows = db.query(Suppression).order_by(Suppression.created_at.desc(), Suppression.id.desc()).all()
+    return [
+        {
+            "id": row.id,
+            "email": row.email,
+            "reason": row.reason,
+            "source": row.source,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+def delete_suppression(db: Session, suppression_id: int) -> None:
+    row = db.query(Suppression).filter(Suppression.id == suppression_id).first()
+    if not row:
+        raise CampaignError("Suppression not found", 404)
+    db.delete(row)
+    db.commit()
 
 
 def unsubscribe_url(email: str, campaign_id: int) -> str:
@@ -767,6 +855,7 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
     started = 0
     skipped_suppressed = 0
     skipped_idempotent = 0
+    skipped_addresses: list[str] = []
     seen_keys: set[str] = set(
         r.recipient_key
         for r in db.query(CampaignRow)
@@ -782,21 +871,22 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
             skipped_idempotent += 1
             continue
         key = (row.recipient_key or "").strip().lower()
+        merge = _merge(row)
+        to = (merge.get("contact_email") or key or "").strip()
+        blocked_as = ""
         if key and suppressed(db, key):
+            blocked_as = key
+        elif to and suppressed(db, to):
+            blocked_as = to.lower()
+        if blocked_as:
             row.row_status = "suppressed"
             row.suppression_reason = "unsubscribed"
             skipped_suppressed += 1
+            skipped_addresses.append(blocked_as)
             continue
         if key and key in seen_keys:
             continue
-        merge = _merge(row)
-        if key and suppressed(db, merge.get("contact_email") or key):
-            row.row_status = "suppressed"
-            row.suppression_reason = "unsubscribed"
-            skipped_suppressed += 1
-            continue
         subject, html, text = render_first_touch(campaign, merge, test=False)
-        to = (merge.get("contact_email") or key or "").strip()
         if not looks_like_email(to):
             row.row_status = "failed"
             row.suppression_reason = "manual"
@@ -854,6 +944,7 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
         "started": started,
         "pending": pending,
         "skipped_suppressed": skipped_suppressed,
+        "skipped_suppressed_addresses": list(dict.fromkeys(skipped_addresses)),
         "skipped_idempotent": skipped_idempotent,
         "status": campaign.status,
     }

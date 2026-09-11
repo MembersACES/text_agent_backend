@@ -1,7 +1,7 @@
 """
 Pydantic schemas for API requests and responses
 """
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator, model_validator
 from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime
 import json
@@ -713,6 +713,26 @@ class ClientManualActivityCreate(BaseModel):
     offer_type_custom: Optional[str] = None
 
 
+class ActivityTestDataPreview(BaseModel):
+    """Dry-run counts for deleting test@acesolutions.com.au activity rows."""
+    email: str
+    offer_activity_count: int
+    client_manual_count: int
+    strategy_item_count: int
+    autonomous_runs_unlinked: int
+    by_type: Dict[str, int]
+    sample_clients: List[str]
+
+
+class ActivityTestDataPurgeResult(BaseModel):
+    """Result of deleting test@acesolutions.com.au activity rows."""
+    email: str
+    offer_activities_deleted: int
+    client_manual_deleted: int
+    strategy_items_deleted: int
+    autonomous_runs_unlinked: int
+
+
 # --- Strategy & WIP (per-client strategy items) ---
 
 
@@ -1013,6 +1033,26 @@ class AutonomousSequenceTemplateStepUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class AckTemplatePayload(BaseModel):
+    """Thank-you / ack copy. Accept `body` as an alias for `html` (same mismatch shape as system_prompt vs email_system_prompt)."""
+
+    subject: str = ""
+    html: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _html_or_body(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        html = data.get("html")
+        if html is None or (isinstance(html, str) and not html.strip()):
+            html = data.get("body") or html or ""
+        return {"subject": data.get("subject") or "", "html": html or ""}
+
+    class Config:
+        extra = "ignore"
+
+
 class AutonomousSequenceTemplateBase(BaseModel):
     sequence_type: str
     display_name: str
@@ -1028,8 +1068,8 @@ class AutonomousSequenceTemplateBase(BaseModel):
     validity_mode: str = "fixed_days"
     validity_days: int = 7
     stop_on: Optional[List[str]] = None
-    ack_template_signed: Optional[Dict[str, str]] = None
-    ack_template_invoice: Optional[Dict[str, str]] = None
+    ack_template_signed: Optional[AckTemplatePayload] = None
+    ack_template_invoice: Optional[AckTemplatePayload] = None
     figures_mode: str = "comparison"
 
 
@@ -1052,9 +1092,16 @@ class AutonomousSequenceTemplateUpdate(BaseModel):
     validity_days: Optional[int] = None
     linked_flow_keys: Optional[List[str]] = None
     stop_on: Optional[List[str]] = None
-    ack_template_signed: Optional[Dict[str, str]] = None
-    ack_template_invoice: Optional[Dict[str, str]] = None
+    ack_template_signed: Optional[AckTemplatePayload] = None
+    ack_template_invoice: Optional[AckTemplatePayload] = None
     figures_mode: Optional[str] = None
+
+    @field_validator("ack_template_signed", "ack_template_invoice", mode="before")
+    @classmethod
+    def _explicit_empty_ack_clears(cls, v: Any) -> Any:
+        if v == "":
+            return None
+        return v
 
 
 class AutonomousSequenceTemplateStepResponse(BaseModel):
