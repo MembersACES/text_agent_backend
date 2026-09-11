@@ -223,6 +223,8 @@ from models import (
     PuduConsumable,
     PuduConsumableRobotState,
     PuduConsumableBaselineRun,
+    OperationalEmailTemplate,
+    OperationalEmailRecipient,
 )
 from schemas import (
     TaskCreate,
@@ -2341,6 +2343,42 @@ def get_base2_ci_gas_energy_reference(
     )
     logging.info(
         "[base2/ci-gas-energy-reference] user=%s postcode=%r relax=%s debug=%s -> strategy=%s used_fallback=%s sample_count=%s median=%s message=%r",
+        email,
+        postcode,
+        relax_postcode,
+        debug,
+        result.get("match_strategy"),
+        result.get("used_fallback"),
+        result.get("sample_count"),
+        result.get("median_energy_share"),
+        result.get("message"),
+    )
+    return result
+
+
+@app.get("/api/base2/ci-electricity-energy-reference")
+def get_base2_ci_electricity_energy_reference(
+    postcode: str = Query(..., min_length=3, max_length=32, description="Postcode or address fragment (4-digit AU postcode extracted server-side)"),
+    relax_postcode: bool = Query(
+        False,
+        description="Legacy query param; ignored. Matching uses a fixed numeric postcode band (see AIRTABLE_CI_ELEC_REF_POSTCODE_NUMERIC_BAND).",
+    ),
+    debug: bool = Query(
+        False,
+        description="If true, include diagnostics in JSON and log summary (field keys, match counts, samples)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """
+    Median (energy charges ÷ invoice total) from C&I Electricity Records whose address postcodes fall in a numeric
+    band around the target (default ±10). Field names are configurable via AIRTABLE_CI_ELEC_REF_* env vars.
+    """
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    result = airtable_client.fetch_ci_electricity_energy_share_reference(
+        postcode, relax_postcode=relax_postcode, debug=debug
+    )
+    logging.info(
+        "[base2/ci-electricity-energy-reference] user=%s postcode=%r relax=%s debug=%s -> strategy=%s used_fallback=%s sample_count=%s median=%s message=%r",
         email,
         postcode,
         relax_postcode,
@@ -6551,19 +6589,37 @@ async def signed_agreement_lodgement(
 
 # Also add an endpoint to get available contract types
 @app.get("/api/contract-types")
-def get_contract_types(user_info: dict = Depends(verify_google_token)):
+def get_contract_types(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
     """
     Get available contract types for the frontend dropdown
     """
     from tools.send_supplier_signed_agreement import CONTRACT_EMAIL_MAPPINGS, EOI_EMAIL_MAPPINGS
-    
+    from services.operational_emails import list_recipients, recipient_to_dict, seed_operational_emails
+
     contracts = list(CONTRACT_EMAIL_MAPPINGS.keys())
     eois = list(EOI_EMAIL_MAPPINGS.keys())
-    
+    contract_recipients = []
+    eoi_recipients = []
+    try:
+        seed_operational_emails(db)
+        contract_recipients = [recipient_to_dict(row) for row in list_recipients(db, "signed_contract")]
+        eoi_recipients = [recipient_to_dict(row) for row in list_recipients(db, "eoi")]
+        if contract_recipients:
+            contracts = [row["key"] for row in contract_recipients]
+        if eoi_recipients:
+            eois = [row["key"] for row in eoi_recipients]
+    except Exception as e:
+        logging.warning("contract-types falling back to hardcoded maps: %s", e)
+
     return {
         "contracts": contracts,
         "eois": eois,
-        "user_email": user_info.get("email")
+        "contract_recipients": contract_recipients,
+        "eoi_recipients": eoi_recipients,
+        "user_email": user_info.get("email"),
     }
 
 
@@ -14466,5 +14522,7 @@ def rebuild_staged_activity(
 
 
 from campaign_routes import register_campaign_routes
+from email_template_routes import register_email_template_routes
 
 register_campaign_routes(app, get_current_user_with_db)
+register_email_template_routes(app, verify_google_token)

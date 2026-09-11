@@ -53,6 +53,36 @@ def build_share_folder_email(
     signoff = sender
     if sender_em:
         signoff = f"{sender}<br>{sender_em}"
+    try:
+        from services.operational_emails import load_template_content, render_tokens, with_db
+
+        loaded = with_db(lambda db: load_template_content(db, "share_folder.default"))
+        if loaded:
+            values = {
+                "business_name": biz,
+                "folder_url": folder,
+                "files_html": files_block,
+                "signoff_html": signoff,
+            }
+            subject = render_tokens(loaded[0], {
+                "business_name": (business_name or "").strip() or "your organisation",
+            })
+            html_body = render_tokens(loaded[1], values)
+            text_names = "\n".join(f"- {name}" for name in (file_names or []) if str(name).strip())
+            text_body = (
+                f"Hello,\n\n{BRAND_NAME} has shared documents with you for {(business_name or '').strip() or 'your organisation'}.\n\n"
+                f"Open the folder: {(folder_url or '').strip()}\n"
+            )
+            if text_names:
+                text_body += f"\nDocuments included:\n{text_names}\n"
+            text_body += f"\nKind regards,\n{(sender_name or '').strip() or BRAND_NAME}\n"
+            return {
+                "subject": subject,
+                "html_body": html_body,
+                "body_text": text_body,
+            }
+    except Exception as e:
+        logger.warning("share folder template lookup failed: %s", e)
     html_body = f"""<!DOCTYPE html>
 <html>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">

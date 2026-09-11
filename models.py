@@ -1,7 +1,7 @@
 """
 Database models
 """
-from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Float, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -660,4 +660,47 @@ class Suppression(Base):
     reason = Column(String(64), nullable=False)
     source = Column(String(64), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+
+class OperationalEmailTemplate(Base):
+    """Editable operational email copy (data/quote/lodgement). Independent of autonomous sequences."""
+
+    __tablename__ = "operational_email_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(120), nullable=False, unique=True, index=True)
+    category = Column(String(64), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    subject = Column(Text, nullable=False)
+    html_body = Column(Text, nullable=False)
+    merge_fields = Column(JSON_COLUMN_TYPE, nullable=True)
+    sample_values = Column(JSON_COLUMN_TYPE, nullable=True)
+    updated_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class OperationalEmailRecipient(Base):
+    """Recipient directories for operational emails (retailers, contract types, EOIs)."""
+
+    __tablename__ = "operational_email_recipients"
+    __table_args__ = (
+        UniqueConstraint("flow", "key", name="uq_op_email_recipients_flow_key"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    flow = Column(String(64), nullable=False, index=True)
+    key = Column(String(255), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    emails_json = Column(JSON_COLUMN_TYPE, nullable=False)
+    aliases_json = Column(JSON_COLUMN_TYPE, nullable=True)
+    group_name = Column(String(255), nullable=True, index=True)
+    extra_groups_json = Column(JSON_COLUMN_TYPE, nullable=True)
+    is_placeholder = Column(Integer, nullable=False, default=0)
+    is_active = Column(Integer, nullable=False, default=1)
+    sort_order = Column(Integer, nullable=False, default=0)
+    updated_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

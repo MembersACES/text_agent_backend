@@ -217,11 +217,44 @@ def generate_email_template(
   <p> NOTE: This email, including any attachments, is strictly confidential. If you received this email in error, please notify the sender and delete it as well as any copies from your system. You must not use, print, distribute, copy, or disclose the content of this email if you are not the intended recipient. </p>
 </body>
 </html>"""
-    
-    return {
+
+    fallback = {
         "subject": subject,
         "html_content": html_content
     }
+    try:
+        from services.operational_emails import load_template_content, render_tokens, with_db
+
+        loaded = with_db(lambda db: load_template_content(db, "quote_request.default"))
+        if loaded:
+            values = {
+                "subject_prefix": "Blend & Extend Request" if request_kind == "blend_extend" else "Quote Request",
+                "request_kind_label": "blend & extend" if request_kind == "blend_extend" else "quote",
+                "business_name": business_name or "",
+                "identifier_display": identifier_display,
+                "start_date": start_date or "",
+                "quote_details": quote_details or "",
+                "commission": commission or "",
+                "current_retailer": current_retailer or "",
+                "offer_due": offer_due or "",
+                "trading_as": trading_as or "",
+                "abn": abn or "",
+                "site_address": site_address or "",
+                "client_name": client_name or "",
+                "client_number": client_number or "",
+                "client_email": client_email or "",
+                "nmi": nmi or "",
+                "mrin": mrin or "",
+                "consumption_html": consumption_html,
+                "attachments_html": attachments_html,
+            }
+            return {
+                "subject": render_tokens(loaded[0], values),
+                "html_content": render_tokens(loaded[1], values),
+            }
+    except Exception as e:
+        logger.warning("quote request DB template render failed, using fallback: %s", e)
+    return fallback
 
 def send_supplier_quote_request(
     selected_retailers: List[str],
@@ -271,10 +304,25 @@ def send_supplier_quote_request(
         logger.info(f"==========================================")
         
         # Validate retailers
-        invalid_retailers = [r for r in selected_retailers if r not in QUOTE_RETAILER_EMAILS]
-        if invalid_retailers:
-            logger.error(f"Invalid retailers: {invalid_retailers}")
-            return f"❌ Error: Invalid retailers specified: {', '.join(invalid_retailers)}. Valid options are: {', '.join(QUOTE_RETAILER_EMAILS.keys())}"
+        retailer_rows = None
+        try:
+            from services.operational_emails import emails_csv, quote_retailer_lookup, with_db
+
+            lookup = with_db(lambda db: quote_retailer_lookup(db, selected_retailers))
+            if lookup:
+                missing, retailer_rows = lookup
+                if missing:
+                    logger.error(f"Invalid retailers: {missing}")
+                    return f"❌ Error: Invalid retailers specified: {', '.join(missing)}. Valid options are: {', '.join(retailer_rows.keys())}"
+        except Exception as e:
+            logger.warning("quote recipient DB lookup failed: %s", e)
+            retailer_rows = None
+
+        if retailer_rows is None:
+            invalid_retailers = [r for r in selected_retailers if r not in QUOTE_RETAILER_EMAILS]
+            if invalid_retailers:
+                logger.error(f"Invalid retailers: {invalid_retailers}")
+                return f"❌ Error: Invalid retailers specified: {', '.join(invalid_retailers)}. Valid options are: {', '.join(QUOTE_RETAILER_EMAILS.keys())}"
         
         # Generate email template
         email_template = generate_email_template(
@@ -339,13 +387,21 @@ def send_supplier_quote_request(
         # Add retailer-specific information and build email list
         retailer_emails = []
         for retailer in selected_retailers:
-            retailer_info = QUOTE_RETAILER_EMAILS[retailer]
+            if retailer_rows is not None and retailer in retailer_rows:
+                from services.operational_emails import emails_csv
+                row = retailer_rows[retailer]
+                retailer_name = row.display_name
+                retailer_email = emails_csv(row)
+            else:
+                retailer_info = QUOTE_RETAILER_EMAILS[retailer]
+                retailer_name = retailer_info["name"]
+                retailer_email = retailer_info["email"]
             n8n_payload["retailers"].append({
-                "name": retailer_info["name"],
-                "email": retailer_info["email"],
+                "name": retailer_name,
+                "email": retailer_email,
                 "retailer_type": "C&I" if "C&I" in retailer else "SME"
             })
-            retailer_emails.append(retailer_info["email"])
+            retailer_emails.append(retailer_email)
         
         logger.info(f"Sending quote request to n8n webhook...")
         logger.debug(f"Request data: {json.dumps(n8n_payload, indent=2)}")

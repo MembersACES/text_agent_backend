@@ -183,6 +183,17 @@ def find_supplier_email_for_agreement(contract_type: str, agreement_type: str) -
         Tuple of (email_address, resolved_name, is_default)
     """
     logger.info(f"Looking up email for contract type: '{contract_type}', agreement type: '{agreement_type}'")
+
+    flow = "eoi" if agreement_type == "eoi" else "signed_contract"
+    try:
+        from services.operational_emails import emails_csv, find_recipient_match, with_db
+
+        match = with_db(lambda db: find_recipient_match(db, flow, contract_type))
+        if match:
+            logger.info(f"DB match found: {match.display_name}")
+            return emails_csv(match), match.display_name, False
+    except Exception as e:
+        logger.warning("signed agreement recipient DB lookup failed: %s", e)
     
     # Select the appropriate mapping based on agreement type
     if agreement_type == "eoi":
@@ -205,6 +216,50 @@ def find_supplier_email_for_agreement(contract_type: str, agreement_type: str) -
     # Use default email if no match found
     logger.warning(f"No match found for contract type: '{contract_type}', using default email")
     return DEFAULT_EMAIL["email"], DEFAULT_EMAIL["name"], True
+
+
+def _signed_agreement_email_fields(
+    business_name: str,
+    contract_type: str,
+    agreement_type: str,
+    identifier: str | None = None,
+    identifier_type: str | None = None,
+) -> dict[str, str]:
+    if agreement_type == "eoi":
+        agreement_label = "EOI"
+    elif agreement_type == "contract_multiple_attachments":
+        agreement_label = "contracts"
+    else:
+        agreement_label = "contract"
+    identifier_html = ""
+    if identifier and identifier_type:
+        identifier_html = f"<p>{identifier_type.upper()}: {identifier}</p>"
+    values = {
+        "business_name": business_name,
+        "contract_type": contract_type,
+        "agreement_label": agreement_label,
+        "identifier_html": identifier_html,
+        "nmi": identifier if identifier_type == "nmi" else "",
+        "mirn": identifier if identifier_type == "mirn" else "",
+    }
+    try:
+        from services.operational_emails import load_template_content, render_tokens, with_db
+
+        loaded = with_db(lambda db: load_template_content(db, "signed_agreement.default"))
+        if loaded:
+            return {
+                "email_subject": render_tokens(loaded[0], values),
+                "email_html_content": render_tokens(loaded[1], values),
+            }
+    except Exception as e:
+        logger.warning("signed agreement template lookup failed: %s", e)
+    subject = f"Signed {agreement_label} - {business_name} - {contract_type}"
+    html = (
+        f"<p>Hello Team,</p><p>Please find attached the signed {agreement_label} "
+        f"for our member <strong>{business_name}</strong>.</p>"
+        f"<p>Document type: {contract_type}</p>{identifier_html}"
+    )
+    return {"email_subject": subject, "email_html_content": html}
 
 def send_supplier_signed_agreement(
     file_path: str,
@@ -267,6 +322,15 @@ def send_supplier_signed_agreement(
         "supplier_email": supplier_email,
         "resolved_supplier_name": resolved_supplier_name,
     }
+    payload.update(
+        _signed_agreement_email_fields(
+            actual_business_name,
+            contract_type,
+            agreement_type,
+            identifier,
+            identifier_type,
+        )
+    )
     
     # Add identifier if present
     if identifier and identifier_type:
@@ -423,6 +487,15 @@ def send_supplier_signed_agreement_multiple(
         "resolved_supplier_name": resolved_supplier_name,
         "file_count": len(file_paths),
     }
+    payload.update(
+        _signed_agreement_email_fields(
+            actual_business_name,
+            contract_type,
+            agreement_type,
+            identifier,
+            identifier_type,
+        )
+    )
     
     # Add identifier if present
     if identifier and identifier_type:
