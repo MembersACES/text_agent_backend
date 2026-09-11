@@ -713,6 +713,26 @@ class ClientManualActivityCreate(BaseModel):
     offer_type_custom: Optional[str] = None
 
 
+class ActivityTestDataPreview(BaseModel):
+    """Dry-run counts for deleting test@acesolutions.com.au activity rows."""
+    email: str
+    offer_activity_count: int
+    client_manual_count: int
+    strategy_item_count: int
+    autonomous_runs_unlinked: int
+    by_type: Dict[str, int]
+    sample_clients: List[str]
+
+
+class ActivityTestDataPurgeResult(BaseModel):
+    """Result of deleting test@acesolutions.com.au activity rows."""
+    email: str
+    offer_activities_deleted: int
+    client_manual_deleted: int
+    strategy_items_deleted: int
+    autonomous_runs_unlinked: int
+
+
 # --- Strategy & WIP (per-client strategy items) ---
 
 
