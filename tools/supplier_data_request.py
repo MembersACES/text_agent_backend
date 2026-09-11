@@ -388,38 +388,67 @@ def supplier_data_request(
         logger.info(f"Identifier type: {identifier_type}")
         logger.info(f"========================================")
         
-        # Get template
-        template_key = f"{service_type}_data"
-        if template_key not in EMAIL_TEMPLATES:
-            logger.error(f"No template found for service type: {service_type}")
-            return f"Error: No template found for {service_type}. Valid types are: electricity_ci, electricity_sme, gas_ci, gas_sme, waste"
-       
-        template_config = EMAIL_TEMPLATES[template_key]
-        
-        # Look up supplier email
-        supplier_email, resolved_supplier_name, is_default = find_retailer_email(supplier_name, service_type)
-        logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
-        
-        # If using default email, add a warning note
-        default_note = ""
-        if is_default:
-            default_note = f"\n\n⚠️ Note: '{supplier_name}' was not recognized in our retailer database. The request will be sent to our general members email address for manual processing."
-        
-        # Prepare template variables
         template_vars = {
             "business_name": business_name,
             "nmi": account_identifier if identifier_type == "NMI" else "",
             "mrin": account_identifier if identifier_type == "MRIN" else "",
             "account_number": account_identifier if identifier_type == "account_number" else ""
         }
-       
-        # Format email - catch any formatting errors
+
+        db_template = None
+        db_recipient = None
         try:
-            email_body = template_config["template"].format(**template_vars)
-            email_subject = template_config["subject"].format(**template_vars)
-        except KeyError as e:
-            logger.error(f"Template formatting error: {e}")
-            return f"Error: Template formatting failed - missing variable: {e}"
+            from services.operational_emails import (
+                find_data_request_recipient,
+                load_template_content,
+                render_tokens,
+                with_db,
+            )
+
+            def _load(db):
+                return (
+                    load_template_content(db, f"data_request.{service_type}"),
+                    find_data_request_recipient(db, supplier_name, service_type),
+                )
+
+            loaded = with_db(_load)
+            if loaded:
+                db_template, db_recipient = loaded
+        except Exception as e:
+            logger.warning("operational email lookup failed for data request: %s", e)
+
+        if db_recipient:
+            supplier_email, resolved_supplier_name, is_default = db_recipient
+        else:
+            supplier_email, resolved_supplier_name, is_default = find_retailer_email(supplier_name, service_type)
+        logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
+
+        default_note = ""
+        if is_default:
+            default_note = f"\n\n⚠️ Note: '{supplier_name}' was not recognized in our retailer database. The request will be sent to our general members email address for manual processing."
+
+        if db_template:
+            try:
+                from services.operational_emails import render_tokens
+                email_subject = render_tokens(db_template[0], template_vars)
+                email_body = render_tokens(db_template[1], template_vars)
+            except Exception as e:
+                logger.warning("data request DB template render failed, using fallback: %s", e)
+                db_template = None
+
+        if not db_template:
+            template_key = f"{service_type}_data"
+            if template_key not in EMAIL_TEMPLATES:
+                logger.error(f"No template found for service type: {service_type}")
+                return f"Error: No template found for {service_type}. Valid types are: electricity_ci, electricity_sme, gas_ci, gas_sme, waste"
+
+            template_config = EMAIL_TEMPLATES[template_key]
+            try:
+                email_body = template_config["template"].format(**template_vars)
+                email_subject = template_config["subject"].format(**template_vars)
+            except KeyError as e:
+                logger.error(f"Template formatting error: {e}")
+                return f"Error: Template formatting failed - missing variable: {e}"
         
         # Prepare request for n8n
         request_data = {

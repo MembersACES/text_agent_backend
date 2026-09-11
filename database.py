@@ -454,3 +454,21 @@ def init_db():
                 logging.info("✅ Added offers.campaign_id column")
     except Exception as e:
         logging.warning("Could not ensure offers.campaign_id column: %s", e)
+
+    try:
+        from models import OperationalEmailRecipient, OperationalEmailTemplate  # noqa: F401
+        from services.operational_emails import seed_operational_emails
+
+        db = SessionLocal()
+        try:
+            inserted = seed_operational_emails(db)
+            if inserted.get("templates") or inserted.get("recipients"):
+                logging.info(
+                    "Seeded operational email templates=%s recipients=%s",
+                    inserted.get("templates"),
+                    inserted.get("recipients"),
+                )
+        finally:
+            db.close()
+    except Exception as e:
+        logging.warning("Could not seed operational email templates: %s", e)

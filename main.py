@@ -223,6 +223,8 @@ from models import (
     PuduConsumable,
     PuduConsumableRobotState,
     PuduConsumableBaselineRun,
+    OperationalEmailTemplate,
+    OperationalEmailRecipient,
 )
 from schemas import (
     TaskCreate,
@@ -6587,19 +6589,37 @@ async def signed_agreement_lodgement(
 
 # Also add an endpoint to get available contract types
 @app.get("/api/contract-types")
-def get_contract_types(user_info: dict = Depends(verify_google_token)):
+def get_contract_types(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
     """
     Get available contract types for the frontend dropdown
     """
     from tools.send_supplier_signed_agreement import CONTRACT_EMAIL_MAPPINGS, EOI_EMAIL_MAPPINGS
-    
+    from services.operational_emails import list_recipients, recipient_to_dict, seed_operational_emails
+
     contracts = list(CONTRACT_EMAIL_MAPPINGS.keys())
     eois = list(EOI_EMAIL_MAPPINGS.keys())
-    
+    contract_recipients = []
+    eoi_recipients = []
+    try:
+        seed_operational_emails(db)
+        contract_recipients = [recipient_to_dict(row) for row in list_recipients(db, "signed_contract")]
+        eoi_recipients = [recipient_to_dict(row) for row in list_recipients(db, "eoi")]
+        if contract_recipients:
+            contracts = [row["key"] for row in contract_recipients]
+        if eoi_recipients:
+            eois = [row["key"] for row in eoi_recipients]
+    except Exception as e:
+        logging.warning("contract-types falling back to hardcoded maps: %s", e)
+
     return {
         "contracts": contracts,
         "eois": eois,
-        "user_email": user_info.get("email")
+        "contract_recipients": contract_recipients,
+        "eoi_recipients": eoi_recipients,
+        "user_email": user_info.get("email"),
     }
 
 
@@ -14502,5 +14522,7 @@ def rebuild_staged_activity(
 
 
 from campaign_routes import register_campaign_routes
+from email_template_routes import register_email_template_routes
 
 register_campaign_routes(app, get_current_user_with_db)
+register_email_template_routes(app, verify_google_token)
