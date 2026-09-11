@@ -13025,10 +13025,10 @@ def autonomous_sequence_update_template(
     if body.stop_on is not None:
         from services.autonomous_sequence import parse_stop_on
         template.stop_on = json.dumps(parse_stop_on(body.stop_on))
-    if body.ack_template_signed is not None:
+    if "ack_template_signed" in body.model_fields_set:
         from services.autonomous_sequence import dump_ack_template
         template.ack_template_signed = dump_ack_template(body.ack_template_signed)
-    if body.ack_template_invoice is not None:
+    if "ack_template_invoice" in body.model_fields_set:
         from services.autonomous_sequence import dump_ack_template
         template.ack_template_invoice = dump_ack_template(body.ack_template_invoice)
     if body.figures_mode is not None:

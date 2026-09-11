@@ -30,8 +30,10 @@ from services.campaigns import (
     add_suppression,
     assert_campaign_unsubscribe_config,
     create_campaign,
+    delete_suppression,
     extract_email_id_from_webhook_response,
     fire_test_send,
+    list_suppressions,
     patch_campaign,
     render_first_touch,
     replace_rows,
@@ -344,13 +346,14 @@ def test_suppressed_addresses_are_never_started():
     db.refresh(campaign)
     patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
     db.refresh(campaign)
-    start_campaign(db, campaign, "a@b.com")
+    out = start_campaign(db, campaign, "a@b.com")
     suppressed_row = (
         db.query(CampaignRow).filter(CampaignRow.recipient_key == "person0@example.com").one()
     )
     assert suppressed_row.row_status == "suppressed"
     assert suppressed_row.run_id is None
     assert db.query(AutonomousSequenceRun).count() == 1
+    assert out["skipped_suppressed_addresses"] == ["person0@example.com"]
 
 
 def test_daily_cap_leaves_rest_pending():
@@ -496,7 +499,7 @@ def _campaign_client(session):
 
     register_campaign_routes(app, fake_user)
     app.dependency_overrides[get_db] = override_db
-    return TestClient(app)
+    return TestClient(app, follow_redirects=False)
 
 
 def _live_run(db, email: str, status: str = "running"):
@@ -537,7 +540,8 @@ def test_dispatched_first_touch_contains_absolute_unsubscribe_link():
     assert unsub.startswith("https://api.example.test/api/autonomous/campaigns/unsubscribe?token=")
     assert unsub in payload["body_html"]
     assert unsub in payload["body_text"]
-    assert f'<a href="{escape(unsub, quote=True)}">' in payload["body_html"]
+    assert f'<a href="{escape(unsub, quote=True)}">Unsubscribe</a>' in payload["body_html"]
+    assert f">{unsub}<" not in payload["body_html"]
     assert "unsubscribe from these emails at any time" in payload["body_html"].lower()
     assert "unsubscribe from these emails at any time" in payload["body_text"].lower()
     assert "{{unsubscribe_url}}" not in payload["body_html"]
@@ -553,8 +557,10 @@ def test_unsubscribe_get_does_not_write_suppression():
     assert res.status_code == 200
     assert "ada@example.com" in res.text
     assert "Unsubscribe" in res.text
+    assert "Carbon Zero Australasia" in res.text
     assert "<form" in res.text.lower()
     assert 'method="post"' in res.text.lower()
+    assert "https://api.example.test/api/autonomous/campaigns/unsubscribe?token=" in res.text
     assert db.query(Suppression).count() == 0
 
 
@@ -568,6 +574,9 @@ def test_unsubscribe_post_writes_suppression_and_stops_live_run():
     client = _campaign_client(db)
     res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
     assert res.status_code == 200
+    assert res.headers.get("location") in (None, "")
+    assert "has been unsubscribed" in res.text.lower()
+    assert "Carbon Zero Australasia" in res.text
     assert db.query(Suppression).count() == 1
     db.refresh(running)
     db.refresh(queued)
@@ -604,3 +613,102 @@ def test_startup_raises_when_secret_is_dev_default_outside_local_dev(monkeypatch
         raise AssertionError("expected startup config to raise")
     except RuntimeError as exc:
         assert "CAMPAIGN_UNSUBSCRIBE_SECRET" in str(exc)
+
+
+def test_unsubscribe_get_and_post_work_with_no_session_and_do_not_redirect_to_auth():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    token = sign_unsubscribe_token("ada@example.com", campaign.id)
+    app = FastAPI()
+
+    def override_db():
+        yield db
+
+    def forbid_auth():
+        raise AssertionError("unsubscribe must not require a session")
+
+    register_campaign_routes(app, forbid_auth)
+    app.dependency_overrides[get_db] = override_db
+    client = TestClient(app, follow_redirects=False)
+
+    get_res = client.get("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    assert get_res.status_code == 200
+    assert not get_res.headers.get("location")
+    assert "login" not in get_res.text.lower()
+    assert "sign in" not in get_res.text.lower()
+    assert "Carbon Zero Australasia" in get_res.text
+    assert db.query(Suppression).count() == 0
+
+    post_res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    assert post_res.status_code == 200
+    assert not post_res.headers.get("location")
+    assert "login" not in post_res.text.lower()
+    assert "sign in" not in post_res.text.lower()
+    assert "has been unsubscribed" in post_res.text.lower()
+    assert db.query(Suppression).count() == 1
+
+
+def test_upload_names_suppressed_address_instead_of_failing():
+    db = _db()
+    _template(db)
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
+    add_suppression(db, "ada@example.com", "unsubscribed", "test")
+    summary = replace_rows(
+        db,
+        campaign,
+        ["company_name", "contact_email"],
+        [["Acme", "ada@example.com"], ["Beta", "bob@example.com"]],
+        {"company_name": "company_name", "contact_email": "contact_email"},
+    )
+    assert summary["suppressed_addresses"] == ["ada@example.com"]
+    assert summary["pending"] == 1
+    ada = db.query(CampaignRow).filter(CampaignRow.recipient_key == "ada@example.com").one()
+    assert ada.row_status == "suppressed"
+
+
+def test_suppression_list_and_delete_clears_address_for_campaign_start():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    add_suppression(db, "person0@example.com", "unsubscribed", "test")
+    listed = list_suppressions(db)
+    assert listed[0]["email"] == "person0@example.com"
+    client = _campaign_client(db)
+    res = client.get("/api/autonomous/campaigns/suppressions")
+    assert res.status_code == 200
+    assert res.json()[0]["email"] == "person0@example.com"
+    suppression_id = res.json()[0]["id"]
+    delete_res = client.delete(f"/api/autonomous/campaigns/suppressions/{suppression_id}")
+    assert delete_res.status_code == 200
+    assert list_suppressions(db) == []
+    row = db.query(CampaignRow).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    out = start_campaign(db, campaign, "a@b.com")
+    assert out["started"] == 1
+    assert out["skipped_suppressed_addresses"] == []
+
+
+def test_send_first_touch_names_suppressed_address():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    add_suppression(db, "blocked@example.com", "unsubscribed", "test")
+    try:
+        send_first_touch_email(
+            db=db,
+            to="blocked@example.com",
+            subject="Hi",
+            html="<p>Hi</p>",
+            text="Hi",
+            campaign=campaign,
+            row=db.query(CampaignRow).first(),
+            test=False,
+        )
+        raise AssertionError("expected suppression error")
+    except CampaignError as exc:
+        assert exc.status_code == 409
+        assert "blocked@example.com" in str(exc)
+        assert "unsubscribed" in str(exc).lower()
+
