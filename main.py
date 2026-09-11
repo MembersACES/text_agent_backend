@@ -257,6 +257,8 @@ from schemas import (
     SolarCleaningSignedUploadResponse,
     MemberDocumentUploadActivityCreate,
     ActivityReportItem,
+    ActivityTestDataPreview,
+    ActivityTestDataPurgeResult,
     ClientManualActivityCreate,
     OfferPipelineStage as OfferPipelineStageSchema,
     StrategyItemCreate,
@@ -317,6 +319,7 @@ from services.crm import (
     sync_strategy_items_from_crm,
     enrich_client_response,
 )
+from services.activity_report import activity_report_service
 from services.entity_groups import (
     build_entity_group_summary,
     compute_entity_group_suggestions,
@@ -13655,6 +13658,60 @@ def delete_offer(
 
     logging.info(f"Offer {offer_id} and dependent records deleted")
     return {"status": "success", "message": "Offer and related data deleted"}
+
+
+@app.get("/api/reports/activities/export")
+def export_activity_report(
+    client_id: Optional[int] = Query(None, description="Filter by client id"),
+    activity_type: Optional[str] = Query(None, description="Filter by activity type"),
+    created_after: Optional[str] = Query(None, description="On or after date (YYYY-MM-DD)"),
+    created_before: Optional[str] = Query(None, description="On or before date (YYYY-MM-DD)"),
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Export activity report rows as CSV using the same filters as the report page."""
+    content, filename = activity_report_service.export_csv(
+        db,
+        client_id,
+        activity_type,
+        created_after,
+        created_before,
+    )
+    return Response(
+        content=content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/reports/activities/test-data", response_model=ActivityTestDataPreview)
+def preview_test_activity_data(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """Dry-run counts of activity rows created by the test user."""
+    email = ((user_data.get("idinfo") or {}).get("email") or "").strip().lower()
+    if not email.endswith("@acesolutions.com.au"):
+        raise HTTPException(status_code=403, detail="ACES staff access required")
+    return activity_report_service.preview_test_data(db)
+
+
+@app.delete("/api/reports/activities/test-data", response_model=ActivityTestDataPurgeResult)
+def purge_test_activity_data(
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    """
+    Delete offer activities and client-manual lines created by test@acesolutions.com.au.
+    Also removes linked Strategy WIP rows and unlinks autonomous runs. Does not delete
+    offers, clients, Drive files, tasks, or notes.
+    """
+    email = ((user_data.get("idinfo") or {}).get("email") or "").strip().lower()
+    if not email.endswith("@acesolutions.com.au"):
+        raise HTTPException(status_code=403, detail="ACES staff access required")
+    actor = email or "unknown"
+    logging.info("Test activity purge requested by %s", actor)
+    return activity_report_service.purge_test_data(db)
 
 
 @app.delete("/api/reports/activities/{activity_id}", response_model=dict)
