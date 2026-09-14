@@ -50,6 +50,7 @@ def test_folder_maps_to_expected_types():
         "WASTE/Darebin RSL - Waste review-1.pdf": "waste",
         "Cooking Oil /Testimonial_-_Longbeach_RSL_-_Cooking_Oil_Review.docx": "resource_recovery",
         "DMA /Cheltenham RSL Step 1 (5-6) DMA.png": "dma",
+        "VAS /REM Lodge testimonial - Value Added Service.docx": "vas",
         "Cleaning robot /Frankston RSL Automated Cleaning Robot Testimonial & Result.pdf": "automated_cleaning_robot",
         "Solar Cleaning /Richmond FC minimalist Solar cleaning 10.06.png": "solar_panel_cleaning",
     }
@@ -82,6 +83,14 @@ def test_aaa_suffixes():
     assert type_from_aaa_filename("RSL Victoria testimonial - Association Endorsement.docx") == "association_endorsement"
     assert type_from_aaa_filename("Healesville RSL testimonial - Solar Review.docx") == "solar_review"
     assert type_from_aaa_filename("Swin Alumni (Geelong & Surfcoast Laundry) testimonial - Gas Billing Discrepancy Recovery.docx") == "gas_discrepancy"
+    assert type_from_aaa_filename("REM Lodge testimonial - Value Added Service.docx") == "vas"
+
+
+def test_vas_is_allowlisted():
+    assert "vas" in ALL_SOLUTION_TYPE_IDS
+    challenge = DEFAULT_CONTENT["vas"]["key_challenge_of_solution"]
+    assert "Describe the challenge" not in challenge
+    assert "value-added service" in challenge.lower() or "vas" in challenge.lower()
 
 
 def test_member_hints():
