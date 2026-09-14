@@ -119,6 +119,8 @@ def test_sheet_labels_map_to_solution_type_ids():
     assert solution_type_id_from_label("C&I Gas Reviews") == "ci_gas"
     assert solution_type_id_from_label("Oil / Resource Recovery") == "resource_recovery"
     assert solution_type_id_from_label("CDS (Container Deposit Scheme)") == "cds"
+    assert solution_type_id_from_label("Value Added Service") == "vas"
+    assert solution_type_id_from_label("vas") == "vas"
     assert solution_type_id_from_label("client_endorsement") == "client_endorsement"
     assert solution_type_id_from_label("not a real type") is None
     assert solution_type_id_from_label(
