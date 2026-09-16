@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, inspect, text
 
 from crm_enums import OfferStatus
 from models import (
@@ -475,6 +475,25 @@ def _campaign_side_effects(db: Session, campaign: Campaign) -> tuple[list[int], 
     return sorted(run_ids), offer_ids
 
 
+def _delete_sequence_context(db: Session, run_ids: list[int]) -> None:
+    if not run_ids:
+        return
+    conn = db.connection()
+    insp = inspect(conn)
+    names = set(insp.get_table_names())
+    if conn.dialect.name == "postgresql":
+        names |= set(insp.get_table_names(schema="public"))
+    if "autonomous_sequence_context" not in names:
+        return
+    ctx_tbl = (
+        "public.autonomous_sequence_context"
+        if conn.dialect.name == "postgresql"
+        else "autonomous_sequence_context"
+    )
+    for run_id in run_ids:
+        db.execute(text(f"DELETE FROM {ctx_tbl} WHERE run_id = :run_id"), {"run_id": run_id})
+
+
 def _delete_runs_and_offers(db: Session, run_ids: list[int], offer_ids: list[int]) -> None:
     if run_ids:
         db.query(AutonomousSequenceEvent).filter(
@@ -483,6 +502,7 @@ def _delete_runs_and_offers(db: Session, run_ids: list[int], offer_ids: list[int
         db.query(AutonomousSequenceStep).filter(
             AutonomousSequenceStep.run_id.in_(run_ids)
         ).delete(synchronize_session=False)
+        _delete_sequence_context(db, run_ids)
         db.query(AutonomousSequenceRun).filter(
             AutonomousSequenceRun.id.in_(run_ids)
         ).delete(synchronize_session=False)
