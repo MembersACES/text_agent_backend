@@ -189,6 +189,92 @@ def looks_like_email(value: str) -> bool:
     return "@" in text and "." in text.split("@")[-1]
 
 
+AU_STATES = frozenset({"nsw", "vic", "qld", "sa", "wa", "tas", "nt", "act"})
+SHAPE_THRESHOLD = 0.9
+SHAPE_FIELD_LABELS = {
+    "contact_email": "Contact email",
+    "contact_phone": "Contact phone",
+    "state": "State",
+    "postcode": "Postcode",
+}
+
+
+def matches_column_shape(key: str, value: str) -> bool | None:
+    text = (value or "").strip()
+    match key:
+        case "contact_email":
+            return "@" in text
+        case "contact_phone":
+            return sum(ch.isdigit() for ch in text) >= 8
+        case "state":
+            return text.lower() in AU_STATES
+        case "postcode":
+            return bool(re.fullmatch(r"\d{4}", text))
+        case _:
+            return None
+
+
+def unique_recipient_merges(merges: list[dict[str, str]]) -> list[dict[str, str]]:
+    uniques: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, merge in enumerate(merges):
+        email = (merge.get("contact_email") or "").strip().lower()
+        uid = f"email:{email}" if email else f"row:{index}"
+        if uid in seen:
+            continue
+        seen.add(uid)
+        uniques.append(merge)
+    return uniques
+
+
+def column_shape_warnings(merges: list[dict[str, str]]) -> list[dict[str, Any]]:
+    uniques = unique_recipient_merges(merges)
+    total = len(uniques)
+    if total == 0:
+        return []
+    present = {key for merge in uniques for key in merge}
+    warnings: list[dict[str, Any]] = []
+    for key, label in SHAPE_FIELD_LABELS.items():
+        if key not in present:
+            continue
+        ok_count = 0
+        for merge in uniques:
+            if matches_column_shape(key, merge.get(key) or ""):
+                ok_count += 1
+        ok_fraction = ok_count / total
+        if ok_fraction < SHAPE_THRESHOLD:
+            warnings.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "ok_count": ok_count,
+                    "fail_count": total - ok_count,
+                    "total": total,
+                    "ok_fraction": ok_fraction,
+                }
+            )
+    return warnings
+
+
+def row_shape_failures(merge: dict[str, str], raised_keys: set[str]) -> list[str]:
+    failures: list[str] = []
+    for key in ("contact_email", "contact_phone", "state", "postcode"):
+        if key not in raised_keys:
+            continue
+        if matches_column_shape(key, merge.get(key) or ""):
+            continue
+        failures.append(key)
+    return failures
+
+
+def shape_summary(merges: list[dict[str, str]]) -> tuple[int, list[dict[str, Any]], list[list[str]]]:
+    warnings = column_shape_warnings(merges)
+    raised = {item["key"] for item in warnings}
+    per_row = [row_shape_failures(merge, raised) for merge in merges]
+    warning_rows = sum(1 for keys in per_row if keys)
+    return warning_rows, warnings, per_row
+
+
 def parse_json_obj(raw: Any, default: dict | None = None) -> dict:
     if isinstance(raw, dict):
         return raw

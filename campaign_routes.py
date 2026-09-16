@@ -12,6 +12,7 @@ from database import get_db
 from services.campaigns import (
     CampaignError,
     apply_unsubscribe,
+    archive_campaigns,
     campaign_to_dict,
     create_campaign,
     delete_campaign,
@@ -24,6 +25,7 @@ from services.campaigns import (
     replace_rows,
     resume_campaign,
     row_to_dict,
+    set_archived,
     set_human_only,
     start_campaign,
     fire_test_send,
@@ -49,6 +51,7 @@ class CampaignPatchBody(BaseModel):
     daily_cap: Optional[int] = None
     send_window_start: Optional[str] = None
     send_window_end: Optional[str] = None
+    acknowledge_warnings: Optional[int] = None
 
 
 class CampaignRowsBody(BaseModel):
@@ -63,9 +66,8 @@ class TestSendBody(BaseModel):
     row_id: int
 
 
-class HumanOnlyBody(BaseModel):
-    human_only: bool
-    reason: Optional[str] = None
+class ArchiveBody(BaseModel):
+    ids: list[int] = Field(default_factory=list)
 
 
 def _actor(user_data: dict) -> Optional[str]:
@@ -73,7 +75,8 @@ def _actor(user_data: dict) -> Optional[str]:
 
 
 def _raise(exc: CampaignError) -> None:
-    raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    detail = exc.payload if exc.payload is not None else str(exc)
+    raise HTTPException(status_code=exc.status_code, detail=detail) from exc
 
 
 def register_campaign_routes(app, get_current_user_with_db):
@@ -86,8 +89,17 @@ def register_campaign_routes(app, get_current_user_with_db):
         return campaign_to_dict(campaign, db)
 
     @app.get("/api/autonomous/campaigns")
-    def list_all(db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
-        return [campaign_to_dict(c, db) for c in list_campaigns(db)]
+    def list_all(
+        include_archived: bool = Query(False),
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user_with_db),
+    ):
+        return [campaign_to_dict(c, db) for c in list_campaigns(db, include_archived)]
+
+    @app.post("/api/autonomous/campaigns/archive")
+    def archive_many(body: ArchiveBody, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
+        updated = archive_campaigns(db, body.ids)
+        return [campaign_to_dict(c, db) for c in updated]
 
     @app.get("/api/autonomous/campaigns/unsubscribe")
     def unsubscribe_get(token: str):
@@ -125,7 +137,7 @@ def register_campaign_routes(app, get_current_user_with_db):
     @app.get("/api/autonomous/campaigns/{campaign_id}")
     def get_one(
         campaign_id: int,
-        limit: int = Query(100),
+        limit: int = Query(2000),
         offset: int = Query(0),
         db: Session = Depends(get_db),
         user_data: dict = Depends(get_current_user_with_db),
@@ -146,13 +158,36 @@ def register_campaign_routes(app, get_current_user_with_db):
         return campaign_to_dict(campaign, db)
 
     @app.delete("/api/autonomous/campaigns/{campaign_id}")
-    def delete(campaign_id: int, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
+    def delete(
+        campaign_id: int,
+        confirm: bool = Query(False),
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user_with_db),
+    ):
         try:
             campaign = get_campaign(db, campaign_id)
-            delete_campaign(db, campaign)
+            delete_campaign(db, campaign, confirm)
         except CampaignError as exc:
             _raise(exc)
         return {"ok": True}
+
+    @app.post("/api/autonomous/campaigns/{campaign_id}/archive")
+    def archive_one(campaign_id: int, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
+        try:
+            campaign = get_campaign(db, campaign_id)
+            campaign = set_archived(db, campaign, True)
+        except CampaignError as exc:
+            _raise(exc)
+        return campaign_to_dict(campaign, db)
+
+    @app.post("/api/autonomous/campaigns/{campaign_id}/unarchive")
+    def unarchive_one(campaign_id: int, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
+        try:
+            campaign = get_campaign(db, campaign_id)
+            campaign = set_archived(db, campaign, False)
+        except CampaignError as exc:
+            _raise(exc)
+        return campaign_to_dict(campaign, db)
 
     @app.post("/api/autonomous/campaigns/{campaign_id}/rows")
     def post_rows(campaign_id: int, body: CampaignRowsBody, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):

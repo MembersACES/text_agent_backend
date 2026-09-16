@@ -613,6 +613,7 @@ class Campaign(Base):
     daily_cap = Column(Integer, nullable=True)
     send_window_start = Column(String(5), nullable=True)
     send_window_end = Column(String(5), nullable=True)
+    archived = Column(Integer, nullable=False, default=0)
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)

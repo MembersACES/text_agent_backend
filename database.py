@@ -456,6 +456,18 @@ def init_db():
         logging.warning("Could not ensure offers.campaign_id column: %s", e)
 
     try:
+        insp = inspect(engine)
+        if "campaigns" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("campaigns")]
+            if "archived" not in cols:
+                logging.info("Adding missing campaigns.archived column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE campaigns ADD COLUMN archived INTEGER DEFAULT 0 NOT NULL"))
+                logging.info("✅ Added campaigns.archived column")
+    except Exception as e:
+        logging.warning("Could not ensure campaigns.archived column: %s", e)
+
+    try:
         from models import OperationalEmailRecipient, OperationalEmailTemplate  # noqa: F401
         from services.operational_emails import seed_operational_emails
 
