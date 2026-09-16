@@ -1206,18 +1206,21 @@ def get_invoice_history(business_name: str) -> Dict:
         Dict with invoices list and count
     """
     try:
-        if not business_name:
-            return {
-                "invoices": [],
-                "error": "Missing required field: business_name"
-            }
-        
+        search_name = (business_name or "").strip()
+
         if not SHEET_ID:
             logger.warning("SHEET_ID not configured, falling back to n8n")
             logger.warning(f"ONE_MONTH_SAVINGS_SHEET_ID env var: {os.getenv('ONE_MONTH_SAVINGS_SHEET_ID', 'NOT SET')}")
+            if not search_name:
+                return {
+                    "invoices": [],
+                    "error": "ONE_MONTH_SAVINGS_SHEET_ID not configured",
+                }
             return _get_invoice_history_via_n8n(business_name)
         
-        logger.info(f"Fetching invoice history for: {business_name}")
+        logger.info(
+            "Fetching invoice history for: %s", search_name or "ALL"
+        )
         logger.info(f"Sheet ID: {SHEET_ID}, Sheet Name: {SHEET_NAME}")
         
         # Get Google Sheets service
@@ -1270,14 +1273,17 @@ def get_invoice_history(business_name: str) -> Dict:
             # Filter by business name (column A, index 0)
             # Handle both string and non-string values
             row_business_name = str(row[0]).strip() if len(row) > 0 and row[0] is not None else ""
-            search_business_name = business_name.strip()
+            search_business_name = search_name
             
             # Log first few rows for debugging
             if idx < 3:
                 logger.info(f"Row {idx}: Business='{row_business_name}', Invoice='{str(row[5]).strip() if len(row) > 5 and row[5] is not None else 'N/A'}'")
                 logger.info(f"Row {idx} full data: {row}")
             
-            if len(row) > 0 and row_business_name.lower() == search_business_name.lower():
+            if len(row) > 0 and (
+                not search_business_name
+                or row_business_name.lower() == search_business_name.lower()
+            ):
                 invoice_number = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
                 if not invoice_number:
                     continue
