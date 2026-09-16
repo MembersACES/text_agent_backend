@@ -6729,6 +6729,24 @@ def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verif
     }
 
 
+@app.get("/api/invoicing/one-month-savings/invoices")
+def invoicing_one_month_savings_invoices_endpoint(
+    user_info: dict = Depends(verify_google_token),
+):
+    """All 1st Month Savings invoices with status (Generated / Sent / Paid)."""
+    require_invoicing_user(user_info)
+    result = get_invoice_history("")
+    err = result.get("error")
+    invoices = result.get("invoices") or []
+    if err and not invoices:
+        raise HTTPException(status_code=502, detail=str(err))
+    return {
+        "invoices": invoices,
+        "count": result.get("count", len(invoices)),
+        "user_email": user_info.get("email"),
+    }
+
+
 @app.get("/api/invoicing/drive/businesses")
 def invoicing_drive_businesses_endpoint(
     category: str = Query(
