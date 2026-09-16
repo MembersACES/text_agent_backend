@@ -7,7 +7,7 @@ from html import escape
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -959,6 +959,49 @@ def test_confirmed_delete_leaves_no_offer_with_dangling_campaign_id():
     leftover_ids = [offer.campaign_id for offer in db.query(Offer).all() if offer.campaign_id]
     for leftover in leftover_ids:
         assert db.query(Campaign).filter(Campaign.id == leftover).first() is not None
+    assert db.query(AutonomousSequenceRun).count() == 0
+
+
+def test_confirmed_delete_clears_sequence_context_before_runs():
+    db = _db()
+    db.execute(text("PRAGMA foreign_keys=ON"))
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    row = db.query(CampaignRow).filter(CampaignRow.human_only == 0).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    run = db.query(AutonomousSequenceRun).one()
+    db.execute(
+        text(
+            """
+            CREATE TABLE autonomous_sequence_context (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES autonomous_sequence_runs(id),
+                context TEXT,
+                source VARCHAR(32),
+                source_id VARCHAR(255)
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            "INSERT INTO autonomous_sequence_context (run_id, context, source, source_id) "
+            "VALUES (:rid, 'thread', 'email', 'abc')"
+        ),
+        {"rid": run.id},
+    )
+    db.commit()
+    campaign_id = campaign.id
+    client = _campaign_client(db)
+    res = client.delete(f"/api/autonomous/campaigns/{campaign_id}", params={"confirm": True})
+    assert res.status_code == 200, res.text
+    assert db.query(Campaign).filter(Campaign.id == campaign_id).first() is None
+    leftover = db.execute(text("SELECT COUNT(*) FROM autonomous_sequence_context")).scalar()
+    assert leftover == 0
     assert db.query(AutonomousSequenceRun).count() == 0
 
 
