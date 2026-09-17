@@ -336,6 +336,13 @@ def test_run_list_source_splits_campaign_stubs_from_followups():
     assert campaign_run.id not in followup_ids
     assert campaign_run.id in campaign_ids
     assert followup.id not in campaign_ids
+    from main import _autonomous_list_item
+
+    listed = _autonomous_list_item(db, campaign_run)
+    assert listed.campaign_id == campaign.id
+    assert listed.campaign_name == campaign.name
+    followup_listed = _autonomous_list_item(db, followup)
+    assert followup_listed.campaign_id is None
 
 
 def test_start_is_idempotent():

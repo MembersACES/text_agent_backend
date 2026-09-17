@@ -12268,14 +12268,38 @@ def verify_autonomous_inbound_secret(
         raise HTTPException(status_code=401, detail="Invalid X-Autonomous-Inbound-Secret")
 
 
+def _campaign_meta_by_offer(db: Session, offer_ids: list[int]) -> dict[int, tuple[int | None, str | None]]:
+    from models import Campaign
+
+    unique = [oid for oid in dict.fromkeys(offer_ids) if oid]
+    if not unique:
+        return {}
+    offers = db.query(Offer.id, Offer.campaign_id).filter(Offer.id.in_(unique)).all()
+    campaign_ids = [cid for _, cid in offers if cid]
+    names: dict[int, str] = {}
+    if campaign_ids:
+        names = {
+            cid: name
+            for cid, name in db.query(Campaign.id, Campaign.name).filter(Campaign.id.in_(campaign_ids)).all()
+        }
+    return {oid: (cid, names.get(cid) if cid else None) for oid, cid in offers}
+
+
 def _autonomous_list_item(
     db: Session,
     run: AutonomousSequenceRun,
     ack_draft: Optional[dict] = None,
+    campaign_id: Optional[int] = None,
+    campaign_name: Optional[str] = None,
 ) -> AutonomousSequenceRunListItem:
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
     business_name = offer.business_name if offer else None
+    resolved_campaign_id = campaign_id if campaign_id is not None else (offer.campaign_id if offer else None)
+    resolved_campaign_name = campaign_name
+    if resolved_campaign_id and resolved_campaign_name is None:
+        meta = _campaign_meta_by_offer(db, [run.offer_id])
+        resolved_campaign_id, resolved_campaign_name = meta.get(run.offer_id, (resolved_campaign_id, None))
     pending = [
         s
         for s in steps
@@ -12302,6 +12326,8 @@ def _autonomous_list_item(
         steps_total=len(steps),
         ack_draft_pending=ack_draft is not None,
         ack_draft_thread_id=(ack_draft or {}).get("thread_id"),
+        campaign_id=resolved_campaign_id,
+        campaign_name=resolved_campaign_name,
     )
 
 
@@ -13342,11 +13368,14 @@ def autonomous_sequence_list_runs(
 
     ack_by_run = latest_ack_drafts_for_runs(db, [r.id for r in runs])
     reviewed = run_ids_with_ack_reviewed(db, [r.id for r in runs])
+    campaign_meta = _campaign_meta_by_offer(db, [r.offer_id for r in runs if r.offer_id])
     items = [
         _autonomous_list_item(
             db,
             r,
             None if r.id in reviewed else ack_by_run.get(r.id),
+            campaign_id=campaign_meta.get(r.offer_id, (None, None))[0],
+            campaign_name=campaign_meta.get(r.offer_id, (None, None))[1],
         ).model_dump(mode="json")
         for r in runs
     ]
