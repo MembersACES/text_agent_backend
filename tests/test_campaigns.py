@@ -29,6 +29,7 @@ from services.campaigns import (
     DEV_UNSUBSCRIBE_SECRET,
     FIGURE_COLUMNS,
     add_suppression,
+    apply_unsubscribe,
     assert_campaign_unsubscribe_config,
     campaign_to_dict,
     campaign_detail,
@@ -49,6 +50,7 @@ from services.campaigns import (
     start_campaign,
 )
 from services.merge_template import sanitize_html, split_row, matches_column_shape
+from services.autonomous_sequence import apply_run_source_filter
 
 
 @pytest.fixture(autouse=True)
@@ -308,6 +310,32 @@ def test_stub_offers_have_null_figures():
         assert getattr(offer, col) is None, col
     run = db.query(AutonomousSequenceRun).one()
     assert "16.76" not in (run.context_json or "")
+
+
+def test_run_list_source_splits_campaign_stubs_from_followups():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    row = db.query(CampaignRow).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    campaign_run = db.query(AutonomousSequenceRun).one()
+    followup = _live_run(db, "live@example.com")
+    followup_ids = {
+        item.id
+        for item in apply_run_source_filter(db.query(AutonomousSequenceRun), "followup").all()
+    }
+    campaign_ids = {
+        item.id
+        for item in apply_run_source_filter(db.query(AutonomousSequenceRun), "campaign").all()
+    }
+    assert followup.id in followup_ids
+    assert campaign_run.id not in followup_ids
+    assert campaign_run.id in campaign_ids
+    assert followup.id not in campaign_ids
 
 
 def test_start_is_idempotent():

@@ -13255,10 +13255,14 @@ def autonomous_sequence_list_runs(
     ),
     limit: int = Query(50, le=2000),
     offset: int = Query(0, ge=0),
+    source: Optional[str] = Query(
+        None,
+        description="followup (Offer.campaign_id is null) | campaign (stub offers from outbound campaigns)",
+    ),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    from services.autonomous_sequence import finalize_run_if_exhausted
+    from services.autonomous_sequence import apply_run_source_filter, finalize_run_if_exhausted
 
     if run_status_group == "running":
         stuck = (
@@ -13319,6 +13323,7 @@ def autonomous_sequence_list_runs(
         )
     elif run_status:
         q = q.filter(AutonomousSequenceRun.run_status == run_status.strip())
+    q = apply_run_source_filter(q, source)
     total = q.count()
     runs = (
         q.options(joinedload(AutonomousSequenceRun.steps))
