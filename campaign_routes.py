@@ -24,6 +24,7 @@ from services.campaigns import (
     list_suppressions,
     pause_campaign,
     patch_campaign,
+    preview_rows,
     replace_rows,
     resume_campaign,
     row_to_dict,
@@ -112,6 +113,17 @@ def register_campaign_routes(app, get_current_user_with_db):
     def archive_many(body: ArchiveBody, db: Session = Depends(get_db), user_data: dict = Depends(get_current_user_with_db)):
         updated = archive_campaigns(db, body.ids)
         return [campaign_to_dict(c, db) for c in updated]
+
+    @app.post("/api/autonomous/campaigns/preview-rows")
+    def preview_import(
+        body: CampaignRowsBody,
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user_with_db),
+    ):
+        try:
+            return preview_rows(db, body.headers, body.rows, body.column_map)
+        except CampaignError as exc:
+            _raise(exc)
 
     @app.get("/api/autonomous/campaigns/unsubscribe")
     def unsubscribe_get(token: str):
