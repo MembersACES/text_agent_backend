@@ -50,13 +50,25 @@ logger = logging.getLogger(__name__)
 N8N_EMAIL_URL = os.getenv("N8N_AUTONOMOUS_EMAIL_WEBHOOK_URL", "").strip()
 DEV_UNSUBSCRIBE_SECRET = "campaign-unsubscribe-dev"
 LOCAL_DEV_ENVIRONMENTS = frozenset({"development", "dev", "local"})
-TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled"})
+TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled", "errored"})
 UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
 UNSUBSCRIBE_LINK_TEXT = "Unsubscribe"
 WORDMARK = "Carbon Zero Australasia"
 MELBOURNE = ZoneInfo("Australia/Melbourne")
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
+CONTENT_PATCH_KEYS = (
+    "name",
+    "sequence_type",
+    "first_touch_subject",
+    "first_touch_html",
+    "merge_field_map",
+    "provenance_note",
+)
+THROTTLE_PATCH_KEYS = ("daily_cap", "send_window_start", "send_window_end")
+TERMINAL_CAMPAIGN_STATUSES = frozenset({"done"})
+SEND_NEXT_MAX = 100
+CAMPAIGN_DETAIL_ROW_LIMIT = 2000
 FIGURE_COLUMNS = (
     "annual_savings",
     "current_cost",
@@ -333,6 +345,10 @@ def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False
     return payload
 
 
+def campaign_detail(campaign: Campaign, db: Session) -> dict[str, Any]:
+    return campaign_to_dict(campaign, db, include_rows=True, limit=CAMPAIGN_DETAIL_ROW_LIMIT)
+
+
 def row_to_dict(row: CampaignRow, shape_warnings: list[str] | None = None) -> dict[str, Any]:
     return {
         "id": row.id,
@@ -387,10 +403,26 @@ def _assert_draft(campaign: Campaign) -> None:
         raise CampaignError("Only a draft campaign can be edited", 409)
 
 
+def _campaign_is_terminal(campaign: Campaign) -> bool:
+    return campaign.status in TERMINAL_CAMPAIGN_STATUSES or bool(campaign.archived)
+
+
 def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor: str | None) -> Campaign:
     next_status = body.get("status")
     if next_status and next_status != campaign.status and next_status != "ready":
         raise CampaignError(f"Cannot set status to {next_status} via PATCH")
+
+    wants_content = any(k in body for k in CONTENT_PATCH_KEYS)
+    wants_throttle = any(k in body for k in THROTTLE_PATCH_KEYS)
+    terminal = _campaign_is_terminal(campaign)
+
+    if wants_content and campaign.status != "draft":
+        raise CampaignError("Only a draft campaign can be edited", 409)
+    if wants_throttle and terminal:
+        raise CampaignError(
+            "Daily cap and send window can only be changed before a campaign is finished",
+            409,
+        )
 
     if campaign.status == "draft":
         if "name" in body and body["name"] is not None:
@@ -406,13 +438,16 @@ def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor:
             campaign.merge_field_map = _json(body["merge_field_map"])
         if "provenance_note" in body:
             campaign.provenance_note = body["provenance_note"]
+
+    if wants_throttle and not terminal:
         if "daily_cap" in body:
             campaign.daily_cap = body["daily_cap"]
         if "send_window_start" in body:
             campaign.send_window_start = body["send_window_start"]
         if "send_window_end" in body:
             campaign.send_window_end = body["send_window_end"]
-        db.flush()
+
+    db.flush()
 
     if next_status and next_status != campaign.status:
         if next_status == "ready":
@@ -420,11 +455,6 @@ def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor:
             campaign.status = "ready"
         else:
             raise CampaignError(f"Cannot set status to {next_status} via PATCH")
-
-    if campaign.status != "draft" and next_status != "ready" and any(
-        k in body for k in ("name", "first_touch_subject", "first_touch_html", "merge_field_map", "provenance_note")
-    ):
-        raise CampaignError("Only a draft campaign can be edited", 409)
 
     db.commit()
     db.refresh(campaign)
@@ -996,7 +1026,9 @@ def _create_stub_offer(db: Session, campaign: Campaign, merge: dict[str, str], a
     return offer
 
 
-def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[str, Any]:
+def _refuse_inactive_start(campaign: Campaign) -> dict[str, Any] | None:
+    if bool(campaign.archived):
+        raise CampaignError("An archived campaign cannot send", 409)
     if campaign.status == "draft":
         raise CampaignError("A draft campaign can only send a test to one typed-in address", 409)
     if campaign.status == "paused":
@@ -1011,28 +1043,25 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
         }
     if campaign.status not in {"ready", "sending"}:
         raise CampaignError(f"Cannot start from status {campaign.status}", 409)
+    return None
 
-    if not _inside_send_window(campaign):
-        return {
-            "ok": True,
-            "started": 0,
-            "pending": _pending_sendable(db, campaign.id),
-            "reason": "outside_send_window",
-            "status": campaign.status,
-        }
 
-    cap = campaign.daily_cap
-    already = _started_today(db, campaign.id)
-    remaining = None if cap is None else max(0, int(cap) - already)
-    if remaining == 0:
-        return {
-            "ok": True,
-            "started": 0,
-            "pending": _pending_sendable(db, campaign.id),
-            "reason": "daily_cap",
-            "status": campaign.status,
-        }
+def _outside_window_result(db: Session, campaign: Campaign) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "started": 0,
+        "pending": _pending_sendable(db, campaign.id),
+        "reason": "outside_send_window",
+        "status": campaign.status,
+    }
 
+
+def _start_pending_rows(
+    db: Session,
+    campaign: Campaign,
+    actor: str | None,
+    remaining: int | None,
+) -> dict[str, Any]:
     from services.autonomous_sequence import start_gas_base2_sequence
 
     all_rows = (
@@ -1144,6 +1173,63 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
         "skipped_idempotent": skipped_idempotent,
         "status": campaign.status,
     }
+
+
+def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[str, Any]:
+    done = _refuse_inactive_start(campaign)
+    if done is not None:
+        return done
+    if not _inside_send_window(campaign):
+        return _outside_window_result(db, campaign)
+
+    cap = campaign.daily_cap
+    already = _started_today(db, campaign.id)
+    remaining = None if cap is None else max(0, int(cap) - already)
+    if remaining == 0:
+        return {
+            "ok": True,
+            "started": 0,
+            "pending": _pending_sendable(db, campaign.id),
+            "reason": "daily_cap",
+            "status": campaign.status,
+        }
+    return _start_pending_rows(db, campaign, actor, remaining)
+
+
+def send_next_n(db: Session, campaign: Campaign, n: int, actor: str | None) -> dict[str, Any]:
+    done = _refuse_inactive_start(campaign)
+    if done is not None:
+        raise CampaignError("A finished campaign has nothing left to send", 409)
+    if not _inside_send_window(campaign):
+        return _outside_window_result(db, campaign)
+    try:
+        count = int(n)
+    except (TypeError, ValueError):
+        raise CampaignError("n must be a positive integer") from None
+    if count < 1:
+        raise CampaignError("n must be at least 1")
+    if count > SEND_NEXT_MAX:
+        raise CampaignError(f"n cannot exceed {SEND_NEXT_MAX}")
+
+    result = _start_pending_rows(db, campaign, actor, count)
+    event = CampaignEvent(
+        campaign_id=campaign.id,
+        event_type="send_next_n",
+        actor=actor,
+        payload_json=_json(
+            {
+                "n": count,
+                "started": result["started"],
+                "pending": result["pending"],
+                "bypassed_daily_cap": True,
+            }
+        ),
+    )
+    db.add(event)
+    db.commit()
+    result["bypassed_daily_cap"] = True
+    result["requested"] = count
+    return result
 
 
 def _pending_sendable(db: Session, campaign_id: int) -> int:

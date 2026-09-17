@@ -12267,13 +12267,9 @@ def _autonomous_list_item(
     if pending:
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
-    done = len(
-        [
-            s
-            for s in steps
-            if s.step_status in ("executed", "completed", "error", "failed", "skipped")
-        ]
-    )
+    from services.autonomous_sequence import count_steps_done
+
+    done = count_steps_done(steps)
     return AutonomousSequenceRunListItem(
         id=run.id,
         offer_id=run.offer_id,
@@ -13231,22 +13227,77 @@ def autonomous_sequence_delete_template_step(
 
 @app.get("/api/autonomous/sequences/runs")
 def autonomous_sequence_list_runs(
-    run_status: Optional[str] = Query(None, description="running | stopped | completed | cancelled"),
+    run_status: Optional[str] = Query(None, description="running | stopped | completed | cancelled | errored"),
     run_status_group: Optional[str] = Query(
         None,
-        description="running = only active runs; finished = stopped, completed, or cancelled",
+        description=(
+            "running | finished | stopped_negative | stopped_signed | "
+            "stopped_invoice | stopped_unsubscribed | completed | errored | stopped_other"
+        ),
     ),
-    limit: int = Query(50, le=200),
+    limit: int = Query(50, le=2000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
+    from services.autonomous_sequence import finalize_run_if_exhausted
+
+    if run_status_group == "running":
+        stuck = (
+            db.query(AutonomousSequenceRun)
+            .options(joinedload(AutonomousSequenceRun.steps))
+            .filter(AutonomousSequenceRun.run_status == "running")
+            .all()
+        )
+        closed = False
+        for run in stuck:
+            if finalize_run_if_exhausted(db, run):
+                closed = True
+        if closed:
+            db.commit()
+
     q = db.query(AutonomousSequenceRun)
+    named_reasons = (
+        "negative_sentiment_stop",
+        "agreement_signed",
+        "invoice_received",
+        "unsubscribed",
+    )
     if run_status_group == "running":
         q = q.filter(AutonomousSequenceRun.run_status == "running")
     elif run_status_group == "finished":
         q = q.filter(
-            AutonomousSequenceRun.run_status.in_(("stopped", "completed", "cancelled"))
+            AutonomousSequenceRun.run_status.in_(("stopped", "completed", "cancelled", "errored"))
+        )
+    elif run_status_group == "stopped_negative":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "negative_sentiment_stop",
+        )
+    elif run_status_group == "stopped_signed":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "agreement_signed",
+        )
+    elif run_status_group == "stopped_invoice":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "invoice_received",
+        )
+    elif run_status_group == "stopped_unsubscribed":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "unsubscribed",
+        )
+    elif run_status_group == "completed":
+        q = q.filter(AutonomousSequenceRun.run_status == "completed")
+    elif run_status_group == "errored":
+        q = q.filter(AutonomousSequenceRun.run_status == "errored")
+    elif run_status_group == "stopped_other":
+        q = q.filter(
+            AutonomousSequenceRun.run_status.in_(("stopped", "cancelled")),
+            (AutonomousSequenceRun.stop_reason.is_(None))
+            | (~AutonomousSequenceRun.stop_reason.in_(named_reasons)),
         )
     elif run_status:
         q = q.filter(AutonomousSequenceRun.run_status == run_status.strip())
