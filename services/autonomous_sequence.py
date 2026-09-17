@@ -26,6 +26,7 @@ from models import (
     Offer,
     OfferActivity,
 )
+from services.schedule_tz import schedule_tz_name
 
 
 def apply_run_source_filter(query, source: str | None):
@@ -536,12 +537,47 @@ def latest_ack_drafts_for_runs(db: Session, run_ids: list[int]) -> dict[int, dic
 
 
 def count_runs_with_ack_draft(db: Session) -> int:
-    return (
-        db.query(func.count(func.distinct(AutonomousSequenceEvent.run_id)))
-        .filter(AutonomousSequenceEvent.event_type == "ack_drafted")
-        .scalar()
-        or 0
+    reviewed_ids = [
+        row[0]
+        for row in db.query(AutonomousSequenceEvent.run_id)
+        .filter(AutonomousSequenceEvent.event_type == "ack_reviewed")
+        .distinct()
+        .all()
+    ]
+    query = db.query(func.count(func.distinct(AutonomousSequenceEvent.run_id))).filter(
+        AutonomousSequenceEvent.event_type == "ack_drafted",
     )
+    if reviewed_ids:
+        query = query.filter(~AutonomousSequenceEvent.run_id.in_(reviewed_ids))
+    return query.scalar() or 0
+
+
+def run_ids_with_ack_reviewed(db: Session, run_ids: list[int]) -> set[int]:
+    if not run_ids:
+        return set()
+    rows = (
+        db.query(AutonomousSequenceEvent.run_id)
+        .filter(
+            AutonomousSequenceEvent.run_id.in_(run_ids),
+            AutonomousSequenceEvent.event_type == "ack_reviewed",
+        )
+        .distinct()
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def mark_ack_reviewed(db: Session, run_id: int, actor: str | None) -> bool:
+    run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
+    if not run:
+        return False
+    if latest_ack_draft(db, run_id) is None:
+        raise ValueError("No acknowledgement draft to review")
+    if run_id in run_ids_with_ack_reviewed(db, [run_id]):
+        return True
+    _log_event(db, run_id, "ack_reviewed", payload={"actor": actor})
+    db.commit()
+    return True
 
 
 def clear_validity_context(context: dict[str, Any]) -> None:
@@ -888,7 +924,7 @@ RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstri
 RETELL_KEY = os.getenv("RETELL_API_KEY", "").strip()
 
 # Default when run/template do not supply an IANA zone. Scheduling is per-run via resolve_schedule_tz.
-AUTONOMOUS_SCHEDULE_TZ = "Australia/Melbourne"
+AUTONOMOUS_SCHEDULE_TZ = schedule_tz_name()
 
 
 def _utc_now_naive() -> datetime:
@@ -905,11 +941,11 @@ def resolve_schedule_tz(
     run: Optional[AutonomousSequenceRun] = None,
     template: Optional[AutonomousSequenceTemplate] = None,
 ) -> ZoneInfo:
-    """First present of run.timezone → template.timezone → Australia/Melbourne."""
+    """First present of run.timezone → template.timezone → configured AUTONOMOUS_SCHEDULE_TZ."""
     for raw in (
         run.timezone if run is not None else None,
         template.timezone if template is not None else None,
-        AUTONOMOUS_SCHEDULE_TZ,
+        schedule_tz_name(),
     ):
         name = (str(raw).strip() if raw is not None else "")
         if name:

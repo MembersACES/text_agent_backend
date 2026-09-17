@@ -93,6 +93,28 @@ def test_list_payload_pending_true_when_ack_event_exists():
     assert item["ack_draft_thread_id"] == "t-gmail"
 
 
+def test_ack_reviewed_clears_pending_and_count():
+    db = _db()
+    _template(db)
+    run = _run(db)
+    _log_event(
+        db,
+        run.id,
+        "ack_drafted",
+        payload={"thread_id": "t-gmail", "stop_reason": "invoice_received"},
+    )
+    db.commit()
+    from services.autonomous_sequence import count_runs_with_ack_draft, mark_ack_reviewed, run_ids_with_ack_reviewed
+
+    assert count_runs_with_ack_draft(db) == 1
+    assert mark_ack_reviewed(db, run.id, "a@b.com") is True
+    assert run.id in run_ids_with_ack_reviewed(db, [run.id])
+    assert count_runs_with_ack_draft(db) == 0
+    ack = latest_ack_drafts_for_runs(db, [run.id]).get(run.id)
+    item = _list_item(db, run, None if run.id in run_ids_with_ack_reviewed(db, [run.id]) else ack)
+    assert item["ack_draft_pending"] is False
+
+
 def test_list_payload_pending_false_without_ack_event():
     db = _db()
     _template(db)

@@ -12,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
-from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy.orm import Session
@@ -44,6 +43,7 @@ from services.merge_template import (
     split_row,
     validate_template,
 )
+from services.schedule_tz import schedule_tz, schedule_tz_name
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,6 @@ TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled", "errored
 UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
 UNSUBSCRIBE_LINK_TEXT = "Unsubscribe"
 WORDMARK = "Carbon Zero Australasia"
-MELBOURNE = ZoneInfo("Australia/Melbourne")
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
 CONTENT_PATCH_KEYS = (
@@ -236,32 +235,43 @@ def _merge(row: CampaignRow) -> dict[str, str]:
     return {str(k): "" if v is None else str(v) for k, v in data.items()}
 
 
+def _row_key(row: CampaignRow) -> str:
+    return (row.recipient_key or "").strip()
+
+
+def _human_only_keys(rows: list[CampaignRow]) -> set[str]:
+    return {_row_key(row) for row in rows if row.human_only and _row_key(row)}
+
+
 def _counts_from_rows(rows: list[CampaignRow]) -> dict[str, Any]:
     merges = [_merge(row) for row in rows]
     warning_rows, shape_warnings, per_row = shape_summary(merges)
     blank_keys = 0
     keys: set[str] = set()
-    human_only = 0
+    human_only_keys = _human_only_keys(rows)
+    human_only_blanks = 0
     started_keys = {
-        (row.recipient_key or "").strip()
+        _row_key(row)
         for row in rows
-        if row.run_id and (row.recipient_key or "").strip()
+        if row.run_id and _row_key(row)
     }
     sendable_keys: set[str] = set()
     sendable_blanks = 0
     warning_ids: set[int] = set()
     for row, fails in zip(rows, per_row):
-        key = (row.recipient_key or "").strip()
+        key = _row_key(row)
         if key:
             keys.add(key)
         else:
             blank_keys += 1
-        if row.human_only:
-            human_only += 1
+            if row.human_only:
+                human_only_blanks += 1
         if fails:
             warning_ids.add(row.id)
             continue
-        if row.row_status != "pending" or row.human_only:
+        if row.row_status != "pending":
+            continue
+        if row.human_only or (key and key in human_only_keys):
             continue
         if key and key in started_keys:
             continue
@@ -275,7 +285,7 @@ def _counts_from_rows(rows: list[CampaignRow]) -> dict[str, Any]:
         "unique_recipients": len(keys) + blank_keys,
         "pending": sendable,
         "sendable": sendable,
-        "human_only": human_only,
+        "human_only": len(human_only_keys) + human_only_blanks,
         "warnings": warning_rows,
         "shape_warnings": shape_warnings,
         "per_row_shape_warnings": per_row,
@@ -321,6 +331,7 @@ def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False
         "send_window_start": campaign.send_window_start,
         "send_window_end": campaign.send_window_end,
         "archived": bool(campaign.archived),
+        "schedule_timezone": schedule_tz_name(),
         "created_by": campaign.created_by,
         "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
         "updated_at": campaign.updated_at.isoformat() if campaign.updated_at else None,
@@ -334,6 +345,23 @@ def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False
             "test_sends": test_sends,
         },
         "shape_warnings": counted["shape_warnings"],
+        "mid_send_edits": [
+            {
+                "id": event.id,
+                "actor": event.actor,
+                "created_at": event.created_at.isoformat() if event.created_at else None,
+                "payload": parse_json_obj(event.payload_json),
+            }
+            for event in (
+                db.query(CampaignEvent)
+                .filter(
+                    CampaignEvent.campaign_id == campaign.id,
+                    CampaignEvent.event_type == "mid_send_template_edit",
+                )
+                .order_by(CampaignEvent.created_at.desc())
+                .all()
+            )
+        ],
     }
     if include_rows:
         page = all_rows[offset : offset + limit]
@@ -407,17 +435,41 @@ def _campaign_is_terminal(campaign: Campaign) -> bool:
     return campaign.status in TERMINAL_CAMPAIGN_STATUSES or bool(campaign.archived)
 
 
+def _started_row_count(db: Session, campaign_id: int) -> int:
+    return (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign_id, CampaignRow.run_id.isnot(None))
+        .count()
+    )
+
+
 def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor: str | None) -> Campaign:
     next_status = body.get("status")
     if next_status and next_status != campaign.status and next_status != "ready":
         raise CampaignError(f"Cannot set status to {next_status} via PATCH")
 
     wants_content = any(k in body for k in CONTENT_PATCH_KEYS)
+    wants_email = "first_touch_subject" in body or "first_touch_html" in body
     wants_throttle = any(k in body for k in THROTTLE_PATCH_KEYS)
     terminal = _campaign_is_terminal(campaign)
+    already_sent = _started_row_count(db, campaign.id)
 
-    if wants_content and campaign.status != "draft":
+    if wants_content and campaign.status != "draft" and not wants_email:
         raise CampaignError("Only a draft campaign can be edited", 409)
+    if wants_email and terminal:
+        raise CampaignError("A finished campaign's email cannot be edited", 409)
+    if wants_email and campaign.status != "draft" and already_sent > 0 and not body.get("confirm_mid_send_edit"):
+        remaining = _pending_sendable(db, campaign.id)
+        raise CampaignError(
+            f"{already_sent} already sent. {remaining} will get the new version.",
+            409,
+            payload={
+                "code": "mid_send_edit_confirmation",
+                "message": f"{already_sent} already sent. {remaining} will get the new version.",
+                "already_sent": already_sent,
+                "will_get_new": remaining,
+            },
+        )
     if wants_throttle and terminal:
         raise CampaignError(
             "Daily cap and send window can only be changed before a campaign is finished",
@@ -438,6 +490,28 @@ def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor:
             campaign.merge_field_map = _json(body["merge_field_map"])
         if "provenance_note" in body:
             campaign.provenance_note = body["provenance_note"]
+    elif wants_email and not terminal:
+        if "first_touch_subject" in body:
+            campaign.first_touch_subject = body["first_touch_subject"]
+        if "first_touch_html" in body:
+            campaign.first_touch_html = sanitize_html(body["first_touch_html"] or "")
+            campaign.first_touch_text = html_to_plain_text(campaign.first_touch_html)
+        if already_sent > 0:
+            remaining = _pending_sendable(db, campaign.id)
+            db.add(
+                CampaignEvent(
+                    campaign_id=campaign.id,
+                    event_type="mid_send_template_edit",
+                    actor=actor,
+                    payload_json=_json(
+                        {
+                            "already_sent": already_sent,
+                            "will_get_new": remaining,
+                            "subject": campaign.first_touch_subject,
+                        }
+                    ),
+                )
+            )
 
     if wants_throttle and not terminal:
         if "daily_cap" in body:
@@ -697,11 +771,25 @@ def replace_rows(
     _assert_draft(campaign)
     mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
     campaign.merge_field_map = _json(mapping)
+    existing = (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign.id)
+        .all()
+    )
+    preserved: dict[str, str | None] = {}
+    for row in existing:
+        key = _row_key(row)
+        if key and row.human_only:
+            preserved[key] = row.human_only_reason
     db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).delete()
     _ = client_merge_json
     built, suppressed_emails, groups = _ephemeral_rows(db, headers, rows, mapping, campaign.id)
     for row in built:
         row.campaign_id = campaign.id
+        key = _row_key(row)
+        if key in preserved:
+            row.human_only = 1
+            row.human_only_reason = preserved[key]
         db.add(row)
     db.commit()
     stored_rows = (
@@ -714,8 +802,14 @@ def replace_rows(
     return _summary_from_counted(counted, len(stored_rows), suppressed_emails, _row_conflicts(groups))
 
 
+def _assert_can_flag_human_only(campaign: Campaign, row: CampaignRow) -> None:
+    if bool(campaign.archived) or campaign.status == "done":
+        raise CampaignError("Human-only can only be changed before a campaign is finished", 409)
+    if row.row_status == "started" or row.run_id:
+        raise CampaignError("A row that has already been sent cannot be flagged human-only", 409)
+
+
 def set_human_only(db: Session, campaign: Campaign, row_id: int, human_only: bool, reason: str | None) -> CampaignRow:
-    _assert_draft(campaign)
     row = (
         db.query(CampaignRow)
         .filter(CampaignRow.id == row_id, CampaignRow.campaign_id == campaign.id)
@@ -723,9 +817,21 @@ def set_human_only(db: Session, campaign: Campaign, row_id: int, human_only: boo
     )
     if not row:
         raise CampaignError("Row not found", 404)
-    row.human_only = 1 if human_only else 0
+    _assert_can_flag_human_only(campaign, row)
     trimmed = (reason or "").strip()[:255] or None
-    row.human_only_reason = trimmed if human_only else None
+    key = _row_key(row)
+    targets = [row]
+    if key:
+        targets = (
+            db.query(CampaignRow)
+            .filter(CampaignRow.campaign_id == campaign.id, CampaignRow.recipient_key == row.recipient_key)
+            .all()
+        )
+    for target in targets:
+        if target.row_status == "started" or target.run_id:
+            continue
+        target.human_only = 1 if human_only else 0
+        target.human_only_reason = trimmed if human_only else None
     db.commit()
     db.refresh(row)
     return row
@@ -1047,14 +1153,16 @@ def _inside_send_window(campaign: Campaign, now: datetime | None = None) -> bool
     end = (campaign.send_window_end or "").strip()
     if not start or not end:
         return True
-    current = (now or datetime.now(MELBOURNE)).astimezone(MELBOURNE).strftime("%H:%M")
+    zone = schedule_tz()
+    current = (now or datetime.now(zone)).astimezone(zone).strftime("%H:%M")
     if start <= end:
         return start <= current <= end
     return current >= start or current <= end
 
 
 def _started_today(db: Session, campaign_id: int) -> int:
-    start = datetime.now(MELBOURNE).replace(hour=0, minute=0, second=0, microsecond=0)
+    zone = schedule_tz()
+    start = datetime.now(zone).replace(hour=0, minute=0, second=0, microsecond=0)
     start_naive = start.astimezone(timezone.utc).replace(tzinfo=None)
     return (
         db.query(CampaignRow)
@@ -1127,10 +1235,14 @@ def _start_pending_rows(
     )
     counted = _counts_from_rows(all_rows)
     warning_ids = counted["warning_ids"]
+    blocked_keys = _human_only_keys(all_rows)
     rows = [
         row
         for row in all_rows
-        if row.row_status == "pending" and not row.human_only and row.id not in warning_ids
+        if row.row_status == "pending"
+        and not row.human_only
+        and _row_key(row) not in blocked_keys
+        and row.id not in warning_ids
     ]
     started = 0
     skipped_suppressed = 0
@@ -1198,7 +1310,7 @@ def _start_pending_rows(
             client_id=None,
             crm_activity_id=None,
             anchor_at=datetime.now(timezone.utc),
-            tz="Australia/Melbourne",
+            tz=schedule_tz_name(),
             context=context,
         )
         _complete_first_email_step(db, run.id)
