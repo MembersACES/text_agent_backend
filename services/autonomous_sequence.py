@@ -1155,6 +1155,47 @@ def skip_remaining_steps(db: Session, run_id: int) -> None:
             s.completed_at = _utc_now_naive()
 
 
+OPEN_STEP_STATUSES = frozenset({"ready", "to_start", "in_progress"})
+ERROR_STEP_STATUSES = frozenset({"error", "failed"})
+
+
+def step_is_open(status: str | None) -> bool:
+    return (status or "") in OPEN_STEP_STATUSES
+
+
+def count_steps_done(steps: list[AutonomousSequenceStep]) -> int:
+    return len([s for s in steps if not step_is_open(s.step_status)])
+
+
+def finalize_run_if_exhausted(db: Session, run: AutonomousSequenceRun) -> bool:
+    """Close a run that has no remaining pending steps.
+
+    Last-step failures used to leave run_status=running forever because
+    complete paths only ran after a successful send. A run with nothing left
+    to do must become completed or errored regardless of the last outcome.
+    """
+    if run.run_status != "running":
+        return False
+    steps = list(run.steps) if run.steps is not None else (
+        db.query(AutonomousSequenceStep)
+        .filter(AutonomousSequenceStep.run_id == run.id)
+        .all()
+    )
+    if any(step_is_open(s.step_status) for s in steps):
+        return False
+    has_error = any((s.step_status or "") in ERROR_STEP_STATUSES for s in steps)
+    if has_error:
+        run.run_status = "errored"
+        if not run.stop_reason:
+            run.stop_reason = "step_error"
+        _log_event(db, run.id, "run_errored", payload={"stop_reason": run.stop_reason})
+    else:
+        run.run_status = "completed"
+        run.stop_reason = None
+        _log_event(db, run.id, "run_completed", payload={})
+    return True
+
+
 _RESTARTABLE_SEQUENCE_TYPES = frozenset(
     {
         "gas_base2_followup_v1",
@@ -1681,8 +1722,8 @@ def restart_sequence_from_finished_run(db: Session, run_id: int) -> Optional[dic
     run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == run_id).first()
     if not run:
         return None
-    if run.run_status not in ("stopped", "completed", "cancelled"):
-        raise ValueError("Only stopped, completed, or cancelled runs can be restarted")
+    if run.run_status not in ("stopped", "completed", "cancelled", "errored"):
+        raise ValueError("Only stopped, completed, cancelled, or errored runs can be restarted")
     tpl = get_sequence_template_by_type(db, run.sequence_type)
     if tpl and not bool(tpl.is_restartable):
         raise ValueError("This sequence type is not restartable")
@@ -2395,19 +2436,8 @@ def execute_due_steps_sync(db: Session) -> int:
 
         db.commit()
 
-        pending = (
-            db.query(AutonomousSequenceStep)
-            .filter(
-                AutonomousSequenceStep.run_id == run.id,
-                AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
-            )
-            .count()
-        )
-        if pending == 0 and run.run_status == "running":
-            run.run_status = "completed"
-            run.stop_reason = None
-            _log_event(db, run.id, "run_completed", payload={})
-            db.commit()
+        finalize_run_if_exhausted(db, run)
+        db.commit()
 
     return executed
 
@@ -2480,6 +2510,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
             step_id=step.id,
             payload={"error": str(e), "channel": step.channel},
         )
+        finalize_run_if_exhausted(db, run)
         db.commit()
         raise
     if out.get("mode") == "placeholder":
@@ -2500,6 +2531,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
             step_id=step.id,
             payload={"error": out, "channel": step.channel},
         )
+        finalize_run_if_exhausted(db, run)
         db.commit()
         raise ValueError(str(out.get("error") or "Send failed"))
 
@@ -2522,10 +2554,8 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
         )
         .count()
     )
-    if pending == 0 and run.run_status == "running":
-        run.run_status = "completed"
-        run.stop_reason = None
-        _log_event(db, run.id, "run_completed", payload={})
+    if pending == 0:
+        finalize_run_if_exhausted(db, run)
     db.commit()
     db.refresh(run)
     return {"ok": True, "run_id": run.id, "step_id": step.id, "result": out}
@@ -2753,18 +2783,7 @@ def mark_step_dispatched(
             payload={"error": summary, "channel": step.channel},
         )
     db.flush()
-    pending = (
-        db.query(AutonomousSequenceStep)
-        .filter(
-            AutonomousSequenceStep.run_id == run.id,
-            AutonomousSequenceStep.step_status.in_(("ready", "to_start", "in_progress")),
-        )
-        .count()
-    )
-    if success and pending == 0 and run.run_status == "running":
-        run.run_status = "completed"
-        run.stop_reason = None
-        _log_event(db, run.id, "run_completed", payload={})
+    finalize_run_if_exhausted(db, run)
     db.commit()
     db.refresh(run)
     return run

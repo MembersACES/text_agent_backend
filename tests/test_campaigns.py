@@ -7,7 +7,7 @@ from html import escape
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -18,6 +18,7 @@ from models import (
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
     AutonomousSequenceTemplateStep,
+    Campaign,
     CampaignEvent,
     CampaignRow,
     Offer,
@@ -29,7 +30,10 @@ from services.campaigns import (
     FIGURE_COLUMNS,
     add_suppression,
     assert_campaign_unsubscribe_config,
+    campaign_to_dict,
+    campaign_detail,
     create_campaign,
+    delete_campaign,
     delete_suppression,
     extract_email_id_from_webhook_response,
     fire_test_send,
@@ -37,12 +41,14 @@ from services.campaigns import (
     patch_campaign,
     render_first_touch,
     replace_rows,
+    preview_rows,
     send_first_touch_email,
+    send_next_n,
     set_human_only,
     sign_unsubscribe_token,
     start_campaign,
 )
-from services.merge_template import sanitize_html, split_row
+from services.merge_template import sanitize_html, split_row, matches_column_shape
 
 
 @pytest.fixture(autouse=True)
@@ -334,6 +340,170 @@ def test_human_only_rows_are_never_started():
     assert human.run_id is None
     assert human.row_status == "pending"
     assert db.query(AutonomousSequenceRun).count() == 1
+
+
+def _shifted_email_workbook():
+    headers = ["company_name", "contact_email", "state"]
+    rows = []
+    for i in range(45):
+        copies = 7 if i < 33 else 6
+        for _ in range(copies):
+            rows.append([f"Co {i}", f"person{i}@example.com", "VIC"])
+    for i in range(15):
+        rows.append([f"Shifted {i}", f"FirstName{i}", "VIC"])
+    return headers, rows
+
+
+def test_import_shape_check_flags_shifted_email_column():
+    db = _db()
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
+    headers, rows = _shifted_email_workbook()
+    assert len(rows) == 318
+    summary = replace_rows(
+        db,
+        campaign,
+        headers,
+        rows,
+        {
+            "company_name": "company_name",
+            "contact_email": "contact_email",
+            "state": "state",
+        },
+    )
+    assert summary["rows"] == 318
+    assert summary["unique_recipients"] == 60
+    assert summary["sendable"] == 45
+    assert summary["pending"] == 45
+    assert summary["warnings"] == 15
+    assert summary["warnings"] > 0
+    email = next(item for item in summary["shape_warnings"] if item["key"] == "contact_email")
+    assert email["fail_count"] == 15
+    payload = campaign_to_dict(campaign, db, include_rows=True, limit=500)
+    assert payload["row_counts"]["warnings"] == 15
+    assert payload["row_counts"]["sendable"] == 45
+    assert payload["row_counts"]["unique_recipients"] == 60
+    flagged = [row for row in payload["rows"] if "contact_email" in row["shape_warnings"]]
+    assert len(flagged) == 15
+    client = _campaign_client(db)
+    res = client.post(
+        f"/api/autonomous/campaigns/{campaign.id}/rows",
+        json={
+            "headers": headers,
+            "rows": rows,
+            "column_map": {
+                "company_name": "company_name",
+                "contact_email": "contact_email",
+                "state": "state",
+            },
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["warnings"] == 15
+    assert body["sendable"] == 45
+    assert body["unique_recipients"] == 60
+    assert next(item for item in body["shape_warnings"] if item["key"] == "contact_email")["fail_count"] == 15
+
+
+def test_warning_rows_are_not_started_and_ready_requires_acknowledgement():
+    db = _db()
+    _template(db)
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
+    headers, rows = _shifted_email_workbook()
+    replace_rows(
+        db,
+        campaign,
+        headers,
+        rows,
+        {
+            "company_name": "company_name",
+            "contact_email": "contact_email",
+            "state": "state",
+        },
+    )
+    patch_campaign(
+        db,
+        campaign,
+        {
+            "first_touch_subject": "Hello {{company_name}}",
+            "first_touch_html": "<p>Hi {{company_name}}</p>",
+            "provenance_note": "Public records research.",
+        },
+        "a@b.com",
+    )
+    db.refresh(campaign)
+    good = (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign.id, CampaignRow.recipient_key.like("%@example.com"))
+        .first()
+    )
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", good.id, "a@b.com")
+    db.refresh(campaign)
+    try:
+        patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+        raise AssertionError("expected ready to fail without warning acknowledgement")
+    except CampaignError as exc:
+        assert "15" in str(exc)
+        assert "acknowledge_warnings" in str(exc)
+    campaign = patch_campaign(
+        db,
+        campaign,
+        {"status": "ready", "acknowledge_warnings": 15},
+        "a@b.com",
+    )
+    assert campaign.status == "ready"
+    start_campaign(db, campaign, "a@b.com")
+    payload = campaign_to_dict(campaign, db, include_rows=True, limit=500)
+    warning_ids = {row["id"] for row in payload["rows"] if "contact_email" in row["shape_warnings"]}
+    assert len(warning_ids) == 15
+    stored = db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).all()
+    for row in stored:
+        if row.id in warning_ids:
+            assert row.run_id is None
+            assert row.row_status == "pending"
+    assert db.query(AutonomousSequenceRun).count() == 45
+    assert campaign_to_dict(campaign, db)["row_counts"]["sendable"] == 0
+
+
+def test_shape_checkers_match_expected_column_shapes():
+    assert matches_column_shape("contact_email", "ada@example.com") is True
+    assert matches_column_shape("contact_email", "Kim McGill") is False
+    assert matches_column_shape("contact_phone", "03 9429 5111") is True
+    assert matches_column_shape("contact_phone", "1234") is False
+    assert matches_column_shape("state", "VIC") is True
+    assert matches_column_shape("state", "California") is False
+    assert matches_column_shape("postcode", "3000") is True
+    assert matches_column_shape("postcode", "300") is False
+    assert matches_column_shape("company_name", "Nissan") is None
+
+
+def test_flag_five_of_forty_five_drops_sendable_and_is_not_started():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=45)
+    rows = (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign.id)
+        .order_by(CampaignRow.id)
+        .all()
+    )
+    assert len(rows) == 45
+    for row in rows[:5]:
+        set_human_only(db, campaign, row.id, True, "government")
+    counts = campaign_to_dict(campaign, db)["row_counts"]
+    assert counts["human_only"] == 5
+    assert counts["pending"] == 40
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", rows[5].id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    for row in rows[:5]:
+        db.refresh(row)
+        assert row.run_id is None
+        assert row.row_status == "pending"
+        assert row.human_only == 1
+    assert db.query(AutonomousSequenceRun).count() == 40
 
 
 def test_suppressed_addresses_are_never_started():
@@ -711,4 +881,302 @@ def test_send_first_touch_names_suppressed_address():
         assert exc.status_code == 409
         assert "blocked@example.com" in str(exc)
         assert "unsubscribed" in str(exc).lower()
+
+
+def test_archive_hides_from_list_and_show_archived_brings_it_back():
+    db = _db()
+    campaign = create_campaign(db, "GCI clutter", "gci_outbound_v1", "a@b.com")
+    campaign.status = "sending"
+    db.commit()
+    client = _campaign_client(db)
+    listed = client.get("/api/autonomous/campaigns").json()
+    assert any(item["id"] == campaign.id for item in listed)
+    res = client.post(f"/api/autonomous/campaigns/{campaign.id}/archive")
+    assert res.status_code == 200
+    assert res.json()["archived"] is True
+    listed = client.get("/api/autonomous/campaigns").json()
+    assert all(item["id"] != campaign.id for item in listed)
+    archived = client.get("/api/autonomous/campaigns", params={"include_archived": True}).json()
+    match = next(item for item in archived if item["id"] == campaign.id)
+    assert match["archived"] is True
+    un = client.post(f"/api/autonomous/campaigns/{campaign.id}/unarchive")
+    assert un.status_code == 200
+    listed = client.get("/api/autonomous/campaigns").json()
+    assert any(item["id"] == campaign.id and not item["archived"] for item in listed)
+
+
+def test_bulk_archive_hides_selected_campaigns():
+    db = _db()
+    first = create_campaign(db, "One", "gci_outbound_v1", "a@b.com")
+    second = create_campaign(db, "Two", "gci_outbound_v1", "a@b.com")
+    client = _campaign_client(db)
+    res = client.post("/api/autonomous/campaigns/archive", json={"ids": [first.id, second.id]})
+    assert res.status_code == 200
+    listed = client.get("/api/autonomous/campaigns").json()
+    ids = {item["id"] for item in listed}
+    assert first.id not in ids
+    assert second.id not in ids
+
+
+def test_delete_with_runs_is_refused_without_confirm_and_names_counts():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=2)
+    row = db.query(CampaignRow).filter(CampaignRow.human_only == 0).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    assert db.query(Offer).filter(Offer.campaign_id == campaign.id).count() == 2
+    assert db.query(AutonomousSequenceRun).count() == 2
+    client = _campaign_client(db)
+    res = client.delete(f"/api/autonomous/campaigns/{campaign.id}")
+    assert res.status_code == 409
+    detail = res.json()["detail"]
+    assert detail["runs"] == 2
+    assert detail["offers"] == 2
+    assert detail["confirm_required"] is True
+    assert "2 runs" in detail["message"]
+    assert "2 offers" in detail["message"]
+    assert db.query(Campaign).filter(Campaign.id == campaign.id).one()
+    assert db.query(Offer).filter(Offer.campaign_id == campaign.id).count() == 2
+
+
+def test_confirmed_delete_leaves_no_offer_with_dangling_campaign_id():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=2)
+    row = db.query(CampaignRow).filter(CampaignRow.human_only == 0).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    campaign_id = campaign.id
+    client = _campaign_client(db)
+    res = client.delete(f"/api/autonomous/campaigns/{campaign_id}", params={"confirm": True})
+    assert res.status_code == 200
+    assert db.query(Campaign).filter(Campaign.id == campaign_id).first() is None
+    assert db.query(Offer).filter(Offer.campaign_id == campaign_id).count() == 0
+    leftover_ids = [offer.campaign_id for offer in db.query(Offer).all() if offer.campaign_id]
+    for leftover in leftover_ids:
+        assert db.query(Campaign).filter(Campaign.id == leftover).first() is not None
+    assert db.query(AutonomousSequenceRun).count() == 0
+
+
+def test_confirmed_delete_clears_sequence_context_before_runs():
+    db = _db()
+    db.execute(text("PRAGMA foreign_keys=ON"))
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    row = db.query(CampaignRow).filter(CampaignRow.human_only == 0).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    run = db.query(AutonomousSequenceRun).one()
+    db.execute(
+        text(
+            """
+            CREATE TABLE autonomous_sequence_context (
+                id INTEGER PRIMARY KEY,
+                run_id INTEGER NOT NULL REFERENCES autonomous_sequence_runs(id),
+                context TEXT,
+                source VARCHAR(32),
+                source_id VARCHAR(255)
+            )
+            """
+        )
+    )
+    db.execute(
+        text(
+            "INSERT INTO autonomous_sequence_context (run_id, context, source, source_id) "
+            "VALUES (:rid, 'thread', 'email', 'abc')"
+        ),
+        {"rid": run.id},
+    )
+    db.commit()
+    campaign_id = campaign.id
+    client = _campaign_client(db)
+    res = client.delete(f"/api/autonomous/campaigns/{campaign_id}", params={"confirm": True})
+    assert res.status_code == 200, res.text
+    assert db.query(Campaign).filter(Campaign.id == campaign_id).first() is None
+    leftover = db.execute(text("SELECT COUNT(*) FROM autonomous_sequence_context")).scalar()
+    assert leftover == 0
+    assert db.query(AutonomousSequenceRun).count() == 0
+
+
+def test_draft_delete_without_runs_does_not_need_confirm():
+    db = _db()
+    campaign = create_campaign(db, "Empty draft", "gci_outbound_v1", "a@b.com")
+    delete_campaign(db, campaign, confirm=False)
+    assert db.query(Campaign).filter(Campaign.id == campaign.id).first() is None
+
+
+def test_campaign_detail_includes_rows_in_every_status():
+    db = _db()
+    campaign = _draft_with_rows(db, n=2)
+    for status in ("draft", "ready", "sending", "paused", "done"):
+        campaign.status = status
+        db.commit()
+        payload = campaign_detail(campaign, db)
+        assert payload["status"] == status
+        assert payload["row_counts"]["rows"] == 2
+        assert len(payload["rows"]) == 2
+    campaign.archived = 1
+    db.commit()
+    payload = campaign_detail(campaign, db)
+    assert payload["archived"] is True
+    assert payload["row_counts"]["rows"] == 2
+    assert len(payload["rows"]) == 2
+
+
+def test_sending_campaign_accepts_daily_cap_and_rejects_html():
+    db = _db()
+    campaign = _ready_campaign(db, n=5)
+    patch_campaign(db, campaign, {"daily_cap": 2}, "a@b.com")
+    start_campaign(db, campaign, "a@b.com")
+    db.refresh(campaign)
+    assert campaign.status == "sending"
+    campaign = patch_campaign(db, campaign, {"daily_cap": 10}, "a@b.com")
+    assert campaign.daily_cap == 10
+    try:
+        patch_campaign(db, campaign, {"first_touch_html": "<p>changed</p>"}, "a@b.com")
+        raise AssertionError("expected content edit to fail")
+    except CampaignError as exc:
+        assert exc.status_code == 409
+    client = _campaign_client(db)
+    res = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"daily_cap": 12})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["daily_cap"] == 12
+    assert body["row_counts"]["rows"] == 5
+    assert "rows" in body
+    blocked = client.patch(
+        f"/api/autonomous/campaigns/{campaign.id}",
+        json={"first_touch_html": "<p>nope</p>"},
+    )
+    assert blocked.status_code == 409
+
+
+def test_send_next_n_bypasses_daily_cap_and_records_actor():
+    db = _db()
+    campaign = _ready_campaign(db, n=5)
+    patch_campaign(db, campaign, {"daily_cap": 1}, "a@b.com")
+    first = start_campaign(db, campaign, "a@b.com")
+    assert first["started"] == 1
+    blocked = start_campaign(db, campaign, "a@b.com")
+    assert blocked["started"] == 0
+    assert blocked["reason"] == "daily_cap"
+    out = send_next_n(db, campaign, 3, "morgan@acesolutions.com.au")
+    assert out["started"] == 3
+    assert out["bypassed_daily_cap"] is True
+    event = (
+        db.query(CampaignEvent)
+        .filter(CampaignEvent.campaign_id == campaign.id, CampaignEvent.event_type == "send_next_n")
+        .one()
+    )
+    assert event.actor == "morgan@acesolutions.com.au"
+    payload = json.loads(event.payload_json)
+    assert payload["n"] == 3
+    assert payload["started"] == 3
+    assert payload["bypassed_daily_cap"] is True
+    still_capped = start_campaign(db, campaign, "a@b.com")
+    assert still_capped["started"] == 0
+    client = _campaign_client(db)
+    res = client.post(f"/api/autonomous/campaigns/{campaign.id}/send-next", json={"n": 1})
+    assert res.status_code == 200, res.text
+    assert res.json()["started"] == 1
+
+
+def test_raising_daily_cap_lets_start_send_the_remainder():
+    db = _db()
+    campaign = _ready_campaign(db, n=15)
+    patch_campaign(db, campaign, {"daily_cap": 5}, "a@b.com")
+    first = start_campaign(db, campaign, "a@b.com")
+    assert first["started"] == 5
+    db.refresh(campaign)
+    assert campaign.status == "sending"
+    blocked = start_campaign(db, campaign, "a@b.com")
+    assert blocked["started"] == 0
+    assert blocked["reason"] == "daily_cap"
+    patch_campaign(db, campaign, {"daily_cap": 15}, "a@b.com")
+    db.refresh(campaign)
+    assert campaign.daily_cap == 15
+    third = start_campaign(db, campaign, "a@b.com")
+    assert third["started"] == 10
+    pending = (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign.id, CampaignRow.row_status == "pending")
+        .count()
+    )
+    assert pending == 0
+    db.refresh(campaign)
+    assert campaign.status == "done"
+
+
+def test_raising_daily_cap_via_http_start_sends_the_remainder():
+    db = _db()
+    campaign = _ready_campaign(db, n=15)
+    client = _campaign_client(db)
+    cap = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"daily_cap": 5})
+    assert cap.status_code == 200, cap.text
+    first = client.post(f"/api/autonomous/campaigns/{campaign.id}/start")
+    assert first.status_code == 200, first.text
+    assert first.json()["started"] == 5
+    assert first.json()["status"] == "sending"
+    blocked = client.post(f"/api/autonomous/campaigns/{campaign.id}/start")
+    assert blocked.status_code == 200, blocked.text
+    assert blocked.json()["started"] == 0
+    assert blocked.json()["reason"] == "daily_cap"
+    raised = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"daily_cap": 15})
+    assert raised.status_code == 200, raised.text
+    assert raised.json()["daily_cap"] == 15
+    third = client.post(f"/api/autonomous/campaigns/{campaign.id}/start")
+    assert third.status_code == 200, third.text
+    assert third.json()["started"] == 10
+    assert third.json()["status"] == "done"
+    pending = (
+        db.query(CampaignRow)
+        .filter(CampaignRow.campaign_id == campaign.id, CampaignRow.row_status == "pending")
+        .count()
+    )
+    assert pending == 0
+
+
+def test_preview_rows_matches_save_and_persists_nothing():
+    db = _db()
+    headers, rows = _shifted_email_workbook()
+    mapping = {
+        "company_name": "company_name",
+        "contact_email": "contact_email",
+        "state": "state",
+    }
+    before_campaigns = db.query(Campaign).count()
+    before_rows = db.query(CampaignRow).count()
+    preview = preview_rows(db, headers, rows, mapping)
+    assert db.query(Campaign).count() == before_campaigns
+    assert db.query(CampaignRow).count() == before_rows
+    assert preview["preview"] is True
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
+    saved = replace_rows(db, campaign, headers, rows, mapping)
+    assert preview["rows"] == saved["rows"]
+    assert preview["unique_recipients"] == saved["unique_recipients"]
+    assert preview["sendable"] == saved["sendable"]
+    assert preview["human_only"] == saved["human_only"]
+    assert preview["warnings"] == saved["warnings"]
+    assert preview["shape_warnings"] == saved["shape_warnings"]
+    client = _campaign_client(db)
+    res = client.post(
+        "/api/autonomous/campaigns/preview-rows",
+        json={"headers": headers, "rows": rows, "column_map": mapping},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["rows"] == saved["rows"]
+    assert body["sendable"] == saved["sendable"]
+    assert body["warnings"] == saved["warnings"]
+    assert db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).count() == saved["rows"]
 

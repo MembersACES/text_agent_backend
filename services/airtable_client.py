@@ -650,6 +650,76 @@ def _normalize_contract_end_date(value: Any) -> Optional[str]:
     return None
 
 
+_UTILITY_BUSINESS_NAME_FIELDS = (
+    "Bus Name Copy (from Link to LOA)",
+    "Trading As",
+    "Client Name",
+    "Business Name",
+)
+_UTILITY_LOA_LINK_FIELDS = (
+    "Link to LOA",
+    "Link to LOA Business Details",
+    "LOA Business Details",
+    "Link to LOA Business details",
+)
+_UTILITY_ADDRESS_FIELDS = (
+    "Site Address:",
+    "Site Address",
+    "Address",
+    "Site address",
+    "Supply Address",
+)
+_UTILITY_STATE_FIELDS = ("State", "State/Territory", "Jurisdiction")
+
+
+def _first_text_from_value(val: Any) -> str:
+    if val is None or isinstance(val, bool):
+        return ""
+    if isinstance(val, list):
+        for item in val:
+            text = _first_text_from_value(item)
+            if text:
+                return text
+        return ""
+    return str(val).strip()
+
+
+def _first_text_from_fields(fields: dict, names: tuple[str, ...]) -> str:
+    for name in names:
+        text = _first_text_from_value(fields.get(name))
+        if text:
+            return text
+    return ""
+
+
+def _first_record_id(val: Any) -> str:
+    if isinstance(val, list):
+        for item in val:
+            rid = _first_record_id(item)
+            if rid:
+                return rid
+        return ""
+    if isinstance(val, str) and val.startswith("rec") and len(val) >= 10:
+        return val
+    return ""
+
+
+def _loa_record_id_from_utility_fields(fields: dict) -> str:
+    for name in _UTILITY_LOA_LINK_FIELDS:
+        rid = _first_record_id(fields.get(name))
+        if rid:
+            return rid
+    for key, val in fields.items():
+        kn = (key or "").strip().lower()
+        if "from link to loa" in kn:
+            continue
+        if "loa" in kn and "link" in kn:
+            rid = _first_record_id(val)
+            if rid:
+                return rid
+    return ""
+
+
 def _normalize_drive_folder_id(raw: Any) -> str:
     """Normalize a Drive folder cell (raw ID or URL) to a canonical folder ID string."""
     if raw is None:
@@ -708,6 +778,16 @@ def list_all_loa_records() -> list[dict]:
                     "trading_as": (fields.get("Trading As") or "").strip(),
                     "abn": (fields.get("Business ABN") or "").strip(),
                     "drive_folder_id": _normalize_drive_folder_id(folder_raw),
+                    "contact_name": _first_text_from_fields(fields, ("Contact Name",)),
+                    "email": _first_text_from_fields(fields, ("Contact Email",)),
+                    "telephone": _first_text_from_fields(
+                        fields, ("Contact Number", "Contact Phone", "Telephone")
+                    ),
+                    "site_address": _first_text_from_fields(
+                        fields, ("Site Address", "Site Address:")
+                    ),
+                    "postal_address": _first_text_from_fields(fields, ("Postal Address",)),
+                    "state": _first_text_from_fields(fields, _UTILITY_STATE_FIELDS),
                 })
             next_offset = data.get("offset")
             print(
@@ -729,7 +809,8 @@ def list_all_utility_records(utility_type: str) -> list[dict]:
     """
     List all records from the Airtable table for the given utility type.
     utility_type must be "C&I Electricity" or "C&I Gas".
-    Returns a list of dicts: { "identifier", "contract_end_date", "retailer", "record_id" }.
+    Returns a list of dicts: identifier, contract_end_date, retailer, record_id,
+    plus reporting fields when present (business_name, loa_record_id, site_address, state).
     Uses pagination (offset) to fetch all records. contract_end_date is YYYY-MM-DD or None.
     """
     if utility_type not in ("C&I Electricity", "C&I Gas"):
@@ -785,6 +866,10 @@ def list_all_utility_records(utility_type: str) -> list[dict]:
                     "contract_end_date": contract_end,
                     "retailer": retailer,
                     "record_id": rid,
+                    "business_name": _first_text_from_fields(f, _UTILITY_BUSINESS_NAME_FIELDS),
+                    "loa_record_id": _loa_record_id_from_utility_fields(f),
+                    "site_address": _first_text_from_fields(f, _UTILITY_ADDRESS_FIELDS),
+                    "state": _first_text_from_fields(f, _UTILITY_STATE_FIELDS),
                 })
             next_offset = data.get("offset")
             print(f"[airtable] list_all_utility_records: {utility_type} page {page} -> {len(records)} records (total so far: {len(out)}), next_offset={bool(next_offset)}", flush=True)

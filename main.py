@@ -166,6 +166,7 @@ from tools.new_revenue import (
 from tools.solar_cleaning_quote import generate_solar_cleaning_quote, preview_solar_quote_extract
 from services.vinyl_wrap_spec import generate_vinyl_wrap_spec_payload
 from tools.contract_ending_sheet import sync_contract_end_dates_to_airtable
+from services.contract_ending import enrich_contract_records
 from tools.discrepancy_check_sheet import (
     get_discrepancy_rows,
     get_electricity_contract_discrepancy_rows,
@@ -4594,6 +4595,7 @@ def get_contract_ending(
     year: Optional[int] = Query(None, ge=2000, le=2100, description="Filter contracts ending in this year"),
     utility_type: Optional[str] = Query(None, description="Filter by utility type: C&I Electricity or C&I Gas"),
     user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """
     Return C&I Electricity and C&I Gas utility records split into contracts with end date
@@ -4642,13 +4644,7 @@ def get_contract_ending(
             print(f"[contract-ending] {ut}: {len(records)} total, {n_with_date} with end date, {n_undefined} undefined", flush=True)
             logging.info("[contract-ending] %s: %s records (%s with end date, %s undefined)", ut, len(records), n_with_date, n_undefined)
             for rec in records:
-                item = {
-                    "identifier": rec.get("identifier", ""),
-                    "utility_type": ut,
-                    "contract_end_date": rec.get("contract_end_date"),
-                    "retailer": rec.get("retailer", ""),
-                    "record_id": rec.get("record_id", ""),
-                }
+                rec["utility_type"] = ut
                 if rec.get("contract_end_date"):
                     # Optional server-side filter by month/year
                     if month is not None or year is not None:
@@ -4662,12 +4658,30 @@ def get_contract_ending(
                                     continue
                         except (ValueError, IndexError):
                             pass
-                    contracts_with_end_date.append(item)
+                    contracts_with_end_date.append(rec)
                 else:
-                    end_dates_undefined.append(item)
+                    end_dates_undefined.append(rec)
         except Exception as e:
             logging.warning("[contract-ending] list_all_utility_records %s failed: %s", ut, e)
             print(f"[contract-ending] Airtable failed for {ut}: {e}", flush=True)
+
+    loa_records: List[dict] = []
+    clients = []
+    try:
+        print("[contract-ending] Fetching LOA records for member/contact enrichment", flush=True)
+        loa_records = airtable_client.list_all_loa_records()
+    except Exception as e:
+        logging.warning("[contract-ending] list_all_loa_records failed: %s", e)
+        print(f"[contract-ending] LOA fetch failed: {e}", flush=True)
+    try:
+        clients = db.query(Client.id, Client.business_name, Client.external_business_id).all()
+    except Exception as e:
+        logging.warning("[contract-ending] CRM client lookup failed: %s", e)
+        print(f"[contract-ending] CRM lookup failed: {e}", flush=True)
+
+    contracts_with_end_date = enrich_contract_records(contracts_with_end_date, loa_records, clients)
+    end_dates_undefined = enrich_contract_records(end_dates_undefined, loa_records, clients)
+
     print(f"[contract-ending] Response: {len(contracts_with_end_date)} with end date, {len(end_dates_undefined)} undefined", flush=True)
     return {
         "contracts_with_end_date": contracts_with_end_date,
@@ -6725,6 +6739,24 @@ def invoicing_trojan_oil_unique_clients_endpoint(user_info: dict = Depends(verif
         raise HTTPException(status_code=502, detail=err)
     return {
         "unique_client_count": count,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/one-month-savings/invoices")
+def invoicing_one_month_savings_invoices_endpoint(
+    user_info: dict = Depends(verify_google_token),
+):
+    """All 1st Month Savings invoices with status (Generated / Sent / Paid)."""
+    require_invoicing_user(user_info)
+    result = get_invoice_history("")
+    err = result.get("error")
+    invoices = result.get("invoices") or []
+    if err and not invoices:
+        raise HTTPException(status_code=502, detail=str(err))
+    return {
+        "invoices": invoices,
+        "count": result.get("count", len(invoices)),
         "user_email": user_info.get("email"),
     }
 
@@ -12249,13 +12281,9 @@ def _autonomous_list_item(
     if pending:
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
-    done = len(
-        [
-            s
-            for s in steps
-            if s.step_status in ("executed", "completed", "error", "failed", "skipped")
-        ]
-    )
+    from services.autonomous_sequence import count_steps_done
+
+    done = count_steps_done(steps)
     return AutonomousSequenceRunListItem(
         id=run.id,
         offer_id=run.offer_id,
@@ -13213,22 +13241,77 @@ def autonomous_sequence_delete_template_step(
 
 @app.get("/api/autonomous/sequences/runs")
 def autonomous_sequence_list_runs(
-    run_status: Optional[str] = Query(None, description="running | stopped | completed | cancelled"),
+    run_status: Optional[str] = Query(None, description="running | stopped | completed | cancelled | errored"),
     run_status_group: Optional[str] = Query(
         None,
-        description="running = only active runs; finished = stopped, completed, or cancelled",
+        description=(
+            "running | finished | stopped_negative | stopped_signed | "
+            "stopped_invoice | stopped_unsubscribed | completed | errored | stopped_other"
+        ),
     ),
-    limit: int = Query(50, le=200),
+    limit: int = Query(50, le=2000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
+    from services.autonomous_sequence import finalize_run_if_exhausted
+
+    if run_status_group == "running":
+        stuck = (
+            db.query(AutonomousSequenceRun)
+            .options(joinedload(AutonomousSequenceRun.steps))
+            .filter(AutonomousSequenceRun.run_status == "running")
+            .all()
+        )
+        closed = False
+        for run in stuck:
+            if finalize_run_if_exhausted(db, run):
+                closed = True
+        if closed:
+            db.commit()
+
     q = db.query(AutonomousSequenceRun)
+    named_reasons = (
+        "negative_sentiment_stop",
+        "agreement_signed",
+        "invoice_received",
+        "unsubscribed",
+    )
     if run_status_group == "running":
         q = q.filter(AutonomousSequenceRun.run_status == "running")
     elif run_status_group == "finished":
         q = q.filter(
-            AutonomousSequenceRun.run_status.in_(("stopped", "completed", "cancelled"))
+            AutonomousSequenceRun.run_status.in_(("stopped", "completed", "cancelled", "errored"))
+        )
+    elif run_status_group == "stopped_negative":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "negative_sentiment_stop",
+        )
+    elif run_status_group == "stopped_signed":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "agreement_signed",
+        )
+    elif run_status_group == "stopped_invoice":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "invoice_received",
+        )
+    elif run_status_group == "stopped_unsubscribed":
+        q = q.filter(
+            AutonomousSequenceRun.run_status == "stopped",
+            AutonomousSequenceRun.stop_reason == "unsubscribed",
+        )
+    elif run_status_group == "completed":
+        q = q.filter(AutonomousSequenceRun.run_status == "completed")
+    elif run_status_group == "errored":
+        q = q.filter(AutonomousSequenceRun.run_status == "errored")
+    elif run_status_group == "stopped_other":
+        q = q.filter(
+            AutonomousSequenceRun.run_status.in_(("stopped", "cancelled")),
+            (AutonomousSequenceRun.stop_reason.is_(None))
+            | (~AutonomousSequenceRun.stop_reason.in_(named_reasons)),
         )
     elif run_status:
         q = q.filter(AutonomousSequenceRun.run_status == run_status.strip())
