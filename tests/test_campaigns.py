@@ -31,6 +31,7 @@ from services.campaigns import (
     add_suppression,
     assert_campaign_unsubscribe_config,
     campaign_to_dict,
+    campaign_detail,
     create_campaign,
     delete_campaign,
     delete_suppression,
@@ -41,6 +42,7 @@ from services.campaigns import (
     render_first_touch,
     replace_rows,
     send_first_touch_email,
+    send_next_n,
     set_human_only,
     sign_unsubscribe_token,
     start_campaign,
@@ -1010,4 +1012,80 @@ def test_draft_delete_without_runs_does_not_need_confirm():
     campaign = create_campaign(db, "Empty draft", "gci_outbound_v1", "a@b.com")
     delete_campaign(db, campaign, confirm=False)
     assert db.query(Campaign).filter(Campaign.id == campaign.id).first() is None
+
+
+def test_campaign_detail_includes_rows_in_every_status():
+    db = _db()
+    campaign = _draft_with_rows(db, n=2)
+    for status in ("draft", "ready", "sending", "paused", "done"):
+        campaign.status = status
+        db.commit()
+        payload = campaign_detail(campaign, db)
+        assert payload["status"] == status
+        assert payload["row_counts"]["rows"] == 2
+        assert len(payload["rows"]) == 2
+    campaign.archived = 1
+    db.commit()
+    payload = campaign_detail(campaign, db)
+    assert payload["archived"] is True
+    assert payload["row_counts"]["rows"] == 2
+    assert len(payload["rows"]) == 2
+
+
+def test_sending_campaign_accepts_daily_cap_and_rejects_html():
+    db = _db()
+    campaign = _ready_campaign(db, n=5)
+    patch_campaign(db, campaign, {"daily_cap": 2}, "a@b.com")
+    start_campaign(db, campaign, "a@b.com")
+    db.refresh(campaign)
+    assert campaign.status == "sending"
+    campaign = patch_campaign(db, campaign, {"daily_cap": 10}, "a@b.com")
+    assert campaign.daily_cap == 10
+    try:
+        patch_campaign(db, campaign, {"first_touch_html": "<p>changed</p>"}, "a@b.com")
+        raise AssertionError("expected content edit to fail")
+    except CampaignError as exc:
+        assert exc.status_code == 409
+    client = _campaign_client(db)
+    res = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"daily_cap": 12})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["daily_cap"] == 12
+    assert body["row_counts"]["rows"] == 5
+    assert "rows" in body
+    blocked = client.patch(
+        f"/api/autonomous/campaigns/{campaign.id}",
+        json={"first_touch_html": "<p>nope</p>"},
+    )
+    assert blocked.status_code == 409
+
+
+def test_send_next_n_bypasses_daily_cap_and_records_actor():
+    db = _db()
+    campaign = _ready_campaign(db, n=5)
+    patch_campaign(db, campaign, {"daily_cap": 1}, "a@b.com")
+    first = start_campaign(db, campaign, "a@b.com")
+    assert first["started"] == 1
+    blocked = start_campaign(db, campaign, "a@b.com")
+    assert blocked["started"] == 0
+    assert blocked["reason"] == "daily_cap"
+    out = send_next_n(db, campaign, 3, "morgan@acesolutions.com.au")
+    assert out["started"] == 3
+    assert out["bypassed_daily_cap"] is True
+    event = (
+        db.query(CampaignEvent)
+        .filter(CampaignEvent.campaign_id == campaign.id, CampaignEvent.event_type == "send_next_n")
+        .one()
+    )
+    assert event.actor == "morgan@acesolutions.com.au"
+    payload = json.loads(event.payload_json)
+    assert payload["n"] == 3
+    assert payload["started"] == 3
+    assert payload["bypassed_daily_cap"] is True
+    still_capped = start_campaign(db, campaign, "a@b.com")
+    assert still_capped["started"] == 0
+    client = _campaign_client(db)
+    res = client.post(f"/api/autonomous/campaigns/{campaign.id}/send-next", json={"n": 1})
+    assert res.status_code == 200, res.text
+    assert res.json()["started"] == 1
 
