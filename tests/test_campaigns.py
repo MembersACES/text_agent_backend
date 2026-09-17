@@ -534,6 +534,99 @@ def test_flag_five_of_forty_five_drops_sendable_and_is_not_started():
     assert db.query(AutonomousSequenceRun).count() == 40
 
 
+def test_human_only_tick_drops_sendable_persists_on_get_and_is_not_started():
+    db = _db()
+    _template(db)
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "a@b.com")
+    headers, rows = _shifted_email_workbook()
+    replace_rows(
+        db,
+        campaign,
+        headers,
+        rows,
+        {
+            "company_name": "company_name",
+            "contact_email": "contact_email",
+            "state": "state",
+        },
+    )
+    patch_campaign(
+        db,
+        campaign,
+        {
+            "first_touch_subject": "Hello {{company_name}}",
+            "first_touch_html": "<p>Hi {{company_name}}</p>",
+            "provenance_note": "Public records research.",
+        },
+        "a@b.com",
+    )
+    db.refresh(campaign)
+    client = _campaign_client(db)
+    before = client.get(f"/api/autonomous/campaigns/{campaign.id}").json()
+    assert before["row_counts"]["sendable"] == 45
+    target = next(
+        row
+        for row in before["rows"]
+        if row["recipient_key"]
+        and row["recipient_key"].endswith("@example.com")
+        and row["row_status"] == "pending"
+        and not row["human_only"]
+        and not row["shape_warnings"]
+    )
+    flagged = client.post(
+        f"/api/autonomous/campaigns/{campaign.id}/rows/{target['id']}/human-only",
+        json={"human_only": True, "reason": "hospital"},
+    )
+    assert flagged.status_code == 200, flagged.text
+    assert flagged.json()["human_only"] is True
+    after = client.get(f"/api/autonomous/campaigns/{campaign.id}").json()
+    assert after["row_counts"]["sendable"] == 44
+    assert after["row_counts"]["human_only"] == 1
+    siblings = [row for row in after["rows"] if row["recipient_key"] == target["recipient_key"]]
+    assert siblings
+    assert all(row["human_only"] is True for row in siblings)
+    good = next(
+        row
+        for row in after["rows"]
+        if row["recipient_key"] != target["recipient_key"]
+        and row["recipient_key"]
+        and row["recipient_key"].endswith("@example.com")
+        and not row["shape_warnings"]
+    )
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", good["id"], "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready", "acknowledge_warnings": 15}, "a@b.com")
+    db.refresh(campaign)
+    started = client.post(f"/api/autonomous/campaigns/{campaign.id}/start")
+    assert started.status_code == 200, started.text
+    assert started.json()["started"] == 44
+    stored = (
+        db.query(CampaignRow)
+        .filter(
+            CampaignRow.campaign_id == campaign.id,
+            CampaignRow.recipient_key == target["recipient_key"],
+        )
+        .all()
+    )
+    assert stored
+    assert all(row.run_id is None for row in stored)
+    assert db.query(AutonomousSequenceRun).count() == 44
+
+
+def test_human_only_can_be_flagged_after_ready_before_send():
+    db = _db()
+    campaign = _ready_campaign(db, n=3)
+    row = db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).first()
+    set_human_only(db, campaign, row.id, True, "council")
+    counts = campaign_to_dict(campaign, db)["row_counts"]
+    assert counts["human_only"] == 1
+    assert counts["sendable"] == 2
+    start_campaign(db, campaign, "a@b.com")
+    db.refresh(row)
+    assert row.run_id is None
+    assert db.query(AutonomousSequenceRun).count() == 2
+
+
 def test_suppressed_addresses_are_never_started():
     db = _db()
     _template(db)
@@ -1061,7 +1154,7 @@ def test_campaign_detail_includes_rows_in_every_status():
     assert len(payload["rows"]) == 2
 
 
-def test_sending_campaign_accepts_daily_cap_and_rejects_html():
+def test_sending_campaign_accepts_daily_cap_and_confirms_html():
     db = _db()
     campaign = _ready_campaign(db, n=5)
     patch_campaign(db, campaign, {"daily_cap": 2}, "a@b.com")
@@ -1072,9 +1165,29 @@ def test_sending_campaign_accepts_daily_cap_and_rejects_html():
     assert campaign.daily_cap == 10
     try:
         patch_campaign(db, campaign, {"first_touch_html": "<p>changed</p>"}, "a@b.com")
-        raise AssertionError("expected content edit to fail")
+        raise AssertionError("expected content edit to require confirmation")
     except CampaignError as exc:
         assert exc.status_code == 409
+        assert exc.payload is not None
+        assert exc.payload["code"] == "mid_send_edit_confirmation"
+        assert exc.payload["already_sent"] == 2
+        assert exc.payload["will_get_new"] == 3
+    campaign = patch_campaign(
+        db,
+        campaign,
+        {"first_touch_html": "<p>changed</p>", "confirm_mid_send_edit": True},
+        "a@b.com",
+    )
+    assert "<p>changed</p>" in (campaign.first_touch_html or "")
+    event = (
+        db.query(CampaignEvent)
+        .filter(CampaignEvent.campaign_id == campaign.id, CampaignEvent.event_type == "mid_send_template_edit")
+        .one()
+    )
+    assert event.actor == "a@b.com"
+    payload = json.loads(event.payload_json)
+    assert payload["already_sent"] == 2
+    assert payload["will_get_new"] == 3
     client = _campaign_client(db)
     res = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"daily_cap": 12})
     assert res.status_code == 200, res.text
@@ -1082,11 +1195,18 @@ def test_sending_campaign_accepts_daily_cap_and_rejects_html():
     assert body["daily_cap"] == 12
     assert body["row_counts"]["rows"] == 5
     assert "rows" in body
+    assert body["mid_send_edits"]
     blocked = client.patch(
         f"/api/autonomous/campaigns/{campaign.id}",
         json={"first_touch_html": "<p>nope</p>"},
     )
     assert blocked.status_code == 409
+    confirmed = client.patch(
+        f"/api/autonomous/campaigns/{campaign.id}",
+        json={"first_touch_html": "<p>nope</p>", "confirm_mid_send_edit": True},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["mid_send_edits"]
 
 
 def test_send_next_n_bypasses_daily_cap_and_records_actor():

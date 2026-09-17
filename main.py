@@ -12888,7 +12888,9 @@ def autonomous_sequence_create_template(
         if not source:
             raise HTTPException(status_code=404, detail=f"copy_from template not found: {copy_from}")
 
-    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Brisbane"
+    from services.schedule_tz import schedule_tz_name
+
+    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or schedule_tz_name()
     description = (body.description or "").strip() or None
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
@@ -13332,11 +13334,20 @@ def autonomous_sequence_list_runs(
         .limit(limit)
         .all()
     )
-    from services.autonomous_sequence import count_runs_with_ack_draft, latest_ack_drafts_for_runs
+    from services.autonomous_sequence import (
+        count_runs_with_ack_draft,
+        latest_ack_drafts_for_runs,
+        run_ids_with_ack_reviewed,
+    )
 
     ack_by_run = latest_ack_drafts_for_runs(db, [r.id for r in runs])
+    reviewed = run_ids_with_ack_reviewed(db, [r.id for r in runs])
     items = [
-        _autonomous_list_item(db, r, ack_by_run.get(r.id)).model_dump(mode="json")
+        _autonomous_list_item(
+            db,
+            r,
+            None if r.id in reviewed else ack_by_run.get(r.id),
+        ).model_dump(mode="json")
         for r in runs
     ]
     return JSONResponse(
@@ -13402,6 +13413,24 @@ def autonomous_sequence_restart_run(
     return JSONResponse(content=result)
 
 
+@app.post("/api/autonomous/sequences/runs/{run_id}/ack-reviewed")
+def autonomous_sequence_ack_reviewed(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import mark_ack_reviewed
+
+    actor = (user_data.get("idinfo") or {}).get("email")
+    try:
+        updated = mark_ack_reviewed(db, run_id, actor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"ok": True, "run_id": run_id}
+
+
 @app.delete("/api/autonomous/sequences/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
 def autonomous_sequence_delete_run(
     run_id: int,
@@ -13413,6 +13442,39 @@ def autonomous_sequence_delete_run(
     if not delete_autonomous_sequence_run(db, run_id):
         raise HTTPException(status_code=404, detail="Run not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class BatchRunsBody(BaseModel):
+    ids: list[int]
+    action: str
+
+
+@app.post("/api/autonomous/sequences/runs/batch")
+def autonomous_sequence_batch_runs(
+    body: BatchRunsBody,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_autonomous_sequence_run, manual_stop_run
+
+    action = (body.action or "").strip().lower()
+    if action not in {"delete", "stop"}:
+        raise HTTPException(status_code=400, detail="action must be delete or stop")
+    ids = list(dict.fromkeys(int(item) for item in body.ids))
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="Cannot batch more than 200 runs")
+    updated: list[int] = []
+    missing: list[int] = []
+    for run_id in ids:
+        if action == "delete":
+            ok = delete_autonomous_sequence_run(db, run_id)
+        else:
+            ok = manual_stop_run(db, run_id) is not None
+        if ok:
+            updated.append(run_id)
+        else:
+            missing.append(run_id)
+    return {"ok": True, "action": action, "updated": updated, "missing": missing}
 
 
 @app.patch("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
