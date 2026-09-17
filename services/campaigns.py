@@ -583,6 +583,109 @@ def delete_campaign(db: Session, campaign: Campaign, confirm: bool = False) -> N
     db.commit()
 
 
+def _summary_from_counted(
+    counted: dict[str, Any],
+    stored: int,
+    suppressed_emails: list[str],
+    conflicts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "rows": stored,
+        "unique_recipients": counted["unique_recipients"],
+        "groups_with_conflicts": conflicts or [],
+        "pending": counted["pending"],
+        "sendable": counted["sendable"],
+        "human_only": counted["human_only"],
+        "warnings": counted["warnings"],
+        "shape_warnings": counted["shape_warnings"],
+        "suppressed_addresses": list(dict.fromkeys(suppressed_emails)),
+    }
+
+
+def _ephemeral_rows(
+    db: Session,
+    headers: list[str],
+    rows: list[list[str]],
+    column_map: dict[str, str],
+    campaign_id: int | None = None,
+) -> tuple[list[CampaignRow], list[str], dict[str, list[dict[str, str]]]]:
+    mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
+    built: list[CampaignRow] = []
+    suppressed_emails: list[str] = []
+    groups: dict[str, list[dict[str, str]]] = {}
+    for cells in rows:
+        merge, intelligence = split_row(headers, cells, mapping)
+        key = recipient_key_from_merge(merge)
+        blocked = bool(key and suppressed(db, key))
+        built.append(
+            CampaignRow(
+                campaign_id=campaign_id or 0,
+                merge_json=_json(merge),
+                intelligence_json=_json(intelligence),
+                recipient_key=key,
+                row_status="suppressed" if blocked else "pending",
+                suppression_reason="unsubscribed" if blocked else None,
+                human_only=0,
+            )
+        )
+        if blocked and key:
+            suppressed_emails.append(key)
+        if key:
+            groups.setdefault(key, []).append(merge)
+    return built, suppressed_emails, groups
+
+
+def _row_conflicts(groups: dict[str, list[dict[str, str]]]) -> list[dict[str, Any]]:
+    conflicts = []
+    for email, members in groups.items():
+        if len(members) < 2:
+            continue
+        keys: set[str] = set()
+        for member in members:
+            keys.update(member.keys())
+        differing = []
+        for field in keys:
+            values = {(m.get(field) or "").strip().lower() for m in members}
+            if len(values) > 1:
+                differing.append(field)
+        if differing:
+            conflicts.append({"email": email, "count": len(members), "differing_keys": differing})
+    return conflicts
+
+
+def preview_rows(
+    db: Session,
+    headers: list[str],
+    rows: list[list[str]],
+    column_map: dict[str, str],
+) -> dict[str, Any]:
+    mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
+    built, suppressed_emails, groups = _ephemeral_rows(db, headers, rows, mapping)
+    counted = _counts_from_rows(built)
+    flags = counted["per_row_shape_warnings"]
+    summary = _summary_from_counted(counted, len(built), suppressed_emails, _row_conflicts(groups))
+    summary["preview"] = True
+    summary["preview_rows"] = [
+        {
+            "id": -(index + 1),
+            "campaign_id": None,
+            "merge_json": _merge(row),
+            "intelligence_json": parse_json_obj(row.intelligence_json),
+            "recipient_key": row.recipient_key,
+            "row_status": row.row_status,
+            "suppression_reason": row.suppression_reason,
+            "run_id": None,
+            "offer_id": None,
+            "human_only": False,
+            "human_only_reason": None,
+            "shape_warnings": list(flag),
+            "started_at": None,
+        }
+        for index, (row, flag) in enumerate(zip(built, flags))
+    ]
+    return summary
+
+
 def replace_rows(
     db: Session,
     campaign: Campaign,
@@ -595,49 +698,12 @@ def replace_rows(
     mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
     campaign.merge_field_map = _json(mapping)
     db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).delete()
-
-    groups: dict[str, list[dict[str, str]]] = {}
-    stored = 0
-    suppressed_emails: list[str] = []
-    for cells in rows:
-        merge, intelligence = split_row(headers, cells, mapping)
-        # Guard: never persist a client-supplied merge blob. If one was sent, ignore it.
-        _ = client_merge_json
-        key = recipient_key_from_merge(merge)
-        blocked = bool(key and suppressed(db, key))
-        db.add(
-            CampaignRow(
-                campaign_id=campaign.id,
-                merge_json=_json(merge),
-                intelligence_json=_json(intelligence),
-                recipient_key=key,
-                row_status="suppressed" if blocked else "pending",
-                suppression_reason="unsubscribed" if blocked else None,
-                human_only=0,
-            )
-        )
-        stored += 1
-        if blocked and key:
-            suppressed_emails.append(key)
-        if key:
-            groups.setdefault(key, []).append(merge)
-
+    _ = client_merge_json
+    built, suppressed_emails, groups = _ephemeral_rows(db, headers, rows, mapping, campaign.id)
+    for row in built:
+        row.campaign_id = campaign.id
+        db.add(row)
     db.commit()
-    conflicts = []
-    for email, members in groups.items():
-        if len(members) < 2:
-            continue
-        keys = set()
-        for member in members:
-            keys.update(member.keys())
-        differing = []
-        for field in keys:
-            values = {(m.get(field) or "").strip().lower() for m in members}
-            if len(values) > 1:
-                differing.append(field)
-        if differing:
-            conflicts.append({"email": email, "count": len(members), "differing_keys": differing})
-
     stored_rows = (
         db.query(CampaignRow)
         .filter(CampaignRow.campaign_id == campaign.id)
@@ -645,18 +711,7 @@ def replace_rows(
         .all()
     )
     counted = _counts_from_rows(stored_rows)
-    unique_suppressed = list(dict.fromkeys(suppressed_emails))
-    return {
-        "rows": stored,
-        "unique_recipients": counted["unique_recipients"],
-        "groups_with_conflicts": conflicts,
-        "pending": counted["pending"],
-        "sendable": counted["sendable"],
-        "human_only": counted["human_only"],
-        "warnings": counted["warnings"],
-        "shape_warnings": counted["shape_warnings"],
-        "suppressed_addresses": unique_suppressed,
-    }
+    return _summary_from_counted(counted, len(stored_rows), suppressed_emails, _row_conflicts(groups))
 
 
 def set_human_only(db: Session, campaign: Campaign, row_id: int, human_only: bool, reason: str | None) -> CampaignRow:
@@ -1179,6 +1234,8 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
     done = _refuse_inactive_start(campaign)
     if done is not None:
         return done
+    db.expire(campaign)
+    campaign = get_campaign(db, campaign.id)
     if not _inside_send_window(campaign):
         return _outside_window_result(db, campaign)
 
@@ -1191,9 +1248,14 @@ def start_campaign(db: Session, campaign: Campaign, actor: str | None) -> dict[s
             "started": 0,
             "pending": _pending_sendable(db, campaign.id),
             "reason": "daily_cap",
+            "daily_cap": cap,
+            "started_today": already,
             "status": campaign.status,
         }
-    return _start_pending_rows(db, campaign, actor, remaining)
+    result = _start_pending_rows(db, campaign, actor, remaining)
+    result["daily_cap"] = cap
+    result["started_today"] = already + result["started"]
+    return result
 
 
 def send_next_n(db: Session, campaign: Campaign, n: int, actor: str | None) -> dict[str, Any]:
