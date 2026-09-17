@@ -79,6 +79,8 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_sheet_tabs,
 )
 from tools.invoicing_access import require_invoicing_user
+from auth_domain import apply_email_domain_policy, bind_request_context, reset_request_context
+from auth_scheduler import verify_cloud_scheduler_oidc
 from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
 from tools.invoicing_drive import list_documents as list_invoicing_drive_documents
 from tools.invoicing_drive import list_category_keys as list_invoicing_drive_category_keys
@@ -480,6 +482,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def capture_auth_request_context(request: Request, call_next):
+    tokens = bind_request_context(request)
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_context(tokens)
+
 from fastapi import Header
 from starlette.requests import Request as StarletteRequest
 
@@ -563,7 +574,9 @@ def verify_google_token(authorization: str = Header(...)):
         # Use ID token verification for basic auth (no API access needed)
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Token verified for user: {idinfo.get('email')}")
-        return idinfo
+        return apply_email_domain_policy(idinfo, "verify_google_token")
+    except HTTPException:
+        raise
     except ValueError as e:
         error_msg = str(e).lower()
         logging.error(f"Token verification failed: {e}")
@@ -955,7 +968,9 @@ def verify_roster_access(
     token = authorization.split("Bearer ", 1)[1]
     try:
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
-        return idinfo
+        return apply_email_domain_policy(idinfo, "verify_roster_access")
+    except HTTPException:
+        raise
     except ValueError as e:
         if "expired" in str(e).lower():
             raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
@@ -4100,9 +4115,11 @@ def pudu_consumables_baseline_redetect_all_sites_endpoint(
 @app.post("/api/pudu/consumables/baseline-redetect-all-sites-cron")
 def pudu_consumables_baseline_redetect_all_sites_cron(
     db: Session = Depends(get_db),
+    _scheduler: dict = Depends(verify_cloud_scheduler_oidc),
 ):
     """
-    Cron endpoint mirroring /api/tasks/check-due-cron style (no auth dependency).
+    Cron endpoint mirroring /api/tasks/check-due-cron.
+    Auth: Cloud Scheduler OIDC (audience = this Cloud Run URL), not a user ID token.
     Fills missing baselines only (does not re-walk Pudu history for robots that already have one),
     so it stays within typical HTTP timeouts after the first full baseline pass.
     """
@@ -4873,6 +4890,8 @@ def _verify_video_write_auth(authorization: str) -> None:
     if token != os.getenv("BACKEND_API_KEY", "test-key"):
         try:
             verify_google_token(authorization)
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid authorization")
 
@@ -10512,27 +10531,12 @@ def delete_strategy_item(
     logging.info("Deleted strategy item id=%s", item_id)
     return {"status": "success", "message": "Strategy item deleted"}
 
-@app.get("/api/client-status/debug/all")
-def debug_all_notes(db: Session = Depends(get_db)):
-    """Debug endpoint to see all notes"""
-    notes = db.query(ClientStatusNote).all()
-    return {
-        "count": len(notes), 
-        "notes": [{
-            "id": n.id, 
-            "business_name": n.business_name, 
-            "client_id": n.client_id,
-            "note": n.note[:100],
-            "user_email": n.user_email,
-            "note_type": n.note_type,
-            "created_at": str(n.created_at)
-        } for n in notes]
-    }
-
-
 @app.post("/api/tasks/check-due-cron")
-async def check_due_tasks_cron(db: Session = Depends(get_db)):
-    """Cron endpoint for Cloud Scheduler - no auth required"""
+async def check_due_tasks_cron(
+    db: Session = Depends(get_db),
+    _scheduler: dict = Depends(verify_cloud_scheduler_oidc),
+):
+    """Cron endpoint for Cloud Scheduler. Auth: OIDC audience = this Cloud Run URL."""
     logging.info("Cron job triggered: checking due tasks")
     
     try:
