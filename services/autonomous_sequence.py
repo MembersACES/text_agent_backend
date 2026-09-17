@@ -27,6 +27,21 @@ from models import (
     OfferActivity,
 )
 
+
+def apply_run_source_filter(query, source: str | None):
+    """Split campaign first-touch runs from comparison follow-ups via Offer.campaign_id."""
+    key = (source or "").strip().lower()
+    session = query.session
+    campaign_offer_ids = session.query(Offer.id).filter(Offer.campaign_id.isnot(None))
+    if key == "campaign":
+        return query.filter(AutonomousSequenceRun.offer_id.in_(campaign_offer_ids))
+    if key == "followup":
+        return query.filter(
+            AutonomousSequenceRun.offer_id.is_(None)
+            | (~AutonomousSequenceRun.offer_id.in_(campaign_offer_ids))
+        )
+    return query
+
 def _is_postgresql(bind) -> bool:
     return bind.dialect.name == "postgresql"
 
