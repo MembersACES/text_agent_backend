@@ -180,7 +180,7 @@ def test_collision_does_not_stamp_partner_id():
     collision = db.query(PartnerLeadCollision).one()
     assert collision.existing_client_id == existing.id
     assert collision.partner_id == partner.id
-    assert db.query(PartnerAuditEvent).filter_by(action="lead_collision").count() == 1
+    assert db.query(PartnerAuditEvent).filter_by(action="lead_collision").count() == 0
 
 
 def test_own_lead_is_not_a_collision_and_does_not_restamp():
@@ -244,3 +244,140 @@ def test_audit_write_records_partner_id_email_action_target():
     assert stored.target_type == "client"
     assert stored.target_id == "99"
     assert stored.path == "/api/partner/base1"
+
+
+def test_partner_client_public_exact_keys():
+    db = _session()
+    row = _client(db, "Visible Co", partner_id=None)
+    row.owner_email = "internal@acesolutions.com.au"
+    row.stage = "qualified"
+    db.commit()
+    payload = partner_authz.partner_client_public(row)
+    assert set(payload) == partner_authz.PARTNER_CLIENT_KEYS
+    assert set(payload) == {"id", "business_name", "primary_contact_email", "created_at"}
+    from schemas import ClientResponse, PartnerClientResponse
+
+    assert set(PartnerClientResponse.model_fields) == partner_authz.PARTNER_CLIENT_KEYS
+    leaked = {
+        "owner_email",
+        "notes",
+        "stage",
+        "stage_changed_at",
+        "commission",
+        "margin",
+        "gdrive_folder_url",
+        "updated_at",
+        "partner_id",
+        "referred_by_client_id",
+        "referred_by_business_name",
+    }
+    assert leaked.isdisjoint(PartnerClientResponse.model_fields)
+    assert "owner_email" in ClientResponse.model_fields
+    assert "stage" in ClientResponse.model_fields
+    assert payload["business_name"] == "Visible Co"
+    assert "owner_email" not in payload
+    assert "stage" not in payload
+
+
+def test_validate_base1_files_accepts_pdf_jpg_png_heic():
+    heic = b"\x00\x00\x00\x18ftypheic" + b"\x00" * 8
+    partner_authz.validate_base1_files(
+        [
+            ("a.pdf", b"%PDF-1.4\n%", "application/pdf"),
+            ("b.jpg", b"\xff\xd8\xff\xdb", "image/jpeg"),
+            ("c.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 8, "image/png"),
+            ("d.heic", heic, "image/heic"),
+        ]
+    )
+
+
+def test_validate_base1_files_rejects_bad_type_and_oversize():
+    with pytest.raises(HTTPException) as empty:
+        partner_authz.validate_base1_files([])
+    assert empty.value.status_code == 400
+    with pytest.raises(HTTPException) as exe:
+        partner_authz.validate_base1_files([("malware.pdf", b"MZ\x90\x00", "application/pdf")])
+    assert exe.value.status_code == 400
+    too_big = b"%PDF-1.4\n" + (b"x" * (partner_authz.BASE1_MAX_FILE_BYTES + 1))
+    with pytest.raises(HTTPException) as size:
+        partner_authz.validate_base1_files([("big.pdf", too_big, "application/pdf")])
+    assert size.value.status_code == 400
+    many = [
+        (f"{i}.pdf", b"%PDF-1.4\n%", "application/pdf")
+        for i in range(partner_authz.BASE1_MAX_FILES + 1)
+    ]
+    with pytest.raises(HTTPException) as count:
+        partner_authz.validate_base1_files(many)
+    assert count.value.status_code == 400
+
+
+def test_base1_rate_limit_per_partner():
+    db = _session()
+    partner, user = _seed_partner(db)
+    principal = _principal(partner_id=partner.id, partner_user_id=user.id, email=user.email)
+    for _ in range(partner_authz.BASE1_MAX_SUBMISSIONS_PER_HOUR):
+        log_partner_write(
+            db,
+            principal,
+            action=partner_authz.BASE1_RATE_ACTION,
+            target_type="partner",
+            target_id=partner.id,
+            path="/api/partner/base1",
+        )
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        partner_authz.assert_base1_rate_limit(db, partner.id)
+    assert exc.value.status_code == 429
+    assert exc.value.detail["code"] == "rate_limited"
+    assert "try again shortly" in exc.value.detail["message"].lower()
+    other = Partner(name="Other", slug="other-rate", enabled_tools="[]", active=1)
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    partner_authz.assert_base1_rate_limit(db, other.id)
+
+
+def test_persist_collision_files_writes_drive_refs(monkeypatch):
+    db = _session()
+    partner, user = _seed_partner(db)
+    partner.drive_folder_id = "partner-drive-root"
+    db.commit()
+    existing = _client(db, "Acme Pty Ltd", partner_id=None)
+    principal = _principal(partner_id=partner.id, partner_user_id=user.id, email=user.email)
+    result = admit_partner_lead(db, principal, "Acme Pty Ltd")
+    collision = db.query(PartnerLeadCollision).one()
+
+    created = []
+
+    def fake_find_or_create(parent_id, name, drive=None):
+        created.append((parent_id, name))
+        return f"folder-{len(created)}", True
+
+    def fake_upload(data, name, dest_id, mimetype="application/octet-stream"):
+        return {"id": f"file-{name}", "url": f"https://drive.example/{name}"}
+
+    monkeypatch.setattr("tools.member_folder_drive.find_or_create_folder", fake_find_or_create)
+    monkeypatch.setattr("tools.member_folder_drive.upload_bytes_to_folder", fake_upload)
+    refs = partner_authz.persist_collision_files(
+        partner,
+        collision,
+        [("bill.pdf", b"%PDF-1.4\n%", "application/pdf")],
+    )
+    assert refs[0]["id"] == "file-bill.pdf"
+    assert refs[0]["name"] == "bill.pdf"
+    assert refs[0]["folder_id"] == "folder-2"
+    event = log_partner_write(
+        db,
+        principal,
+        action="lead_collision",
+        target_type="partner_lead_collision",
+        target_id=collision.id,
+        path="/api/partner/base1",
+        detail={"file_count": 1, "files": refs},
+    )
+    db.commit()
+    stored = db.query(PartnerAuditEvent).filter_by(action="lead_collision").one()
+    assert stored.id == event.id
+    assert '"file-bill.pdf"' in stored.detail_json
+    assert existing.partner_id is None
+

@@ -124,6 +124,7 @@ class PartnerLeadCollision(Base):
     submitted_business_name = Column(String(255), nullable=False)
     existing_client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
     payload_json = Column(JSON_COLUMN_TYPE, nullable=True)
+    files_json = Column(JSON_COLUMN_TYPE, nullable=True)
     status = Column(String(32), nullable=False, default="pending")
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -141,6 +142,7 @@ class PartnerAuditEvent(Base):
     target_type = Column(String(64), nullable=False)
     target_id = Column(String(64), nullable=True)
     path = Column(String(255), nullable=True)
+    detail_json = Column(JSON_COLUMN_TYPE, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
 

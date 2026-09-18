@@ -366,6 +366,24 @@ class ClientResponse(BaseModel):
             return ClientStage.LEAD
 
 
+class PartnerClientResponse(BaseModel):
+    """Minimal partner-facing client. Do not reuse ClientResponse on partner routes."""
+
+    id: int
+    business_name: str
+    primary_contact_email: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return dt.isoformat()
+
+
 class EntityGroupCreate(BaseModel):
     slug: str
     display_name: str

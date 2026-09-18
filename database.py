@@ -490,6 +490,27 @@ def init_db():
         logging.warning("Could not ensure clients.partner_id column: %s", e)
 
     try:
+        insp = inspect(engine)
+        tables = set(insp.get_table_names() or [])
+        with engine.begin() as conn:
+            if "partner_lead_collisions" in tables:
+                conn.execute(
+                    text(
+                        "ALTER TABLE partner_lead_collisions "
+                        "ADD COLUMN IF NOT EXISTS files_json TEXT"
+                    )
+                )
+            if "partner_audit_events" in tables:
+                conn.execute(
+                    text(
+                        "ALTER TABLE partner_audit_events "
+                        "ADD COLUMN IF NOT EXISTS detail_json TEXT"
+                    )
+                )
+    except Exception as e:
+        logging.warning("Could not ensure partner collision file columns: %s", e)
+
+    try:
         from models import OperationalEmailRecipient, OperationalEmailTemplate  # noqa: F401
         from services.operational_emails import seed_operational_emails
 

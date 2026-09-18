@@ -574,7 +574,11 @@ def verify_google_token(authorization: str = Header(...)):
         # Use ID token verification for basic auth (no API access needed)
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Token verified for user: {idinfo.get('email')}")
-        return apply_email_domain_policy(idinfo, "verify_google_token")
+        idinfo = apply_email_domain_policy(idinfo, "verify_google_token")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
+        return idinfo
     except HTTPException:
         raise
     except ValueError as e:
@@ -587,6 +591,29 @@ def verify_google_token(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
         logging.error(f"Token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def verify_partner_token(authorization: str = Header(...)):
+    """Google ID token that must resolve to an active partner_users row."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        idinfo = apply_email_domain_policy(idinfo, "verify_partner_token")
+        from partner_authz import partner_principal_from_idinfo
+
+        if partner_principal_from_idinfo(idinfo) is None:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return idinfo
+    except HTTPException:
+        raise
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
@@ -968,7 +995,11 @@ def verify_roster_access(
     token = authorization.split("Bearer ", 1)[1]
     try:
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
-        return apply_email_domain_policy(idinfo, "verify_roster_access")
+        idinfo = apply_email_domain_policy(idinfo, "verify_roster_access")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
+        return idinfo
     except HTTPException:
         raise
     except ValueError as e:
@@ -14763,6 +14794,8 @@ def rebuild_staged_activity(
 
 from campaign_routes import register_campaign_routes
 from email_template_routes import register_email_template_routes
+from partner_routes import register_partner_routes
 
 register_campaign_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
+register_partner_routes(app, verify_partner_token, get_db)

@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS partner_lead_collisions (
     submitted_business_name VARCHAR(255) NOT NULL,
     existing_client_id INTEGER NOT NULL REFERENCES clients(id),
     payload_json TEXT,
+    files_json TEXT,
     status VARCHAR(32) NOT NULL DEFAULT 'pending',
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS partner_audit_events (
     target_type VARCHAR(64) NOT NULL,
     target_id VARCHAR(64),
     path VARCHAR(255),
+    detail_json TEXT,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
