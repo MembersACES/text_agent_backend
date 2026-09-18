@@ -60,6 +60,11 @@ def test_mode_invalid_falls_back_to_log(monkeypatch, caplog):
 
 def test_policy_allows_staff_unchanged(monkeypatch):
     monkeypatch.setenv("AUTH_DOMAIN_MODE", "enforce")
+
+    def boom(email, db=None):
+        raise AssertionError("staff must not call partner lookup")
+
+    monkeypatch.setattr("partner_authz.lookup_active_partner_principal", boom)
     idinfo = {"email": "morgan.h@acesolutions.com.au", "sub": "1"}
     assert auth_domain.apply_email_domain_policy(idinfo, "verify_google_token") is idinfo
 
@@ -67,6 +72,7 @@ def test_policy_allows_staff_unchanged(monkeypatch):
 def test_policy_log_only_lets_gmail_through(monkeypatch, caplog):
     monkeypatch.setenv("AUTH_DOMAIN_MODE", "log")
     monkeypatch.setenv("AUTH_ALLOWED_EMAIL_DOMAINS", "acesolutions.com.au,czeroanz.com")
+    monkeypatch.setattr("partner_authz.lookup_active_partner_principal", lambda email, db=None: None)
     idinfo = {"email": "you@gmail.com"}
     with caplog.at_level(logging.WARNING):
         out = auth_domain.apply_email_domain_policy(idinfo, "verify_google_token")
@@ -79,6 +85,7 @@ def test_policy_log_only_lets_gmail_through(monkeypatch, caplog):
 
 def test_policy_enforce_403s_gmail(monkeypatch, caplog):
     monkeypatch.setenv("AUTH_DOMAIN_MODE", "enforce")
+    monkeypatch.setattr("partner_authz.lookup_active_partner_principal", lambda email, db=None: None)
     idinfo = {"email": "you@gmail.com"}
     with caplog.at_level(logging.WARNING):
         with pytest.raises(HTTPException) as exc:

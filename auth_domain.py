@@ -116,10 +116,27 @@ def email_domain_allowed(email: str | None) -> bool:
 
 
 def apply_email_domain_policy(idinfo: dict[str, Any], auth_path: str) -> dict[str, Any]:
-    """Log or 403 off-domain Google ID tokens. Returns idinfo unchanged on allow or log-only."""
+    """Allow staff domain, else an active partner_users row, else log/403.
+
+    Staff never enter the partner lookup. Empty partner_users is a no-op.
+    """
     email = str(idinfo.get("email") or "").strip()
     if email_domain_allowed(email):
         return idinfo
+
+    from partner_authz import LOG_PARTNER_ALLOW, lookup_active_partner_principal, tag_idinfo
+
+    principal = lookup_active_partner_principal(email)
+    if principal is not None:
+        logger.info(
+            "%s auth_path=%s path=%s partner_id=%s email=%s",
+            LOG_PARTNER_ALLOW,
+            auth_path,
+            current_request_path(),
+            principal.partner_id,
+            email or "-",
+        )
+        return tag_idinfo(idinfo, principal)
 
     mode = get_auth_domain_mode()
     path = current_request_path()

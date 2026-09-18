@@ -2,6 +2,7 @@
 Database models
 """
 from sqlalchemy import Column, Integer, String, DateTime, Date, Text, ForeignKey, Float, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
@@ -9,6 +10,8 @@ from database import Base
 
 # SQLite does not have a native JSON type; use Text for JSON metadata for compatibility.
 JSON_COLUMN_TYPE = Text
+# Partner config/tools: jsonb on Postgres, Text on SQLite.
+PARTNER_JSON_COLUMN = Text().with_variant(JSONB(), "postgresql")
 
 
 class Client(Base):
@@ -46,6 +49,9 @@ class Client(Base):
     # Commercial multisite grouping (explicit assignment; separate from reporting_entity)
     entity_group_id = Column(Integer, ForeignKey("entity_groups.id"), nullable=True, index=True)
 
+    # Distributor tenancy. Null = ACES-owned. Never stamp this onto a pre-existing row.
+    partner_id = Column(Integer, ForeignKey("partners.id"), nullable=True, index=True)
+
 
 class EntityGroup(Base):
     __tablename__ = "entity_groups"
@@ -75,6 +81,67 @@ class ClientReferral(Base):
     active = Column(Integer, nullable=False, default=1)  # 1=active, 0=inactive
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class Partner(Base):
+    """Distributor organisation. active=0 deactivates every login for this partner."""
+
+    __tablename__ = "partners"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    slug = Column(String(128), unique=True, nullable=False, index=True)
+    drive_folder_id = Column(String(128), nullable=True)
+    enabled_tools = Column(PARTNER_JSON_COLUMN, nullable=False, default=list)
+    config = Column(PARTNER_JSON_COLUMN, nullable=True)
+    active = Column(Integer, nullable=False, default=1)
+    deactivated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PartnerUser(Base):
+    """Google email allowed to sign in as this partner. Unique email in v1."""
+
+    __tablename__ = "partner_users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(Integer, ForeignKey("partners.id"), nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    active = Column(Integer, nullable=False, default=1)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PartnerLeadCollision(Base):
+    """Distributor submitted a business_name that already exists. Staff-only; never returned to the partner."""
+
+    __tablename__ = "partner_lead_collisions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(Integer, ForeignKey("partners.id"), nullable=False, index=True)
+    submitted_by_email = Column(String(255), nullable=False)
+    submitted_business_name = Column(String(255), nullable=False)
+    existing_client_id = Column(Integer, ForeignKey("clients.id"), nullable=False)
+    payload_json = Column(JSON_COLUMN_TYPE, nullable=True)
+    status = Column(String(32), nullable=False, default="pending")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class PartnerAuditEvent(Base):
+    """Every partner-originated write. target_id is an internal id; never sent back as proof of an ACES client."""
+
+    __tablename__ = "partner_audit_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    partner_id = Column(Integer, ForeignKey("partners.id"), nullable=False, index=True)
+    email = Column(String(255), nullable=False)
+    action = Column(String(64), nullable=False)
+    target_type = Column(String(64), nullable=False)
+    target_id = Column(String(64), nullable=True)
+    path = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
 
 class User(Base):

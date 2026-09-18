@@ -83,6 +83,13 @@ def init_db():
     For now this includes:
     - Adding offers.pipeline_stage if it does not exist (used for the detailed offer pipeline).
     """
+    from models import (  # noqa: F401
+        Partner,
+        PartnerAuditEvent,
+        PartnerLeadCollision,
+        PartnerUser,
+    )
+
     Base.metadata.create_all(bind=engine)
     logging.info("✅ Database tables initialized")
 
@@ -466,6 +473,21 @@ def init_db():
                 logging.info("✅ Added campaigns.archived column")
     except Exception as e:
         logging.warning("Could not ensure campaigns.archived column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "clients" in (insp.get_table_names() or []):
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE clients ADD COLUMN IF NOT EXISTS partner_id INTEGER")
+                )
+                conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_clients_partner_id ON clients (partner_id)"
+                    )
+                )
+    except Exception as e:
+        logging.warning("Could not ensure clients.partner_id column: %s", e)
 
     try:
         from models import OperationalEmailRecipient, OperationalEmailTemplate  # noqa: F401
