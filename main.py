@@ -464,6 +464,7 @@ _CORS_ORIGINS_BASE = [
     "http://127.0.0.1:8081",
     "https://acespartnerinterfacedev-672026052958.australia-southeast2.run.app",
     "https://acespartnerinterface-672026052958.australia-southeast2.run.app",
+    "https://partners.acesolutions.com.au",
     "https://script.google.com",
 ]
 
@@ -471,7 +472,7 @@ _CORS_ORIGINS_BASE = [
 def _build_cors_origins() -> list[str]:
     """Static allowlist plus optional comma-separated CORS_EXTRA_ORIGINS (CZA Cloud Run URLs)."""
     extra_raw = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
-    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    extra = [o.strip() for o in extra_raw.replace(",", " ").split() if o.strip()]
     merged = list(_CORS_ORIGINS_BASE)
     for origin in extra:
         if origin not in merged:
@@ -13426,6 +13427,7 @@ def autonomous_sequence_list_runs(
         "agreement_signed",
         "invoice_received",
         "unsubscribed",
+        "undeliverable",
     )
     if run_status_group == "running":
         q = q.filter(AutonomousSequenceRun.run_status == "running")

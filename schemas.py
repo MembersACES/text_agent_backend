@@ -1343,6 +1343,7 @@ class RetellAgentPromptResponse(BaseModel):
     response_engine_type: Optional[str] = None
     llm_id: Optional[str] = None
     llm_version: Optional[Any] = None
+    version: Optional[Any] = None
     is_published: Optional[bool] = None
     llm_is_published: Optional[bool] = None
     prompt_editable: bool = False

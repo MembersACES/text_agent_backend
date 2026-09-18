@@ -654,6 +654,26 @@ def test_suppressed_addresses_are_never_started():
     assert out["skipped_suppressed_addresses"] == ["person0@example.com"]
 
 
+def test_undeliverable_suppression_skips_start_and_keeps_reason():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=2)
+    add_suppression(db, "person0@example.com", "undeliverable", "hard_bounce")
+    row = db.query(CampaignRow).filter(CampaignRow.recipient_key == "person1@example.com").first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+    suppressed_row = (
+        db.query(CampaignRow).filter(CampaignRow.recipient_key == "person0@example.com").one()
+    )
+    assert suppressed_row.row_status == "suppressed"
+    assert suppressed_row.suppression_reason == "undeliverable"
+    assert suppressed_row.run_id is None
+    assert db.query(AutonomousSequenceRun).count() == 1
+
+
 def test_daily_cap_leaves_rest_pending():
     db = _db()
     _template(db)

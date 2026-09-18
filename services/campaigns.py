@@ -1046,10 +1046,15 @@ def fire_test_send(db: Session, campaign: Campaign, to: str, row_id: int, actor:
 
 
 def suppressed(db: Session, email: str) -> bool:
+    return suppression_reason_for(db, email) is not None
+
+
+def suppression_reason_for(db: Session, email: str) -> str | None:
     key = (email or "").strip().lower()
     if not key:
-        return False
-    return db.query(Suppression).filter(Suppression.email == key).first() is not None
+        return None
+    row = db.query(Suppression).filter(Suppression.email == key).first()
+    return row.reason if row else None
 
 
 def _unsubscribed_message(emails: list[str]) -> str:
@@ -1272,7 +1277,7 @@ def _start_pending_rows(
             blocked_as = to.lower()
         if blocked_as:
             row.row_status = "suppressed"
-            row.suppression_reason = "unsubscribed"
+            row.suppression_reason = suppression_reason_for(db, blocked_as) or "unsubscribed"
             skipped_suppressed += 1
             skipped_addresses.append(blocked_as)
             continue
