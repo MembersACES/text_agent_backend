@@ -174,7 +174,7 @@ def test_collision_does_not_stamp_partner_id():
     db.commit()
     db.refresh(existing)
     assert result.outcome == "collision"
-    assert result.public == {"status": "received"}
+    assert result.public == partner_authz.COLLISION_PUBLIC
     assert result.client_id is None
     assert existing.partner_id is None
     collision = db.query(PartnerLeadCollision).one()
@@ -210,6 +210,7 @@ def test_other_partner_lead_is_collision():
     db.commit()
     db.refresh(existing)
     assert result.outcome == "collision"
+    assert result.public == partner_authz.COLLISION_PUBLIC
     assert existing.partner_id == other.id
 
 

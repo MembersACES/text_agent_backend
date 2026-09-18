@@ -20,8 +20,11 @@ from partner_authz import (
     BASE1_MAX_SUBMISSIONS_PER_HOUR,
     BASE1_RATE_ACTION,
     BASE1_RATE_LIMIT_MESSAGE,
+    COLLISION_HTTP_STATUS,
+    COLLISION_PUBLIC,
     PARTNER_CLIENT_KEYS,
 )
+from partner_collision_notify import MATCH_ACES, MATCH_OTHER_DISTRIBUTOR
 
 PARTNER_EMAIL = "nigel@specialistenergy.com.au"
 STAFF_EMAIL = "pat@acesolutions.com.au"
@@ -254,8 +257,13 @@ def test_base1_create_own_lead(api):
     db.close()
 
 
-def test_base1_collision_ack_only(api):
-    client, SessionLocal, _partner = api
+def test_base1_collision_neutral_failure(api, monkeypatch):
+    client, SessionLocal, partner = api
+    captured = []
+    monkeypatch.setattr(
+        "partner_routes.notify_staff_of_lead_collision",
+        captured.append,
+    )
     _add_client(SessionLocal, business_name="Existing ACES", partner_id=None)
     res = client.post(
         "/api/partner/base1",
@@ -263,8 +271,8 @@ def test_base1_collision_ack_only(api):
         data={"companyName": "Existing ACES"},
         files=[("files", ("bill.pdf", b"%PDF-1.4\n%", "application/pdf"))],
     )
-    assert res.status_code == 200
-    assert res.json() == {"status": "received"}
+    assert res.status_code == COLLISION_HTTP_STATUS
+    assert res.json() == {"detail": COLLISION_PUBLIC}
     db = SessionLocal()
     row = db.query(Client).filter(Client.business_name == "Existing ACES").one()
     assert row.partner_id is None
@@ -274,6 +282,52 @@ def test_base1_collision_ack_only(api):
     audit = db.query(PartnerAuditEvent).filter_by(action="lead_collision").one()
     assert '"drive-file-1"' in (audit.detail_json or "")
     db.close()
+    assert len(captured) == 1
+    assert captured[0]["match_kind"] == MATCH_ACES
+    assert captured[0]["existing_client_id"] == row.id
+    assert captured[0]["distributor_name"] == partner.name
+    assert captured[0]["submitted_business_name"] == "Existing ACES"
+    assert captured[0]["folder_url"]
+
+
+def test_base1_other_distributor_collision_same_body(api, monkeypatch):
+    client, SessionLocal, _partner = api
+    captured = []
+    monkeypatch.setattr(
+        "partner_routes.notify_staff_of_lead_collision",
+        captured.append,
+    )
+    other = Partner(
+        name="Other Co",
+        slug="other-co-collision",
+        enabled_tools="[]",
+        active=1,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db = SessionLocal()
+    db.add(other)
+    db.commit()
+    db.refresh(other)
+    other_id = other.id
+    db.close()
+    _add_client(SessionLocal, business_name="Shared Name", partner_id=other_id)
+    res = client.post(
+        "/api/partner/base1",
+        headers=AUTH,
+        data={"companyName": "Shared Name"},
+        files=[("files", ("bill.pdf", b"%PDF-1.4\n%", "application/pdf"))],
+    )
+    assert res.status_code == COLLISION_HTTP_STATUS
+    assert res.json() == {"detail": COLLISION_PUBLIC}
+    db = SessionLocal()
+    row = db.query(Client).filter(Client.business_name == "Shared Name").one()
+    assert row.partner_id == other_id
+    db.close()
+    assert len(captured) == 1
+    assert captured[0]["match_kind"] == MATCH_OTHER_DISTRIBUTOR
+    assert captured[0]["matched_partner_name"] == "Other Co"
+    assert captured[0]["existing_client_id"] == row.id
 
 
 def test_base1_rejects_disallowed_file(api):

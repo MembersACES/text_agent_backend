@@ -30,7 +30,16 @@ logger = logging.getLogger(__name__)
 ACES_AUTH_KEY = "aces_auth"
 ROLE_PARTNER = "partner"
 
-COLLISION_PUBLIC_ACK = {"status": "received"}
+COLLISION_HTTP_STATUS = 422
+COLLISION_PUBLIC_CODE = "not_processed"
+COLLISION_PUBLIC_MESSAGE = (
+    "This submission could not be processed automatically. "
+    "Our team has been notified and will be in touch."
+)
+COLLISION_PUBLIC = {
+    "code": COLLISION_PUBLIC_CODE,
+    "message": COLLISION_PUBLIC_MESSAGE,
+}
 LOG_PARTNER_ALLOW = "ACES_AUTH_PARTNER_ALLOW"
 
 PARTNER_CLIENT_KEYS = frozenset(PartnerClientResponse.model_fields)
@@ -321,7 +330,7 @@ def admit_partner_lead(
     db.flush()
     return PartnerLeadAdmitResult(
         outcome="collision",
-        public=dict(COLLISION_PUBLIC_ACK),
+        public=dict(COLLISION_PUBLIC),
         collision_id=collision.id,
     )
 

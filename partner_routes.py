@@ -5,17 +5,20 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from fastapi import BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from crm_enums import ClientStage
 from models import Client, Partner, PartnerLeadCollision
 from partner_authz import (
     BASE1_RATE_ACTION,
+    COLLISION_HTTP_STATUS,
+    COLLISION_PUBLIC,
     PartnerTool,
     admit_partner_lead,
     assert_base1_rate_limit,
@@ -25,6 +28,11 @@ from partner_authz import (
     persist_collision_files,
     require_partner_tool,
     validate_base1_files,
+)
+from partner_collision_notify import (
+    MATCH_ACES,
+    MATCH_OTHER_DISTRIBUTOR,
+    notify_staff_of_lead_collision,
 )
 from schemas import PartnerClientResponse
 
@@ -174,6 +182,35 @@ def register_partner_routes(app, verify_partner_token, get_db):
             )
             refs = persist_collision_files(partner_row, collision, parsed)
             collision.files_json = json.dumps(refs)
+            existing = (
+                db.query(Client)
+                .filter(Client.id == collision.existing_client_id)
+                .one()
+            )
+            matched_partner = None
+            if existing.partner_id is None:
+                match_kind = MATCH_ACES
+            else:
+                match_kind = MATCH_OTHER_DISTRIBUTOR
+                matched_partner = (
+                    db.query(Partner)
+                    .filter(Partner.id == existing.partner_id)
+                    .one_or_none()
+                )
+            notify_payload = {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "distributor_name": partner_row.name,
+                "distributor_slug": partner_row.slug,
+                "partner_id": partner_row.id,
+                "submitted_by_email": principal.email,
+                "submitted_business_name": collision.submitted_business_name,
+                "existing_client_id": existing.id,
+                "existing_business_name": existing.business_name,
+                "match_kind": match_kind,
+                "matched_partner_name": matched_partner.name if matched_partner else None,
+                "folder_url": refs[0]["folder_url"] if refs else None,
+                "collision_id": collision.id,
+            }
             log_partner_write(
                 db,
                 principal,
@@ -198,24 +235,30 @@ def register_partner_routes(app, verify_partner_token, get_db):
             )
         db.commit()
 
-        if admit.outcome != "collision":
-            form_fields = {
-                "fullName": fullName,
-                "companyName": business_name,
-                "email": contact_email,
-                "phone": phone,
-                "state": state,
-                "additionalInfo": additionalInfo,
-                "partner_id": str(principal.partner_id),
-                "client_id": str(client_id or ""),
-            }
-            background_tasks.add_task(
-                _forward_base1_to_n8n,
-                form_fields,
-                [(name, data, ctype or "application/octet-stream") for name, data, ctype in parsed],
+        if admit.outcome == "collision":
+            background_tasks.add_task(notify_staff_of_lead_collision, notify_payload)
+            return JSONResponse(
+                status_code=COLLISION_HTTP_STATUS,
+                content={"detail": dict(COLLISION_PUBLIC)},
             )
 
+        form_fields = {
+            "fullName": fullName,
+            "companyName": business_name,
+            "email": contact_email,
+            "phone": phone,
+            "state": state,
+            "additionalInfo": additionalInfo,
+            "partner_id": str(principal.partner_id),
+            "client_id": str(client_id or ""),
+        }
+        background_tasks.add_task(
+            _forward_base1_to_n8n,
+            form_fields,
+            [(name, data, ctype or "application/octet-stream") for name, data, ctype in parsed],
+        )
+
         public = dict(admit.public)
-        if admit.outcome != "collision" and client_id is not None:
+        if client_id is not None:
             public["client_id"] = client_id
         return public
