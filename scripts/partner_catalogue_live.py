@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -132,8 +133,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("refuse", "partner"))
     parser.add_argument("--base", required=True)
-    parser.add_argument("--token", required=True)
+    parser.add_argument("--token", default=os.environ.get("PARTNER_CATALOGUE_TOKEN", ""))
     args = parser.parse_args()
+    if not args.token:
+        print("set PARTNER_CATALOGUE_TOKEN or pass --token")
+        return 2
     if args.mode == "refuse":
         return run_refuse(args.base, args.token)
     return run_partner(args.base, args.token)

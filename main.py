@@ -457,6 +457,8 @@ _CORS_ORIGINS_BASE = [
     "http://localhost:8081",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:8081",
+    "https://acespartnerinterfacedev-672026052958.australia-southeast2.run.app",
+    "https://acespartnerinterface-672026052958.australia-southeast2.run.app",
     "https://script.google.com",
 ]
 

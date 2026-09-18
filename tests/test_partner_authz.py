@@ -358,14 +358,19 @@ def test_persist_collision_files_writes_drive_refs(monkeypatch):
 
     monkeypatch.setattr("tools.member_folder_drive.find_or_create_folder", fake_find_or_create)
     monkeypatch.setattr("tools.member_folder_drive.upload_bytes_to_folder", fake_upload)
+    monkeypatch.setattr(
+        "tools.member_folder_drive.get_distributors_folder_id",
+        lambda: "aces-distributors-root",
+    )
     refs = partner_authz.persist_collision_files(
         partner,
         collision,
         [("bill.pdf", b"%PDF-1.4\n%", "application/pdf")],
     )
+    assert created[0] == ("partner-drive-root", "Lead collisions")
     assert refs[0]["id"] == "file-bill.pdf"
     assert refs[0]["name"] == "bill.pdf"
-    assert refs[0]["folder_id"] == "folder-2"
+    assert refs[0]["folder_id"] == "folder-3"
     event = log_partner_write(
         db,
         principal,
@@ -380,4 +385,31 @@ def test_persist_collision_files_writes_drive_refs(monkeypatch):
     assert stored.id == event.id
     assert '"file-bill.pdf"' in stored.detail_json
     assert existing.partner_id is None
+
+
+def test_ensure_partner_drive_folder_provisions_under_root_without_sharing(monkeypatch):
+    db = _session()
+    partner, _user = _seed_partner(db)
+    assert partner.drive_folder_id is None
+    created = []
+
+    def fake_find_or_create(parent_id, name, drive=None):
+        created.append((parent_id, name))
+        return f"id-{name}", True
+
+    monkeypatch.setattr("tools.member_folder_drive.find_or_create_folder", fake_find_or_create)
+    monkeypatch.setattr(
+        "tools.member_folder_drive.get_distributors_folder_id",
+        lambda: "aces-distributors-root",
+    )
+
+    def fail_share(*_args, **_kwargs):
+        raise AssertionError("must not share Drive folders with partner emails")
+
+    monkeypatch.setattr("tools.share_folder.share_member_folder", fail_share, raising=False)
+    folder_id = partner_authz.ensure_partner_drive_folder(partner)
+    assert folder_id == "id-Partner - specialist-energy"
+    assert partner.drive_folder_id == folder_id
+    assert created[0] == ("aces-distributors-root", "Partner - specialist-energy")
+    assert created[1] == (folder_id, "Lead collisions")
 

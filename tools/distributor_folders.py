@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from googleapiclient.errors import HttpError
 
 from tools.member_folder_drive import (
-    DISTRIBUTORS_FOLDER_ID,
     MemberFolderDriveError,
+    get_distributors_folder_id,
     upload_bytes_to_folder,
     _user_drive_service,
 )
@@ -38,7 +38,7 @@ def display_distributor_name(name: str) -> str:
 
 
 def get_distributors_parent_id() -> str:
-    return (DISTRIBUTORS_FOLDER_ID or "").strip()
+    return get_distributors_folder_id()
 
 
 def _drive_or_error() -> Tuple[Any, Optional[str]]:

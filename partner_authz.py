@@ -58,6 +58,7 @@ BASE1_RATE_LIMIT_MESSAGE = (
 )
 BASE1_TYPE_MESSAGE = "PDF, JPG, PNG, or HEIC only"
 COLLISION_UPLOAD_FOLDER = "Lead collisions"
+PARTNER_DRIVE_FOLDER_PREFIX = "Partner - "
 HEIC_FTYP_BRANDS = frozenset(
     {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
 )
@@ -325,22 +326,56 @@ def admit_partner_lead(
     )
 
 
-def persist_collision_files(
-    partner: Partner,
-    collision: PartnerLeadCollision,
-    files: list[tuple[str, bytes, str | None]],
-) -> list[dict[str, Any]]:
-    """Write collision uploads into the partner Drive folder. No CRM client is created."""
-    folder_id = (partner.drive_folder_id or "").strip()
-    if not folder_id:
-        logger.error("ACES_PARTNER_COLLISION_NO_DRIVE partner_id=%s", partner.id)
+def partner_drive_folder_name(partner: Partner) -> str:
+    slug = (partner.slug or "").strip() or f"partner-{partner.id}"
+    return f"{PARTNER_DRIVE_FOLDER_PREFIX}{slug}"
+
+
+def ensure_partner_drive_folder(partner: Partner) -> str:
+    """Partner folder under the distributors root. Never share with partner emails."""
+    existing = (partner.drive_folder_id or "").strip()
+    from tools.member_folder_drive import (
+        MemberFolderDriveError,
+        find_or_create_folder,
+        get_distributors_folder_id,
+    )
+
+    try:
+        if existing:
+            find_or_create_folder(existing, COLLISION_UPLOAD_FOLDER)
+            return existing
+        root_id = get_distributors_folder_id()
+        if not root_id:
+            raise MemberFolderDriveError(
+                "Distributors Drive root is not configured.",
+                status_code=503,
+            )
+        folder_id, _created = find_or_create_folder(
+            root_id, partner_drive_folder_name(partner)
+        )
+        find_or_create_folder(folder_id, COLLISION_UPLOAD_FOLDER)
+        partner.drive_folder_id = folder_id
+        return folder_id
+    except MemberFolderDriveError:
+        logger.exception(
+            "ACES_PARTNER_DRIVE_PROVISION_FAIL partner_id=%s", partner.id
+        )
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "drive_unavailable",
                 "message": "We could not save your documents. Please try again shortly.",
             },
-        )
+        ) from None
+
+
+def persist_collision_files(
+    partner: Partner,
+    collision: PartnerLeadCollision,
+    files: list[tuple[str, bytes, str | None]],
+) -> list[dict[str, Any]]:
+    """Write collision uploads into the partner Drive folder. No CRM client is created."""
+    folder_id = ensure_partner_drive_folder(partner)
     from tools.member_folder_drive import (
         MemberFolderDriveError,
         find_or_create_folder,
