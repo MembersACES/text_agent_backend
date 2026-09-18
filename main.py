@@ -79,6 +79,11 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_sheet_tabs,
 )
 from tools.invoicing_access import require_invoicing_user
+from tools.invoicing_direct_invoices import (
+    list_direct_client_stream_ids,
+    list_direct_invoices,
+    update_direct_invoice_status,
+)
 from auth_domain import apply_email_domain_policy, bind_request_context, reset_request_context
 from auth_scheduler import verify_cloud_scheduler_oidc
 from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
@@ -457,6 +462,8 @@ _CORS_ORIGINS_BASE = [
     "http://localhost:8081",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:8081",
+    "https://acespartnerinterfacedev-672026052958.australia-southeast2.run.app",
+    "https://acespartnerinterface-672026052958.australia-southeast2.run.app",
     "https://script.google.com",
 ]
 
@@ -574,7 +581,11 @@ def verify_google_token(authorization: str = Header(...)):
         # Use ID token verification for basic auth (no API access needed)
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Token verified for user: {idinfo.get('email')}")
-        return apply_email_domain_policy(idinfo, "verify_google_token")
+        idinfo = apply_email_domain_policy(idinfo, "verify_google_token")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
+        return idinfo
     except HTTPException:
         raise
     except ValueError as e:
@@ -587,6 +598,29 @@ def verify_google_token(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
         logging.error(f"Token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def verify_partner_token(authorization: str = Header(...)):
+    """Google ID token that must resolve to an active partner_users row."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        idinfo = apply_email_domain_policy(idinfo, "verify_partner_token")
+        from partner_authz import partner_principal_from_idinfo
+
+        if partner_principal_from_idinfo(idinfo) is None:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return idinfo
+    except HTTPException:
+        raise
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
@@ -968,7 +1002,11 @@ def verify_roster_access(
     token = authorization.split("Bearer ", 1)[1]
     try:
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
-        return apply_email_domain_policy(idinfo, "verify_roster_access")
+        idinfo = apply_email_domain_policy(idinfo, "verify_roster_access")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
+        return idinfo
     except HTTPException:
         raise
     except ValueError as e:
@@ -6778,6 +6816,82 @@ def invoicing_one_month_savings_invoices_endpoint(
         "count": result.get("count", len(invoices)),
         "user_email": user_info.get("email"),
     }
+
+
+@app.get("/api/invoicing/direct-client/invoices")
+def invoicing_direct_client_invoices_endpoint(
+    stream: str = Query(..., description="Direct client invoicing stream id"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Native invoice list with Generated / Sent / Paid for Direct client streams."""
+    require_invoicing_user(user_info)
+    stream_id = (stream or "").strip()
+    if stream_id not in list_direct_client_stream_ids():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid stream. Use one of: {', '.join(list_direct_client_stream_ids())}",
+        )
+    result = list_direct_invoices(stream_id)
+    err = result.get("error")
+    invoices = result.get("invoices") or []
+    if err and not invoices:
+        raise HTTPException(status_code=502, detail=str(err))
+    return {
+        "invoices": invoices,
+        "count": result.get("count", len(invoices)),
+        "stream": stream_id,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.patch("/api/invoicing/direct-client/status")
+async def invoicing_direct_client_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Update Generated / Sent / Paid on a Direct client invoice ledger."""
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    require_invoicing_user(user_info)
+    stream_id = str(request_data.get("stream") or "").strip()
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    invoice_file_id = str(request_data.get("invoice_file_id") or "")
+    if stream_id not in list_direct_client_stream_ids():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid stream. Use one of: {', '.join(list_direct_client_stream_ids())}",
+        )
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(
+            status_code=400,
+            detail="stream, business_name, invoice_number and status are required",
+        )
+    result = update_direct_invoice_status(
+        stream_id,
+        str(business_name),
+        str(invoice_number),
+        str(status),
+        invoice_file_id,
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400 if "No matching" in str(result.get("error", "")) else 500,
+            detail=result.get("error", "Failed to update status"),
+        )
+    return result
 
 
 @app.get("/api/invoicing/drive/businesses")
@@ -14763,6 +14877,8 @@ def rebuild_staged_activity(
 
 from campaign_routes import register_campaign_routes
 from email_template_routes import register_email_template_routes
+from partner_routes import register_partner_routes
 
 register_campaign_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
+register_partner_routes(app, verify_partner_token, get_db)

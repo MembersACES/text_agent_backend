@@ -21,10 +21,17 @@ MEMBERS_B_FOLDER_ID = os.getenv(
     "MEMBERS_B_FOLDER_ID",
     "1QeUpiWaBdNGa9DBjqWoBNfvMo9vd1uLy",
 )
+# Shared Drive "ACES Distributors". Override with DISTRIBUTORS_FOLDER_ID after
+# 003-Distributors is moved in, using that folder's id.
+ACES_DISTRIBUTORS_DRIVE_ID = "0AByqxaR8uK18Uk9PVA"
 DISTRIBUTORS_FOLDER_ID = os.getenv(
     "DISTRIBUTORS_FOLDER_ID",
-    "16fJN23di6zJxa_eK5bfpPUQsMYPbb5Fv",
+    ACES_DISTRIBUTORS_DRIVE_ID,
 )
+
+
+def get_distributors_folder_id() -> str:
+    return (os.getenv("DISTRIBUTORS_FOLDER_ID") or "").strip() or ACES_DISTRIBUTORS_DRIVE_ID
 MEMBER_TEMPLATE_FOLDER_ID = os.getenv(
     "MEMBER_TEMPLATE_FOLDER_ID",
     "1sCeC8zGfS739zoLzL-nbopfeCFuaxnZH",
