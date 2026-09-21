@@ -36,8 +36,18 @@ _MIRN_PREFIX_STATE = {
 }
 
 
+_PLACEHOLDER_NAMES = frozenset({"n/a", "na", "n.a.", "n.a", "none", "unknown", "-", "—"})
+
+
 def _norm_name(value: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _display_name(value: Optional[str]) -> str:
+    text = (value or "").strip()
+    if not text or _norm_name(text) in _PLACEHOLDER_NAMES:
+        return ""
+    return text
 
 
 def classify_phone(phone: Optional[str]) -> str:
@@ -152,15 +162,15 @@ def enrich_contract_item(
     client_by_name: dict[str, int],
 ) -> dict:
     loa_id = str(rec.get("loa_record_id") or "").strip()
-    business_name = str(rec.get("business_name") or "").strip()
+    business_name = _display_name(rec.get("business_name"))
     loa = loa_by_id.get(loa_id)
-    if loa is None:
+    if loa is None and business_name:
         loa = loa_by_name.get(_norm_name(business_name))
     if loa is None:
         loa = {}
 
     if not business_name:
-        business_name = str(loa.get("business_name") or loa.get("trading_as") or "").strip()
+        business_name = _display_name(loa.get("business_name")) or _display_name(loa.get("trading_as"))
     if not loa_id:
         loa_id = str(loa.get("record_id") or "").strip()
 
