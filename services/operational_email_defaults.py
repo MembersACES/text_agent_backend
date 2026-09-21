@@ -213,6 +213,41 @@ ALINTA_HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+ALINTA_ELEC_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+</head>
+<body>
+  <p>Hello Team,</p>
+  <p>I hope this email finds you well.</p>
+  <p>This is an Agreement Request for our member, {{company_name}} (NMI {{nmi_display}}).</p>
+  {{request_kind_html}}
+  <p>Company Name: {{company_name}}</p>
+  <p>ACN/ABN:{{acn_abn}}<br>
+  Address: {{address}}<br>
+  Tel: {{tel}}<br>
+  Contact Name: {{contact_name}}<br>
+  Email: {{email}}</p>
+  <p>{{nmi_lines}}</p>
+  <p>Period</p>
+  <p>Start date:{{start_date}}<br>
+  End date: {{end_date}}<br>
+  Peak: {{peak_rate_c_kwh}}<br>
+  Off-peak: {{off_peak_rate_c_kwh}}<br>
+  Shoulder: {{shoulder_rate_c_kwh}}<br>
+  Commission: {{commission_c_kwh}}</p>
+  <p>Annual consumption: {{annual_kwh}}</p>
+  <p>Take or Pay: {{take_or_pay_pct}}</p>
+  <p>Attached are both the LOA &amp; the signed engagement form.</p>
+  <p>Kind regards,</p>
+  <p>Alice</p>
+  <p>FORNRG Pty Ltd<br>
+  1300 938 638<br>
+  W: <a href="http://www.fornrg.com/">http://www.fornrg.com/</a></p>
+</body>
+</html>"""
+
 SHARE_FOLDER_HTML = """<!DOCTYPE html>
 <html>
 <body style="margin:0;padding:0;background:#f3f4f6;font-family:Arial,Helvetica,sans-serif;">
@@ -431,6 +466,54 @@ def extra_templates() -> list[dict]:
             },
         },
         {
+            "key": "alinta_electricity.default",
+            "category": "alinta_electricity",
+            "name": "Alinta C&I electricity agreement request",
+            "description": "Agreement request email built from the Alinta electricity EF form.",
+            "subject": "Agreement Request: E-C&I {{request_kind}} {{company_name}} NMI {{nmi_display}}",
+            "html_body": ALINTA_ELEC_HTML,
+            "merge_fields": [
+                "company_name",
+                "nmis",
+                "nmi_display",
+                "nmi_lines",
+                "request_kind",
+                "request_kind_html",
+                "acn_abn",
+                "address",
+                "tel",
+                "contact_name",
+                "email",
+                "start_date",
+                "end_date",
+                "peak_rate_c_kwh",
+                "off_peak_rate_c_kwh",
+                "shoulder_rate_c_kwh",
+                "commission_c_kwh",
+                "annual_kwh",
+            ],
+            "sample_values": {
+                "company_name": "Example Pty Ltd",
+                "nmis": "41020000000, VEEE0WPKWT",
+                "nmi_display": "41020000000 & VEEE0WPKWT",
+                "nmi_lines": "NMI: 41020000000<br>\n  NMI: VEEE0WPKWT",
+                "request_kind": "Retention",
+                "request_kind_html": "<p>Please note this is a retention account.</p>",
+                "acn_abn": "12 345 678 901",
+                "address": "1 Example St, Melbourne VIC 3000",
+                "tel": "03 9000 0000",
+                "contact_name": "Jane Smith",
+                "email": "jane@example.com",
+                "start_date": "01/10/2026",
+                "end_date": "30/09/2029",
+                "peak_rate_c_kwh": "18.50 c/kWh",
+                "off_peak_rate_c_kwh": "12.20 c/kWh",
+                "shoulder_rate_c_kwh": "15.00 c/kWh",
+                "commission_c_kwh": "0.30 c/kWh",
+                "annual_kwh": "1,200,000 kWh",
+            },
+        },
+        {
             "key": "share_folder.default",
             "category": "share_folder",
             "name": "Shared folder notification",
@@ -565,6 +648,15 @@ def all_recipients() -> list[dict]:
             flow="alinta_gas",
             key="default",
             display_name="Alinta gas agreement request",
+            emails=["data.quote@fornrg.com"],
+            group_name="Alinta",
+        )
+    )
+    rows.append(
+        _recipient_row(
+            flow="alinta_electricity",
+            key="default",
+            display_name="Alinta electricity agreement request",
             emails=["data.quote@fornrg.com"],
             group_name="Alinta",
         )
