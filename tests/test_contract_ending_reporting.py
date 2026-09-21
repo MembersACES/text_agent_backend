@@ -52,6 +52,60 @@ def test_airtable_lookup_fields_extract_name_and_loa_id():
     assert _loa_record_id_from_utility_fields(fields) == "recABCDEFGHIJK"
 
 
+def test_airtable_lookup_uses_sheet_loa_link_and_skips_na_trading_as():
+    fields = {
+        "Trading As": ["N/A"],
+        "Client Name": ["Selvan Naidoo"],
+        "1st Sheet - LOA Business Details 3": ["recafZHjICWMdueoo"],
+    }
+    assert _first_text_from_fields(fields, ("Business Name", "Trading As")) == ""
+    assert _loa_record_id_from_utility_fields(fields) == "recafZHjICWMdueoo"
+
+
+def test_enrich_replaces_na_name_from_linked_loa():
+    records = [
+        {
+            "identifier": "4311286487",
+            "utility_type": "C&I Electricity",
+            "contract_end_date": "2026-12-31",
+            "retailer": "Stanwell Corporation Limited",
+            "record_id": "recUtilNa",
+            "business_name": "N/A",
+            "loa_record_id": "recafZHjICWMdueoo",
+            "site_address": "1 Eels Place, Parramatta, NSW, 2150",
+            "state": "",
+        }
+    ]
+    loa_records = [
+        {
+            "record_id": "recafZHjICWMdueoo",
+            "business_name": "Parramatta Leagues Club Ltd",
+            "trading_as": "N/A",
+            "contact_name": "Selvan Naidoo",
+            "email": "selvan.naidoo@parraleagues.com.au",
+            "telephone": "0410 626 442",
+            "site_address": "1 Eels Place, Parramatta, NSW, 2150",
+            "postal_address": "",
+            "state": "NSW",
+        }
+    ]
+    clients = [
+        SimpleNamespace(
+            id=38,
+            business_name="Parramatta Leagues Club Ltd",
+            external_business_id="recafZHjICWMdueoo",
+        )
+    ]
+    row = enrich_contract_records(records, loa_records, clients)[0]
+    assert row["business_name"] == "Parramatta Leagues Club Ltd"
+    assert row["contact_name"] == "Selvan Naidoo"
+    assert row["email"] == "selvan.naidoo@parraleagues.com.au"
+    assert row["telephone"] == "0410 626 442"
+    assert row["phone_type"] == "mobile"
+    assert row["client_id"] == 38
+    assert row["portal_path"] == "/crm-members/38"
+
+
 def test_enrich_joins_loa_contact_and_crm_portal():
     records = [
         {
