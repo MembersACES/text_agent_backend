@@ -83,6 +83,12 @@ SEQUENCE_FLOW_CATALOG: list[dict[str, str]] = [
         "source": "Document Generation — engagement form",
         "copy_hint": "solar_panel_cleaning_engagement_form_v1",
     },
+    {
+        "sequence_type": "agreement_followup_v1",
+        "display_name": "Agreement Follow-up",
+        "source": "Autonomous Agent — Agreement Follow Up",
+        "copy_hint": "agreement_followup_v1",
+    },
 ]
 
 

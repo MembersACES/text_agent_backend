@@ -12634,6 +12634,7 @@ def autonomous_sequence_start(
 ):
     from services.autonomous_sequence import (
         SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
         apply_validity_to_context,
         ensure_autonomous_sequence_type_row,
         get_sequence_template_by_type,
@@ -12675,7 +12676,10 @@ def autonomous_sequence_start(
     sequence_type = str(template.sequence_type)
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if requested_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if requested_type not in {
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+    }:
         incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
         if not incoming_validity:
             # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
@@ -15031,9 +15035,11 @@ def rebuild_staged_activity(
 
 
 from campaign_routes import register_campaign_routes
+from agreement_followup_routes import register_agreement_followup_routes
 from email_template_routes import register_email_template_routes
 from partner_routes import register_partner_routes
 
 register_campaign_routes(app, get_current_user_with_db)
+register_agreement_followup_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
 register_partner_routes(app, verify_partner_token, get_db)
