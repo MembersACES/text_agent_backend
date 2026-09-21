@@ -70,6 +70,14 @@ from tools.alinta_gas_ef import (
     build_extract_response,
     send_alinta_gas_agreement,
 )
+from tools.alinta_electricity_ef import (
+    apply_electricity_overrides,
+    build_electricity_email_html,
+    build_electricity_email_subject,
+    build_electricity_extract_response,
+    send_alinta_electricity_agreement,
+    split_nmis,
+)
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
     get_commission_figures_client_count,
@@ -79,6 +87,13 @@ from tools.invoicing_retailer_sheets import (
     list_retailer_sheet_tabs,
 )
 from tools.invoicing_access import require_invoicing_user
+from tools.invoicing_direct_invoices import (
+    list_direct_client_stream_ids,
+    list_direct_invoices,
+    update_direct_invoice_status,
+)
+from auth_domain import apply_email_domain_policy, bind_request_context, reset_request_context
+from auth_scheduler import verify_cloud_scheduler_oidc
 from tools.invoicing_drive import list_businesses as list_invoicing_drive_businesses
 from tools.invoicing_drive import list_documents as list_invoicing_drive_documents
 from tools.invoicing_drive import list_category_keys as list_invoicing_drive_category_keys
@@ -455,6 +470,9 @@ _CORS_ORIGINS_BASE = [
     "http://localhost:8081",
     "http://127.0.0.1:8080",
     "http://127.0.0.1:8081",
+    "https://acespartnerinterfacedev-672026052958.australia-southeast2.run.app",
+    "https://acespartnerinterface-672026052958.australia-southeast2.run.app",
+    "https://partners.acesolutions.com.au",
     "https://script.google.com",
 ]
 
@@ -462,7 +480,7 @@ _CORS_ORIGINS_BASE = [
 def _build_cors_origins() -> list[str]:
     """Static allowlist plus optional comma-separated CORS_EXTRA_ORIGINS (CZA Cloud Run URLs)."""
     extra_raw = (os.getenv("CORS_EXTRA_ORIGINS") or "").strip()
-    extra = [o.strip() for o in extra_raw.split(",") if o.strip()]
+    extra = [o.strip() for o in extra_raw.replace(",", " ").split() if o.strip()]
     merged = list(_CORS_ORIGINS_BASE)
     for origin in extra:
         if origin not in merged:
@@ -479,6 +497,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def capture_auth_request_context(request: Request, call_next):
+    tokens = bind_request_context(request)
+    try:
+        return await call_next(request)
+    finally:
+        reset_request_context(tokens)
 
 from fastapi import Header
 from starlette.requests import Request as StarletteRequest
@@ -563,7 +590,13 @@ def verify_google_token(authorization: str = Header(...)):
         # Use ID token verification for basic auth (no API access needed)
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
         logging.info(f"Token verified for user: {idinfo.get('email')}")
+        idinfo = apply_email_domain_policy(idinfo, "verify_google_token")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
         return idinfo
+    except HTTPException:
+        raise
     except ValueError as e:
         error_msg = str(e).lower()
         logging.error(f"Token verification failed: {e}")
@@ -574,6 +607,29 @@ def verify_google_token(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid token")
     except Exception as e:
         logging.error(f"Token verification error: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def verify_partner_token(authorization: str = Header(...)):
+    """Google ID token that must resolve to an active partner_users row."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ", 1)[1]
+    try:
+        idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        idinfo = apply_email_domain_policy(idinfo, "verify_partner_token")
+        from partner_authz import partner_principal_from_idinfo
+
+        if partner_principal_from_idinfo(idinfo) is None:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return idinfo
+    except HTTPException:
+        raise
+    except ValueError as e:
+        if "expired" in str(e).lower():
+            raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 # Optional: Access token verification (only if you need Google API access)
@@ -955,7 +1011,13 @@ def verify_roster_access(
     token = authorization.split("Bearer ", 1)[1]
     try:
         idinfo = id_token.verify_oauth2_token(token, grequests.Request(), GOOGLE_CLIENT_ID)
+        idinfo = apply_email_domain_policy(idinfo, "verify_roster_access")
+        from partner_authz import refuse_staff_route_if_partner
+
+        refuse_staff_route_if_partner(idinfo)
         return idinfo
+    except HTTPException:
+        raise
     except ValueError as e:
         if "expired" in str(e).lower():
             raise HTTPException(status_code=401, detail="REAUTHENTICATION_REQUIRED")
@@ -2536,6 +2598,151 @@ async def alinta_gas_agreement_send(
     return result
 
 
+@app.post("/api/alinta-electricity-agreement/extract")
+async def alinta_electricity_agreement_extract(
+    file: UploadFile = File(...),
+    business_name: Optional[str] = Form(None),
+    nmis: Optional[str] = Form(None),
+    user_info: dict = Depends(verify_google_token),
+):
+    logging.info(
+        "alinta-electricity-agreement/extract file=%s business=%r nmis=%r user=%s",
+        file.filename,
+        business_name,
+        nmis,
+        user_info.get("email") if isinstance(user_info, dict) else None,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if file.filename and not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted")
+    return build_electricity_extract_response(
+        contents,
+        filename=file.filename or "",
+        business_name=(business_name or "").strip(),
+        query_nmis=split_nmis(nmis or ""),
+    )
+
+
+@app.post("/api/alinta-electricity-agreement/send")
+async def alinta_electricity_agreement_send(
+    file: UploadFile = File(...),
+    draft_json: str = Form(...),
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    logging.info(
+        "alinta-electricity-agreement/send file=%s user=%s",
+        file.filename,
+        email,
+    )
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file")
+    try:
+        payload = json.loads(draft_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="draft_json is not valid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="draft_json must be an object")
+
+    draft = payload.get("draft") if isinstance(payload.get("draft"), dict) else payload
+    overrides = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    if overrides:
+        draft = apply_electricity_overrides(draft, overrides)
+    if payload.get("request_kind"):
+        draft = apply_electricity_overrides(draft, {"request_kind": payload.get("request_kind")})
+    if payload.get("loa_file_id") and not draft.get("loa_file_id"):
+        draft["loa_file_id"] = payload.get("loa_file_id")
+    if payload.get("gdrive_folder_url") and not draft.get("gdrive_folder_url"):
+        draft["gdrive_folder_url"] = payload.get("gdrive_folder_url")
+
+    company = ""
+    fields = draft.get("fields") or {}
+    company_field = fields.get("company_name")
+    if isinstance(company_field, dict):
+        company = str(company_field.get("value") or "").strip()
+    elif company_field:
+        company = str(company_field).strip()
+    if not company:
+        company = str(payload.get("business_name") or "").strip()
+
+    client = None
+    raw_client_id = payload.get("client_id") or payload.get("clientId")
+    if raw_client_id not in (None, ""):
+        try:
+            client = db.query(Client).filter(Client.id == int(raw_client_id)).first()
+        except (TypeError, ValueError):
+            client = None
+    if client is None and company:
+        client = db.query(Client).filter(Client.business_name == company).first()
+    if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
+        draft["gdrive_folder_url"] = client.gdrive_folder_url
+
+    result = send_alinta_electricity_agreement(
+        draft,
+        pdf_bytes=contents,
+        filename=file.filename or "",
+        user_email=email,
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
+
+    try:
+        if client:
+            nmi_value = ""
+            nmi_field = fields.get("nmis")
+            if isinstance(nmi_field, dict):
+                nmi_value = str(nmi_field.get("value") or "").strip()
+            elif nmi_field:
+                nmi_value = str(nmi_field).strip()
+            offer = get_or_create_offer_for_activity(
+                db,
+                client.id,
+                company or client.business_name,
+                "C&I Electricity",
+                created_by=email,
+                utility_type_identifier="Alinta C&I Electricity agreement request",
+            )
+            doc_link = result.get("client_folder_url") or None
+            meta = {
+                "source": "alinta_electricity_agreement_request",
+                "email_subject": result.get("email_subject"),
+                "recipient": result.get("recipient"),
+                "request_kind": draft.get("request_kind"),
+                "nmis": nmi_value or payload.get("nmis"),
+                "agreement_type": result.get("agreement_type"),
+            }
+            if not result.get("lodge_error"):
+                create_offer_activity(
+                    db,
+                    offer=offer,
+                    client=client,
+                    activity_type=OfferActivityType.ENGAGEMENT_FORM_SIGNED,
+                    document_link=doc_link,
+                    metadata=meta,
+                    created_by=email,
+                )
+            create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.ALINTA_AGREEMENT_REQUESTED,
+                document_link=doc_link,
+                metadata=meta,
+                created_by=email,
+            )
+    except Exception as act_e:
+        logging.warning("Failed to log alinta electricity agreement activity: %s", act_e)
+
+    result["email_subject"] = result.get("email_subject") or build_electricity_email_subject(draft)
+    result["email_html_content"] = build_electricity_email_html(draft)
+    result["user_email"] = email
+    return result
+
+
 @app.get("/api/base2/sme-gas-airtable-annual-usage")
 def get_base2_sme_gas_airtable_annual_usage(
     mrin: str = Query(
@@ -4100,9 +4307,11 @@ def pudu_consumables_baseline_redetect_all_sites_endpoint(
 @app.post("/api/pudu/consumables/baseline-redetect-all-sites-cron")
 def pudu_consumables_baseline_redetect_all_sites_cron(
     db: Session = Depends(get_db),
+    _scheduler: dict = Depends(verify_cloud_scheduler_oidc),
 ):
     """
-    Cron endpoint mirroring /api/tasks/check-due-cron style (no auth dependency).
+    Cron endpoint mirroring /api/tasks/check-due-cron.
+    Auth: Cloud Scheduler OIDC (audience = this Cloud Run URL), not a user ID token.
     Fills missing baselines only (does not re-walk Pudu history for robots that already have one),
     so it stays within typical HTTP timeouts after the first full baseline pass.
     """
@@ -4873,6 +5082,8 @@ def _verify_video_write_auth(authorization: str) -> None:
     if token != os.getenv("BACKEND_API_KEY", "test-key"):
         try:
             verify_google_token(authorization)
+        except HTTPException:
+            raise
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid authorization")
 
@@ -6759,6 +6970,82 @@ def invoicing_one_month_savings_invoices_endpoint(
         "count": result.get("count", len(invoices)),
         "user_email": user_info.get("email"),
     }
+
+
+@app.get("/api/invoicing/direct-client/invoices")
+def invoicing_direct_client_invoices_endpoint(
+    stream: str = Query(..., description="Direct client invoicing stream id"),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Native invoice list with Generated / Sent / Paid for Direct client streams."""
+    require_invoicing_user(user_info)
+    stream_id = (stream or "").strip()
+    if stream_id not in list_direct_client_stream_ids():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid stream. Use one of: {', '.join(list_direct_client_stream_ids())}",
+        )
+    result = list_direct_invoices(stream_id)
+    err = result.get("error")
+    invoices = result.get("invoices") or []
+    if err and not invoices:
+        raise HTTPException(status_code=502, detail=str(err))
+    return {
+        "invoices": invoices,
+        "count": result.get("count", len(invoices)),
+        "stream": stream_id,
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.patch("/api/invoicing/direct-client/status")
+async def invoicing_direct_client_status_endpoint(
+    request: Request,
+    authorization: str = Header(...),
+):
+    """Update Generated / Sent / Paid on a Direct client invoice ledger."""
+    request_data = await request.json()
+    if authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ")[1]
+        if token == os.getenv("BACKEND_API_KEY", "test-key"):
+            user_info = {"email": request_data.get("user_email", "api_user@example.com")}
+        else:
+            try:
+                user_info = verify_google_token(authorization)
+            except Exception as e:
+                logging.error(f"Token verification failed: {e}")
+                raise HTTPException(status_code=401, detail="Invalid Google token")
+    else:
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    require_invoicing_user(user_info)
+    stream_id = str(request_data.get("stream") or "").strip()
+    business_name = request_data.get("business_name")
+    invoice_number = request_data.get("invoice_number")
+    status = request_data.get("status")
+    invoice_file_id = str(request_data.get("invoice_file_id") or "")
+    if stream_id not in list_direct_client_stream_ids():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid stream. Use one of: {', '.join(list_direct_client_stream_ids())}",
+        )
+    if not business_name or not invoice_number or not status:
+        raise HTTPException(
+            status_code=400,
+            detail="stream, business_name, invoice_number and status are required",
+        )
+    result = update_direct_invoice_status(
+        stream_id,
+        str(business_name),
+        str(invoice_number),
+        str(status),
+        invoice_file_id,
+    )
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400 if "No matching" in str(result.get("error", "")) else 500,
+            detail=result.get("error", "Failed to update status"),
+        )
+    return result
 
 
 @app.get("/api/invoicing/drive/businesses")
@@ -10512,27 +10799,12 @@ def delete_strategy_item(
     logging.info("Deleted strategy item id=%s", item_id)
     return {"status": "success", "message": "Strategy item deleted"}
 
-@app.get("/api/client-status/debug/all")
-def debug_all_notes(db: Session = Depends(get_db)):
-    """Debug endpoint to see all notes"""
-    notes = db.query(ClientStatusNote).all()
-    return {
-        "count": len(notes), 
-        "notes": [{
-            "id": n.id, 
-            "business_name": n.business_name, 
-            "client_id": n.client_id,
-            "note": n.note[:100],
-            "user_email": n.user_email,
-            "note_type": n.note_type,
-            "created_at": str(n.created_at)
-        } for n in notes]
-    }
-
-
 @app.post("/api/tasks/check-due-cron")
-async def check_due_tasks_cron(db: Session = Depends(get_db)):
-    """Cron endpoint for Cloud Scheduler - no auth required"""
+async def check_due_tasks_cron(
+    db: Session = Depends(get_db),
+    _scheduler: dict = Depends(verify_cloud_scheduler_oidc),
+):
+    """Cron endpoint for Cloud Scheduler. Auth: OIDC audience = this Cloud Run URL."""
     logging.info("Cron job triggered: checking due tasks")
     
     try:
@@ -12264,14 +12536,38 @@ def verify_autonomous_inbound_secret(
         raise HTTPException(status_code=401, detail="Invalid X-Autonomous-Inbound-Secret")
 
 
+def _campaign_meta_by_offer(db: Session, offer_ids: list[int]) -> dict[int, tuple[int | None, str | None]]:
+    from models import Campaign
+
+    unique = [oid for oid in dict.fromkeys(offer_ids) if oid]
+    if not unique:
+        return {}
+    offers = db.query(Offer.id, Offer.campaign_id).filter(Offer.id.in_(unique)).all()
+    campaign_ids = [cid for _, cid in offers if cid]
+    names: dict[int, str] = {}
+    if campaign_ids:
+        names = {
+            cid: name
+            for cid, name in db.query(Campaign.id, Campaign.name).filter(Campaign.id.in_(campaign_ids)).all()
+        }
+    return {oid: (cid, names.get(cid) if cid else None) for oid, cid in offers}
+
+
 def _autonomous_list_item(
     db: Session,
     run: AutonomousSequenceRun,
     ack_draft: Optional[dict] = None,
+    campaign_id: Optional[int] = None,
+    campaign_name: Optional[str] = None,
 ) -> AutonomousSequenceRunListItem:
     steps = sorted(run.steps, key=lambda s: s.step_index)
     offer = db.query(Offer).filter(Offer.id == run.offer_id).first()
     business_name = offer.business_name if offer else None
+    resolved_campaign_id = campaign_id if campaign_id is not None else (offer.campaign_id if offer else None)
+    resolved_campaign_name = campaign_name
+    if resolved_campaign_id and resolved_campaign_name is None:
+        meta = _campaign_meta_by_offer(db, [run.offer_id])
+        resolved_campaign_id, resolved_campaign_name = meta.get(run.offer_id, (resolved_campaign_id, None))
     pending = [
         s
         for s in steps
@@ -12298,6 +12594,8 @@ def _autonomous_list_item(
         steps_total=len(steps),
         ack_draft_pending=ack_draft is not None,
         ack_draft_thread_id=(ack_draft or {}).get("thread_id"),
+        campaign_id=resolved_campaign_id,
+        campaign_name=resolved_campaign_name,
     )
 
 
@@ -12884,7 +13182,9 @@ def autonomous_sequence_create_template(
         if not source:
             raise HTTPException(status_code=404, detail=f"copy_from template not found: {copy_from}")
 
-    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or "Australia/Brisbane"
+    from services.schedule_tz import schedule_tz_name
+
+    timezone = (body.timezone or "").strip() or (source.timezone if source else None) or schedule_tz_name()
     description = (body.description or "").strip() or None
     if description is None and source and source.description:
         description = f"Copied from {source.display_name}."
@@ -13251,10 +13551,14 @@ def autonomous_sequence_list_runs(
     ),
     limit: int = Query(50, le=2000),
     offset: int = Query(0, ge=0),
+    source: Optional[str] = Query(
+        None,
+        description="followup (Offer.campaign_id is null) | campaign (stub offers from outbound campaigns)",
+    ),
     db: Session = Depends(get_db),
     user_data: dict = Depends(get_current_user_with_db),
 ):
-    from services.autonomous_sequence import finalize_run_if_exhausted
+    from services.autonomous_sequence import apply_run_source_filter, finalize_run_if_exhausted
 
     if run_status_group == "running":
         stuck = (
@@ -13276,6 +13580,7 @@ def autonomous_sequence_list_runs(
         "agreement_signed",
         "invoice_received",
         "unsubscribed",
+        "undeliverable",
     )
     if run_status_group == "running":
         q = q.filter(AutonomousSequenceRun.run_status == "running")
@@ -13315,6 +13620,7 @@ def autonomous_sequence_list_runs(
         )
     elif run_status:
         q = q.filter(AutonomousSequenceRun.run_status == run_status.strip())
+    q = apply_run_source_filter(q, source)
     total = q.count()
     runs = (
         q.options(joinedload(AutonomousSequenceRun.steps))
@@ -13323,11 +13629,23 @@ def autonomous_sequence_list_runs(
         .limit(limit)
         .all()
     )
-    from services.autonomous_sequence import count_runs_with_ack_draft, latest_ack_drafts_for_runs
+    from services.autonomous_sequence import (
+        count_runs_with_ack_draft,
+        latest_ack_drafts_for_runs,
+        run_ids_with_ack_reviewed,
+    )
 
     ack_by_run = latest_ack_drafts_for_runs(db, [r.id for r in runs])
+    reviewed = run_ids_with_ack_reviewed(db, [r.id for r in runs])
+    campaign_meta = _campaign_meta_by_offer(db, [r.offer_id for r in runs if r.offer_id])
     items = [
-        _autonomous_list_item(db, r, ack_by_run.get(r.id)).model_dump(mode="json")
+        _autonomous_list_item(
+            db,
+            r,
+            None if r.id in reviewed else ack_by_run.get(r.id),
+            campaign_id=campaign_meta.get(r.offer_id, (None, None))[0],
+            campaign_name=campaign_meta.get(r.offer_id, (None, None))[1],
+        ).model_dump(mode="json")
         for r in runs
     ]
     return JSONResponse(
@@ -13393,6 +13711,24 @@ def autonomous_sequence_restart_run(
     return JSONResponse(content=result)
 
 
+@app.post("/api/autonomous/sequences/runs/{run_id}/ack-reviewed")
+def autonomous_sequence_ack_reviewed(
+    run_id: int,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import mark_ack_reviewed
+
+    actor = (user_data.get("idinfo") or {}).get("email")
+    try:
+        updated = mark_ack_reviewed(db, run_id, actor)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"ok": True, "run_id": run_id}
+
+
 @app.delete("/api/autonomous/sequences/runs/{run_id}", status_code=status.HTTP_204_NO_CONTENT)
 def autonomous_sequence_delete_run(
     run_id: int,
@@ -13404,6 +13740,39 @@ def autonomous_sequence_delete_run(
     if not delete_autonomous_sequence_run(db, run_id):
         raise HTTPException(status_code=404, detail="Run not found")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class BatchRunsBody(BaseModel):
+    ids: list[int]
+    action: str
+
+
+@app.post("/api/autonomous/sequences/runs/batch")
+def autonomous_sequence_batch_runs(
+    body: BatchRunsBody,
+    db: Session = Depends(get_db),
+    user_data: dict = Depends(get_current_user_with_db),
+):
+    from services.autonomous_sequence import delete_autonomous_sequence_run, manual_stop_run
+
+    action = (body.action or "").strip().lower()
+    if action not in {"delete", "stop"}:
+        raise HTTPException(status_code=400, detail="action must be delete or stop")
+    ids = list(dict.fromkeys(int(item) for item in body.ids))
+    if len(ids) > 200:
+        raise HTTPException(status_code=400, detail="Cannot batch more than 200 runs")
+    updated: list[int] = []
+    missing: list[int] = []
+    for run_id in ids:
+        if action == "delete":
+            ok = delete_autonomous_sequence_run(db, run_id)
+        else:
+            ok = manual_stop_run(db, run_id) is not None
+        if ok:
+            updated.append(run_id)
+        else:
+            missing.append(run_id)
+    return {"ok": True, "action": action, "updated": updated, "missing": missing}
 
 
 @app.patch("/api/autonomous/sequences/runs/{run_id}", response_model=AutonomousSequenceRunResponse)
@@ -14663,6 +15032,8 @@ def rebuild_staged_activity(
 
 from campaign_routes import register_campaign_routes
 from email_template_routes import register_email_template_routes
+from partner_routes import register_partner_routes
 
 register_campaign_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
+register_partner_routes(app, verify_partner_token, get_db)

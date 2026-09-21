@@ -366,6 +366,24 @@ class ClientResponse(BaseModel):
             return ClientStage.LEAD
 
 
+class PartnerClientResponse(BaseModel):
+    """Minimal partner-facing client. Do not reuse ClientResponse on partner routes."""
+
+    id: int
+    business_name: str
+    primary_contact_email: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return dt.isoformat()
+
+
 class EntityGroupCreate(BaseModel):
     slug: str
     display_name: str
@@ -1260,6 +1278,8 @@ class AutonomousSequenceRunListItem(BaseModel):
     steps_total: int = 0
     ack_draft_pending: bool = False
     ack_draft_thread_id: Optional[str] = None
+    campaign_id: Optional[int] = None
+    campaign_name: Optional[str] = None
 
     @field_serializer("anchor_at", "next_step_at")
     def serialize_item_dt(self, dt: Optional[datetime], _info):
@@ -1323,6 +1343,7 @@ class RetellAgentPromptResponse(BaseModel):
     response_engine_type: Optional[str] = None
     llm_id: Optional[str] = None
     llm_version: Optional[Any] = None
+    version: Optional[Any] = None
     is_published: Optional[bool] = None
     llm_is_published: Optional[bool] = None
     prompt_editable: bool = False

@@ -26,7 +26,6 @@ from tools.distributor_agreement import (
 )
 from tools.distributor_folders import DOCUMENTS_FOLDER_NAME
 from tools.member_folder_drive import (
-    DISTRIBUTORS_FOLDER_ID,
     MEMBERS_B_FOLDER_ID,
     WIP_TEMPLATE_FILE_ID,
     MemberFolderDriveError,
@@ -34,6 +33,7 @@ from tools.member_folder_drive import (
     create_empty_named_folder,
     create_member_drive_folder,
     find_named_file_in_folder,
+    get_distributors_folder_id,
     list_child_folders,
     member_wip_spreadsheet_name,
     upload_bytes_to_folder,
@@ -644,7 +644,7 @@ def create_distributor_folder(
     # Ensure 003-Distributors exists under Members-B as well as using the known ID.
     from tools.member_folder_drive import find_or_create_folder
 
-    parent_id = (DISTRIBUTORS_FOLDER_ID or "").strip()
+    parent_id = get_distributors_folder_id()
     if not parent_id:
         parent_id, _ = find_or_create_folder(MEMBERS_B_FOLDER_ID, "003-Distributors")
 

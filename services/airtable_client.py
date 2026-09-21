@@ -652,16 +652,17 @@ def _normalize_contract_end_date(value: Any) -> Optional[str]:
 
 _UTILITY_BUSINESS_NAME_FIELDS = (
     "Bus Name Copy (from Link to LOA)",
-    "Trading As",
-    "Client Name",
     "Business Name",
+    "Trading As",
 )
 _UTILITY_LOA_LINK_FIELDS = (
     "Link to LOA",
     "Link to LOA Business Details",
     "LOA Business Details",
     "Link to LOA Business details",
+    "1st Sheet - LOA Business Details 3",
 )
+_PLACEHOLDER_NAMES = frozenset({"n/a", "na", "n.a.", "n.a", "none", "unknown", "-", "—"})
 _UTILITY_ADDRESS_FIELDS = (
     "Site Address:",
     "Site Address",
@@ -678,16 +679,20 @@ def _first_text_from_value(val: Any) -> str:
     if isinstance(val, list):
         for item in val:
             text = _first_text_from_value(item)
-            if text:
+            if text and not _is_placeholder_name(text):
                 return text
         return ""
     return str(val).strip()
 
 
+def _is_placeholder_name(text: str) -> bool:
+    return (text or "").strip().lower() in _PLACEHOLDER_NAMES
+
+
 def _first_text_from_fields(fields: dict, names: tuple[str, ...]) -> str:
     for name in names:
         text = _first_text_from_value(fields.get(name))
-        if text:
+        if text and not _is_placeholder_name(text):
             return text
     return ""
 
@@ -711,12 +716,16 @@ def _loa_record_id_from_utility_fields(fields: dict) -> str:
             return rid
     for key, val in fields.items():
         kn = (key or "").strip().lower()
-        if "from link to loa" in kn:
+        if "from link to loa" in kn or "site address" in kn:
             continue
-        if "loa" in kn and "link" in kn:
-            rid = _first_record_id(val)
-            if rid:
-                return rid
+        looks_like_loa_link = ("loa" in kn and "link" in kn) or (
+            "loa" in kn and "business details" in kn
+        )
+        if not looks_like_loa_link:
+            continue
+        rid = _first_record_id(val)
+        if rid:
+            return rid
     return ""
 
 

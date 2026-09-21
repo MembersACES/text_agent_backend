@@ -56,6 +56,7 @@ class CampaignPatchBody(BaseModel):
     send_window_start: Optional[str] = None
     send_window_end: Optional[str] = None
     acknowledge_warnings: Optional[int] = None
+    confirm_mid_send_edit: Optional[bool] = None
 
 
 class CampaignRowsBody(BaseModel):
