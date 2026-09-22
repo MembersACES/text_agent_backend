@@ -390,6 +390,24 @@ class TestimonialSolutionType(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class AgreementFollowupType(Base):
+    """Staff-managed retailer agreement types for the Agreement Follow Up page."""
+
+    __tablename__ = "agreement_followup_types"
+
+    id = Column(String(80), primary_key=True)
+    label = Column(String(160), nullable=False)
+    utility_type = Column(String(80), nullable=False)
+    retailer = Column(String(80), nullable=True)
+    default_subject = Column(Text, nullable=True)
+    default_body = Column(Text, nullable=True)
+    is_active = Column(Integer, nullable=False, default=1)
+    sort_order = Column(Integer, nullable=False, default=0)
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class MarketingVideo(Base):
     """
     CZA marketing or testimonial video registered in the Interface Videos library.

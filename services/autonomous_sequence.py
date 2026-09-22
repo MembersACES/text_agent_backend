@@ -836,6 +836,7 @@ N8N_ENGAGEMENT_FORM_URL = os.getenv("N8N_AUTONOMOUS_ENGAGEMENT_FORM_WEBHOOK_URL"
 
 SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE = "Solar Panel Cleaning"
 SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE = "solar_panel_cleaning_engagement_form_v1"
+AGREEMENT_FOLLOWUP_SEQUENCE_TYPE = "agreement_followup_v1"
 
 SOLAR_ENGAGEMENT_INITIAL_SUBJECT = (
     "Solar cleaning — quick win to protect performance and your solar investment"
@@ -918,6 +919,40 @@ SOLAR_ENGAGEMENT_STEP_PROMPTS: tuple[str, str, str] = (
     "Follow-up 1 (reply on thread): gentle check-in; no validity date; no Drive links; do not re-attach files.",
     "Follow-up 2 (reply on thread): polite reminder to return signed engagement form; no validity; no links.",
     "Follow-up 3 (reply on thread): final friendly nudge; offer to close out if not proceeding; no validity; no links.",
+)
+
+AGREEMENT_FOLLOWUP_INITIAL_SUBJECT = "Alinta agreement ready for signing"
+
+AGREEMENT_FOLLOWUP_SYSTEM_PROMPT = """You write follow-up emails for ACES after a retailer agreement PDF has already been emailed to the member.
+
+The client already received the initial email with the agreement PDF attached. These follow-ups must REPLY on that Gmail thread (do not start a new email). Do not include Google Drive links — the client cannot access them; the PDF is on the original message. Do not re-attach the PDF.
+
+Do NOT mention offer validity dates, "valid until", expiry, or savings figures unless they are explicitly in context.
+
+Tone: professional, warm, Australian English. Greet with first name only (first_name), never the full contact_name. Sign with the HTML signature provided in context.
+
+Step 0 was the first-touch with the PDF (already sent). Step 1: light follow-up asking them to return the signed agreement. Step 2: polite reminder. Step 3: final friendly nudge (offer to close out if not proceeding). Keep body under 120 words before the signature."""
+
+AGREEMENT_FOLLOWUP_EMAIL_EXAMPLE = """Hi {{first_name}},
+
+Just following up on the {{agreement_label}} we sent through for {{business_name}}.
+
+When you have a moment, please return the signed agreement by replying to this email. Happy to walk through any questions.
+
+Kind regards,"""
+
+AGREEMENT_FOLLOWUP_STEP_PROMPTS: tuple[str, str, str, str] = (
+    "First-touch already sent with the agreement PDF attached. Do not send this step again.",
+    "Follow-up 1 (reply on thread): gentle check-in to return the signed {{agreement_label}}; no validity; no Drive links; do not re-attach.",
+    "Follow-up 2 (reply on thread): polite reminder to sign and return the agreement; no validity; no links.",
+    "Follow-up 3 (reply on thread): final friendly nudge; offer to close out if not proceeding; no validity; no links.",
+)
+
+SIGNING_FOLLOWUP_SEQUENCE_TYPES = frozenset(
+    {
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+    }
 )
 
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
@@ -1442,6 +1477,17 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "is_restartable": 0,
         },
         {
+            "sequence_type": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            "display_name": "Agreement Follow-up v1",
+            "description": (
+                "Send the retailer agreement PDF immediately, then three email follow-ups "
+                "every two business days until the member returns the signed agreement."
+            ),
+            "is_restartable": 0,
+            "figures_mode": FIGURES_MODE_NONE,
+            "stop_on": json.dumps(["agreement_signed", "negative_sentiment_stop"]),
+        },
+        {
             "sequence_type": "solar_panel_cleaning_followup_v1",
             "display_name": "Solar Panel Cleaning Follow-up v1",
             "description": "Outreach cadence (email, voice, SMS) after solar cleaning quote sent.",
@@ -1460,6 +1506,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
         (0, 1, "email", "09:00"),
         (1, 2, "email", "09:00"),
         (2, 3, "email", "09:00"),
+    ]
+    agreement_followup_step_defaults = [
+        (0, 1, "email", "09:00"),
+        (1, 3, "email", "09:00"),
+        (2, 5, "email", "09:00"),
+        (3, 7, "email", "09:00"),
     ]
     solar_followup_step_defaults = step_defaults
     changed = False
@@ -1480,16 +1532,28 @@ def ensure_default_sequence_templates(db: Session) -> None:
             timezone=AUTONOMOUS_SCHEDULE_TZ,
             is_active=1,
             is_restartable=d["is_restartable"],
+            figures_mode=d.get("figures_mode"),
+            stop_on=d.get("stop_on"),
         )
         db.add(t)
         db.flush()
         if d["sequence_type"] == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
             steps_for_template = solar_engagement_step_defaults
+        elif d["sequence_type"] == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            steps_for_template = agreement_followup_step_defaults
         elif d["sequence_type"] == "solar_panel_cleaning_followup_v1":
             steps_for_template = solar_followup_step_defaults
         else:
             steps_for_template = step_defaults
+        agreement_prompts = (
+            AGREEMENT_FOLLOWUP_STEP_PROMPTS
+            if d["sequence_type"] == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE
+            else None
+        )
         for idx, day_num, channel, hhmm in steps_for_template:
+            prompt_text = None
+            if agreement_prompts and idx < len(agreement_prompts):
+                prompt_text = agreement_prompts[idx]
             db.add(
                 AutonomousSequenceTemplateStep(
                     template_id=t.id,
@@ -1497,7 +1561,7 @@ def ensure_default_sequence_templates(db: Session) -> None:
                     day_number=day_num,
                     channel=channel,
                     send_time_local=hhmm,
-                    prompt_text=None,
+                    prompt_text=prompt_text,
                     retell_agent_id=None,
                     is_active=1,
                 )
@@ -1512,6 +1576,8 @@ def ensure_default_sequence_templates(db: Session) -> None:
     elif sync_solar_engagement_step_prompts_only(db):
         db.commit()
     if ensure_solar_engagement_type_prompts(db):
+        db.commit()
+    if ensure_agreement_followup_type_prompts(db):
         db.commit()
 
     # Bootstrap templates from existing run data where needed.
@@ -1688,6 +1754,39 @@ def ensure_solar_engagement_type_prompts(db: Session) -> bool:
     return True
 
 
+def ensure_agreement_followup_type_prompts(db: Session) -> bool:
+    """Seed / refresh autonomous_sequence_type prompts for agreement signing follow-ups."""
+    ensure_autonomous_sequence_type_row(db, AGREEMENT_FOLLOWUP_SEQUENCE_TYPE)
+    insp = inspect(db.bind)
+    tables = _reflect_table_names(insp, db.bind)
+    if "autonomous_sequence_type" not in tables:
+        return False
+    ast_tbl = _qualified_table(db.bind, "autonomous_sequence_type")
+    row = db.execute(
+        text(f"SELECT system_prompt, email_example FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE},
+    ).mappings().first()
+    if not row:
+        return False
+    cur_sys = str(row.get("system_prompt") or "")
+    cur_email = str(row.get("email_example") or "")
+    if cur_sys.strip() and cur_email.strip():
+        return False
+    db.execute(
+        text(
+            f"UPDATE {ast_tbl} SET system_prompt = :system_prompt, email_example = :email_example "
+            "WHERE sequence_type = :st"
+        ),
+        {
+            "st": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            "system_prompt": AGREEMENT_FOLLOWUP_SYSTEM_PROMPT,
+            "email_example": AGREEMENT_FOLLOWUP_EMAIL_EXAMPLE,
+        },
+    )
+    logger.info("Updated agreement follow-up type prompts in autonomous_sequence_type")
+    return True
+
+
 def sync_solar_engagement_step_prompts_only(db: Session) -> bool:
     """Update step prompt_text on existing 3-step template without resetting schedules."""
     tpl = get_sequence_template_by_type(db, SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE)
@@ -1725,14 +1824,17 @@ def _prepare_email_context(
     if thread_id:
         out["gmail_thread_id"] = thread_id
         out["thread_id"] = thread_id
-    if run.sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if run.sequence_type in SIGNING_FOLLOWUP_SEQUENCE_TYPES:
         out["reply_in_thread"] = True
         out["omit_validity"] = True
         out["omit_document_links"] = True
         out.pop("offer_validity_date", None)
         out.pop("offer_valid_until", None)
         out.pop("offer_validity_days", None)
-        out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        if run.sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+            out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        elif run.sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            out.setdefault("initial_email_subject", AGREEMENT_FOLLOWUP_INITIAL_SUBJECT)
     out["signature_html"] = _resolve_signature_html(run.sequence_type, template, out)
     out["use_html_signature"] = True
     extra = _resolve_extra_context(template, out)
@@ -1997,14 +2099,17 @@ def start_gas_base2_sequence(
     anchor_utc = _to_utc_naive(anchor_at)
     context_payload = dict(context or {})
     run_validity_date: Optional[date] = None
-    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if sequence_type in SIGNING_FOLLOWUP_SEQUENCE_TYPES:
         context_payload.pop("offer_validity_date", None)
         context_payload.pop("offer_valid_until", None)
         context_payload.pop("offer_validity_days", None)
         context_payload.setdefault("reply_in_thread", True)
         context_payload.setdefault("omit_validity", True)
         context_payload.setdefault("omit_document_links", True)
-        context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+            context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        elif sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            context_payload.setdefault("initial_email_subject", AGREEMENT_FOLLOWUP_INITIAL_SUBJECT)
     else:
         validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
         if validity_raw:
