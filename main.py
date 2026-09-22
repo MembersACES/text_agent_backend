@@ -418,6 +418,9 @@ def on_startup() -> None:
         db = SessionLocal()
         try:
             ensure_default_sequence_templates(db)
+            from services.agreement_followup import ensure_agreement_followup_types
+
+            ensure_agreement_followup_types(db)
         finally:
             db.close()
     except Exception:

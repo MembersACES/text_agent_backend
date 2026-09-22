@@ -19,6 +19,8 @@ from models import (
 )
 from services.agreement_followup import (
     AgreementFollowupError,
+    create_agreement_type,
+    list_agreement_types,
     render_first_touch,
     resolve_agreement_type,
     start_agreement_followup,
@@ -85,16 +87,32 @@ def _client(db) -> Client:
 
 
 def test_resolve_agreement_type_accepts_label_or_id():
-    assert resolve_agreement_type("Alinta C&I Gas")["id"] == "alinta_ci_gas"
-    assert resolve_agreement_type("alinta_sme_electricity")["label"] == "Alinta SME Electricity"
+    db = _db()
+    assert resolve_agreement_type(db, "Alinta C&I Gas")["id"] == "alinta_ci_gas"
+    assert resolve_agreement_type(db, "alinta_sme_electricity")["label"] == "Alinta SME Electricity"
 
 
 def test_resolve_agreement_type_rejects_unknown():
+    db = _db()
     try:
-        resolve_agreement_type("Origin C&I Gas")
+        resolve_agreement_type(db, "Origin C&I Gas")
         raise AssertionError("expected error")
     except AgreementFollowupError as exc:
         assert "Unknown" in str(exc)
+
+
+def test_staff_can_add_a_new_agreement_type():
+    db = _db()
+    created = create_agreement_type(
+        db,
+        label="Origin C&I Gas",
+        utility_type="C&I Gas",
+        retailer="Origin",
+    )
+    assert created["id"] == "origin_c_i_gas"
+    ids = [row["id"] for row in list_agreement_types(db)]
+    assert "origin_c_i_gas" in ids
+    assert resolve_agreement_type(db, "Origin C&I Gas")["utility_type"] == "C&I Gas"
 
 
 def test_first_touch_names_the_agreement():

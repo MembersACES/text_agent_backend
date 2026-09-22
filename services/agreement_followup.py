@@ -10,10 +10,10 @@ from html import escape
 from typing import Any
 
 import httpx
-from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from crm_enums import OfferActivityType, OfferStatus
-from models import Client, Offer
+from models import AgreementFollowupType, Client, Offer
 from services.autonomous_sequence import (
     AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
     ACES_TEAM_FOLLOWUP_SIGNATURE_HTML,
@@ -28,31 +28,45 @@ logger = logging.getLogger(__name__)
 N8N_AGREEMENT_FOLLOWUP_URL = os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL", "").strip()
 MAX_PDF_BYTES = 15 * 1024 * 1024
 
-AGREEMENT_TYPES: tuple[dict[str, str], ...] = (
+UTILITY_TYPES: tuple[str, ...] = (
+    "C&I Gas",
+    "C&I Electricity",
+    "SME Gas",
+    "SME Electricity",
+    "Waste",
+    "Oil",
+    "DMA",
+    "Other",
+)
+
+SEED_AGREEMENT_TYPES: tuple[dict[str, str], ...] = (
     {
         "id": "alinta_ci_gas",
         "label": "Alinta C&I Gas",
         "utility_type": "C&I Gas",
+        "retailer": "Alinta",
     },
     {
         "id": "alinta_ci_electricity",
         "label": "Alinta C&I Electricity",
         "utility_type": "C&I Electricity",
+        "retailer": "Alinta",
     },
     {
         "id": "alinta_sme_gas",
         "label": "Alinta SME Gas",
         "utility_type": "SME Gas",
+        "retailer": "Alinta",
     },
     {
         "id": "alinta_sme_electricity",
         "label": "Alinta SME Electricity",
         "utility_type": "SME Electricity",
+        "retailer": "Alinta",
     },
 )
 
-_AGREEMENT_BY_ID = {row["id"]: row for row in AGREEMENT_TYPES}
-_AGREEMENT_BY_LABEL = {row["label"].lower(): row for row in AGREEMENT_TYPES}
+AGREEMENT_TYPES = SEED_AGREEMENT_TYPES
 
 
 class AgreementFollowupError(Exception):
@@ -61,15 +75,177 @@ class AgreementFollowupError(Exception):
         self.status_code = status_code
 
 
-def resolve_agreement_type(raw: str) -> dict[str, str]:
+def slugify_agreement_type(label: str) -> str:
+    text = re.sub(r"[^a-z0-9]+", "_", (label or "").strip().lower()).strip("_")
+    if not text:
+        raise AgreementFollowupError("Type name must include at least one letter or number")
+    if not text[0].isalpha():
+        text = f"type_{text}"
+    return text[:80]
+
+
+def _type_to_dict(row: AgreementFollowupType) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "label": row.label,
+        "utility_type": row.utility_type,
+        "retailer": (row.retailer or "").strip(),
+        "default_subject": row.default_subject or "",
+        "default_body": row.default_body or "",
+        "is_active": bool(row.is_active),
+        "sort_order": int(row.sort_order or 0),
+    }
+
+
+def ensure_agreement_followup_types(db: Session) -> None:
+    existing = {row.id for row in db.query(AgreementFollowupType).all()}
+    added = False
+    for index, seed in enumerate(SEED_AGREEMENT_TYPES):
+        if seed["id"] in existing:
+            continue
+        db.add(
+            AgreementFollowupType(
+                id=seed["id"],
+                label=seed["label"],
+                utility_type=seed["utility_type"],
+                retailer=seed.get("retailer") or "",
+                is_active=1,
+                sort_order=index,
+            )
+        )
+        added = True
+    if added:
+        db.commit()
+
+
+def list_agreement_types(db: Session, include_inactive: bool = False) -> list[dict[str, Any]]:
+    ensure_agreement_followup_types(db)
+    q = db.query(AgreementFollowupType)
+    if not include_inactive:
+        q = q.filter(AgreementFollowupType.is_active == 1)
+    rows = q.order_by(AgreementFollowupType.sort_order, AgreementFollowupType.label).all()
+    return [_type_to_dict(row) for row in rows]
+
+
+def resolve_agreement_type(db: Session, raw: str) -> dict[str, Any]:
+    ensure_agreement_followup_types(db)
     key = (raw or "").strip()
     if not key:
         raise AgreementFollowupError("agreement_type is required")
-    found = _AGREEMENT_BY_ID.get(key) or _AGREEMENT_BY_LABEL.get(key.lower())
-    if not found:
-        allowed = ", ".join(row["label"] for row in AGREEMENT_TYPES)
+    row = (
+        db.query(AgreementFollowupType)
+        .filter(AgreementFollowupType.id == key)
+        .first()
+    )
+    if row is None:
+        row = (
+            db.query(AgreementFollowupType)
+            .filter(AgreementFollowupType.label.ilike(key))
+            .first()
+        )
+    if row is None:
+        allowed = ", ".join(item["label"] for item in list_agreement_types(db))
         raise AgreementFollowupError(f"Unknown agreement type. Use one of: {allowed}")
-    return found
+    return _type_to_dict(row)
+
+
+def create_agreement_type(
+    db: Session,
+    *,
+    label: str,
+    utility_type: str,
+    retailer: str = "",
+    default_subject: str = "",
+    default_body: str = "",
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    ensure_agreement_followup_types(db)
+    name = (label or "").strip()
+    if not name:
+        raise AgreementFollowupError("Type name is required")
+    utility = (utility_type or "").strip()
+    if utility not in UTILITY_TYPES:
+        raise AgreementFollowupError(f"utility_type must be one of: {', '.join(UTILITY_TYPES)}")
+    slug = slugify_agreement_type(name)
+    clash = (
+        db.query(AgreementFollowupType)
+        .filter(
+            or_(
+                AgreementFollowupType.id == slug,
+                AgreementFollowupType.label.ilike(name),
+            )
+        )
+        .first()
+    )
+    if clash:
+        raise AgreementFollowupError(f"A type named {clash.label} already exists")
+    max_order = db.query(AgreementFollowupType.sort_order).order_by(
+        AgreementFollowupType.sort_order.desc()
+    ).first()
+    next_order = int((max_order[0] if max_order else 0) or 0) + 1
+    row = AgreementFollowupType(
+        id=slug,
+        label=name,
+        utility_type=utility,
+        retailer=(retailer or "").strip(),
+        default_subject=(default_subject or "").strip() or None,
+        default_body=(default_body or "").strip() or None,
+        is_active=1,
+        sort_order=next_order,
+        created_by=created_by,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _type_to_dict(row)
+
+
+def update_agreement_type(
+    db: Session,
+    type_id: str,
+    *,
+    label: str | None = None,
+    utility_type: str | None = None,
+    retailer: str | None = None,
+    default_subject: str | None = None,
+    default_body: str | None = None,
+    is_active: bool | None = None,
+) -> dict[str, Any]:
+    ensure_agreement_followup_types(db)
+    row = db.query(AgreementFollowupType).filter(AgreementFollowupType.id == type_id).first()
+    if not row:
+        raise AgreementFollowupError("Agreement type not found", 404)
+    if label is not None:
+        name = label.strip()
+        if not name:
+            raise AgreementFollowupError("Type name is required")
+        clash = (
+            db.query(AgreementFollowupType)
+            .filter(
+                AgreementFollowupType.label.ilike(name),
+                AgreementFollowupType.id != type_id,
+            )
+            .first()
+        )
+        if clash:
+            raise AgreementFollowupError(f"A type named {clash.label} already exists")
+        row.label = name
+    if utility_type is not None:
+        utility = utility_type.strip()
+        if utility not in UTILITY_TYPES:
+            raise AgreementFollowupError(f"utility_type must be one of: {', '.join(UTILITY_TYPES)}")
+        row.utility_type = utility
+    if retailer is not None:
+        row.retailer = retailer.strip()
+    if default_subject is not None:
+        row.default_subject = default_subject.strip() or None
+    if default_body is not None:
+        row.default_body = default_body.strip() or None
+    if is_active is not None:
+        row.is_active = 1 if is_active else 0
+    db.commit()
+    db.refresh(row)
+    return _type_to_dict(row)
 
 
 def greeting_first_name(contact_name: str) -> str:
@@ -77,6 +253,25 @@ def greeting_first_name(contact_name: str) -> str:
     if not raw:
         return "there"
     return raw.split()[0] or "there"
+
+
+def fill_copy_template(
+    template: str,
+    *,
+    first_name: str,
+    business_name: str,
+    agreement_label: str,
+) -> str:
+    return (
+        (template or "")
+        .replace("{{first_name}}", first_name)
+        .replace("{{contact_name}}", first_name)
+        .replace("{{business_name}}", business_name)
+        .replace("{{agreement_label}}", agreement_label)
+        .replace("{{label}}", agreement_label)
+    )
+    company = (business_name or "").strip() or "your business"
+    return f"{agreement_label} ready for signing — {company}"
 
 
 def first_touch_subject(*, agreement_label: str, business_name: str) -> str:
@@ -129,13 +324,29 @@ def render_first_touch(
     subject: str | None = None,
     body_text: str | None = None,
     signature_html: str | None = None,
+    template_subject: str | None = None,
+    template_body: str | None = None,
 ) -> tuple[str, str, str, str]:
     sig = (signature_html or "").strip() or ACES_TEAM_FOLLOWUP_SIGNATURE_HTML
-    resolved_subject = (subject or "").strip() or first_touch_subject(
+    first_name = greeting_first_name(contact_name)
+    company = (business_name or "").strip() or "your business"
+    filled_subject = fill_copy_template(
+        template_subject or "",
+        first_name=first_name,
+        business_name=company,
+        agreement_label=agreement_label,
+    )
+    filled_body = fill_copy_template(
+        template_body or "",
+        first_name=first_name,
+        business_name=company,
+        agreement_label=agreement_label,
+    )
+    resolved_subject = (subject or "").strip() or filled_subject or first_touch_subject(
         agreement_label=agreement_label,
         business_name=business_name,
     )
-    resolved_body = (body_text or "").strip() or first_touch_body_text(
+    resolved_body = (body_text or "").strip() or filled_body or first_touch_body_text(
         agreement_label=agreement_label,
         business_name=business_name,
         contact_name=contact_name,
@@ -334,7 +545,7 @@ def start_agreement_followup(
     if not client:
         raise AgreementFollowupError("Member not found", 404)
 
-    agreement = resolve_agreement_type(agreement_type_raw)
+    agreement = resolve_agreement_type(db, agreement_type_raw)
     loa = loa_contact_for_business(client.business_name)
     display_name = (contact_name or "").strip() or loa["contact_name"]
     phone = (contact_phone or "").strip() or loa["contact_phone"]
@@ -397,6 +608,8 @@ def start_agreement_followup(
         contact_name=display_name,
         subject=subject,
         body_text=body_text,
+        template_subject=str(agreement.get("default_subject") or ""),
+        template_body=str(agreement.get("default_body") or ""),
     )
     upload_name = _safe_pdf_filename(filename, agreement["label"], business_name)
 

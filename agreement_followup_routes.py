@@ -3,27 +3,93 @@
 from __future__ import annotations
 
 from fastapi import Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db
 from services.agreement_followup import (
-    AGREEMENT_TYPES,
+    UTILITY_TYPES,
     AgreementFollowupError,
+    create_agreement_type,
+    list_agreement_types,
     loa_contact_for_business,
     render_first_touch,
     resolve_agreement_type,
     start_agreement_followup,
+    update_agreement_type,
 )
 from models import Client
 
 
+class AgreementTypeCreateBody(BaseModel):
+    label: str
+    utility_type: str
+    retailer: str = ""
+    default_subject: str = ""
+    default_body: str = ""
+
+
+class AgreementTypeUpdateBody(BaseModel):
+    label: str | None = None
+    utility_type: str | None = None
+    retailer: str | None = None
+    default_subject: str | None = None
+    default_body: str | None = None
+    is_active: bool | None = None
+
+
 def register_agreement_followup_routes(app, get_current_user):
     @app.get("/api/autonomous/agreement-followup/types")
-    def list_agreement_types(
+    def list_agreement_types_route(
+        include_inactive: bool = False,
         db: Session = Depends(get_db),
         user_data: dict = Depends(get_current_user),
     ):
-        return {"items": list(AGREEMENT_TYPES)}
+        return {
+            "items": list_agreement_types(db, include_inactive=include_inactive),
+            "utility_types": list(UTILITY_TYPES),
+        }
+
+    @app.post("/api/autonomous/agreement-followup/types")
+    def create_agreement_type_route(
+        body: AgreementTypeCreateBody,
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user),
+    ):
+        created_by = ((user_data or {}).get("idinfo") or {}).get("email")
+        try:
+            return create_agreement_type(
+                db,
+                label=body.label,
+                utility_type=body.utility_type,
+                retailer=body.retailer,
+                default_subject=body.default_subject,
+                default_body=body.default_body,
+                created_by=created_by,
+            )
+        except AgreementFollowupError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    @app.patch("/api/autonomous/agreement-followup/types/{type_id}")
+    def update_agreement_type_route(
+        type_id: str,
+        body: AgreementTypeUpdateBody,
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user),
+    ):
+        try:
+            return update_agreement_type(
+                db,
+                type_id,
+                label=body.label,
+                utility_type=body.utility_type,
+                retailer=body.retailer,
+                default_subject=body.default_subject,
+                default_body=body.default_body,
+                is_active=body.is_active,
+            )
+        except AgreementFollowupError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @app.get("/api/clients/{client_id}/contact-defaults")
     def client_contact_defaults(
@@ -52,13 +118,15 @@ def register_agreement_followup_routes(app, get_current_user):
         user_data: dict = Depends(get_current_user),
     ):
         try:
-            agreement = resolve_agreement_type(agreement_type)
+            agreement = resolve_agreement_type(db, agreement_type)
         except AgreementFollowupError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         subject, body_text, html, text = render_first_touch(
             agreement_label=agreement["label"],
             business_name=business_name,
             contact_name=contact_name,
+            template_subject=str(agreement.get("default_subject") or ""),
+            template_body=str(agreement.get("default_body") or ""),
         )
         return {
             "agreement_type": agreement["id"],
