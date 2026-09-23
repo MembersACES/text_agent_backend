@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -13,12 +15,15 @@ from services.agreement_followup import (
     create_agreement_type,
     list_agreement_types,
     loa_contact_for_business,
+    purge_agreement_followup_test_stubs,
     render_first_touch,
     resolve_agreement_type,
     start_agreement_followup,
     update_agreement_type,
 )
 from models import Client
+
+logger = logging.getLogger(__name__)
 
 
 class AgreementTypeCreateBody(BaseModel):
@@ -68,6 +73,13 @@ def register_agreement_followup_routes(app, get_current_user):
                 created_by=created_by,
             )
         except AgreementFollowupError as exc:
+            logger.warning(
+                "agreement-followup type create rejected status=%s label=%r utility=%r: %s",
+                exc.status_code,
+                body.label,
+                body.utility_type,
+                exc,
+            )
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @app.patch("/api/autonomous/agreement-followup/types/{type_id}")
@@ -148,12 +160,14 @@ def register_agreement_followup_routes(app, get_current_user):
         contact_phone: str = Form(""),
         subject: str = Form(""),
         body_text: str = Form(""),
+        test_mode: str = Form("false"),
         db: Session = Depends(get_db),
         user_data: dict = Depends(get_current_user),
     ):
         created_by = ((user_data or {}).get("idinfo") or {}).get("email")
+        is_test = str(test_mode or "").strip().lower() in {"1", "true", "yes", "on"}
         parsed_offer_id: int | None = None
-        if offer_id is not None and str(offer_id).strip():
+        if not is_test and offer_id is not None and str(offer_id).strip():
             try:
                 parsed_offer_id = int(str(offer_id).strip())
             except ValueError:
@@ -174,6 +188,14 @@ def register_agreement_followup_routes(app, get_current_user):
                 subject=subject or "",
                 body_text=body_text or "",
                 created_by=created_by,
+                test_mode=is_test,
             )
         except AgreementFollowupError as exc:
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    @app.post("/api/autonomous/agreement-followup/test-stubs/purge")
+    def purge_agreement_followup_test_stubs_route(
+        db: Session = Depends(get_db),
+        user_data: dict = Depends(get_current_user),
+    ):
+        return {"ok": True, **purge_agreement_followup_test_stubs(db)}

@@ -7,13 +7,24 @@ import os
 import re
 from datetime import datetime, timezone
 from html import escape
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 from sqlalchemy import or_
+from sqlalchemy.orm import Session
 
 from crm_enums import OfferActivityType, OfferStatus
-from models import AgreementFollowupType, Client, Offer
+from models import (
+    AgreementFollowupType,
+    AutonomousSequenceEvent,
+    AutonomousSequenceRun,
+    AutonomousSequenceStep,
+    Campaign,
+    Client,
+    Offer,
+    OfferActivity,
+    StrategyItem,
+)
 from services.autonomous_sequence import (
     AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
     ACES_TEAM_FOLLOWUP_SIGNATURE_HTML,
@@ -27,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 N8N_AGREEMENT_FOLLOWUP_URL = os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL", "").strip()
 MAX_PDF_BYTES = 15 * 1024 * 1024
+
+
+def agreement_followup_webhook_url() -> str:
+    return (os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL") or N8N_AGREEMENT_FOLLOWUP_URL or "").strip()
+
+
+AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME = "Agreement Follow Up — test stubs"
+AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER = "agreement_followup_test_stub"
 
 UTILITY_TYPES: tuple[str, ...] = (
     "C&I Gas",
@@ -178,7 +197,14 @@ def create_agreement_type(
         .first()
     )
     if clash:
-        raise AgreementFollowupError(f"A type named {clash.label} already exists")
+        if not bool(clash.is_active):
+            raise AgreementFollowupError(
+                f"“{clash.label}” already exists but is hidden. Use Show on that row "
+                "instead of creating a duplicate."
+            )
+        raise AgreementFollowupError(
+            f"A type named {clash.label} already exists. Pick a different name, or use the existing tile."
+        )
     max_order = db.query(AgreementFollowupType.sort_order).order_by(
         AgreementFollowupType.sort_order.desc()
     ).first()
@@ -445,22 +471,13 @@ def send_agreement_first_touch_email(
     offer_id: int | None,
     client_id: int | None,
 ) -> dict[str, Any]:
-    if not N8N_AGREEMENT_FOLLOWUP_URL:
-        logger.info(
-            "[agreement-followup] webhook not set; placeholder to=%s file=%s",
-            to,
-            filename,
+    webhook_url = agreement_followup_webhook_url()
+    if not webhook_url:
+        raise AgreementFollowupError(
+            "The agreement email was not sent: N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL is empty "
+            "on this process. No sequence was started.",
+            502,
         )
-        return {
-            "ok": True,
-            "mode": "placeholder",
-            "payload": {
-                "to": to,
-                "subject": subject,
-                "filename": filename,
-                "agreement_type": agreement_type,
-            },
-        }
 
     form = {
         "channel": "email",
@@ -487,34 +504,176 @@ def send_agreement_first_touch_email(
         )
     }
     with httpx.Client(timeout=90.0) as client:
-        response = client.post(N8N_AGREEMENT_FOLLOWUP_URL, data=form, files=files)
+        response = client.post(webhook_url, data=form, files=files)
         response.raise_for_status()
         try:
-            return {"ok": True, "response": response.json()}
-        except Exception:
-            return {"ok": True, "response_text": response.text[:2000]}
+            body = response.json()
+        except Exception as exc:
+            raise AgreementFollowupError(
+                "The agreement webhook returned HTTP "
+                f"{response.status_code} but not JSON, so Gmail ids could not be confirmed. "
+                "No sequence was started.",
+                502,
+            ) from exc
+        if not isinstance(body, (dict, list)):
+            raise AgreementFollowupError(
+                "The agreement webhook JSON was empty, so the send was not confirmed. "
+                "No sequence was started.",
+                502,
+            )
+        return {"ok": True, "mode": "n8n", "response": body}
 
 
-def _complete_first_email_step(db: Session, run_id: int) -> None:
-    from models import AutonomousSequenceStep
-
-    step = (
-        db.query(AutonomousSequenceStep)
-        .filter(
-            AutonomousSequenceStep.run_id == run_id,
-            AutonomousSequenceStep.step_index == 0,
+def _require_delivered_first_touch(n8n_result: Any) -> tuple[str | None, str | None]:
+    if not isinstance(n8n_result, dict) or not n8n_result.get("ok"):
+        raise AgreementFollowupError(
+            "The agreement email was not sent (no webhook result). No sequence was started.",
+            502,
         )
+    if n8n_result.get("mode") == "placeholder":
+        raise AgreementFollowupError(
+            "The agreement email was not sent: the webhook was skipped (placeholder). "
+            "No sequence was started.",
+            502,
+        )
+    webhook_body = n8n_result.get("response")
+    email_id = extract_email_id_from_webhook_response(webhook_body)
+    thread_id = extract_thread_id_from_webhook_response(webhook_body)
+    if not email_id and not thread_id:
+        raise AgreementFollowupError(
+            "The agreement webhook did not return Gmail email_id or thread_id, so the send "
+            "was not confirmed. No sequence was started. Check the n8n Respond node.",
+            502,
+        )
+    return email_id, thread_id
+
+
+def _insert_completed_first_touch_step(
+    db: Session,
+    run_id: int,
+    *,
+    to: str,
+    filename: str,
+    email_id: str | None,
+) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    existing = (
+        db.query(AutonomousSequenceStep)
+        .filter(AutonomousSequenceStep.run_id == run_id)
+        .order_by(AutonomousSequenceStep.step_index.desc())
+        .all()
+    )
+    for step in existing:
+        step.step_index += 1
+    db.flush()
+    db.add(
+        AutonomousSequenceStep(
+            run_id=run_id,
+            step_index=0,
+            day_number=0,
+            channel="email",
+            offset_minutes_from_day_start=0,
+            step_status="completed",
+            scheduled_at=now,
+            started_at=now,
+            completed_at=now,
+            last_outcome_summary=(
+                f"First-touch PDF sent to {to} ({filename})"
+                + (f"; email_id={email_id}" if email_id else "")
+            ),
+        )
+    )
+    db.commit()
+
+
+def is_agreement_followup_test_offer(offer: Offer | None) -> bool:
+    if offer is None:
+        return False
+    if (offer.identifier or "").strip() == AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER:
+        return True
+    campaign = getattr(offer, "campaign", None)
+    if campaign is not None and (getattr(campaign, "name", None) or "") == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME:
+        return True
+    return False
+
+
+def ensure_agreement_followup_test_campaign(db: Session) -> Campaign:
+    row = (
+        db.query(Campaign)
+        .filter(Campaign.name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME)
         .first()
     )
-    if not step or (step.channel or "").strip().lower() != "email":
-        return
-    if step.step_status in {"ready", "to_start"}:
-        step.step_status = "completed"
-        step.completed_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        step.last_outcome_summary = (
-            "agreement follow-up first-touch sent with PDF attachment (not LLM-drafted)"
+    if row:
+        return row
+    row = Campaign(
+        name=AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
+        sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+        status="draft",
+        archived=1,
+        provenance_note="Hidden stub campaign for Agreement Follow Up test sends. Not a real outbound campaign.",
+        created_by="system",
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _create_test_stub_offer(
+    db: Session,
+    *,
+    business_name: str,
+    utility_type: str,
+    agreement_label: str,
+    created_by: str | None,
+) -> Offer:
+    campaign = ensure_agreement_followup_test_campaign(db)
+    offer = Offer(
+        client_id=None,
+        business_name=business_name,
+        utility_type=utility_type,
+        utility_type_identifier=agreement_label,
+        identifier=AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER,
+        status=OfferStatus.AUTONOMOUS_AGENT_TRIGGER.value,
+        campaign_id=campaign.id,
+        created_by=created_by,
+    )
+    db.add(offer)
+    db.flush()
+    return offer
+
+
+def purge_agreement_followup_test_stubs(db: Session) -> dict[str, int]:
+    campaign = (
+        db.query(Campaign)
+        .filter(Campaign.name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME)
+        .first()
+    )
+    if not campaign:
+        return {"offers": 0, "runs": 0, "campaign_id": 0}
+    offer_ids = [row.id for row in db.query(Offer.id).filter(Offer.campaign_id == campaign.id).all()]
+    if not offer_ids:
+        return {"offers": 0, "runs": 0, "campaign_id": campaign.id}
+    run_ids = [
+        row.id
+        for row in db.query(AutonomousSequenceRun.id)
+        .filter(AutonomousSequenceRun.offer_id.in_(offer_ids))
+        .all()
+    ]
+    if run_ids:
+        db.query(AutonomousSequenceEvent).filter(
+            AutonomousSequenceEvent.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceStep).filter(
+            AutonomousSequenceStep.run_id.in_(run_ids)
+        ).delete(synchronize_session=False)
+        db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id.in_(run_ids)).delete(
+            synchronize_session=False
         )
-        db.commit()
+    db.query(StrategyItem).filter(StrategyItem.offer_id.in_(offer_ids)).delete(synchronize_session=False)
+    db.query(OfferActivity).filter(OfferActivity.offer_id.in_(offer_ids)).delete(synchronize_session=False)
+    db.query(Offer).filter(Offer.id.in_(offer_ids)).delete(synchronize_session=False)
+    db.commit()
+    return {"offers": len(offer_ids), "runs": len(run_ids), "campaign_id": campaign.id}
 
 
 def _safe_pdf_filename(filename: str, agreement_label: str, business_name: str) -> str:
@@ -540,6 +699,7 @@ def start_agreement_followup(
     subject: str = "",
     body_text: str = "",
     created_by: str | None = None,
+    test_mode: bool = False,
 ) -> dict[str, Any]:
     client = db.query(Client).filter(Client.id == client_id).first()
     if not client:
@@ -561,10 +721,26 @@ def start_agreement_followup(
 
     offer: Offer | None = None
     created_offer = False
-    if offer_id is not None:
+    if test_mode:
+        offer = _create_test_stub_offer(
+            db,
+            business_name=client.business_name,
+            utility_type=agreement["utility_type"],
+            agreement_label=agreement["label"],
+            created_by=created_by,
+        )
+        created_offer = True
+        db.commit()
+        db.refresh(offer)
+    elif offer_id is not None:
         offer = db.query(Offer).filter(Offer.id == offer_id, Offer.client_id == client_id).first()
         if not offer:
             raise AgreementFollowupError("Offer not found for this member", 404)
+        if is_agreement_followup_test_offer(offer):
+            raise AgreementFollowupError(
+                "That offer is a test stub. Use test mode for another throwaway send, "
+                "or pick a real CRM offer."
+            )
     else:
         offer = Offer(
             client_id=client.id,
@@ -578,8 +754,8 @@ def start_agreement_followup(
         db.add(offer)
         db.flush()
         created_offer = True
-
-    from models import AutonomousSequenceRun
+        db.commit()
+        db.refresh(offer)
 
     existing = (
         db.query(AutonomousSequenceRun)
@@ -597,7 +773,7 @@ def start_agreement_followup(
             409,
         )
 
-    if offer.status not in {OfferStatus.ACCEPTED.value, OfferStatus.LOST.value}:
+    if not test_mode and offer.status not in {OfferStatus.ACCEPTED.value, OfferStatus.LOST.value}:
         offer.status = OfferStatus.AUTONOMOUS_AGENT_TRIGGER.value
 
     business_name = (offer.business_name or client.business_name or "").strip()
@@ -611,7 +787,22 @@ def start_agreement_followup(
         template_subject=str(agreement.get("default_subject") or ""),
         template_body=str(agreement.get("default_body") or ""),
     )
+    if test_mode and not subject.upper().startswith("[TEST]"):
+        subject = f"[TEST] {subject}"
+        html = wrap_first_touch_html(_body, ACES_TEAM_FOLLOWUP_SIGNATURE_HTML)
+        text = html_to_plain_text(html)
     upload_name = _safe_pdf_filename(filename, agreement["label"], business_name)
+
+    def _abort_without_run(exc: BaseException) -> NoReturn:
+        if created_offer:
+            db.delete(offer)
+            db.commit()
+        if isinstance(exc, AgreementFollowupError):
+            raise exc
+        raise AgreementFollowupError(
+            "Could not send the agreement email via n8n. No sequence was started.",
+            502,
+        ) from exc
 
     try:
         n8n_result = send_agreement_first_touch_email(
@@ -625,51 +816,43 @@ def start_agreement_followup(
             agreement_label=agreement["label"],
             business_name=business_name,
             offer_id=offer.id,
-            client_id=client.id,
+            client_id=None if test_mode else client.id,
         )
-    except httpx.HTTPError as exc:
+        email_id, thread_id = _require_delivered_first_touch(n8n_result)
+    except AgreementFollowupError as exc:
+        logger.exception("agreement follow-up first-touch rejected client_id=%s", client.id)
+        _abort_without_run(exc)
+    except (httpx.HTTPError, httpx.RequestError) as exc:
         logger.exception("agreement follow-up first-touch n8n failed client_id=%s", client.id)
-        raise AgreementFollowupError(
-            "Could not send the agreement email via n8n. Check N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL.",
-            502,
-        ) from exc
+        _abort_without_run(exc)
 
-    webhook_body = n8n_result.get("response") if isinstance(n8n_result, dict) else n8n_result
-    email_id = extract_email_id_from_webhook_response(webhook_body)
-    thread_id = extract_thread_id_from_webhook_response(webhook_body)
-    if not email_id:
-        logger.warning(
-            "[agreement-followup] n8n returned no email_id client_id=%s offer_id=%s to=%s",
-            client.id,
-            offer.id,
-            to,
+    activity = None
+    if not test_mode:
+        create_offer_activity(
+            db,
+            offer=offer,
+            client=client,
+            activity_type=OfferActivityType.CONTRACT_RECEIVED,
+            metadata={
+                "agreement_type": agreement["id"],
+                "agreement_label": agreement["label"],
+                "filename": upload_name,
+            },
+            created_by=created_by,
         )
-
-    create_offer_activity(
-        db,
-        offer=offer,
-        client=client,
-        activity_type=OfferActivityType.CONTRACT_RECEIVED,
-        metadata={
-            "agreement_type": agreement["id"],
-            "agreement_label": agreement["label"],
-            "filename": upload_name,
-        },
-        created_by=created_by,
-    )
-    activity = create_offer_activity(
-        db,
-        offer=offer,
-        client=client,
-        activity_type=OfferActivityType.CONTRACT_SENT_FOR_SIGNING,
-        metadata={
-            "agreement_type": agreement["id"],
-            "agreement_label": agreement["label"],
-            "filename": upload_name,
-            "to": to,
-        },
-        created_by=created_by,
-    )
+        activity = create_offer_activity(
+            db,
+            offer=offer,
+            client=client,
+            activity_type=OfferActivityType.CONTRACT_SENT_FOR_SIGNING,
+            metadata={
+                "agreement_type": agreement["id"],
+                "agreement_label": agreement["label"],
+                "filename": upload_name,
+                "to": to,
+            },
+            created_by=created_by,
+        )
 
     context: dict[str, Any] = {
         "business_name": business_name,
@@ -689,6 +872,9 @@ def start_agreement_followup(
         "initial_email_subject": subject,
         "signature_html": ACES_TEAM_FOLLOWUP_SIGNATURE_HTML,
     }
+    if test_mode:
+        context["agreement_test"] = True
+        context["dashboard_test"] = True
     if email_id:
         context["email_ID"] = email_id
         context["email_id"] = email_id
@@ -701,21 +887,28 @@ def start_agreement_followup(
         db,
         sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
         offer_id=offer.id,
-        client_id=client.id,
+        client_id=None if test_mode else client.id,
         crm_activity_id=activity.id if activity else None,
         anchor_at=datetime.now(timezone.utc),
         tz=None,
         context=context,
     )
-    _complete_first_email_step(db, run.id)
+    _insert_completed_first_touch_step(
+        db,
+        run.id,
+        to=to,
+        filename=upload_name,
+        email_id=email_id,
+    )
     db.refresh(run)
 
     return {
         "ok": True,
         "run_id": run.id,
         "offer_id": offer.id,
-        "client_id": client.id,
+        "client_id": None if test_mode else client.id,
         "created_offer": created_offer,
+        "test": test_mode,
         "sequence_type": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
         "agreement_type": agreement["id"],
         "agreement_label": agreement["label"],
