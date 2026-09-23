@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone
 from html import escape
 from typing import Any, NoReturn
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy import or_
@@ -36,12 +37,97 @@ from services.merge_template import html_to_plain_text, looks_like_email, saniti
 
 logger = logging.getLogger(__name__)
 
+N8N_AGREEMENT_FOLLOWUP_HARDCODED_URL = (
+    "https://membersaces.app.n8n.cloud/webhook/aces-autonomous-agent/agreement-followup-email"
+)
+N8N_AGREEMENT_FOLLOWUP_ENV_KEYS: tuple[str, ...] = (
+    "N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL",
+    "N8N_AGREEMENT_FOLLOWUP_WEBHOOK_URL",
+    "AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL",
+)
 N8N_AGREEMENT_FOLLOWUP_URL = os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL", "").strip()
 MAX_PDF_BYTES = 15 * 1024 * 1024
 
 
+def _safe_url_for_log(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    host = parsed.netloc or "?"
+    path = parsed.path or "/"
+    return f"{host}{path}"
+
+
+def _process_identity() -> dict[str, str]:
+    backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dotenv_path = os.path.join(backend_root, ".env")
+    return {
+        "k_service": (os.getenv("K_SERVICE") or "").strip() or "-",
+        "k_revision": (os.getenv("K_REVISION") or "").strip() or "-",
+        "k_configuration": (os.getenv("K_CONFIGURATION") or "").strip() or "-",
+        "dotenv_present": "yes" if os.path.isfile(dotenv_path) else "no",
+    }
+
+
+def _webhook_env_snapshot() -> list[str]:
+    rows: list[str] = []
+    seen: set[str] = set()
+    for key in N8N_AGREEMENT_FOLLOWUP_ENV_KEYS:
+        seen.add(key)
+        raw = os.getenv(key)
+        if raw is None:
+            rows.append(f"{key}=missing")
+        elif not raw.strip():
+            rows.append(f"{key}=empty")
+        else:
+            rows.append(f"{key}=set:{len(raw.strip())}:{_safe_url_for_log(raw)}")
+    for key in sorted(os.environ):
+        upper = key.upper()
+        if key in seen:
+            continue
+        if "N8N" not in upper and "WEBHOOK" not in upper and "AGREEMENT_FOLLOWUP" not in upper:
+            continue
+        raw = os.environ.get(key) or ""
+        rows.append(f"{key}={'set:' + str(len(raw.strip())) if raw.strip() else 'empty'}")
+    return rows
+
+
+def resolve_agreement_followup_webhook() -> tuple[str, str]:
+    for key in N8N_AGREEMENT_FOLLOWUP_ENV_KEYS:
+        raw = (os.getenv(key) or "").strip()
+        if raw:
+            return raw, f"env:{key}"
+    import_time = (N8N_AGREEMENT_FOLLOWUP_URL or "").strip()
+    if import_time:
+        return import_time, "import_time_env"
+    return N8N_AGREEMENT_FOLLOWUP_HARDCODED_URL, "hardcoded"
+
+
 def agreement_followup_webhook_url() -> str:
-    return (os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL") or N8N_AGREEMENT_FOLLOWUP_URL or "").strip()
+    url, _source = resolve_agreement_followup_webhook()
+    return url
+
+
+def _log_webhook_resolution(url: str, source: str) -> None:
+    identity = _process_identity()
+    logger.info(
+        "agreement_followup webhook resolve source=%s url=%s k_service=%s k_revision=%s "
+        "k_configuration=%s import_time_env=%s dotenv_present=%s related_env=%s",
+        source,
+        _safe_url_for_log(url),
+        identity["k_service"],
+        identity["k_revision"],
+        identity["k_configuration"],
+        "set" if N8N_AGREEMENT_FOLLOWUP_URL else "empty",
+        identity["dotenv_present"],
+        _webhook_env_snapshot(),
+    )
+    if source == "hardcoded":
+        logger.warning(
+            "agreement_followup webhook env was empty on this process; using hardcoded n8n URL. "
+            "If you set N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL, it is not on this Cloud Run "
+            "service/revision (k_service=%s k_revision=%s).",
+            identity["k_service"],
+            identity["k_revision"],
+        )
 
 
 AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME = "Agreement Follow Up — test stubs"
@@ -471,11 +557,12 @@ def send_agreement_first_touch_email(
     offer_id: int | None,
     client_id: int | None,
 ) -> dict[str, Any]:
-    webhook_url = agreement_followup_webhook_url()
+    webhook_url, source = resolve_agreement_followup_webhook()
+    _log_webhook_resolution(webhook_url, source)
     if not webhook_url:
         raise AgreementFollowupError(
-            "The agreement email was not sent: N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL is empty "
-            "on this process. No sequence was started.",
+            "The agreement email was not sent: no n8n webhook URL (env empty and hardcoded "
+            "fallback missing). No sequence was started.",
             502,
         )
 
@@ -503,25 +590,104 @@ def send_agreement_first_touch_email(
             "application/pdf",
         )
     }
-    with httpx.Client(timeout=90.0) as client:
-        response = client.post(webhook_url, data=form, files=files)
-        response.raise_for_status()
-        try:
-            body = response.json()
-        except Exception as exc:
-            raise AgreementFollowupError(
-                "The agreement webhook returned HTTP "
-                f"{response.status_code} but not JSON, so Gmail ids could not be confirmed. "
-                "No sequence was started.",
-                502,
-            ) from exc
-        if not isinstance(body, (dict, list)):
-            raise AgreementFollowupError(
-                "The agreement webhook JSON was empty, so the send was not confirmed. "
-                "No sequence was started.",
-                502,
-            )
-        return {"ok": True, "mode": "n8n", "response": body}
+    identity = _process_identity()
+    logger.info(
+        "agreement_followup first-touch POST start source=%s url=%s to=%s subject=%s "
+        "filename=%s pdf_bytes=%s offer_id=%s client_id=%s agreement_type=%s "
+        "k_service=%s k_revision=%s dotenv_present=%s",
+        source,
+        _safe_url_for_log(webhook_url),
+        to,
+        subject,
+        filename,
+        len(pdf_bytes or b""),
+        offer_id,
+        client_id,
+        agreement_type,
+        identity["k_service"],
+        identity["k_revision"],
+        identity["dotenv_present"],
+    )
+    started = datetime.now(timezone.utc)
+    try:
+        with httpx.Client(timeout=90.0) as client:
+            response = client.post(webhook_url, data=form, files=files)
+    except httpx.TimeoutException as exc:
+        logger.exception(
+            "agreement_followup first-touch TIMEOUT source=%s url=%s to=%s",
+            source,
+            _safe_url_for_log(webhook_url),
+            to,
+        )
+        raise AgreementFollowupError(
+            f"n8n webhook timed out after 90s ({_safe_url_for_log(webhook_url)}, source={source}). "
+            "No sequence was started.",
+            502,
+        ) from exc
+    except httpx.RequestError as exc:
+        logger.exception(
+            "agreement_followup first-touch REQUEST_ERROR source=%s url=%s to=%s err=%s",
+            source,
+            _safe_url_for_log(webhook_url),
+            to,
+            exc,
+        )
+        raise AgreementFollowupError(
+            f"n8n webhook could not be reached ({_safe_url_for_log(webhook_url)}, source={source}): "
+            f"{exc}. No sequence was started.",
+            502,
+        ) from exc
+
+    elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+    snippet = (response.text or "")[:500]
+    content_type = (response.headers.get("content-type") or "").split(";")[0]
+    logger.info(
+        "agreement_followup first-touch POST done source=%s url=%s status=%s "
+        "elapsed_ms=%s content_type=%s body=%s",
+        source,
+        _safe_url_for_log(webhook_url),
+        response.status_code,
+        elapsed_ms,
+        content_type or "-",
+        snippet,
+    )
+    if response.status_code >= 400:
+        raise AgreementFollowupError(
+            f"n8n webhook HTTP {response.status_code} from {_safe_url_for_log(webhook_url)} "
+            f"(source={source}). Response: {snippet or '(empty)'}. No sequence was started.",
+            502,
+        )
+    try:
+        body = response.json()
+    except Exception as exc:
+        logger.exception(
+            "agreement_followup first-touch non-JSON status=%s content_type=%s body=%s",
+            response.status_code,
+            content_type,
+            snippet,
+        )
+        raise AgreementFollowupError(
+            "The agreement webhook returned HTTP "
+            f"{response.status_code} ({content_type or 'no content-type'}) but not JSON, "
+            f"so Gmail ids could not be confirmed. Body: {snippet or '(empty)'}. "
+            "No sequence was started.",
+            502,
+        ) from exc
+    if not isinstance(body, (dict, list)):
+        raise AgreementFollowupError(
+            "The agreement webhook JSON was empty, so the send was not confirmed. "
+            "No sequence was started.",
+            502,
+        )
+    email_id = extract_email_id_from_webhook_response(body)
+    thread_id = extract_thread_id_from_webhook_response(body)
+    logger.info(
+        "agreement_followup first-touch parsed email_id=%s thread_id=%s json_type=%s",
+        email_id or "-",
+        thread_id or "-",
+        type(body).__name__,
+    )
+    return {"ok": True, "mode": "n8n", "source": source, "response": body}
 
 
 def _require_delivered_first_touch(n8n_result: Any) -> tuple[str | None, str | None]:
@@ -539,6 +705,12 @@ def _require_delivered_first_touch(n8n_result: Any) -> tuple[str | None, str | N
     webhook_body = n8n_result.get("response")
     email_id = extract_email_id_from_webhook_response(webhook_body)
     thread_id = extract_thread_id_from_webhook_response(webhook_body)
+    logger.info(
+        "agreement_followup first-touch confirm source=%s email_id=%s thread_id=%s",
+        n8n_result.get("source") or n8n_result.get("mode") or "-",
+        email_id or "-",
+        thread_id or "-",
+    )
     if not email_id and not thread_id:
         raise AgreementFollowupError(
             "The agreement webhook did not return Gmail email_id or thread_id, so the send "
@@ -792,6 +964,19 @@ def start_agreement_followup(
         html = wrap_first_touch_html(_body, ACES_TEAM_FOLLOWUP_SIGNATURE_HTML)
         text = html_to_plain_text(html)
     upload_name = _safe_pdf_filename(filename, agreement["label"], business_name)
+
+    logger.info(
+        "agreement_followup start begin client_id=%s offer_id=%s created_offer=%s test_mode=%s "
+        "to=%s agreement=%s filename=%s pdf_bytes=%s",
+        client.id,
+        offer.id,
+        created_offer,
+        test_mode,
+        to,
+        agreement["id"],
+        upload_name,
+        len(pdf_bytes or b""),
+    )
 
     def _abort_without_run(exc: BaseException) -> NoReturn:
         if created_offer:

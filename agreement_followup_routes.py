@@ -173,6 +173,16 @@ def register_agreement_followup_routes(app, get_current_user):
             except ValueError:
                 raise HTTPException(status_code=400, detail="offer_id must be a number")
         pdf_bytes = await file.read()
+        logger.info(
+            "agreement_followup start route client_id=%s offer_id=%s test_mode=%s "
+            "filename=%s pdf_bytes=%s by=%s",
+            client_id,
+            parsed_offer_id,
+            is_test,
+            file.filename,
+            len(pdf_bytes or b""),
+            created_by,
+        )
         try:
             return start_agreement_followup(
                 db,
@@ -191,6 +201,12 @@ def register_agreement_followup_routes(app, get_current_user):
                 test_mode=is_test,
             )
         except AgreementFollowupError as exc:
+            logger.exception(
+                "agreement_followup start route failed client_id=%s status=%s detail=%s",
+                client_id,
+                exc.status_code,
+                exc,
+            )
             raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @app.post("/api/autonomous/agreement-followup/test-stubs/purge")

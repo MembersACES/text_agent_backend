@@ -21,11 +21,13 @@ from models import (
 from services.agreement_followup import (
     AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
     AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER,
+    N8N_AGREEMENT_FOLLOWUP_HARDCODED_URL,
     AgreementFollowupError,
     create_agreement_type,
     list_agreement_types,
     purge_agreement_followup_test_stubs,
     render_first_touch,
+    resolve_agreement_followup_webhook,
     resolve_agreement_type,
     start_agreement_followup,
     update_agreement_type,
@@ -388,3 +390,27 @@ def test_start_fails_when_webhook_returns_no_gmail_ids(monkeypatch):
         assert "email_id" in str(exc) or "thread_id" in str(exc)
     assert db.query(AutonomousSequenceRun).count() == 0
     assert db.query(Offer).count() == 0
+
+
+def test_webhook_url_falls_back_to_hardcoded_when_env_empty(monkeypatch):
+    for key in (
+        "N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL",
+        "N8N_AGREEMENT_FOLLOWUP_WEBHOOK_URL",
+        "AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr("services.agreement_followup.N8N_AGREEMENT_FOLLOWUP_URL", "")
+    url, source = resolve_agreement_followup_webhook()
+    assert source == "hardcoded"
+    assert url == N8N_AGREEMENT_FOLLOWUP_HARDCODED_URL
+    assert "agreement-followup-email" in url
+
+
+def test_webhook_url_prefers_env_over_hardcoded(monkeypatch):
+    monkeypatch.setenv(
+        "N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL",
+        "https://example.test/agreement-hook",
+    )
+    url, source = resolve_agreement_followup_webhook()
+    assert source == "env:N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL"
+    assert url == "https://example.test/agreement-hook"
