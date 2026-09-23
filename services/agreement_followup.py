@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -11,7 +12,7 @@ from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from crm_enums import OfferActivityType, OfferStatus
@@ -29,6 +30,7 @@ from models import (
 from services.autonomous_sequence import (
     AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
     ACES_TEAM_FOLLOWUP_SIGNATURE_HTML,
+    explicit_failure_detail,
     start_gas_base2_sequence,
 )
 from services.campaigns import extract_email_id_from_webhook_response
@@ -360,11 +362,99 @@ def update_agreement_type(
     return _type_to_dict(row)
 
 
+def log_agreement_followup_webhook_at_boot() -> None:
+    service = (os.getenv("K_SERVICE") or "local").strip() or "local"
+    url = (os.getenv("N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL") or "").strip()
+    if not url:
+        logger.error(
+            "N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL is empty on Cloud Run service %s. "
+            "Agreement follow-up email will not use the configured webhook until this "
+            "variable is set on the service.",
+            service,
+        )
+        return
+    logger.info(
+        "N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL is set on Cloud Run service %s (%s)",
+        service,
+        _safe_url_for_log(url),
+    )
+
+
+def _context_dict(run: AutonomousSequenceRun) -> dict[str, Any]:
+    if not run.context_json:
+        return {}
+    try:
+        parsed = json.loads(run.context_json)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def shared_gmail_thread_run_id(run: AutonomousSequenceRun) -> int | None:
+    raw = _context_dict(run).get("shared_gmail_thread_run_id")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _running_agreement_for_recipient(
+    db: Session, contact_email: str, agreement_type_id: str
+) -> AutonomousSequenceRun | None:
+    key = (contact_email or "").strip().lower()
+    type_id = (agreement_type_id or "").strip()
+    if not key or not type_id:
+        return None
+    rows = (
+        db.query(AutonomousSequenceRun)
+        .filter(
+            AutonomousSequenceRun.sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            AutonomousSequenceRun.run_status == "running",
+            func.lower(func.trim(AutonomousSequenceRun.contact_email)) == key,
+        )
+        .all()
+    )
+    for row in rows:
+        if str(_context_dict(row).get("agreement_type") or "").strip() == type_id:
+            return row
+    return None
+
+
+def _note_shared_thread(db: Session, run_id: int, other_run_id: int) -> None:
+    other = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == other_run_id).first()
+    if other is None or shared_gmail_thread_run_id(other) is not None:
+        return
+    ctx = _context_dict(other)
+    ctx["shared_gmail_thread_run_id"] = run_id
+    other.context_json = json.dumps(ctx)
+    db.commit()
+
+
+def _other_run_for_thread(db: Session, thread_id: str | None, email_id: str | None) -> int | None:
+    needles = [item.strip() for item in (thread_id, email_id) if item and str(item).strip()]
+    if not needles:
+        return None
+    clauses = [AutonomousSequenceRun.email_ID.in_(needles)]
+    for needle in needles:
+        clauses.append(AutonomousSequenceRun.context_json.contains(needle))
+    row = db.query(AutonomousSequenceRun.id).filter(or_(*clauses)).first()
+    if row is None:
+        return None
+    return int(row[0])
+
+
 def greeting_first_name(contact_name: str) -> str:
     raw = (contact_name or "").strip()
     if not raw:
         return "there"
-    return raw.split()[0] or "there"
+    token = raw.split()[0]
+    if not token:
+        return "there"
+    if token.isupper() or token.islower():
+        return token[:1].upper() + token[1:].lower()
+    return token
 
 
 def fill_copy_template(
@@ -382,8 +472,6 @@ def fill_copy_template(
         .replace("{{agreement_label}}", agreement_label)
         .replace("{{label}}", agreement_label)
     )
-    company = (business_name or "").strip() or "your business"
-    return f"{agreement_label} ready for signing — {company}"
 
 
 def first_touch_subject(*, agreement_label: str, business_name: str) -> str:
@@ -580,6 +668,12 @@ def send_agreement_first_touch_email(
         "client_id": "" if client_id is None else str(client_id),
         "reply_in_thread": "false",
         "use_html_signature": "false",
+        "append_account_signature": "false",
+        "force_new_thread": "true",
+        "thread_id": "",
+        "gmail_thread_id": "",
+        "message_id": "",
+        "gmail_message_id": "",
         "first_touch": "true",
         "attach_pdf": "true",
     }
@@ -620,8 +714,7 @@ def send_agreement_first_touch_email(
             to,
         )
         raise AgreementFollowupError(
-            f"n8n webhook timed out after 90s ({_safe_url_for_log(webhook_url)}, source={source}). "
-            "No sequence was started.",
+            "We could not confirm whether this was sent. Check the inbox before sending again.",
             502,
         ) from exc
     except httpx.RequestError as exc:
@@ -677,6 +770,12 @@ def send_agreement_first_touch_email(
         raise AgreementFollowupError(
             "The agreement webhook JSON was empty, so the send was not confirmed. "
             "No sequence was started.",
+            502,
+        )
+    failure = explicit_failure_detail(body)
+    if failure:
+        raise AgreementFollowupError(
+            f"The agreement webhook reported success false: {failure}. No sequence was started.",
             502,
         )
     email_id = extract_email_id_from_webhook_response(body)
@@ -891,6 +990,14 @@ def start_agreement_followup(
     if not _filename_is_pdf(filename, content_type, pdf_bytes):
         raise AgreementFollowupError("Upload must be a PDF")
 
+    live = _running_agreement_for_recipient(db, to, agreement["id"])
+    if live is not None:
+        raise AgreementFollowupError(
+            f"{to} already has a running {agreement['label']} follow-up (run #{live.id}). "
+            "Nothing was sent.",
+            409,
+        )
+
     offer: Offer | None = None
     created_offer = False
     if test_mode:
@@ -1011,33 +1118,42 @@ def start_agreement_followup(
         logger.exception("agreement follow-up first-touch n8n failed client_id=%s", client.id)
         _abort_without_run(exc)
 
+    shared_with = _other_run_for_thread(db, thread_id, email_id)
+
     activity = None
     if not test_mode:
-        create_offer_activity(
-            db,
-            offer=offer,
-            client=client,
-            activity_type=OfferActivityType.CONTRACT_RECEIVED,
-            metadata={
-                "agreement_type": agreement["id"],
-                "agreement_label": agreement["label"],
-                "filename": upload_name,
-            },
-            created_by=created_by,
-        )
-        activity = create_offer_activity(
-            db,
-            offer=offer,
-            client=client,
-            activity_type=OfferActivityType.CONTRACT_SENT_FOR_SIGNING,
-            metadata={
-                "agreement_type": agreement["id"],
-                "agreement_label": agreement["label"],
-                "filename": upload_name,
-                "to": to,
-            },
-            created_by=created_by,
-        )
+        try:
+            create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.CONTRACT_RECEIVED,
+                metadata={
+                    "agreement_type": agreement["id"],
+                    "agreement_label": agreement["label"],
+                    "filename": upload_name,
+                },
+                created_by=created_by,
+            )
+            activity = create_offer_activity(
+                db,
+                offer=offer,
+                client=client,
+                activity_type=OfferActivityType.CONTRACT_SENT_FOR_SIGNING,
+                metadata={
+                    "agreement_type": agreement["id"],
+                    "agreement_label": agreement["label"],
+                    "filename": upload_name,
+                    "to": to,
+                },
+                created_by=created_by,
+            )
+        except Exception:
+            logger.exception(
+                "agreement follow-up activity write failed after the email was sent; "
+                "the sequence will still be created"
+            )
+            activity = None
 
     context: dict[str, Any] = {
         "business_name": business_name,
@@ -1067,25 +1183,52 @@ def start_agreement_followup(
     if thread_id:
         context["gmail_thread_id"] = thread_id
         context["thread_id"] = thread_id
+    if shared_with is not None:
+        context["shared_gmail_thread_run_id"] = shared_with
 
-    run = start_gas_base2_sequence(
-        db,
-        sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
-        offer_id=offer.id,
-        client_id=None if test_mode else client.id,
-        crm_activity_id=activity.id if activity else None,
-        anchor_at=datetime.now(timezone.utc),
-        tz=None,
-        context=context,
-    )
-    _insert_completed_first_touch_step(
-        db,
-        run.id,
-        to=to,
-        filename=upload_name,
-        email_id=email_id,
-    )
+    try:
+        run = start_gas_base2_sequence(
+            db,
+            sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            offer_id=offer.id,
+            client_id=None if test_mode else client.id,
+            crm_activity_id=activity.id if activity else None,
+            anchor_at=datetime.now(timezone.utc),
+            tz=None,
+            context=context,
+        )
+    except Exception as exc:
+        logger.exception(
+            "agreement follow-up sequence save failed after the email was sent to=%s",
+            to,
+        )
+        raise AgreementFollowupError(
+            f"The email was sent to {to}. The follow-up sequence could not be saved ({exc}). "
+            "Do not send the agreement again.",
+            502,
+        ) from exc
+    try:
+        _insert_completed_first_touch_step(
+            db,
+            run.id,
+            to=to,
+            filename=upload_name,
+            email_id=email_id,
+        )
+    except Exception:
+        logger.exception(
+            "agreement follow-up first-touch step write failed run_id=%s; the chase still exists",
+            run.id,
+        )
     db.refresh(run)
+    if shared_with is not None and shared_with != run.id:
+        _note_shared_thread(db, run.id, shared_with)
+    warning = None
+    if shared_with is not None and shared_with != run.id:
+        warning = (
+            f"The email was sent. It landed on a Gmail thread already used by run #{shared_with}, "
+            f"so run #{run.id} will chase on that same conversation. Both are in Needs attention."
+        )
 
     return {
         "ok": True,
@@ -1103,4 +1246,6 @@ def start_agreement_followup(
         "thread_id": thread_id,
         "n8n_mode": n8n_result.get("mode") if isinstance(n8n_result, dict) else None,
         "filename": upload_name,
+        "shared_thread_with_run_id": shared_with if shared_with not in (None, run.id) else None,
+        "warning": warning,
     }

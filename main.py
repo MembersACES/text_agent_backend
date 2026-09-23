@@ -411,6 +411,9 @@ def on_startup() -> None:
     from services.campaigns import assert_campaign_unsubscribe_config
 
     assert_campaign_unsubscribe_config()
+    from services.agreement_followup import log_agreement_followup_webhook_at_boot
+
+    log_agreement_followup_webhook_at_boot()
     try:
         from database import SessionLocal
         from services.autonomous_sequence import ensure_default_sequence_templates
@@ -12584,6 +12587,7 @@ def _autonomous_list_item(
     from services.agreement_followup import (
         AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
         is_agreement_followup_test_offer,
+        shared_gmail_thread_run_id,
     )
 
     done = count_steps_done(steps)
@@ -12605,6 +12609,7 @@ def _autonomous_list_item(
         campaign_name=resolved_campaign_name,
         is_test=is_agreement_followup_test_offer(offer)
         or (resolved_campaign_name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME),
+        shared_thread_with_run_id=shared_gmail_thread_run_id(run),
     )
 
 
@@ -15047,8 +15052,10 @@ from campaign_routes import register_campaign_routes
 from agreement_followup_routes import register_agreement_followup_routes
 from email_template_routes import register_email_template_routes
 from partner_routes import register_partner_routes
+from partner_admin_routes import register_partner_admin_routes
 
 register_campaign_routes(app, get_current_user_with_db)
 register_agreement_followup_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
 register_partner_routes(app, verify_partner_token, get_db)
+register_partner_admin_routes(app, verify_google_token)

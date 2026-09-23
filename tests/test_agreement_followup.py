@@ -1,5 +1,6 @@
 """Agreement Follow Up first-touch + sequence start."""
 
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -29,6 +30,7 @@ from services.agreement_followup import (
     render_first_touch,
     resolve_agreement_followup_webhook,
     resolve_agreement_type,
+    send_agreement_first_touch_email,
     start_agreement_followup,
     update_agreement_type,
 )
@@ -134,6 +136,36 @@ def test_first_touch_names_the_agreement():
     assert "Ada Lovelace" not in body_text
     assert "Hi Ada," in html
     assert "signed PDF" in text.lower() or "signed agreement" in text.lower()
+
+
+def test_first_touch_title_cases_the_greeting():
+    _subject, body_text, html, _text = render_first_touch(
+        agreement_label="Alinta C&I Gas",
+        business_name="Acme Bakery",
+        contact_name="MATTHEW HAAS",
+    )
+    assert "Hi Matthew," in body_text
+    assert "Hi MATTHEW," not in body_text
+    assert "Matthew Haas" not in body_text
+    assert "Hi Matthew," in html
+    _subject, empty_body, _html, _plain = render_first_touch(
+        agreement_label="Alinta C&I Gas",
+        business_name="Acme Bakery",
+        contact_name="",
+    )
+    assert "Hi there," in empty_body
+    _subject, mcdonald, _html, _plain = render_first_touch(
+        agreement_label="Alinta C&I Gas",
+        business_name="Acme Bakery",
+        contact_name="McDonald",
+    )
+    assert "Hi McDonald," in mcdonald
+    _subject, obrien, _html, _plain = render_first_touch(
+        agreement_label="Alinta C&I Gas",
+        business_name="Acme Bakery",
+        contact_name="O'Brien",
+    )
+    assert "Hi O'Brien," in obrien
 
 
 def test_custom_subject_and_body_are_used():
@@ -256,6 +288,108 @@ def test_start_rejects_duplicate_running_run(monkeypatch):
         raise AssertionError("expected duplicate error")
     except AgreementFollowupError as exc:
         assert exc.status_code == 409
+
+
+def test_start_refuses_same_recipient_and_type_before_send(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    offer = Offer(
+        client_id=client.id,
+        business_name=client.business_name,
+        status="autonomous_agent_trigger",
+    )
+    db.add(offer)
+    db.flush()
+    db.add(
+        AutonomousSequenceRun(
+            sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            offer_id=offer.id,
+            client_id=client.id,
+            run_status="running",
+            contact_email="Ada@acme.test",
+            context_json=json.dumps({"agreement_type": "alinta_ci_gas"}),
+            anchor_at=datetime.now(timezone.utc),
+        )
+    )
+    db.commit()
+
+    def boom(**kwargs):
+        raise AssertionError("must not send when this person already has this agreement running")
+
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        boom,
+    )
+    try:
+        start_agreement_followup(
+            db,
+            client_id=client.id,
+            agreement_type_raw="alinta_ci_gas",
+            contact_email="ada@acme.test",
+            pdf_bytes=b"%PDF-1.4 fake",
+            filename="x.pdf",
+        )
+        raise AssertionError("expected recipient duplicate")
+    except AgreementFollowupError as exc:
+        assert exc.status_code == 409
+        assert "Nothing was sent" in str(exc)
+        assert "run #" in str(exc)
+    assert db.query(AutonomousSequenceRun).count() == 1
+    assert db.query(Offer).count() == 1
+
+
+def test_shared_thread_still_starts_the_chase(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    offer = Offer(
+        client_id=client.id,
+        business_name=client.business_name,
+        status="autonomous_agent_trigger",
+    )
+    db.add(offer)
+    db.flush()
+    first = AutonomousSequenceRun(
+        sequence_type=AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+        offer_id=offer.id,
+        client_id=client.id,
+        run_status="running",
+        contact_email="ada@acme.test",
+        email_ID="thr-shared",
+        context_json=json.dumps(
+            {"agreement_type": "alinta_ci_gas", "gmail_thread_id": "thr-shared"}
+        ),
+        anchor_at=datetime.now(timezone.utc),
+    )
+    db.add(first)
+    db.commit()
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        lambda **kwargs: {
+            "ok": True,
+            "response": {"email_id": "msg-2", "gmail_thread_id": "thr-shared"},
+        },
+    )
+    result = start_agreement_followup(
+        db,
+        client_id=client.id,
+        agreement_type_raw="Alinta C&I Electricity",
+        contact_email="ada@acme.test",
+        pdf_bytes=b"%PDF-1.4 fake",
+        filename="electricity.pdf",
+        contact_name="Ada Lovelace",
+    )
+    assert result["ok"] is True
+    assert result["run_id"] != first.id
+    assert result["warning"].startswith("The email was sent.")
+    assert f"run #{first.id}" in result["warning"]
+    assert db.query(AutonomousSequenceRun).count() == 2
+    created = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == result["run_id"]).one()
+    assert json.loads(created.context_json)["shared_gmail_thread_run_id"] == first.id
+    assert created.run_status == "running"
+    db.refresh(first)
+    assert json.loads(first.context_json)["shared_gmail_thread_run_id"] == result["run_id"]
 
 
 def test_start_rejects_non_pdf(monkeypatch):
@@ -414,3 +548,42 @@ def test_webhook_url_prefers_env_over_hardcoded(monkeypatch):
     url, source = resolve_agreement_followup_webhook()
     assert source == "env:N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL"
     assert url == "https://example.test/agreement-hook"
+
+
+def test_timeout_does_not_say_the_email_was_not_sent(monkeypatch):
+    import httpx
+
+    class _Client:
+        def __init__(self, timeout=None):
+            return None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, *args, **kwargs):
+            raise httpx.TimeoutException("timed out")
+
+    monkeypatch.setattr("services.agreement_followup.httpx.Client", _Client)
+    try:
+        send_agreement_first_touch_email(
+            to="ada@acme.test",
+            subject="Please sign",
+            html="<p>Hi</p>",
+            text="Hi",
+            pdf_bytes=b"%PDF-1.4",
+            filename="agreement.pdf",
+            agreement_type="alinta_ci_gas",
+            agreement_label="Alinta C&I Gas",
+            business_name="Acme Bakery",
+            offer_id=1,
+            client_id=1,
+        )
+        raise AssertionError("expected timeout")
+    except AgreementFollowupError as exc:
+        assert str(exc) == (
+            "We could not confirm whether this was sent. Check the inbox before sending again."
+        )
+        assert "not sent" not in str(exc).lower()

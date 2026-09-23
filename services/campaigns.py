@@ -819,12 +819,15 @@ def set_human_only(db: Session, campaign: Campaign, row_id: int, human_only: boo
         raise CampaignError("Row not found", 404)
     _assert_can_flag_human_only(campaign, row)
     trimmed = (reason or "").strip()[:255] or None
-    key = _row_key(row)
+    key = _row_key(row).strip().lower()
     targets = [row]
     if key:
         targets = (
             db.query(CampaignRow)
-            .filter(CampaignRow.campaign_id == campaign.id, CampaignRow.recipient_key == row.recipient_key)
+            .filter(
+                CampaignRow.campaign_id == campaign.id,
+                func.lower(func.trim(CampaignRow.recipient_key)) == key,
+            )
             .all()
         )
     for target in targets:
@@ -1230,7 +1233,7 @@ def _start_pending_rows(
     actor: str | None,
     remaining: int | None,
 ) -> dict[str, Any]:
-    from services.autonomous_sequence import start_gas_base2_sequence
+    from services.autonomous_sequence import explicit_failure_detail, start_gas_base2_sequence
 
     all_rows = (
         db.query(CampaignRow)
@@ -1291,6 +1294,18 @@ def _start_pending_rows(
         n8n_result = send_first_touch_email(
             db=db, to=to, subject=subject, html=html, text=text, campaign=campaign, row=row, test=False
         )
+        failure = explicit_failure_detail(n8n_result)
+        if failure:
+            row.row_status = "failed"
+            logger.warning(
+                "[campaign] first-touch success false campaign_id=%s row_id=%s recipient=%s detail=%s",
+                campaign.id,
+                row.id,
+                to,
+                failure,
+            )
+            db.commit()
+            continue
         email_id = extract_email_id_from_webhook_response(n8n_result)
         if not email_id:
             logger.warning(
