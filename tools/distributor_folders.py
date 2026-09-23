@@ -102,6 +102,36 @@ def list_distributor_folders() -> Tuple[Optional[Dict[str, Any]], Optional[str],
     }, None, 200
 
 
+def confirm_distributor_entity(
+    folder_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    """A distributor is a folder directly under 003-Distributors.
+
+    Nested folders (Distributor Documents, Lead collisions) are not entities.
+    """
+    fid = (folder_id or "").strip()
+    if not fid:
+        return None, "missing_folder_id", 400
+
+    drive, err = _drive_or_error()
+    if err:
+        return None, err, 503
+
+    parent_id = get_distributors_parent_id()
+    if not parent_id:
+        return None, _not_configured_message(), 503
+
+    scope, confirm_err = _resolve_under_supplier(drive, fid, parent_id)
+    if confirm_err or not scope:
+        return None, "distributor_not_found", 404
+
+    supplier = scope["supplier"]
+    supplier_id = str(supplier.get("id") or "")
+    if supplier_id != fid:
+        return None, "not_distributor_entity", 400
+    return _folder_payload(supplier), None, 200
+
+
 def list_distributor_documents(
     folder_id: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:

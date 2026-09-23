@@ -15047,8 +15047,10 @@ from campaign_routes import register_campaign_routes
 from agreement_followup_routes import register_agreement_followup_routes
 from email_template_routes import register_email_template_routes
 from partner_routes import register_partner_routes
+from partner_admin_routes import register_partner_admin_routes
 
 register_campaign_routes(app, get_current_user_with_db)
 register_agreement_followup_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
 register_partner_routes(app, verify_partner_token, get_db)
+register_partner_admin_routes(app, verify_google_token)
