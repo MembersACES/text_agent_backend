@@ -79,10 +79,13 @@ Same rules as solar engagement follow-ups:
 On the CRM backend:
 
 ```
-N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL=https://membersaces.app.n8n.cloud/webhook/agreement-followup-email
+N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL=https://membersaces.app.n8n.cloud/webhook/aces-autonomous-agent/agreement-followup-email
 ```
 
-If this is unset, or the webhook is not actually POSTed, or the response is not JSON with Gmail ids, start returns 502 and **no sequence is created**. Do not treat an empty env as a successful send.
+If this is unset, the CRM still POSTs the hardcoded production webhook
+(`https://membersaces.app.n8n.cloud/webhook/aces-autonomous-agent/agreement-followup-email`).
+Cloud Logging will say `source=hardcoded` plus `k_service` / `k_revision` so you can see which
+process handled the send. The start still fails if n8n does not return JSON with Gmail ids.
 
 ## Cadence
 
