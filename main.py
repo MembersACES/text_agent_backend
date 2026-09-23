@@ -411,6 +411,9 @@ def on_startup() -> None:
     from services.campaigns import assert_campaign_unsubscribe_config
 
     assert_campaign_unsubscribe_config()
+    from services.agreement_followup import log_agreement_followup_webhook_at_boot
+
+    log_agreement_followup_webhook_at_boot()
     try:
         from database import SessionLocal
         from services.autonomous_sequence import ensure_default_sequence_templates
@@ -12584,6 +12587,7 @@ def _autonomous_list_item(
     from services.agreement_followup import (
         AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
         is_agreement_followup_test_offer,
+        shared_gmail_thread_run_id,
     )
 
     done = count_steps_done(steps)
@@ -12605,6 +12609,7 @@ def _autonomous_list_item(
         campaign_name=resolved_campaign_name,
         is_test=is_agreement_followup_test_offer(offer)
         or (resolved_campaign_name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME),
+        shared_thread_with_run_id=shared_gmail_thread_run_id(run),
     )
 
 

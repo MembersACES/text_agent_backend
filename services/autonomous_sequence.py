@@ -1813,19 +1813,19 @@ def _prepare_email_context(
     out = dict(ctx)
     out["sequence_type"] = run.sequence_type
     out["step_index"] = int(step.step_index)
-    msg_id = str(run.email_ID or out.get("email_ID") or out.get("email_id") or "").strip()
+    msg_id = str(run.email_ID or "").strip()
+    thread_id = str(
+        out.get("gmail_thread_id") or out.get("thread_id") or ""
+    ).strip()
     if msg_id:
         out["email_ID"] = msg_id
         out["email_id"] = msg_id
         out["gmail_message_id"] = msg_id
-    thread_id = str(
-        out.get("gmail_thread_id") or out.get("thread_id") or out.get("gmail_threadId") or ""
-    ).strip()
     if thread_id:
         out["gmail_thread_id"] = thread_id
         out["thread_id"] = thread_id
     if run.sequence_type in SIGNING_FOLLOWUP_SEQUENCE_TYPES:
-        out["reply_in_thread"] = True
+        out["reply_in_thread"] = bool(msg_id or thread_id)
         out["omit_validity"] = True
         out["omit_document_links"] = True
         out.pop("offer_validity_date", None)
@@ -2462,6 +2462,7 @@ def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: d
         "reply_in_thread": bool(context.get("reply_in_thread")),
         "gmail_message_id": context.get("gmail_message_id") or context.get("email_ID") or context.get("email_id"),
         "gmail_thread_id": context.get("gmail_thread_id") or context.get("thread_id"),
+        "append_account_signature": False,
         "omit_validity": bool(context.get("omit_validity")),
         "omit_document_links": bool(context.get("omit_document_links")),
         "initial_email_subject": context.get("initial_email_subject"),
@@ -2473,9 +2474,13 @@ def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: d
         r = client.post(N8N_EMAIL_URL, json=payload)
         r.raise_for_status()
         try:
-            return {"ok": True, "channel": "email", "response": r.json()}
+            body = r.json()
         except Exception:
             return {"ok": True, "channel": "email", "response_text": r.text[:2000]}
+        failure = explicit_failure_detail(body)
+        if failure:
+            return {"ok": False, "channel": "email", "error": failure, "response": body}
+        return {"ok": True, "channel": "email", "response": body}
 
 
 def _send_sms_placeholder(offer_id: int, run_id: int, step_id: int, context: dict[str, Any]) -> dict[str, Any]:
@@ -2533,6 +2538,33 @@ def _voice_retell_placeholder(
             return {"ok": True, "channel": "voice_call", "response_text": r.text[:2000]}
 
 
+def explicit_failure_detail(payload: Any) -> str | None:
+    """Return the detail string when a dispatch body says success is false.
+
+    A missing success field is not a failure. HTTP 200 with success false is.
+    """
+    if isinstance(payload, list):
+        for item in payload:
+            found = explicit_failure_detail(item)
+            if found:
+                return found
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        detail = payload.get("detail") or payload.get("error") or payload.get("message")
+        return str(detail or "success: false")
+    nested = payload.get("response")
+    if nested is not None and nested is not payload:
+        found = explicit_failure_detail(nested)
+        if found:
+            return found
+    if payload.get("ok") is False:
+        detail = payload.get("error") or payload.get("detail") or payload.get("message")
+        return str(detail or "Send failed")
+    return None
+
+
 def execute_due_steps_sync(db: Session) -> int:
     now = _utc_now_naive()
     runs = (
@@ -2567,6 +2599,9 @@ def execute_due_steps_sync(db: Session) -> int:
 
             try:
                 out = _send_one_step(db, run, step)
+                failure = explicit_failure_detail(out)
+                if failure:
+                    raise RuntimeError(failure)
                 step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
@@ -2669,6 +2704,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
         finalize_run_if_exhausted(db, run)
         db.commit()
         raise
+    failure = explicit_failure_detail(out)
     if out.get("mode") == "placeholder":
         step.step_status = "ready"
         step.started_at = None
@@ -2677,9 +2713,9 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
             "This API cannot actually send this step (email/SMS webhook or Retell key missing), "
             "and the send worker could not see the step in its database."
         )
-    if out.get("ok") is False:
+    if failure or out.get("ok") is False:
         step.step_status = "error"
-        step.last_outcome_summary = json.dumps(out)[:4000]
+        step.last_outcome_summary = (failure or json.dumps(out))[:4000]
         _log_event(
             db,
             run.id,
@@ -2689,7 +2725,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
         )
         finalize_run_if_exhausted(db, run)
         db.commit()
-        raise ValueError(str(out.get("error") or "Send failed"))
+        raise ValueError(failure or str(out.get("error") or "Send failed"))
 
     step.step_status = "executed"
     step.completed_at = _utc_now_naive()
