@@ -30,7 +30,7 @@ Do not use the `/webhook-test/` URL except while clicking **Listen for test even
 
 **Gmail node:** Send a **new** message (not Reply). Attach the webhook binary (`file`).
 
-**Respond to Webhook** must return Gmail ids so follow-ups can reply in-thread:
+**Respond to Webhook** must return Gmail ids. Start **fails and does not create a run** unless this JSON comes back after a real Gmail send:
 
 ```json
 {
@@ -43,7 +43,7 @@ Do not use the `/webhook-test/` URL except while clicking **Listen for test even
 
 (Adjust `$json` to your Gmail node output.)
 
-Without `id` / `threadId`, later steps will send as new emails instead of sitting on the original thread.
+Without `email_id` / `thread_id` (or Gmail `id` / `threadId`), the CRM treats the send as unconfirmed: no run, no “Sent” banner.
 
 Do **not** reuse `/webhook/email-supplier` for this. That workflow emails the retailer and files a signed lodgement.
 
@@ -72,7 +72,7 @@ Same rules as solar engagement follow-ups:
 1. Reply on the thread (`threadId` / In-Reply-To). Do not start a new email.
 2. Do not attach the PDF again.
 3. Do not include Drive links or invented “valid until” dates.
-4. Step 0 is already marked complete (that was the first-touch). Follow-ups are step_index 1, 2, 3.
+4. The immediate PDF send is stored as **day 0 / step_index 0**, marked completed only after n8n returns Gmail ids. Template chases are days 1, 3, 5, 7 (step_index 1–4). Do not mark a future chase complete as a stand-in for the first-touch.
 
 ## Env
 
@@ -82,7 +82,7 @@ On the CRM backend:
 N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL=https://membersaces.app.n8n.cloud/webhook/agreement-followup-email
 ```
 
-If this is unset, the CRM logs a placeholder and still starts the sequence (same as campaigns in local/dev). Set it in Cloud Run before staff use the page live.
+If this is unset, or the webhook is not actually POSTed, or the response is not JSON with Gmail ids, start returns 502 and **no sequence is created**. Do not treat an empty env as a successful send.
 
 ## Cadence
 

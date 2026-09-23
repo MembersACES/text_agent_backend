@@ -13,17 +13,22 @@ from models import (
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
     AutonomousSequenceTemplateStep,
+    Campaign,
     Client,
     Offer,
     OfferActivity,
 )
 from services.agreement_followup import (
+    AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
+    AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER,
     AgreementFollowupError,
     create_agreement_type,
     list_agreement_types,
+    purge_agreement_followup_test_stubs,
     render_first_touch,
     resolve_agreement_type,
     start_agreement_followup,
+    update_agreement_type,
 )
 from services.autonomous_sequence import AGREEMENT_FOLLOWUP_SEQUENCE_TYPE
 
@@ -190,17 +195,21 @@ def test_start_sends_then_completes_step_zero(monkeypatch):
         .order_by(AutonomousSequenceStep.step_index)
         .all()
     )
-    assert [s.step_index for s in steps] == [0, 1, 2, 3]
+    assert [s.step_index for s in steps] == [0, 1, 2, 3, 4]
+    assert [s.day_number for s in steps] == [0, 1, 3, 5, 7]
     assert steps[0].channel == "email"
     assert steps[0].step_status == "completed"
+    assert steps[0].day_number == 0
     assert all(s.channel == "email" for s in steps)
-    assert steps[1].step_status in {"ready", "to_start"}
+    assert all(s.step_status in {"ready", "to_start"} for s in steps[1:])
 
     types = {a.activity_type for a in db.query(OfferActivity).all()}
     assert "contract_received" in types
     assert "contract_sent_for_signing" in types
     offer = db.query(Offer).one()
     assert offer.pipeline_stage == "contract_sent_for_signing"
+    assert offer.campaign_id is None
+    assert offer.client_id == client.id
 
 
 def test_start_rejects_duplicate_running_run(monkeypatch):
@@ -268,3 +277,114 @@ def test_start_rejects_non_pdf(monkeypatch):
         raise AssertionError("expected pdf error")
     except AgreementFollowupError as exc:
         assert "PDF" in str(exc)
+
+
+def test_duplicate_type_name_is_rejected():
+    db = _db()
+    try:
+        create_agreement_type(db, label="Alinta C&I Gas", utility_type="C&I Gas")
+        raise AssertionError("expected duplicate error")
+    except AgreementFollowupError as exc:
+        assert exc.status_code == 400
+        assert "already exists" in str(exc)
+
+
+def test_hidden_type_tells_staff_to_show_it():
+    db = _db()
+    created = create_agreement_type(db, label="Origin C&I Gas", utility_type="C&I Gas", retailer="Origin")
+    update_agreement_type(db, created["id"], is_active=False)
+    try:
+        create_agreement_type(db, label="Origin C&I Gas", utility_type="C&I Gas")
+        raise AssertionError("expected hidden duplicate error")
+    except AgreementFollowupError as exc:
+        assert "hidden" in str(exc).lower()
+        assert "Show" in str(exc)
+
+
+def test_start_test_mode_uses_hidden_stub_offer(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        lambda **kwargs: {"ok": True, "response": {"email_id": "msg-test", "gmail_thread_id": "thr-test"}},
+    )
+    result = start_agreement_followup(
+        db,
+        client_id=client.id,
+        agreement_type_raw="alinta_ci_gas",
+        contact_email="ada@acme.test",
+        pdf_bytes=b"%PDF-1.4 fake",
+        filename="test.pdf",
+        contact_name="Ada Lovelace",
+        test_mode=True,
+    )
+    assert result["test"] is True
+    assert result["subject"].startswith("[TEST]")
+    assert result["client_id"] is None
+    offer = db.query(Offer).one()
+    assert offer.campaign_id is not None
+    assert offer.client_id is None
+    assert offer.identifier == AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER
+    campaign = db.query(Campaign).filter(Campaign.id == offer.campaign_id).one()
+    assert campaign.name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME
+    assert bool(campaign.archived)
+    assert db.query(Offer).filter(Offer.campaign_id.is_(None)).count() == 0
+    assert db.query(OfferActivity).count() == 0
+    run = db.query(AutonomousSequenceRun).one()
+    assert run.client_id is None
+    assert '"agreement_test": true' in (run.context_json or "")
+    purged = purge_agreement_followup_test_stubs(db)
+    assert purged["offers"] == 1
+    assert purged["runs"] == 1
+    assert db.query(Offer).count() == 0
+    assert db.query(AutonomousSequenceRun).count() == 0
+
+
+def _start_kwargs(db, client, **overrides):
+    payload = dict(
+        db=db,
+        client_id=client.id,
+        agreement_type_raw="alinta_ci_gas",
+        contact_email="ada@acme.test",
+        pdf_bytes=b"%PDF-1.4 fake",
+        filename="x.pdf",
+    )
+    payload.update(overrides)
+    return payload
+
+
+def test_start_fails_on_placeholder_and_creates_no_run(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        lambda **kwargs: {"ok": True, "mode": "placeholder", "payload": {}},
+    )
+    try:
+        start_agreement_followup(**_start_kwargs(db, client))
+        raise AssertionError("expected send failure")
+    except AgreementFollowupError as exc:
+        assert exc.status_code == 502
+        assert "not sent" in str(exc).lower() or "placeholder" in str(exc).lower()
+    assert db.query(AutonomousSequenceRun).count() == 0
+    assert db.query(Offer).count() == 0
+
+
+def test_start_fails_when_webhook_returns_no_gmail_ids(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        lambda **kwargs: {"ok": True, "mode": "n8n", "response": {"ok": True}},
+    )
+    try:
+        start_agreement_followup(**_start_kwargs(db, client))
+        raise AssertionError("expected send failure")
+    except AgreementFollowupError as exc:
+        assert exc.status_code == 502
+        assert "email_id" in str(exc) or "thread_id" in str(exc)
+    assert db.query(AutonomousSequenceRun).count() == 0
+    assert db.query(Offer).count() == 0

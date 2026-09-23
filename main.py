@@ -12581,6 +12581,10 @@ def _autonomous_list_item(
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
     from services.autonomous_sequence import count_steps_done
+    from services.agreement_followup import (
+        AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
+        is_agreement_followup_test_offer,
+    )
 
     done = count_steps_done(steps)
     return AutonomousSequenceRunListItem(
@@ -12599,6 +12603,8 @@ def _autonomous_list_item(
         ack_draft_thread_id=(ack_draft or {}).get("thread_id"),
         campaign_id=resolved_campaign_id,
         campaign_name=resolved_campaign_name,
+        is_test=is_agreement_followup_test_offer(offer)
+        or (resolved_campaign_name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME),
     )
 
 

@@ -1280,6 +1280,7 @@ class AutonomousSequenceRunListItem(BaseModel):
     ack_draft_thread_id: Optional[str] = None
     campaign_id: Optional[int] = None
     campaign_name: Optional[str] = None
+    is_test: bool = False
 
     @field_serializer("anchor_at", "next_step_at")
     def serialize_item_dt(self, dt: Optional[datetime], _info):
