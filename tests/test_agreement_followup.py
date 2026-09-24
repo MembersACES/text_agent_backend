@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 
 from database import Base
 from models import (
+    AgreementFollowupType,
     AutonomousSequenceRun,
     AutonomousSequenceStep,
     AutonomousSequenceTemplate,
@@ -22,9 +23,15 @@ from models import (
 from services.agreement_followup import (
     AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
     AGREEMENT_FOLLOWUP_TEST_OFFER_IDENTIFIER,
+    DEFAULT_CHASE_DAYS,
+    DEFAULT_FIRST_EMAIL_BODY,
+    DEFAULT_FIRST_EMAIL_SUBJECT,
     N8N_AGREEMENT_FOLLOWUP_HARDCODED_URL,
     AgreementFollowupError,
     create_agreement_type,
+    ensure_agreement_followup_types,
+    first_touch_body_text,
+    first_touch_subject,
     list_agreement_types,
     purge_agreement_followup_test_stubs,
     render_first_touch,
@@ -33,8 +40,12 @@ from services.agreement_followup import (
     send_agreement_first_touch_email,
     start_agreement_followup,
     update_agreement_type,
+    wrap_first_touch_html,
 )
-from services.autonomous_sequence import AGREEMENT_FOLLOWUP_SEQUENCE_TYPE
+from services.autonomous_sequence import (
+    AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+    apply_inbound,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -83,6 +94,17 @@ def _template(db):
     return template
 
 
+def _valid_copy(**overrides):
+    payload = {
+        "first_email_subject": DEFAULT_FIRST_EMAIL_SUBJECT,
+        "first_email_body": DEFAULT_FIRST_EMAIL_BODY,
+        "chase_body": "",
+        "chase_days": list(DEFAULT_CHASE_DAYS),
+    }
+    payload.update(overrides)
+    return payload
+
+
 def _client(db) -> Client:
     client = Client(
         business_name="Acme Bakery",
@@ -117,6 +139,7 @@ def test_staff_can_add_a_new_agreement_type():
         label="Origin C&I Gas",
         utility_type="C&I Gas",
         retailer="Origin",
+        **_valid_copy(),
     )
     assert created["id"] == "origin_c_i_gas"
     ids = [row["id"] for row in list_agreement_types(db)]
@@ -231,6 +254,7 @@ def test_start_sends_then_completes_step_zero(monkeypatch):
     )
     assert [s.step_index for s in steps] == [0, 1, 2, 3, 4]
     assert [s.day_number for s in steps] == [0, 1, 3, 5, 7]
+    assert not (json.loads(run.context_json).get("chase_body") or "").strip()
     assert steps[0].channel == "email"
     assert steps[0].step_status == "completed"
     assert steps[0].day_number == 0
@@ -418,7 +442,7 @@ def test_start_rejects_non_pdf(monkeypatch):
 def test_duplicate_type_name_is_rejected():
     db = _db()
     try:
-        create_agreement_type(db, label="Alinta C&I Gas", utility_type="C&I Gas")
+        create_agreement_type(db, label="Alinta C&I Gas", utility_type="C&I Gas", **_valid_copy())
         raise AssertionError("expected duplicate error")
     except AgreementFollowupError as exc:
         assert exc.status_code == 400
@@ -427,10 +451,12 @@ def test_duplicate_type_name_is_rejected():
 
 def test_hidden_type_tells_staff_to_show_it():
     db = _db()
-    created = create_agreement_type(db, label="Origin C&I Gas", utility_type="C&I Gas", retailer="Origin")
+    created = create_agreement_type(
+        db, label="Origin C&I Gas", utility_type="C&I Gas", retailer="Origin", **_valid_copy()
+    )
     update_agreement_type(db, created["id"], is_active=False)
     try:
-        create_agreement_type(db, label="Origin C&I Gas", utility_type="C&I Gas")
+        create_agreement_type(db, label="Origin C&I Gas", utility_type="C&I Gas", **_valid_copy())
         raise AssertionError("expected hidden duplicate error")
     except AgreementFollowupError as exc:
         assert "hidden" in str(exc).lower()
@@ -587,3 +613,278 @@ def test_timeout_does_not_say_the_email_was_not_sent(monkeypatch):
             "We could not confirm whether this was sent. Check the inbox before sending again."
         )
         assert "not sent" not in str(exc).lower()
+
+
+def _reject_type(**overrides) -> str:
+    db = _db()
+    kwargs = {"label": "Simply SME Gas", "utility_type": "", **_valid_copy()}
+    kwargs.update(overrides)
+    with pytest.raises(AgreementFollowupError) as exc:
+        create_agreement_type(db, **kwargs)
+    return str(exc.value)
+
+
+def test_subject_is_required():
+    assert "Subject is required" in _reject_type(first_email_subject="  ", default_subject="  ")
+
+
+def test_first_email_body_is_required():
+    assert "First email body is required" in _reject_type(first_email_body="  ", default_body="  ")
+
+
+def test_blank_chase_body_is_allowed():
+    db = _db()
+    created = create_agreement_type(db, label="Simply SME Gas", **_valid_copy(chase_body="   "))
+    assert created["chase_body"] == ""
+
+
+def test_chase_days_must_be_ascending():
+    assert "ascending" in _reject_type(chase_days=[3, 1])
+
+
+def test_chase_days_must_be_unique():
+    assert "duplicate" in _reject_type(chase_days=[1, 1]).lower()
+
+
+def test_chase_day_cannot_be_zero():
+    assert "between 1 and 30" in _reject_type(chase_days=[0, 3])
+
+
+def test_chase_day_cannot_be_over_30():
+    assert "between 1 and 30" in _reject_type(chase_days=[1, 31])
+
+
+def test_chase_days_cannot_exceed_five():
+    assert "at most 5" in _reject_type(chase_days=[1, 2, 3, 4, 5, 6])
+
+
+def test_first_name_is_not_available_on_this_lane():
+    message = _reject_type(first_email_body="Hi {{first_name}},\n\nPlease sign.")
+    assert message == "{{first_name}} is not available on this lane."
+
+
+def test_unknown_token_is_named_and_not_saved():
+    db = _db()
+    with pytest.raises(AgreementFollowupError) as exc:
+        create_agreement_type(
+            db,
+            label="Simply SME Gas",
+            **_valid_copy(first_email_subject="Rate {{current_rate}}"),
+        )
+    assert str(exc.value) == "{{current_rate}} is not available on this lane."
+    saved = (
+        db.query(AgreementFollowupType)
+        .filter(AgreementFollowupType.label.ilike("Simply SME Gas"))
+        .first()
+    )
+    assert saved is None
+
+
+def test_update_rejects_unknown_token_without_changing_the_type():
+    db = _db()
+    created = create_agreement_type(db, label="Simply SME Gas", **_valid_copy())
+    with pytest.raises(AgreementFollowupError) as exc:
+        update_agreement_type(
+            db,
+            created["id"],
+            first_email_body="Hi {{not_a_field}},",
+        )
+    assert "{{not_a_field}}" in str(exc.value)
+    assert "not available on this lane" in str(exc.value)
+    again = resolve_agreement_type(db, created["id"])
+    assert again["first_email_body"] == DEFAULT_FIRST_EMAIL_BODY
+
+
+def test_duplicate_display_name_matches_a_hidden_type():
+    db = _db()
+    created = create_agreement_type(db, display_name="Origin C&I Gas", **_valid_copy())
+    update_agreement_type(db, created["id"], is_active=False)
+    with pytest.raises(AgreementFollowupError) as exc:
+        create_agreement_type(db, display_name="Origin C&I Gas", **_valid_copy())
+    assert "hidden" in str(exc.value).lower()
+
+
+def test_backfilled_type_renders_the_same_first_email():
+    db = _db()
+    resolve_agreement_type(db, "alinta_ci_gas")
+    row = db.query(AgreementFollowupType).filter(AgreementFollowupType.id == "alinta_ci_gas").one()
+    row.first_email_subject = None
+    row.first_email_body = None
+    row.default_subject = None
+    row.default_body = None
+    row.chase_body = None
+    row.chase_days = None
+    db.add(
+        AgreementFollowupType(
+            id="origin_c_i_gas",
+            label="Origin C&I Gas",
+            utility_type="C&I Gas",
+            retailer="Origin",
+            is_active=1,
+            sort_order=20,
+        )
+    )
+    db.commit()
+    ensure_agreement_followup_types(db)
+    cases = (
+        ("alinta_ci_gas", "Acme Bakery", "Ada Lovelace"),
+        ("alinta_ci_gas", "Acme Bakery", "MATTHEW HAAS"),
+        ("alinta_ci_gas", "Acme Bakery", "McDonald"),
+        ("alinta_ci_gas", "", ""),
+        ("origin_c_i_gas", "Acme Bakery", "Ada Lovelace"),
+    )
+    for type_id, business, contact in cases:
+        agreement = resolve_agreement_type(db, type_id)
+        before = render_first_touch(
+            agreement_label=agreement["label"],
+            business_name=business,
+            contact_name=contact,
+        )
+        after = render_first_touch(
+            agreement_label=agreement["label"],
+            business_name=business,
+            contact_name=contact,
+            template_subject=agreement["first_email_subject"],
+            template_body=agreement["first_email_body"],
+        )
+        assert after == before
+        assert agreement["chase_body"] == ""
+        assert agreement["chase_days"] == list(DEFAULT_CHASE_DAYS)
+        hardcoded_subject = first_touch_subject(
+            agreement_label=agreement["label"],
+            business_name=business,
+        )
+        hardcoded_body = first_touch_body_text(
+            agreement_label=agreement["label"],
+            business_name=business,
+            contact_name=contact,
+        )
+        assert after[0] == hardcoded_subject
+        assert after[1] == hardcoded_body
+        assert after[2] == wrap_first_touch_html(hardcoded_body)
+
+
+def test_custom_type_sends_its_copy_and_schedules_its_days(monkeypatch):
+    db = _db()
+    _template(db)
+    client = _client(db)
+    sentence = "CUSTOM_COPY_MARKER_ZXQ"
+    created = create_agreement_type(
+        db,
+        label="Simply Waste",
+        utility_type="",
+        retailer="",
+        first_email_subject="Please sign {{agreement_label}}",
+        first_email_body=(
+            "Hi {{contact_name}},\n\n"
+            + sentence
+            + " for {{business_name}}.\n\nKind regards,"
+        ),
+        chase_body=(
+            "Hi {{contact_name}},\n\nCHASE_"
+            + sentence
+            + " for {{business_name}}.\n\nKind regards,"
+        ),
+        chase_days=[2, 9],
+    )
+    stored_subject = created["first_email_subject"]
+    sent = {}
+
+    def fake_send(**kwargs):
+        sent.update(kwargs)
+        return {"ok": True, "response": {"email_id": "msg-custom", "gmail_thread_id": "thr-custom"}}
+
+    monkeypatch.setattr("services.agreement_followup.send_agreement_first_touch_email", fake_send)
+    result = start_agreement_followup(
+        db,
+        client_id=client.id,
+        agreement_type_raw=created["id"],
+        contact_email="ada@acme.test",
+        pdf_bytes=b"%PDF-1.4 fake",
+        filename="simply.pdf",
+        contact_name="Ada Lovelace",
+    )
+    assert sentence in sent["html"]
+    assert "Please sign Simply Waste" == result["subject"]
+    run = db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == result["run_id"]).one()
+    steps = (
+        db.query(AutonomousSequenceStep)
+        .filter(AutonomousSequenceStep.run_id == run.id)
+        .order_by(AutonomousSequenceStep.step_index)
+        .all()
+    )
+    assert [step.day_number for step in steps] == [0, 2, 9]
+    context = json.loads(run.context_json)
+    assert "CHASE_" + sentence in context["chase_body"]
+    assert context["chase_days"] == [2, 9]
+    again = resolve_agreement_type(db, created["id"])
+    assert again["first_email_subject"] == stored_subject
+
+    start_agreement_followup(
+        db,
+        client_id=client.id,
+        agreement_type_raw="alinta_ci_gas",
+        contact_email="other@acme.test",
+        pdf_bytes=b"%PDF-1.4 fake",
+        filename="alinta.pdf",
+        contact_name="Ada Lovelace",
+        subject="One-off subject",
+        body_text="One-off body for this send only.",
+    )
+    untouched = resolve_agreement_type(db, "alinta_ci_gas")
+    assert "One-off" not in untouched["first_email_subject"]
+    assert "One-off" not in untouched["first_email_body"]
+
+
+def test_custom_type_inherits_agreement_stop_rules(monkeypatch):
+    db = _db()
+    _template(db)
+    created = create_agreement_type(
+        db,
+        label="Simply Waste",
+        **_valid_copy(chase_days=[1, 4]),
+    )
+    monkeypatch.setattr(
+        "services.agreement_followup.send_agreement_first_touch_email",
+        lambda **kwargs: {"ok": True, "response": {"email_id": "msg-stop", "gmail_thread_id": "thr-stop"}},
+    )
+
+    def _run_for(email: str, business: str) -> AutonomousSequenceRun:
+        client = Client(business_name=business, primary_contact_email=email, stage="qualified")
+        db.add(client)
+        db.commit()
+        db.refresh(client)
+        result = start_agreement_followup(
+            db,
+            client_id=client.id,
+            agreement_type_raw=created["id"],
+            contact_email=email,
+            pdf_bytes=b"%PDF-1.4 fake",
+            filename="simply.pdf",
+            contact_name="Ada",
+        )
+        return db.query(AutonomousSequenceRun).filter(AutonomousSequenceRun.id == result["run_id"]).one()
+
+    invoiced = _run_for("invoice@acme.test", "Invoice Bakery")
+    invoiced = apply_inbound(db, invoiced, {"intent": "invoice_received", "invoice_received": True})
+    assert invoiced.run_status == "running"
+    assert invoiced.stop_reason != "invoice_received"
+    ready = (
+        db.query(AutonomousSequenceStep)
+        .filter(
+            AutonomousSequenceStep.run_id == invoiced.id,
+            AutonomousSequenceStep.step_status == "ready",
+        )
+        .count()
+    )
+    assert ready >= 1
+
+    signed = _run_for("signed@acme.test", "Signed Bakery")
+    signed = apply_inbound(db, signed, {"intent": "agreement_signed", "agreement_signed": True})
+    assert signed.run_status == "stopped"
+    assert signed.stop_reason == "agreement_signed"
+
+    stopped = _run_for("stop@acme.test", "Stop Bakery")
+    stopped = apply_inbound(db, stopped, {"intent": "stop"})
+    assert stopped.run_status == "stopped"
+    assert stopped.stop_reason == "negative_sentiment_stop"

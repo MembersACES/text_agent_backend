@@ -79,8 +79,32 @@ def test_manifest_lists_sites_and_closes_before_airtable(monkeypatch):
 
 
 def test_site_detail_closes_before_airtable_and_returns_bundle(monkeypatch):
-    db = _FakeDB()
+    class _DB:
+        def __init__(self):
+            self.closed = False
+
+        def query(self, *a, **k):
+            if self.closed:
+                raise AssertionError("db.query ran after the session was closed")
+
+            class _Query:
+                def filter(self, *args, **kwargs):
+                    return self
+
+                def first(self):
+                    return types.SimpleNamespace(id=7, business_name="Aligned Leisure")
+
+            return _Query()
+
+        def close(self):
+            self.closed = True
+
+    db = _DB()
     events = []
+    monkeypatch.setattr(
+        "services.signed_contract_dry_run.contracts_for",
+        lambda _name, index=None: {},
+    )
 
     # one staged record that matches this site
     monkeypatch.setattr(

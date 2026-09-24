@@ -27,19 +27,29 @@ logger = logging.getLogger(__name__)
 
 
 class AgreementTypeCreateBody(BaseModel):
-    label: str
-    utility_type: str
+    label: str = ""
+    display_name: str = ""
+    utility_type: str = ""
     retailer: str = ""
     default_subject: str = ""
     default_body: str = ""
+    first_email_subject: str = ""
+    first_email_body: str = ""
+    chase_body: str = ""
+    chase_days: list[int] | None = None
 
 
 class AgreementTypeUpdateBody(BaseModel):
     label: str | None = None
+    display_name: str | None = None
     utility_type: str | None = None
     retailer: str | None = None
     default_subject: str | None = None
     default_body: str | None = None
+    first_email_subject: str | None = None
+    first_email_body: str | None = None
+    chase_body: str | None = None
+    chase_days: list[int] | None = None
     is_active: bool | None = None
 
 
@@ -66,10 +76,15 @@ def register_agreement_followup_routes(app, get_current_user):
             return create_agreement_type(
                 db,
                 label=body.label,
+                display_name=body.display_name,
                 utility_type=body.utility_type,
                 retailer=body.retailer,
                 default_subject=body.default_subject,
                 default_body=body.default_body,
+                first_email_subject=body.first_email_subject,
+                first_email_body=body.first_email_body,
+                chase_body=body.chase_body,
+                chase_days=body.chase_days,
                 created_by=created_by,
             )
         except AgreementFollowupError as exc:
@@ -94,10 +109,15 @@ def register_agreement_followup_routes(app, get_current_user):
                 db,
                 type_id,
                 label=body.label,
+                display_name=body.display_name,
                 utility_type=body.utility_type,
                 retailer=body.retailer,
                 default_subject=body.default_subject,
                 default_body=body.default_body,
+                first_email_subject=body.first_email_subject,
+                first_email_body=body.first_email_body,
+                chase_body=body.chase_body,
+                chase_days=body.chase_days,
                 is_active=body.is_active,
             )
         except AgreementFollowupError as exc:
@@ -137,8 +157,12 @@ def register_agreement_followup_routes(app, get_current_user):
             agreement_label=agreement["label"],
             business_name=business_name,
             contact_name=contact_name,
-            template_subject=str(agreement.get("default_subject") or ""),
-            template_body=str(agreement.get("default_body") or ""),
+            template_subject=str(
+                agreement.get("first_email_subject") or agreement.get("default_subject") or ""
+            ),
+            template_body=str(
+                agreement.get("first_email_body") or agreement.get("default_body") or ""
+            ),
         )
         return {
             "agreement_type": agreement["id"],

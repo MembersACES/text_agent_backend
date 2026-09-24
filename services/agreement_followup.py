@@ -12,7 +12,7 @@ from typing import Any, NoReturn
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy import func, or_
+from sqlalchemy import func, inspect, or_, text
 from sqlalchemy.orm import Session
 
 from crm_enums import OfferActivityType, OfferStatus
@@ -35,7 +35,14 @@ from services.autonomous_sequence import (
 )
 from services.campaigns import extract_email_id_from_webhook_response
 from services.crm import create_offer_activity
-from services.merge_template import html_to_plain_text, looks_like_email, sanitize_html
+from services.merge_template import (
+    TOKEN_RE,
+    html_to_plain_text,
+    looks_like_email,
+    render_template,
+    sanitize_html,
+    validate_template,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +182,21 @@ SEED_AGREEMENT_TYPES: tuple[dict[str, str], ...] = (
 
 AGREEMENT_TYPES = SEED_AGREEMENT_TYPES
 
+DEFAULT_CHASE_DAYS: tuple[int, ...] = (1, 3, 5, 7)
+MAX_CHASE_STEPS = 5
+# Only tokens this lane actually substitutes. Anything else is rejected at save.
+AGREEMENT_COPY_KEYS = frozenset(
+    {"agreement_label", "business_name", "label", "contact_name", "company_name"}
+)
+DEFAULT_FIRST_EMAIL_SUBJECT = "{{agreement_label}} ready for signing — {{business_name}}"
+DEFAULT_FIRST_EMAIL_BODY = (
+    "Hi {{contact_name}},\n\n"
+    "Please find attached the {{agreement_label}} for {{business_name}}.\n\n"
+    "Could you review and return the signed agreement at your earliest convenience? "
+    "Reply to this email with the signed PDF, or let us know if you have any questions.\n\n"
+    "Kind regards,"
+)
+
 
 class AgreementFollowupError(Exception):
     def __init__(self, message: str, status_code: int = 400) -> None:
@@ -191,21 +213,147 @@ def slugify_agreement_type(label: str) -> str:
     return text[:80]
 
 
+def _canonical_copy() -> dict[str, str]:
+    return {
+        "first_email_subject": DEFAULT_FIRST_EMAIL_SUBJECT,
+        "first_email_body": DEFAULT_FIRST_EMAIL_BODY,
+        "chase_days": json.dumps(list(DEFAULT_CHASE_DAYS)),
+    }
+
+
+def _parse_chase_days(raw: Any) -> list[int]:
+    if raw is None or raw == "":
+        raise AgreementFollowupError("At least one chase day is required")
+    if isinstance(raw, str):
+        text_value = raw.strip()
+        if not text_value:
+            raise AgreementFollowupError("At least one chase day is required")
+        try:
+            raw = json.loads(text_value)
+        except json.JSONDecodeError:
+            raw = [part.strip() for part in text_value.split(",") if part.strip()]
+    if not isinstance(raw, list) or not raw:
+        raise AgreementFollowupError("At least one chase day is required")
+    days: list[int] = []
+    for item in raw:
+        try:
+            days.append(int(item))
+        except (TypeError, ValueError):
+            raise AgreementFollowupError(
+                "Chase days must be whole numbers between 1 and 30"
+            ) from None
+    if len(days) > MAX_CHASE_STEPS:
+        raise AgreementFollowupError("A type can have at most 5 chase steps")
+    if any(day < 1 or day > 30 for day in days):
+        raise AgreementFollowupError("Chase days must be whole numbers between 1 and 30")
+    if days != sorted(days) or len(set(days)) != len(days):
+        raise AgreementFollowupError(
+            "Chase days must be in ascending order with no duplicates"
+        )
+    return days
+
+
+def _reject_unknown_tokens(*parts: str) -> None:
+    unknown: list[str] = []
+    for part in parts:
+        for token in validate_template(part or "", AGREEMENT_COPY_KEYS):
+            if token not in unknown:
+                unknown.append(token)
+    if not unknown:
+        return
+    named = ", ".join("{{" + token + "}}" for token in unknown)
+    verb = "is" if len(unknown) == 1 else "are"
+    raise AgreementFollowupError(f"{named} {verb} not available on this lane.")
+
+
+def _require_copy(subject: str, body: str, chase_body: str, chase_days: Any) -> list[int]:
+    if not (subject or "").strip():
+        raise AgreementFollowupError("Subject is required")
+    if not (body or "").strip():
+        raise AgreementFollowupError("First email body is required")
+    days = _parse_chase_days(chase_days)
+    _reject_unknown_tokens(subject, body, chase_body)
+    return days
+
+
 def _type_to_dict(row: AgreementFollowupType) -> dict[str, Any]:
+    days_raw = row.chase_days
+    try:
+        days = _parse_chase_days(days_raw) if days_raw else list(DEFAULT_CHASE_DAYS)
+    except AgreementFollowupError:
+        days = list(DEFAULT_CHASE_DAYS)
+    subject = row.first_email_subject or row.default_subject or ""
+    body = row.first_email_body or row.default_body or ""
     return {
         "id": row.id,
         "label": row.label,
-        "utility_type": row.utility_type,
+        "display_name": row.label,
+        "utility_type": row.utility_type or "",
         "retailer": (row.retailer or "").strip(),
-        "default_subject": row.default_subject or "",
-        "default_body": row.default_body or "",
+        "default_subject": row.default_subject or subject,
+        "default_body": row.default_body or body,
+        "first_email_subject": subject,
+        "first_email_body": body,
+        "chase_body": row.chase_body or "",
+        "chase_days": days,
         "is_active": bool(row.is_active),
         "sort_order": int(row.sort_order or 0),
     }
 
 
+def _ensure_type_columns(db: Session) -> None:
+    bind = db.get_bind()
+    insp = inspect(bind)
+    tables = set(insp.get_table_names() or [])
+    if "agreement_followup_types" not in tables:
+        return
+    present = {col["name"] for col in insp.get_columns("agreement_followup_types")}
+    wanted = {
+        "first_email_subject": "TEXT",
+        "first_email_body": "TEXT",
+        "chase_body": "TEXT",
+        "chase_days": "TEXT",
+    }
+    added = False
+    for name, ddl in wanted.items():
+        if name in present:
+            continue
+        db.execute(text(f"ALTER TABLE agreement_followup_types ADD COLUMN {name} {ddl}"))
+        added = True
+    if added:
+        db.commit()
+
+
+def _backfill_type_copy(db: Session) -> None:
+    copy = _canonical_copy()
+    changed = False
+    for row in db.query(AgreementFollowupType).all():
+        if (row.first_email_subject or "").strip() and (row.first_email_body or "").strip() and (
+            row.chase_days or ""
+        ).strip():
+            continue
+        row.first_email_subject = (
+            row.first_email_subject
+            or (row.default_subject or "").strip()
+            or copy["first_email_subject"]
+        )
+        row.first_email_body = (
+            row.first_email_body or (row.default_body or "").strip() or copy["first_email_body"]
+        )
+        row.chase_days = row.chase_days or copy["chase_days"]
+        if not (row.default_subject or "").strip():
+            row.default_subject = row.first_email_subject
+        if not (row.default_body or "").strip():
+            row.default_body = row.first_email_body
+        changed = True
+    if changed:
+        db.commit()
+
+
 def ensure_agreement_followup_types(db: Session) -> None:
+    _ensure_type_columns(db)
     existing = {row.id for row in db.query(AgreementFollowupType).all()}
+    copy = _canonical_copy()
     added = False
     for index, seed in enumerate(SEED_AGREEMENT_TYPES):
         if seed["id"] in existing:
@@ -218,11 +366,18 @@ def ensure_agreement_followup_types(db: Session) -> None:
                 retailer=seed.get("retailer") or "",
                 is_active=1,
                 sort_order=index,
+                first_email_subject=copy["first_email_subject"],
+                first_email_body=copy["first_email_body"],
+                chase_body=None,
+                chase_days=copy["chase_days"],
+                default_subject=copy["first_email_subject"],
+                default_body=copy["first_email_body"],
             )
         )
         added = True
     if added:
         db.commit()
+    _backfill_type_copy(db)
 
 
 def list_agreement_types(db: Session, include_inactive: bool = False) -> list[dict[str, Any]]:
@@ -259,19 +414,24 @@ def resolve_agreement_type(db: Session, raw: str) -> dict[str, Any]:
 def create_agreement_type(
     db: Session,
     *,
-    label: str,
-    utility_type: str,
+    label: str = "",
+    utility_type: str = "",
     retailer: str = "",
     default_subject: str = "",
     default_body: str = "",
+    first_email_subject: str = "",
+    first_email_body: str = "",
+    chase_body: str = "",
+    chase_days: Any = None,
+    display_name: str = "",
     created_by: str | None = None,
 ) -> dict[str, Any]:
     ensure_agreement_followup_types(db)
-    name = (label or "").strip()
+    name = (label or display_name or "").strip()
     if not name:
         raise AgreementFollowupError("Type name is required")
     utility = (utility_type or "").strip()
-    if utility not in UTILITY_TYPES:
+    if utility and utility not in UTILITY_TYPES:
         raise AgreementFollowupError(f"utility_type must be one of: {', '.join(UTILITY_TYPES)}")
     slug = slugify_agreement_type(name)
     clash = (
@@ -293,6 +453,10 @@ def create_agreement_type(
         raise AgreementFollowupError(
             f"A type named {clash.label} already exists. Pick a different name, or use the existing tile."
         )
+    subject = (first_email_subject or default_subject or "").strip()
+    body = (first_email_body or default_body or "").strip()
+    chase = (chase_body or "").strip()
+    days = _require_copy(subject, body, chase, chase_days if chase_days is not None else list(DEFAULT_CHASE_DAYS))
     max_order = db.query(AgreementFollowupType.sort_order).order_by(
         AgreementFollowupType.sort_order.desc()
     ).first()
@@ -302,8 +466,12 @@ def create_agreement_type(
         label=name,
         utility_type=utility,
         retailer=(retailer or "").strip(),
-        default_subject=(default_subject or "").strip() or None,
-        default_body=(default_body or "").strip() or None,
+        default_subject=subject,
+        default_body=body,
+        first_email_subject=subject,
+        first_email_body=body,
+        chase_body=chase or None,
+        chase_days=json.dumps(days),
         is_active=1,
         sort_order=next_order,
         created_by=created_by,
@@ -323,12 +491,19 @@ def update_agreement_type(
     retailer: str | None = None,
     default_subject: str | None = None,
     default_body: str | None = None,
+    first_email_subject: str | None = None,
+    first_email_body: str | None = None,
+    chase_body: str | None = None,
+    chase_days: Any = None,
+    display_name: str | None = None,
     is_active: bool | None = None,
 ) -> dict[str, Any]:
     ensure_agreement_followup_types(db)
     row = db.query(AgreementFollowupType).filter(AgreementFollowupType.id == type_id).first()
     if not row:
         raise AgreementFollowupError("Agreement type not found", 404)
+    if label is None and display_name is not None:
+        label = display_name
     if label is not None:
         name = label.strip()
         if not name:
@@ -346,15 +521,46 @@ def update_agreement_type(
         row.label = name
     if utility_type is not None:
         utility = utility_type.strip()
-        if utility not in UTILITY_TYPES:
+        if utility and utility not in UTILITY_TYPES:
             raise AgreementFollowupError(f"utility_type must be one of: {', '.join(UTILITY_TYPES)}")
         row.utility_type = utility
     if retailer is not None:
         row.retailer = retailer.strip()
-    if default_subject is not None:
-        row.default_subject = default_subject.strip() or None
-    if default_body is not None:
-        row.default_body = default_body.strip() or None
+    copy_touched = any(
+        value is not None
+        for value in (
+            default_subject,
+            default_body,
+            first_email_subject,
+            first_email_body,
+            chase_body,
+            chase_days,
+        )
+    )
+    if copy_touched:
+        subject = (
+            first_email_subject
+            if first_email_subject is not None
+            else default_subject
+            if default_subject is not None
+            else row.first_email_subject or row.default_subject or ""
+        )
+        body = (
+            first_email_body
+            if first_email_body is not None
+            else default_body
+            if default_body is not None
+            else row.first_email_body or row.default_body or ""
+        )
+        chase = chase_body if chase_body is not None else (row.chase_body or "")
+        days_input = chase_days if chase_days is not None else row.chase_days
+        days = _require_copy(subject, body, chase, days_input)
+        row.first_email_subject = subject.strip()
+        row.first_email_body = body.strip()
+        row.default_subject = subject.strip()
+        row.default_body = body.strip()
+        row.chase_body = chase.strip() or None
+        row.chase_days = json.dumps(days)
     if is_active is not None:
         row.is_active = 1 if is_active else 0
     db.commit()
@@ -464,14 +670,14 @@ def fill_copy_template(
     business_name: str,
     agreement_label: str,
 ) -> str:
-    return (
-        (template or "")
-        .replace("{{first_name}}", first_name)
-        .replace("{{contact_name}}", first_name)
-        .replace("{{business_name}}", business_name)
-        .replace("{{agreement_label}}", agreement_label)
-        .replace("{{label}}", agreement_label)
-    )
+    row = {key: "" for key in AGREEMENT_COPY_KEYS}
+    row["contact_name"] = first_name
+    row["business_name"] = business_name
+    row["company_name"] = business_name
+    row["agreement_label"] = agreement_label
+    row["label"] = agreement_label
+    filled, _unresolved = render_template(template, row)
+    return TOKEN_RE.sub("", filled)
 
 
 def first_touch_subject(*, agreement_label: str, business_name: str) -> str:
@@ -1063,8 +1269,12 @@ def start_agreement_followup(
         contact_name=display_name,
         subject=subject,
         body_text=body_text,
-        template_subject=str(agreement.get("default_subject") or ""),
-        template_body=str(agreement.get("default_body") or ""),
+        template_subject=str(
+            agreement.get("first_email_subject") or agreement.get("default_subject") or ""
+        ),
+        template_body=str(
+            agreement.get("first_email_body") or agreement.get("default_body") or ""
+        ),
     )
     if test_mode and not subject.upper().startswith("[TEST]"):
         subject = f"[TEST] {subject}"
@@ -1172,6 +1382,10 @@ def start_agreement_followup(
         "omit_document_links": True,
         "initial_email_subject": subject,
         "signature_html": ACES_TEAM_FOLLOWUP_SIGNATURE_HTML,
+        "chase_body": str(agreement.get("chase_body") or ""),
+        "chase_days": list(agreement.get("chase_days") or list(DEFAULT_CHASE_DAYS)),
+        "company_name": business_name,
+        "label": agreement["label"],
     }
     if test_mode:
         context["agreement_test"] = True
