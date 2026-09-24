@@ -1102,6 +1102,34 @@ def _plan_template_times(
     return plan
 
 
+def _plan_agreement_chase_days(
+    anchor: datetime,
+    chase_days: list,
+    *,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime, Optional[str], Optional[str]]]:
+    tz = ZoneInfo(timezone_name)
+    a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
+    local = a.astimezone(tz)
+    day1 = next_business_day(local.date())
+    plan: list[tuple[int, str, datetime, Optional[str], Optional[str]]] = []
+    for raw in chase_days:
+        day_num = int(raw)
+        target_date = ensure_weekday(day1 + timedelta(days=max(0, day_num - 1)))
+        local_dt = datetime.combine(target_date, time(9, 0), tzinfo=tz)
+        local_dt = clamp_to_contact_hours(local_dt, timezone_name=timezone_name)
+        plan.append(
+            (
+                day_num,
+                "email",
+                local_dt.astimezone(timezone.utc).replace(tzinfo=None),
+                None,
+                None,
+            )
+        )
+    return plan
+
+
 def plan_solar_engagement_form_times(
     anchor: datetime,
     timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
@@ -2166,6 +2194,15 @@ def start_gas_base2_sequence(
     else:
         fallback_plan = plan_gas_base2_followup_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
+
+    if sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+        raw_days = context_payload.get("chase_days")
+        if isinstance(raw_days, list) and raw_days:
+            plan = _plan_agreement_chase_days(
+                anchor_at,
+                raw_days,
+                timezone_name=schedule_tz_name,
+            )
 
     if dashboard_test and plan:
         # Production Day 1 is the next business day, so a test started today is not due yet.
