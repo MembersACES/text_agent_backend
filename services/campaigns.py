@@ -11,7 +11,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -53,6 +53,9 @@ LOCAL_DEV_ENVIRONMENTS = frozenset({"development", "dev", "local"})
 TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled", "errored"})
 UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
 UNSUBSCRIBE_LINK_TEXT = "Unsubscribe"
+ONE_CLICK_BODY = "List-Unsubscribe=One-Click"
+CONFIRM_FIELD = "confirm"
+CONFIRM_VALUE = "page"
 WORDMARK = "Carbon Zero Australasia"
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
@@ -201,12 +204,24 @@ def unsubscribe_confirm_html(email: str, token: str) -> str:
         f"<p style=\"margin:0 0 24px;font-size:16px;line-height:1.5;\">"
         f"Unsubscribe <strong>{escape(email)}</strong> from these emails?</p>"
         f"<form method=\"post\" action=\"{escape(action, quote=True)}\">"
+        f"<input type=\"hidden\" name=\"{CONFIRM_FIELD}\" value=\"{CONFIRM_VALUE}\">"
         "<button type=\"submit\" style=\"appearance:none;border:0;border-radius:999px;"
         "background:#5750F1;color:#fff;font-size:14px;font-weight:700;padding:10px 22px;"
         "cursor:pointer;\">Unsubscribe</button>"
         "</form>"
     )
     return _unsubscribe_page("Unsubscribe", inner)
+
+
+def unsubscribe_post_kind(body: str) -> str | None:
+    """one_click or confirm_page. Anything else is refused."""
+    text = (body or "").strip()
+    if text == ONE_CLICK_BODY:
+        return "one_click"
+    fields = parse_qs(text, keep_blank_values=False)
+    if set(fields) == {CONFIRM_FIELD} and fields.get(CONFIRM_FIELD) == [CONFIRM_VALUE]:
+        return "confirm_page"
+    return None
 
 
 def unsubscribe_done_html(email: str) -> str:

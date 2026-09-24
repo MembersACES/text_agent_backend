@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -35,8 +37,11 @@ from services.campaigns import (
     fire_test_send,
     unsubscribe_confirm_html,
     unsubscribe_done_html,
+    unsubscribe_post_kind,
     verify_unsubscribe_token,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CampaignCreateBody(BaseModel):
@@ -135,7 +140,17 @@ def register_campaign_routes(app, get_current_user_with_db):
         return HTMLResponse(unsubscribe_confirm_html(email, token), status_code=200)
 
     @app.post("/api/autonomous/campaigns/unsubscribe")
-    def unsubscribe_post(request: Request, token: Optional[str] = None, db: Session = Depends(get_db)):
+    async def unsubscribe_post(request: Request, token: Optional[str] = None, db: Session = Depends(get_db)):
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        kind = unsubscribe_post_kind(raw)
+        if kind is None:
+            logger.warning(
+                "Refused unsubscribe POST source=%s content_type=%s body_len=%d",
+                request.headers.get("user-agent") or "unknown",
+                (request.headers.get("content-type") or "missing").split(";")[0].strip() or "missing",
+                len(raw.strip()),
+            )
+            raise HTTPException(status_code=400, detail="Unsubscribe was not confirmed")
         value = token or request.query_params.get("token") or ""
         try:
             result = apply_unsubscribe(db, value)
