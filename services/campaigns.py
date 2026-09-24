@@ -11,7 +11,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -53,6 +53,9 @@ LOCAL_DEV_ENVIRONMENTS = frozenset({"development", "dev", "local"})
 TERMINAL_RUN_STATUSES = frozenset({"stopped", "completed", "cancelled", "errored"})
 UNSUBSCRIBE_FOOTER_INTRO = "You can unsubscribe from these emails at any time."
 UNSUBSCRIBE_LINK_TEXT = "Unsubscribe"
+ONE_CLICK_BODY = "List-Unsubscribe=One-Click"
+CONFIRM_FIELD = "confirm"
+CONFIRM_VALUE = "page"
 WORDMARK = "Carbon Zero Australasia"
 TEST_SEND_LIMIT = 20
 TEST_SEND_WINDOW = timedelta(hours=1)
@@ -201,12 +204,24 @@ def unsubscribe_confirm_html(email: str, token: str) -> str:
         f"<p style=\"margin:0 0 24px;font-size:16px;line-height:1.5;\">"
         f"Unsubscribe <strong>{escape(email)}</strong> from these emails?</p>"
         f"<form method=\"post\" action=\"{escape(action, quote=True)}\">"
+        f"<input type=\"hidden\" name=\"{CONFIRM_FIELD}\" value=\"{CONFIRM_VALUE}\">"
         "<button type=\"submit\" style=\"appearance:none;border:0;border-radius:999px;"
         "background:#5750F1;color:#fff;font-size:14px;font-weight:700;padding:10px 22px;"
         "cursor:pointer;\">Unsubscribe</button>"
         "</form>"
     )
     return _unsubscribe_page("Unsubscribe", inner)
+
+
+def unsubscribe_post_kind(body: str) -> str | None:
+    """one_click or confirm_page. Anything else is refused."""
+    text = (body or "").strip()
+    if text == ONE_CLICK_BODY:
+        return "one_click"
+    fields = parse_qs(text, keep_blank_values=False)
+    if set(fields) == {CONFIRM_FIELD} and fields.get(CONFIRM_FIELD) == [CONFIRM_VALUE]:
+        return "confirm_page"
+    return None
 
 
 def unsubscribe_done_html(email: str) -> str:
@@ -241,6 +256,34 @@ def _row_key(row: CampaignRow) -> str:
 
 def _human_only_keys(rows: list[CampaignRow]) -> set[str]:
     return {_row_key(row) for row in rows if row.human_only and _row_key(row)}
+
+
+HELD_HUMAN_ONLY = "held: marked human only"
+HELD_SHAPE_WARNING = "held: shape warnings on this row"
+FAILED_BAD_ADDRESS = "not sent: address is not a valid email"
+
+
+def _stamp_not_started_reasons(
+    rows: list[CampaignRow],
+    blocked_keys: set[str],
+    warning_ids: set[int],
+) -> None:
+    """Say why a pending row was passed over.
+
+    A row held back for a shape warning or a human-only flag used to stay at
+    pending with no reason recorded, which reads as "not reached yet" rather
+    than "will never be sent". Leave row_status alone so the row still starts
+    once the underlying problem is fixed.
+    """
+    for row in rows:
+        if row.row_status != "pending":
+            continue
+        if row.human_only or _row_key(row) in blocked_keys:
+            row.suppression_reason = HELD_HUMAN_ONLY
+        elif row.id in warning_ids:
+            row.suppression_reason = HELD_SHAPE_WARNING
+        elif row.suppression_reason in (HELD_HUMAN_ONLY, HELD_SHAPE_WARNING):
+            row.suppression_reason = None
 
 
 def _counts_from_rows(rows: list[CampaignRow]) -> dict[str, Any]:
@@ -1252,6 +1295,7 @@ def _start_pending_rows(
         and _row_key(row) not in blocked_keys
         and row.id not in warning_ids
     ]
+    _stamp_not_started_reasons(all_rows, blocked_keys, warning_ids)
     started = 0
     skipped_suppressed = 0
     skipped_idempotent = 0
@@ -1289,7 +1333,7 @@ def _start_pending_rows(
         subject, html, text = render_first_touch(campaign, merge, test=False)
         if not looks_like_email(to):
             row.row_status = "failed"
-            row.suppression_reason = "manual"
+            row.suppression_reason = FAILED_BAD_ADDRESS
             continue
         n8n_result = send_first_touch_email(
             db=db, to=to, subject=subject, html=html, text=text, campaign=campaign, row=row, test=False

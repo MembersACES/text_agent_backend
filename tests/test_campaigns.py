@@ -882,6 +882,24 @@ def test_unsubscribe_get_does_not_write_suppression():
     assert db.query(Suppression).count() == 0
 
 
+def test_unsubscribe_post_without_body_is_refused():
+    db = _db()
+    campaign = _draft_with_rows(db, n=1)
+    token = sign_unsubscribe_token("ada@example.com", campaign.id)
+    client = _campaign_client(db)
+    res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    assert res.status_code == 400
+    assert db.query(Suppression).count() == 0
+    ok = client.post(
+        "/api/autonomous/campaigns/unsubscribe",
+        params={"token": token},
+        content=b"List-Unsubscribe=One-Click",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert ok.status_code == 200
+    assert db.query(Suppression).count() == 1
+
+
 def test_unsubscribe_post_writes_suppression_and_stops_live_run():
     db = _db()
     campaign = _draft_with_rows(db, n=1)
@@ -890,7 +908,11 @@ def test_unsubscribe_post_writes_suppression_and_stops_live_run():
     finished = _live_run(db, "ada@example.com", "completed")
     token = sign_unsubscribe_token("ada@example.com", campaign.id)
     client = _campaign_client(db)
-    res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    res = client.post(
+        "/api/autonomous/campaigns/unsubscribe",
+        params={"token": token},
+        data={"confirm": "page"},
+    )
     assert res.status_code == 200
     assert res.headers.get("location") in (None, "")
     assert "has been unsubscribed" in res.text.lower()
@@ -957,7 +979,11 @@ def test_unsubscribe_get_and_post_work_with_no_session_and_do_not_redirect_to_au
     assert "Carbon Zero Australasia" in get_res.text
     assert db.query(Suppression).count() == 0
 
-    post_res = client.post("/api/autonomous/campaigns/unsubscribe", params={"token": token})
+    post_res = client.post(
+        "/api/autonomous/campaigns/unsubscribe",
+        params={"token": token},
+        data={"confirm": "page"},
+    )
     assert post_res.status_code == 200
     assert not post_res.headers.get("location")
     assert "login" not in post_res.text.lower()
