@@ -405,6 +405,60 @@ def _evidence_uri(row: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# NMI canonicalisation
+#
+# An Australian NMI is 10 characters. An optional 11th digit is a checksum
+# (AEMO "NMI Checksum" procedure). Both spellings circulate, and the LOA has
+# been linking the SAME physical meter under both — e.g. Centurion had
+# 2002323086 (12 invoices) and 20023230869 (0) as two separate "sites", so the
+# coverage report showed one complete meter and one with nothing, when there is
+# only one meter with twelve months of invoices.
+#
+# We collapse to the 10-character form, and only when the trailing digit is the
+# genuine checksum for the preceding ten. That self-validating test means an
+# unrelated 11-character identifier is left alone (it would have to accidentally
+# carry a correct check digit to be touched).
+#
+# Applied to electricity only. Gas MIRNs and waste/oil account numbers do not
+# use this scheme, and guessing at them would be worse than leaving them split.
+# ---------------------------------------------------------------------------
+_NMI_UTILITY_TYPES = frozenset({"C&I Electricity", "SME Electricity"})
+
+
+def nmi_check_digit(nmi10: str) -> Optional[int]:
+    """AEMO checksum for a 10-character NMI. None if the input isn't 10 chars."""
+    s = (nmi10 or "").strip().upper()
+    if len(s) != 10 or not s.isalnum():
+        return None
+    total = 0
+    for i, ch in enumerate(reversed(s)):
+        v = ord(ch)
+        if i % 2 == 0:
+            v *= 2
+        total += sum(int(d) for d in str(v))
+    return (10 - (total % 10)) % 10
+
+
+def canonical_site_id(utility_type: str, identifier: str) -> str:
+    """
+    One physical meter -> one site id.
+
+    Strips a valid NMI checksum digit so the 10- and 11-character spellings of
+    the same meter group together. Anything else is returned unchanged (trimmed
+    and upper-cased for electricity, so casing can't split a site either).
+    """
+    ident = (identifier or "").strip()
+    if not ident or utility_type not in _NMI_UTILITY_TYPES:
+        return ident
+    up = ident.upper()
+    if len(up) == 11 and up.isalnum():
+        check = nmi_check_digit(up[:10])
+        if check is not None and up[10] == str(check):
+            return up[:10]
+    return up
+
+
 def _make_record_id(entity_id: str, activity_type: str, source_row_id: str) -> str:
     digest = hashlib.sha256(f"{entity_id}:{activity_type}:{source_row_id}".encode()).hexdigest()[:12]
     return f"act_{digest}"
@@ -458,7 +512,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         "schema_version": "1.0",
         "record_id": record_id,
         "entity_id": ctx.entity_id,
-        "site_id": ctx.site_id or None,
+        "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
         "client_id": ctx.loa_client_id,
         "reporting_period": {
             "start": period_start.isoformat(),
@@ -546,7 +600,7 @@ def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
         "schema_version": "1.0",
         "record_id": record_id,
         "entity_id": ctx.entity_id,
-        "site_id": ctx.site_id or None,
+        "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
         "client_id": ctx.loa_client_id,
         "reporting_period": {"start": period_start.isoformat(), "end": period_end.isoformat()},
         "activity_type": "cooking_oil",

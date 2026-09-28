@@ -25,7 +25,11 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from models import ClimateActivityRecord
-from services.climate_activity_etl import UTILITY_ACTIVITY_MAP, default_fy_period
+from services.climate_activity_etl import (
+    UTILITY_ACTIVITY_MAP,
+    canonical_site_id,
+    default_fy_period,
+)
 from services.entity_groups import clients_in_disclosure_rollup
 
 # Severity ordering — worst first, so the UI can sort on it without knowing the words.
@@ -76,7 +80,16 @@ def _months_spanned(start: Optional[date], end: Optional[date]) -> list[str]:
 
 
 def _site_key(utility_type: str, identifier: str) -> str:
-    return f"{(utility_type or '').strip()}|{(identifier or '').strip()}"
+    """
+    Group by PHYSICAL meter, not by however the identifier happened to be typed.
+
+    canonical_site_id collapses the 10- and 11-character spellings of one NMI
+    (the 11th digit is an AEMO checksum). Without this the LOA's duplicate links
+    show up as two sites — one complete, one empty — and the report reads as a
+    data gap when it is really a duplicate.
+    """
+    ut = (utility_type or "").strip()
+    return f"{ut}|{canonical_site_id(ut, identifier)}"
 
 
 def build_entity_data_gaps(
