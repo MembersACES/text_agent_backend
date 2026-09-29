@@ -33,8 +33,9 @@ if "tools.business_info" not in sys.modules:
 from tools.supplier_data_request import (  # noqa: E402
     EMAIL_TEMPLATES,
     RETAILER_EMAILS,
+    _invoice_ask,
     _invoice_attachment_clause,
-    _missing_months_clause,
+    place_missing_invoice_ask,
 )
 from services.climate_data_gaps import _evidence_uri_of, month_label  # noqa: E402
 
@@ -47,42 +48,67 @@ TEMPLATE_VARS = {
 }
 
 
-# --- the rider --------------------------------------------------------------
+# --- the ask ----------------------------------------------------------------
 
 @pytest.mark.parametrize("empty", [None, [], ["", "   "]])
-def test_no_months_means_no_rider(empty):
+def test_no_months_means_the_template_is_left_alone(empty):
     """A request sent the old way must read exactly as it always did."""
-    assert _missing_months_clause(empty) == ""
+    body = "<li>Copy of the most recent invoice</li><p>Kind Regards,</p>"
+    assert _invoice_ask(empty) == ""
+    assert place_missing_invoice_ask(body, empty) == body
 
 
-def test_rider_names_every_month():
-    out = _missing_months_clause(["Jul 2025", "Sep 2025", "Jan 2026"])
-    assert "Jul 2025, Sep 2025, Jan 2026" in out
-    assert out.startswith(" ")  # appends inside the <li>, so it needs the space
+def test_the_invoice_bullet_is_replaced_with_the_missing_periods():
+    body = "<ul><li>Copy of the most recent invoice</li></ul><p>Kind Regards,</p><p>NOTE: confidential</p>"
+    out = place_missing_invoice_ask(body, ["Jul 2025", "Sep 2025", "Jan 2026"])
+    assert "Copy of the most recent invoice" not in out
+    assert "Copies of the invoices for these periods, which we do not hold: Jul 2025, Sep 2025, Jan 2026" in out
+    assert out.index("Jul 2025") < out.index("Kind Regards")
+    assert "Specifically, we hold no invoice" not in out
 
 
-def test_rider_is_capped_so_a_broken_report_cannot_flood_the_email():
-    out = _missing_months_clause([f"M{i}" for i in range(40)])
-    assert out.count(",") == 12
-    assert "and earlier" in out
+def test_a_saved_template_does_not_hide_the_ask_under_the_footer():
+    """The email that went to Momentum: generic bullet, months dumped after the note."""
+    body = """<p>Can you please provide the below information:</p>
+<ul>
+<li>12 Months Interval Data</li>
+<li>Contract End Date</li>
+<li>Direct Metering Agreement End Date</li>
+<li>Copy of the most recent invoice</li>
+</ul>
+<p>Please see attached:</p>
+<ul>
+<li>The Letter of Authority</li>
+</ul>
+<p>Kind Regards,</p>
+<p>NOTE: This email, including any attachments, is strictly confidential.</p>"""
+    out = place_missing_invoice_ask(
+        body,
+        ["Jul 2025", "Aug 2025", "Sep 2025", "Oct 2025", "Nov 2025", "Dec 2025", "Jan 2026", "Feb 2026", "Mar 2026"],
+    )
+    assert "Copy of the most recent invoice" not in out
+    assert out.index("Mar 2026") < out.index("Please see attached")
+    assert out.index("Mar 2026") < out.index("Kind Regards")
+    assert not out.strip().endswith("Mar 2026</p>") and "NOTE:" in out
+
+
+def test_the_ask_is_capped_so_a_broken_report_cannot_flood_the_email():
+    out = _invoice_ask([f"M{i}" for i in range(40)])
+    assert "M0, M1, M2, M3, M4, M5, M6, M7, M8, M9, M10, M11, and earlier" in out
+    assert "M12" not in out
 
 
 # --- templates --------------------------------------------------------------
 
 @pytest.mark.parametrize("key", sorted(EMAIL_TEMPLATES))
-def test_every_template_renders_with_and_without_the_rider(key):
+def test_every_template_renders_and_the_gap_rewrites_the_invoice_bullet(key):
     cfg = EMAIL_TEMPLATES[key]
-    rider = _missing_months_clause(["Jul 2025", "Sep 2025"])
-    without = cfg["template"].format(
-        **TEMPLATE_VARS, missing_months_clause="", invoice_attachment_clause=""
-    )
-    with_ = cfg["template"].format(
-        **TEMPLATE_VARS, missing_months_clause=rider, invoice_attachment_clause=""
-    )
+    rendered = cfg["template"].format(**TEMPLATE_VARS, invoice_attachment_clause="")
     cfg["subject"].format(**TEMPLATE_VARS)
-    assert "{" not in without and "}" not in without
-    assert len(with_) - len(without) == len(rider)
-    assert "Jul 2025, Sep 2025" in with_
+    assert "{" not in rendered and "}" not in rendered
+    asked = place_missing_invoice_ask(rendered, ["Jul 2025", "Sep 2025"])
+    assert "Jul 2025, Sep 2025" in asked
+    assert asked.index("Jul 2025") < asked.index("Kind Regards")
 
 
 @pytest.mark.parametrize("key", sorted(EMAIL_TEMPLATES))
@@ -103,7 +129,7 @@ def test_invoice_is_not_promised_as_attached_until_the_workflow_attaches_it(key)
     assert _invoice_attachment_clause("   ") == ""
     assert _invoice_attachment_clause("https://drive.google.com/file/d/abc/view") == ""
     rendered = EMAIL_TEMPLATES[key]["template"].format(
-        **TEMPLATE_VARS, missing_months_clause="", invoice_attachment_clause=""
+        **TEMPLATE_VARS, invoice_attachment_clause=""
     )
     assert "A recent invoice for this account, for reference" not in rendered
 
@@ -204,8 +230,12 @@ def test_the_request_that_actually_goes_out(monkeypatch):
     assert payload["invoice_url"] == "https://drive.google.com/file/d/abc/view"
     assert payload["missing_months"] == ["Jul 2025", "Sep 2025", "Jan 2026"]
     assert "2002323086" in payload["email_subject"]
-    assert "Jul 2025, Sep 2025, Jan 2026" in payload["email_body"]
-    assert "A recent invoice for this account" not in payload["email_body"]
+    body = payload["email_body"]
+    assert "Copy of the most recent invoice" not in body
+    assert "Copies of the invoices for these periods, which we do not hold: Jul 2025, Sep 2025, Jan 2026" in body
+    assert body.index("Jul 2025") < body.index("Kind Regards")
+    assert "Specifically, we hold no invoice" not in body
+    assert "A recent invoice for this account" not in body
     assert "{" not in payload["email_body"]
     assert result.startswith("✅") or "successfully sent" in result
 
@@ -231,7 +261,8 @@ def test_a_request_with_no_gap_reads_as_it_always_did(monkeypatch):
         identifier_type="NMI",
     )
     body = sent["payload"]["email_body"]
-    assert "in particular" not in body
+    assert "Copy of the most recent invoice" in body
+    assert "Copies of the invoices for these periods" not in body
     assert "Specifically, we hold no invoice" not in body
     assert "A recent invoice for this account" not in body
     assert sent["payload"]["invoice_url"] == ""
