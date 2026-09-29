@@ -2,7 +2,7 @@
 Supplier Data Request Tool with Email Templates
 """
 import requests
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 import logging
 from tools.business_info import get_business_information
 import re
@@ -44,7 +44,7 @@ RETAILER_EMAILS = {
     },
     "Veolia Waste": {
         "name": "Veolia",
-        "email": "cx.service@veolia.com.au, business@acesolutions.com.au",
+        "email": "cx.service@veolia.com.au, business@acesolutions.com.au, data.quote@fornrg.com",
         "variants": ["Veolia"]
     },
     "Alinta C&I Electricity": {
@@ -226,11 +226,11 @@ EMAIL_TEMPLATES = {
 <li>12 Months Interval Data</li>
 <li>Contract End Date</li>
 <li>Direct Metering Agreement End Date</li>
-<li>Copy of the most recent invoice</li>
+<li>Copy of the most recent invoice{missing_months_clause}</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -248,11 +248,11 @@ EMAIL_TEMPLATES = {
 <p>I am requesting the following information for my client {business_name} NMI: {nmi}. Can you please provide the below information:</p>
 <ul>
 <li>End date of contract (if applicable)</li>
-<li>12 Months worth of invoices (if applicable)</li>
+<li>12 Months worth of invoices (if applicable){missing_months_clause}</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -271,12 +271,12 @@ EMAIL_TEMPLATES = {
 <ul>
 <li>12 Months Interval Data</li>
 <li>Contract End Date</li>
-<li>Copy of 12 months worth of invoices</li>
+<li>Copy of 12 months worth of invoices{missing_months_clause}</li>
 <li>Copy of current contract in place</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -293,11 +293,11 @@ EMAIL_TEMPLATES = {
 <p>I am requesting the following information for my client {business_name} MRIN: {mrin}. Can you please provide the below information:</p>
 <ul>
 <li>End date of contract (if applicable)</li>
-<li>12 Months worth of invoices (if applicable)</li>
+<li>12 Months worth of invoices (if applicable){missing_months_clause}</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -312,7 +312,7 @@ EMAIL_TEMPLATES = {
 <p>{business_name} has engaged our services to conduct its GHG emissions report. Please see the letter of authority attached & a recent invoice (if available).</p>
 <p>Can you please send me the below details for a 12 month period (preferable most recent)</p>
 <ul>
-<li>12 Months worth of invoices</li>
+<li>12 Months worth of invoices{missing_months_clause}</li>
 <li>Bin Lift weights per waste stream</li>
 <li>Copy of current contract</li>
 <li>For all recycled waste please confirm that it has been recycled. If some of the recycled products have gone to landfill please provide the quantity or % of that has gone to landfill.</li>
@@ -325,6 +325,46 @@ EMAIL_TEMPLATES = {
 <p>Ph: 1300 849 908 | Website: acesolutions.com.au</p>"""
     },
 }
+
+
+# The supplier-data-request webhook accepts invoice_url but does not attach the
+# file. Keep the URL on the payload so that workflow can start attaching without
+# another deploy, and leave this off until it does — the email must not promise
+# a file that is not coming.
+ATTACH_HELD_INVOICE = False
+
+
+def _invoice_attachment_clause(invoice_url: Optional[str] = None) -> str:
+    """
+    Names the invoice in the attachment list when we are sending one.
+
+    Empty while ATTACH_HELD_INVOICE is off, and empty when we hold nothing for
+    the account.
+    """
+    if not ATTACH_HELD_INVOICE:
+        return ""
+    if not (invoice_url or "").strip():
+        return ""
+    return "\r\n<li>A recent invoice for this account, for reference</li>"
+
+
+def _missing_months_clause(missing_months: Optional[List[str]] = None) -> str:
+    """
+    Rider appended to the invoice line when the coverage report knows exactly
+    which periods are missing.
+
+    missing_months arrive already human-formatted ("Jul 2025"). None or empty
+    returns "", so a request sent the old way reads exactly as it always did.
+    """
+    months = [str(m).strip() for m in (missing_months or []) if str(m).strip()]
+    if not months:
+        return ""
+    if len(months) > 12:
+        months = months[:12] + ["and earlier"]
+    return (
+        " &mdash; in particular the periods we hold no invoice for: "
+        + ", ".join(months)
+    )
 
 
 def clean_parameter(value: str) -> str:
@@ -348,7 +388,9 @@ def supplier_data_request(
     business_name: str,
     service_type: Literal["electricity_ci", "electricity_sme", "gas_ci", "gas_sme", "waste"],
     account_identifier: str,
-    identifier_type: str = "NMI"
+    identifier_type: str = "NMI",
+    missing_months: Optional[List[str]] = None,
+    invoice_url: Optional[str] = None,
 ) -> str:
     """
     Request data from a supplier using specific email templates and attaching LOA
@@ -359,6 +401,10 @@ def supplier_data_request(
         service_type: Type of service (electricity_ci, electricity_sme, gas_ci, gas_sme, waste)
         account_identifier: The account identifier (NMI, MRIN, or account number)
         identifier_type: Type of identifier (NMI, MRIN, or account_number)
+        missing_months: Periods with no invoice on file, pre-formatted ("Jul 2025").
+                        Named explicitly in the email when supplied.
+        invoice_url: Link to an invoice we already hold, passed to n8n to attach
+                     alongside the LOA.
     """
     
     try:
@@ -392,7 +438,9 @@ def supplier_data_request(
             "business_name": business_name,
             "nmi": account_identifier if identifier_type == "NMI" else "",
             "mrin": account_identifier if identifier_type == "MRIN" else "",
-            "account_number": account_identifier if identifier_type == "account_number" else ""
+            "account_number": account_identifier if identifier_type == "account_number" else "",
+            "missing_months_clause": _missing_months_clause(missing_months),
+            "invoice_attachment_clause": _invoice_attachment_clause(invoice_url),
         }
 
         db_template = None
@@ -449,7 +497,29 @@ def supplier_data_request(
             except KeyError as e:
                 logger.error(f"Template formatting error: {e}")
                 return f"Error: Template formatting failed - missing variable: {e}"
-        
+
+        # A saved DB override template predates the missing-months rider and has
+        # no token to render it into. Rather than quietly send a request that
+        # never asks for the data we are missing, append the ask outright.
+        _rider = template_vars.get("missing_months_clause") or ""
+        if _rider and _rider.strip() not in email_body:
+            _months = ", ".join(
+                str(m).strip() for m in (missing_months or []) if str(m).strip()
+            )
+            if _months:
+                email_body += (
+                    "<p><b>Specifically, we hold no invoice for the following "
+                    f"periods:</b> {_months}</p>"
+                )
+        if (
+            ATTACH_HELD_INVOICE
+            and invoice_url
+            and "A recent invoice for this account" not in email_body
+        ):
+            email_body += (
+                "<p>A recent invoice for this account is attached for reference.</p>"
+            )
+
         # Prepare request for n8n
         request_data = {
             "supplier_name": resolved_supplier_name,
@@ -461,7 +531,9 @@ def supplier_data_request(
             "identifier_type": identifier_type,
             "email_subject": email_subject,
             "email_body": email_body,
-            "request_type": "supplier_data_request"
+            "request_type": "supplier_data_request",
+            "invoice_url": invoice_url or "",
+            "missing_months": missing_months or [],
         }
         
         logger.info(f"Sending to n8n webhook...")

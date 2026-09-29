@@ -2234,6 +2234,11 @@ class DataRequest(BaseModel):
     supplier_name: str
     request_type: str
     details: Optional[str] = None
+    # Set by the Data disclosure page when chasing a specific coverage gap.
+    # missing_months are human labels ("Jul 2025"); invoice_url is an invoice we
+    # already hold for this meter, passed to n8n to attach beside the LOA.
+    missing_months: Optional[List[str]] = None
+    invoice_url: Optional[str] = None
 
 class RobotDataRequest(BaseModel):
     robot_number: str
@@ -4636,6 +4641,8 @@ def data_request(
             service_type=service_type,
             account_identifier=account_identifier,
             identifier_type=identifier_type,
+            missing_months=request.missing_months,
+            invoice_url=request.invoice_url,
         )
         message = str(raw_result or "").strip()
         is_success = message.startswith("✅") or "Data request successfully sent" in message
