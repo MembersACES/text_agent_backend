@@ -226,7 +226,7 @@ EMAIL_TEMPLATES = {
 <li>12 Months Interval Data</li>
 <li>Contract End Date</li>
 <li>Direct Metering Agreement End Date</li>
-<li>Copy of the most recent invoice{missing_months_clause}</li>
+<li>Copy of the most recent invoice</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
@@ -248,7 +248,7 @@ EMAIL_TEMPLATES = {
 <p>I am requesting the following information for my client {business_name} NMI: {nmi}. Can you please provide the below information:</p>
 <ul>
 <li>End date of contract (if applicable)</li>
-<li>12 Months worth of invoices (if applicable){missing_months_clause}</li>
+<li>12 Months worth of invoices (if applicable)</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
@@ -271,7 +271,7 @@ EMAIL_TEMPLATES = {
 <ul>
 <li>12 Months Interval Data</li>
 <li>Contract End Date</li>
-<li>Copy of 12 months worth of invoices{missing_months_clause}</li>
+<li>Copy of 12 months worth of invoices</li>
 <li>Copy of current contract in place</li>
 </ul>
 <p>Please see attached:</p>
@@ -293,7 +293,7 @@ EMAIL_TEMPLATES = {
 <p>I am requesting the following information for my client {business_name} MRIN: {mrin}. Can you please provide the below information:</p>
 <ul>
 <li>End date of contract (if applicable)</li>
-<li>12 Months worth of invoices (if applicable){missing_months_clause}</li>
+<li>12 Months worth of invoices (if applicable)</li>
 </ul>
 <p>Please see attached:</p>
 <ul>
@@ -312,7 +312,7 @@ EMAIL_TEMPLATES = {
 <p>{business_name} has engaged our services to conduct its GHG emissions report. Please see the letter of authority attached & a recent invoice (if available).</p>
 <p>Can you please send me the below details for a 12 month period (preferable most recent)</p>
 <ul>
-<li>12 Months worth of invoices{missing_months_clause}</li>
+<li>12 Months worth of invoices</li>
 <li>Bin Lift weights per waste stream</li>
 <li>Copy of current contract</li>
 <li>For all recycled waste please confirm that it has been recycled. If some of the recycled products have gone to landfill please provide the quantity or % of that has gone to landfill.</li>
@@ -348,23 +348,64 @@ def _invoice_attachment_clause(invoice_url: Optional[str] = None) -> str:
     return "\r\n<li>A recent invoice for this account, for reference</li>"
 
 
-def _missing_months_clause(missing_months: Optional[List[str]] = None) -> str:
-    """
-    Rider appended to the invoice line when the coverage report knows exactly
-    which periods are missing.
+_INVOICE_BULLETS = (
+    "12 Months worth of invoices (if applicable)",
+    "Copy of 12 months worth of invoices",
+    "Copy of the most recent invoice",
+    "12 Months worth of invoices",
+)
 
-    missing_months arrive already human-formatted ("Jul 2025"). None or empty
-    returns "", so a request sent the old way reads exactly as it always did.
-    """
+
+def _month_list(missing_months: Optional[List[str]] = None) -> list[str]:
     months = [str(m).strip() for m in (missing_months or []) if str(m).strip()]
-    if not months:
-        return ""
     if len(months) > 12:
         months = months[:12] + ["and earlier"]
+    return months
+
+
+def _invoice_ask(missing_months: Optional[List[str]] = None) -> str:
+    """The invoice bullet when the coverage report knows which periods are missing."""
+    months = _month_list(missing_months)
+    if not months:
+        return ""
     return (
-        " &mdash; in particular the periods we hold no invoice for: "
+        "Copies of the invoices for these periods, which we do not hold: "
         + ", ".join(months)
     )
+
+
+def place_missing_invoice_ask(body: str, missing_months: Optional[List[str]] = None) -> str:
+    """
+    Put the missing periods in the invoice bullet, where the retailer reads the ask.
+
+    A saved template has no token for this, so the previous version appended a
+    note after the confidentiality footer. That note is what went out, under
+    the signature, while the bullet still said "Copy of the most recent invoice".
+    Rewriting that bullet keeps a request with no gap byte-identical, and puts
+    the periods in the list when a gap is being chased.
+    """
+    ask = _invoice_ask(missing_months)
+    if not ask or not body:
+        return body
+    if ask in body:
+        return body
+    for bullet in _INVOICE_BULLETS:
+        if bullet in body:
+            return body.replace(bullet, ask, 1)
+    paragraph = f"<p><b>Please send {ask[0].lower()}{ask[1:]}.</b></p>"
+    for marker in (
+        "<p>Please see attached:</p>",
+        "<p>Please see attached",
+        "Please see attached:",
+        "<p>Please let me know if you have any questions",
+        "<p>Kind Regards,</p>",
+        "<p>Kind Regards</p>",
+        "Kind Regards,",
+    ):
+        idx = body.find(marker)
+        if idx != -1:
+            return body[:idx] + paragraph + body[idx:]
+    return paragraph + body
 
 
 def clean_parameter(value: str) -> str:
@@ -439,7 +480,6 @@ def supplier_data_request(
             "nmi": account_identifier if identifier_type == "NMI" else "",
             "mrin": account_identifier if identifier_type == "MRIN" else "",
             "account_number": account_identifier if identifier_type == "account_number" else "",
-            "missing_months_clause": _missing_months_clause(missing_months),
             "invoice_attachment_clause": _invoice_attachment_clause(invoice_url),
         }
 
@@ -498,19 +538,7 @@ def supplier_data_request(
                 logger.error(f"Template formatting error: {e}")
                 return f"Error: Template formatting failed - missing variable: {e}"
 
-        # A saved DB override template predates the missing-months rider and has
-        # no token to render it into. Rather than quietly send a request that
-        # never asks for the data we are missing, append the ask outright.
-        _rider = template_vars.get("missing_months_clause") or ""
-        if _rider and _rider.strip() not in email_body:
-            _months = ", ".join(
-                str(m).strip() for m in (missing_months or []) if str(m).strip()
-            )
-            if _months:
-                email_body += (
-                    "<p><b>Specifically, we hold no invoice for the following "
-                    f"periods:</b> {_months}</p>"
-                )
+        email_body = place_missing_invoice_ask(email_body, missing_months)
         if (
             ATTACH_HELD_INVOICE
             and invoice_url
