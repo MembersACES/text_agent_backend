@@ -57,16 +57,48 @@ def test_wrong_check_digit_is_not_stripped():
     assert canonical_site_id("C&I Electricity", "20023230861") == "20023230861"
 
 
-@pytest.mark.parametrize("utility", ["C&I Gas", "SME Gas", "Waste", "Oil"])
-def test_non_electricity_identifiers_are_untouched(utility):
-    """Gas MIRNs and account numbers don't use the NMI checksum scheme."""
-    assert canonical_site_id(utility, "53237467421") == "53237467421"
-    assert canonical_site_id(utility, "5323746742") == "5323746742"
+# --- gas MIRNs use the SAME scheme -----------------------------------------
+#
+# This was originally asserted the other way round, and the test passed because
+# it used 53237467421 as the "11-character gas MIRN" - whose real check digit is
+# 7, not 1. An invalid checksum never collapses, so the test proved nothing and
+# hid a live duplicate on Frankston RSL for a fortnight. Pin the real pair.
+
+FRANKSTON_GAS = ("5321568754", "53215687544")
 
 
-def test_gas_mirns_from_centurion_are_unchanged():
+def test_frankston_gas_mirn_is_a_genuine_checksum_pair():
+    short, long = FRANKSTON_GAS
+    assert short + str(nmi_check_digit(short)) == long
+
+
+@pytest.mark.parametrize("utility", ["C&I Gas", "SME Gas"])
+def test_gas_spellings_collapse_to_one_meter(utility):
+    short, long = FRANKSTON_GAS
+    assert canonical_site_id(utility, long) == short
+    assert canonical_site_id(utility, short) == short
+    assert _site_key(utility, short) == _site_key(utility, long)
+
+
+def test_centurion_gas_mirns_have_no_twin_so_nothing_changes():
+    """10-character MIRNs with no 11-character sibling must pass through."""
     for mirn in ("5323746742", "5510254955"):
         assert canonical_site_id("C&I Gas", mirn) == mirn
+
+
+@pytest.mark.parametrize("utility", ["C&I Gas", "SME Gas"])
+def test_a_wrong_gas_check_digit_still_does_not_collapse(utility):
+    """5323746742's real check digit is 7. Anything else is a different site."""
+    assert canonical_site_id(utility, "53237467421") == "53237467421"
+    assert canonical_site_id(utility, "53237467427") == "5323746742"
+
+
+@pytest.mark.parametrize("utility", ["Waste", "Oil", "Cleaning", "Robot"])
+def test_schemes_without_a_check_digit_are_untouched(utility):
+    """Waste account numbers and oil site names carry no checksum."""
+    assert canonical_site_id(utility, "53215687544") == "53215687544"
+    assert canonical_site_id(utility, "09097571") == "09097571"
+    assert canonical_site_id(utility, "FRANKSTON RSL") == "FRANKSTON RSL"
 
 
 def test_casing_and_whitespace_cannot_split_a_site():

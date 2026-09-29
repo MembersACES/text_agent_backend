@@ -423,7 +423,17 @@ def _evidence_uri(row: dict) -> Optional[str]:
 # Applied to electricity only. Gas MIRNs and waste/oil account numbers do not
 # use this scheme, and guessing at them would be worse than leaving them split.
 # ---------------------------------------------------------------------------
-_NMI_UTILITY_TYPES = frozenset({"C&I Electricity", "SME Electricity"})
+# Identifier schemes that carry an AEMO mod-10 check digit as an optional 11th
+# character. Electricity NMIs and Victorian gas MIRNs both do, and both circulate
+# in the LOA under either spelling, which splits one physical meter into two
+# sites. Proven on Frankston RSL: 5321568754 + check digit 4 = 53215687544, two
+# links whose invoice months are complementary rather than duplicated.
+# Waste account numbers and oil site names use no such scheme - leave them alone.
+_CHECKSUMMED_UTILITY_TYPES = frozenset({
+    "C&I Electricity", "SME Electricity", "C&I Gas", "SME Gas",
+})
+# Kept for anything still importing the old name.
+_NMI_UTILITY_TYPES = _CHECKSUMMED_UTILITY_TYPES
 
 
 def nmi_check_digit(nmi10: str) -> Optional[int]:
@@ -449,7 +459,7 @@ def canonical_site_id(utility_type: str, identifier: str) -> str:
     and upper-cased for electricity, so casing can't split a site either).
     """
     ident = (identifier or "").strip()
-    if not ident or utility_type not in _NMI_UTILITY_TYPES:
+    if not ident or utility_type not in _CHECKSUMMED_UTILITY_TYPES:
         return ident
     up = ident.upper()
     if len(up) == 11 and up.isalnum():
