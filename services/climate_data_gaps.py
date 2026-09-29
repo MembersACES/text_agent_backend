@@ -18,6 +18,7 @@ that, open the site in the workspace.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -77,6 +78,39 @@ def _months_spanned(start: Optional[date], end: Optional[date]) -> list[str]:
         if len(out) > 24:  # defensive: a nonsense period shouldn't loop forever
             break
     return out
+
+
+_MONTH_NAMES = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def month_label(ym: str) -> str:
+    """'2025-07' -> 'Jul 2025'. What a retailer reads, not what a database stores."""
+    try:
+        y, m = str(ym).split("-")
+        return f"{_MONTH_NAMES[int(m) - 1]} {y}"
+    except Exception:
+        return str(ym)
+
+
+def _evidence_uri_of(row: ClimateActivityRecord) -> Optional[str]:
+    """
+    The invoice link the ETL carried through from Airtable, if this row has one.
+
+    Used to attach an invoice we already hold to the data request, so the
+    retailer can see the account and the format we are asking them to match.
+    """
+    try:
+        refs = (json.loads(row.body_json or "{}") or {}).get("evidence_refs") or []
+    except Exception:
+        return None
+    for ref in refs:
+        uri = (ref or {}).get("evidence_uri")
+        if uri and str(uri).strip().lower().startswith("http"):
+            return str(uri).strip()
+    return None
 
 
 def _site_key(utility_type: str, identifier: str) -> str:
@@ -149,6 +183,8 @@ def build_entity_data_gaps(
                 "undated": 0,
                 "months_present": set(),
                 "activity_types": set(),
+                "sample_invoice_url": None,
+                "sample_invoice_end": None,
             },
         )
 
@@ -165,6 +201,13 @@ def build_entity_data_gaps(
             for mth in _months_spanned(start, end):
                 if mth in fy_months:
                     s["months_present"].add(mth)
+            # Keep the newest invoice link seen for this meter: the most recent
+            # bill is the most useful thing to put in front of a retailer.
+            if s["sample_invoice_end"] is None or (end and end > s["sample_invoice_end"]):
+                uri = _evidence_uri_of(r)
+                if uri:
+                    s["sample_invoice_url"] = uri
+                    s["sample_invoice_end"] = end or start
         elif start:
             # A different financial year — worth reporting, since multi-year
             # staging means prior years are now genuinely available.
@@ -190,6 +233,8 @@ def build_entity_data_gaps(
                     "undated": 0,
                     "months_present": set(),
                     "activity_types": set(),
+                    "sample_invoice_url": None,
+                    "sample_invoice_end": None,
                 },
             )
             s["retailer"] = str(site.get("retailer") or "").strip()
@@ -239,6 +284,8 @@ def build_entity_data_gaps(
                 "activity_types": sorted(s["activity_types"]),
                 "months_present": present,
                 "months_missing": missing,
+                "months_missing_labels": [month_label(m) for m in missing],
+                "sample_invoice_url": s.get("sample_invoice_url"),
                 "coverage_pct": round(100.0 * len(present) / max(1, len(fy_months)), 1),
                 "severity": severity,
                 "headline": headline,
