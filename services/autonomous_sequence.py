@@ -1315,6 +1315,7 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
         "gas_base2_followup_v1",
         "ci_electricity_base2_followup_v1",
         "ci_electricity_offer",
+        "sme_electricity_base2_followup_v1",
     }
 )
 
@@ -1474,6 +1475,70 @@ def rename_sequence_template_type(
         )
 
 
+def copy_sme_electricity_prompts_from_ci(db: Session) -> bool:
+    """Fill empty SME electricity prompts from the C&I electricity template. Does not overwrite staff edits."""
+    source_type = "ci_electricity_base2_followup_v1"
+    dest_type = "sme_electricity_base2_followup_v1"
+    changed = False
+    source = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.sequence_type == source_type)
+        .first()
+    )
+    dest = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.sequence_type == dest_type)
+        .first()
+    )
+    if source and dest:
+        source_steps = (
+            db.query(AutonomousSequenceTemplateStep)
+            .filter(AutonomousSequenceTemplateStep.template_id == source.id)
+            .all()
+        )
+        dest_steps = (
+            db.query(AutonomousSequenceTemplateStep)
+            .filter(AutonomousSequenceTemplateStep.template_id == dest.id)
+            .all()
+        )
+        by_index = {step.step_index: step.prompt_text for step in source_steps}
+        for step in dest_steps:
+            want = by_index.get(step.step_index)
+            if want and not (step.prompt_text or "").strip():
+                step.prompt_text = want
+                changed = True
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        cols = {
+            str(c.get("name") or "")
+            for c in insp.get_columns("autonomous_sequence_type", **_inspector_schema_kw(bind))
+        }
+        prompt_cols = [col for col in ("system_prompt", "email_system_prompt", "email_example", "sms_example", "retell_agent_id") if col in cols]
+        if prompt_cols:
+            src = db.execute(
+                text(f"SELECT {', '.join(prompt_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+                {"st": source_type},
+            ).mappings().first()
+            dst = db.execute(
+                text(f"SELECT {', '.join(prompt_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+                {"st": dest_type},
+            ).mappings().first()
+            if src and dst:
+                for col in prompt_cols:
+                    current = str(dst.get(col) or "").strip()
+                    incoming = str(src.get(col) or "").strip()
+                    if incoming and not current:
+                        db.execute(
+                            text(f"UPDATE {ast_tbl} SET {col} = :value WHERE sequence_type = :st"),
+                            {"value": incoming, "st": dest_type},
+                        )
+                        changed = True
+    return changed
+
+
 def ensure_default_sequence_templates(db: Session) -> None:
     """Seed default templates if missing (idempotent)."""
     defaults = [
@@ -1487,6 +1552,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "sequence_type": "ci_electricity_base2_followup_v1",
             "display_name": "C&I Electricity Base 2 Follow-up v1",
             "description": "Default Base 2 cadence for C&I electricity offers.",
+            "is_restartable": 1,
+        },
+        {
+            "sequence_type": "sme_electricity_base2_followup_v1",
+            "display_name": "SME Electricity Base 2 Follow-up v1",
+            "description": "Base 2 cadence after an SME vs SME electricity comparison. Same steps as C&I electricity.",
             "is_restartable": 1,
         },
         {
@@ -1606,6 +1677,8 @@ def ensure_default_sequence_templates(db: Session) -> None:
     if ensure_solar_engagement_type_prompts(db):
         db.commit()
     if ensure_agreement_followup_type_prompts(db):
+        db.commit()
+    if copy_sme_electricity_prompts_from_ci(db):
         db.commit()
 
     # Bootstrap templates from existing run data where needed.
