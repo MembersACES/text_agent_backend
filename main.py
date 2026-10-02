@@ -288,6 +288,7 @@ from schemas import (
     MarketingVideoPublishPackRequest,
     VideoRegistryResponse,
     MARKETING_VIDEO_STATUSES,
+    SOCIAL_POST_STATUSES,
     TestimonialSolutionContentItem,
     TestimonialSolutionContentUpdate,
     AutonomousSequenceStartRequest,
@@ -9534,7 +9535,7 @@ async def update_testimonial(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Update testimonial status, invoice number, type, and/or linked Drive document (file_id, file_name)."""
+    """Update testimonial status, social post status, invoice number, type, and/or linked Drive document."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -9611,6 +9612,22 @@ async def update_testimonial(
         testimonial.video_long_file_id = body.video_long_file_id.strip() or None
     if body.video_short_file_id is not None:
         testimonial.video_short_file_id = body.video_short_file_id.strip() or None
+    if body.social_status is not None:
+        social = body.social_status.strip()
+        if not social:
+            testimonial.social_status = None
+        elif social not in SOCIAL_POST_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail="Social status must be Drafted, Ready to post, or Posted.",
+            )
+        elif testimonial.status != "Approved":
+            raise HTTPException(
+                status_code=400,
+                detail="Social posts can only be tracked on Approved testimonials.",
+            )
+        else:
+            testimonial.social_status = social
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)
