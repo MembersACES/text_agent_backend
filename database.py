@@ -177,6 +177,7 @@ def init_db():
                 ("testimonial_savings", "VARCHAR(255)"),
                 ("video_long_file_id", "VARCHAR(255)"),
                 ("video_short_file_id", "VARCHAR(255)"),
+                ("social_status", "VARCHAR(50)"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing testimonials.%s column", col_name)
