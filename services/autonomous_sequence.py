@@ -2578,6 +2578,7 @@ def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: d
         "initial_email_subject": context.get("initial_email_subject"),
         "signature_html": context.get("signature_html"),
         "use_html_signature": context.get("use_html_signature"),
+        "sender": context.get("sender") or "ACES",
         "context": context,
     }
     with httpx.Client(timeout=30.0) as client:
