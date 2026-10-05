@@ -1381,3 +1381,139 @@ def test_preview_rows_matches_save_and_persists_nothing():
     assert body["warnings"] == saved["warnings"]
     assert db.query(CampaignRow).filter(CampaignRow.campaign_id == campaign.id).count() == saved["rows"]
 
+
+
+def _template_with_calls(db):
+    template = _template(db)
+    for index, (day, channel) in enumerate([(5, "voice_call"), (7, "sms"), (10, "email")], start=1):
+        db.add(
+            AutonomousSequenceTemplateStep(
+                template_id=template.id,
+                step_index=index,
+                day_number=day,
+                channel=channel,
+                send_time_local="10:00",
+                is_active=1,
+            )
+        )
+    db.commit()
+    return template
+
+
+def _start_one(db, campaign):
+    row = db.query(CampaignRow).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    start_campaign(db, campaign, "a@b.com")
+
+
+def _steps_by_channel(db):
+    steps = db.query(AutonomousSequenceStep).order_by(
+        AutonomousSequenceStep.run_id, AutonomousSequenceStep.step_index
+    ).all()
+    return [(s.channel, s.step_status) for s in steps]
+
+
+def test_new_campaign_defaults_to_email_only():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    assert campaign.include_calls == 0
+    assert campaign_to_dict(campaign, db)["include_calls"] is False
+
+
+def test_email_only_campaign_skips_call_and_sms_steps():
+    db = _db()
+    _template_with_calls(db)
+    campaign = _draft_with_rows(db, n=1)
+    _start_one(db, campaign)
+    steps = _steps_by_channel(db)
+    assert steps[0] == ("email", "completed")
+    assert ("voice_call", "skipped") in steps
+    assert ("sms", "skipped") in steps
+    later_emails = [s for s in steps[1:] if s[0] == "email"]
+    assert later_emails and all(status != "skipped" for _, status in later_emails)
+    skipped = db.query(AutonomousSequenceStep).filter(AutonomousSequenceStep.step_status == "skipped").all()
+    assert all("Call step was off" in (s.last_outcome_summary or "") for s in skipped)
+
+
+def test_call_step_on_keeps_call_and_sms_steps():
+    db = _db()
+    _template_with_calls(db)
+    campaign = _draft_with_rows(db, n=1)
+    patch_campaign(db, campaign, {"include_calls": True}, "a@b.com")
+    db.refresh(campaign)
+    assert campaign_to_dict(campaign, db)["include_calls"] is True
+    _start_one(db, campaign)
+    statuses = [status for _, status in _steps_by_channel(db)]
+    assert "skipped" not in statuses
+
+
+def test_call_step_is_locked_once_campaign_leaves_draft():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    row = db.query(CampaignRow).first()
+    fire_test_send(db, campaign, "morgan@acesolutions.com.au", row.id, "a@b.com")
+    db.refresh(campaign)
+    patch_campaign(db, campaign, {"status": "ready"}, "a@b.com")
+    db.refresh(campaign)
+    try:
+        patch_campaign(db, campaign, {"include_calls": True}, "a@b.com")
+    except CampaignError:
+        pass
+    db.refresh(campaign)
+    assert campaign.include_calls == 0
+
+
+def test_call_step_saves_through_the_patch_route():
+    db = _db()
+    _template(db)
+    campaign = _draft_with_rows(db, n=1)
+    client = _campaign_client(db)
+    res = client.patch(f"/api/autonomous/campaigns/{campaign.id}", json={"include_calls": True})
+    assert res.status_code == 200, res.text
+    assert res.json()["include_calls"] is True
+    db.refresh(campaign)
+    assert campaign.include_calls == 1
+
+
+
+def _draft_with_bad_phones(db, include_calls):
+    campaign = create_campaign(db, "GCI", "gci_outbound_v1", "morgan@acesolutions.com.au")
+    if include_calls:
+        patch_campaign(db, campaign, {"include_calls": True}, "a@b.com")
+        db.refresh(campaign)
+    headers = ["company_name", "contact_email", "contact_phone"]
+    rows = [[f"Co {i}", f"person{i}@example.com", "123"] for i in range(3)]
+    mapping = {"company_name": "company_name", "contact_email": "contact_email", "contact_phone": "contact_phone"}
+    summary = replace_rows(db, campaign, headers, rows, mapping)
+    db.refresh(campaign)
+    return campaign, summary
+
+
+def test_email_only_campaign_ignores_bad_phone_numbers():
+    db = _db()
+    _template(db)
+    campaign, summary = _draft_with_bad_phones(db, include_calls=False)
+    assert summary["warnings"] == 0
+    assert summary["sendable"] == 3
+    assert campaign_to_dict(campaign, db)["row_counts"]["warnings"] == 0
+    preview = preview_rows(
+        db,
+        ["company_name", "contact_email", "contact_phone"],
+        [["Co", "x@example.com", "123"]],
+        {"company_name": "company_name", "contact_email": "contact_email", "contact_phone": "contact_phone"},
+        include_calls=False,
+    )
+    assert preview["warnings"] == 0
+
+
+def test_call_step_on_still_holds_bad_phone_numbers():
+    db = _db()
+    _template(db)
+    _campaign, summary = _draft_with_bad_phones(db, include_calls=True)
+    assert summary["warnings"] == 3
+    assert summary["sendable"] == 0
