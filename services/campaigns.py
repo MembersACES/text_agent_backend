@@ -286,9 +286,15 @@ def _stamp_not_started_reasons(
             row.suppression_reason = None
 
 
-def _counts_from_rows(rows: list[CampaignRow]) -> dict[str, Any]:
+def _shape_ignore_keys(include_calls: bool) -> frozenset[str]:
+    # Email-only campaigns never call or text, so a bad phone number must not
+    # hold the row back.
+    return frozenset() if include_calls else frozenset({"contact_phone"})
+
+
+def _counts_from_rows(rows: list[CampaignRow], include_calls: bool = True) -> dict[str, Any]:
     merges = [_merge(row) for row in rows]
-    warning_rows, shape_warnings, per_row = shape_summary(merges)
+    warning_rows, shape_warnings, per_row = shape_summary(merges, _shape_ignore_keys(include_calls))
     blank_keys = 0
     keys: set[str] = set()
     human_only_keys = _human_only_keys(rows)
@@ -343,7 +349,8 @@ def _campaign_row_counts(db: Session, campaign_id: int) -> dict[str, Any]:
         .order_by(CampaignRow.id)
         .all()
     )
-    return _counts_from_rows(rows)
+    include_calls = db.query(Campaign.include_calls).filter(Campaign.id == campaign_id).scalar()
+    return _counts_from_rows(rows, bool(include_calls))
 
 
 def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False, limit: int = 100, offset: int = 0) -> dict[str, Any]:
@@ -353,7 +360,7 @@ def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False
         .order_by(CampaignRow.id)
         .all()
     )
-    counted = _counts_from_rows(all_rows)
+    counted = _counts_from_rows(all_rows, bool(campaign.include_calls))
     test_sends = (
         db.query(func.count(CampaignEvent.id))
         .filter(CampaignEvent.campaign_id == campaign.id, CampaignEvent.event_type == "test_send")
@@ -374,6 +381,7 @@ def campaign_to_dict(campaign: Campaign, db: Session, include_rows: bool = False
         "send_window_start": campaign.send_window_start,
         "send_window_end": campaign.send_window_end,
         "archived": bool(campaign.archived),
+        "include_calls": bool(campaign.include_calls),
         "schedule_timezone": schedule_tz_name(),
         "created_by": campaign.created_by,
         "created_at": campaign.created_at.isoformat() if campaign.created_at else None,
@@ -533,6 +541,8 @@ def patch_campaign(db: Session, campaign: Campaign, body: dict[str, Any], actor:
             campaign.merge_field_map = _json(body["merge_field_map"])
         if "provenance_note" in body:
             campaign.provenance_note = body["provenance_note"]
+        if "include_calls" in body and body["include_calls"] is not None:
+            campaign.include_calls = 1 if body["include_calls"] else 0
     elif wants_email and not terminal:
         if "first_touch_subject" in body:
             campaign.first_touch_subject = body["first_touch_subject"]
@@ -775,10 +785,11 @@ def preview_rows(
     headers: list[str],
     rows: list[list[str]],
     column_map: dict[str, str],
+    include_calls: bool = True,
 ) -> dict[str, Any]:
     mapping = {str(k): str(v) for k, v in (column_map or {}).items()}
     built, suppressed_emails, groups = _ephemeral_rows(db, headers, rows, mapping)
-    counted = _counts_from_rows(built)
+    counted = _counts_from_rows(built, include_calls)
     flags = counted["per_row_shape_warnings"]
     summary = _summary_from_counted(counted, len(built), suppressed_emails, _row_conflicts(groups))
     summary["preview"] = True
@@ -841,7 +852,7 @@ def replace_rows(
         .order_by(CampaignRow.id)
         .all()
     )
-    counted = _counts_from_rows(stored_rows)
+    counted = _counts_from_rows(stored_rows, bool(campaign.include_calls))
     return _summary_from_counted(counted, len(stored_rows), suppressed_emails, _row_conflicts(groups))
 
 
@@ -1284,7 +1295,7 @@ def _start_pending_rows(
         .order_by(CampaignRow.id)
         .all()
     )
-    counted = _counts_from_rows(all_rows)
+    counted = _counts_from_rows(all_rows, bool(campaign.include_calls))
     warning_ids = counted["warning_ids"]
     blocked_keys = _human_only_keys(all_rows)
     rows = [
@@ -1378,6 +1389,8 @@ def _start_pending_rows(
             context=context,
         )
         _complete_first_email_step(db, run.id)
+        if not campaign.include_calls:
+            _skip_non_email_steps(db, run.id)
         row.row_status = "started"
         row.run_id = run.id
         row.offer_id = offer.id
@@ -1472,6 +1485,30 @@ def send_next_n(db: Session, campaign: Campaign, n: int, actor: str | None) -> d
 
 def _pending_sendable(db: Session, campaign_id: int) -> int:
     return _campaign_row_counts(db, campaign_id)["sendable"]
+
+
+EMAIL_ONLY_SKIP_SUMMARY = "skipped: this campaign sends emails only (Call step was off)"
+
+
+def _skip_non_email_steps(db: Session, run_id: int) -> None:
+    """Email-only campaign: no call or SMS step on this run will ever fire."""
+    steps = (
+        db.query(AutonomousSequenceStep)
+        .filter(AutonomousSequenceStep.run_id == run_id)
+        .all()
+    )
+    changed = False
+    for step in steps:
+        if (step.channel or "").strip().lower() == "email":
+            continue
+        if step.step_status not in {"ready", "to_start"}:
+            continue
+        step.step_status = "skipped"
+        step.completed_at = _now()
+        step.last_outcome_summary = EMAIL_ONLY_SKIP_SUMMARY
+        changed = True
+    if changed:
+        db.commit()
 
 
 def _complete_first_email_step(db: Session, run_id: int) -> None:

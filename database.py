@@ -477,6 +477,18 @@ def init_db():
 
     try:
         insp = inspect(engine)
+        if "campaigns" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("campaigns")]
+            if "include_calls" not in cols:
+                logging.info("Adding missing campaigns.include_calls column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE campaigns ADD COLUMN include_calls INTEGER DEFAULT 0 NOT NULL"))
+                logging.info("✅ Added campaigns.include_calls column")
+    except Exception as e:
+        logging.warning("Could not ensure campaigns.include_calls column: %s", e)
+
+    try:
+        insp = inspect(engine)
         if "clients" in (insp.get_table_names() or []):
             with engine.begin() as conn:
                 conn.execute(

@@ -57,6 +57,7 @@ class CampaignPatchBody(BaseModel):
     first_touch_html: Optional[str] = None
     merge_field_map: Optional[dict[str, str]] = None
     provenance_note: Optional[str] = None
+    include_calls: Optional[bool] = None
     daily_cap: Optional[int] = None
     send_window_start: Optional[str] = None
     send_window_end: Optional[str] = None
@@ -69,6 +70,7 @@ class CampaignRowsBody(BaseModel):
     rows: list[list[str]]
     column_map: dict[str, str]
     merge_json: Optional[dict[str, Any]] = None
+    include_calls: Optional[bool] = None
 
 
 class TestSendBody(BaseModel):
@@ -127,7 +129,13 @@ def register_campaign_routes(app, get_current_user_with_db):
         user_data: dict = Depends(get_current_user_with_db),
     ):
         try:
-            return preview_rows(db, body.headers, body.rows, body.column_map)
+            return preview_rows(
+                db,
+                body.headers,
+                body.rows,
+                body.column_map,
+                include_calls=True if body.include_calls is None else body.include_calls,
+            )
         except CampaignError as exc:
             _raise(exc)
 
