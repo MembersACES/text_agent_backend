@@ -432,9 +432,25 @@ def get_linked_utility_records(loa_record: dict) -> tuple[dict, dict, dict]:
                     "[utility-extra] First record for %s: identifier=%r, contract_end_date=%r, dma_end_date=%r, data_requested=%r, data_recieved=%r",
                     app_key, str(ident).strip() if ident is not None else "", contract_end, dma_end, data_req, data_rec,
                 )
+            # Where the meter physically is. Drives the grid emission factor, so
+            # a missing one is a wrong number rather than a cosmetic gap. The
+            # per-utility record is checked first because it is the supply
+            # address; the LOA's Site Address is the fallback for the whole LOA.
+            site_address = ""
+            for _af in ("Site Address", "Supply Address", "Site Address:",
+                        "Address", "Premises Address"):
+                _v = f.get(_af)
+                if isinstance(_v, list):
+                    _v = _v[0] if _v else ""
+                if _v and str(_v).strip():
+                    site_address = str(_v).strip()
+                    break
+            if not site_address:
+                site_address = ((loa_record.get("fields") or {}).get("Site Address") or "").strip()
             extras.append({
                 "identifier": str(ident).strip() if ident is not None else "",
                 "retailer": retailers[-1],
+                "site_address": site_address or None,
                 "contract_end_date": contract_end,
                 "dma_end_date": dma_end,
                 "data_requested": data_req,

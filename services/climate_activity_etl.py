@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+from services.jurisdiction import resolve_jurisdiction
+
 ADAPTER_VERSION = "0.1.0"
 
 UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
@@ -161,6 +163,18 @@ EVIDENCE_URI_FIELDS = [
 ]
 
 
+def _jurisdiction_fields(ctx) -> dict:
+    """
+    The two fields that decide, and explain, which grid factor B4 applies.
+
+    jurisdiction None means the site's state could not be established. That is
+    deliberately not a value the adapter can price: the whole defect this fixes
+    was an unknown state quietly inheriting Victoria's 0.78.
+    """
+    j = ctx.jurisdiction()
+    return {"jurisdiction": j.grid, "jurisdiction_source": j.source}
+
+
 @dataclass
 class EtlContext:
     entity_id: str
@@ -170,6 +184,17 @@ class EtlContext:
     utility_type: str
     period_start: date
     period_end: date
+    # Where this site physically is. The grid factor applied downstream depends
+    # on it: NSW is 0.64 against Victoria's 0.78, South Australia 0.22. Before
+    # this existed every record fell through to the B4 adapter's pilot default
+    # of VIC, which was right for Frankston and wrong for anyone multi-state.
+    site_address: Optional[str] = None
+    # An explicit state, when one is known from somewhere other than the address.
+    fallback_state: Optional[str] = None
+
+    def jurisdiction(self):
+        """Resolved grid for this site, or an unresolved marker. Never guesses."""
+        return resolve_jurisdiction(self.site_address, self.fallback_state)
 
 
 @dataclass
@@ -523,6 +548,7 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         "record_id": record_id,
         "entity_id": ctx.entity_id,
         "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
+        **_jurisdiction_fields(ctx),
         "client_id": ctx.loa_client_id,
         "reporting_period": {
             "start": period_start.isoformat(),
@@ -611,6 +637,7 @@ def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
         "record_id": record_id,
         "entity_id": ctx.entity_id,
         "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
+        **_jurisdiction_fields(ctx),
         "client_id": ctx.loa_client_id,
         "reporting_period": {"start": period_start.isoformat(), "end": period_end.isoformat()},
         "activity_type": "cooking_oil",
@@ -717,6 +744,7 @@ def transform_invoice_rows(
             years[f"FY{(y + 1 if m >= 7 else y) % 100:02d}"] = (
                 years.get(f"FY{(y + 1 if m >= 7 else y) % 100:02d}", 0) + 1
             )
+    _jur = ctx.jurisdiction()
     diagnostics = {
         "input_rows": len(rows),
         "produced": len(kept),
@@ -726,5 +754,12 @@ def transform_invoice_rows(
         "utility_type": ctx.utility_type,
         "entity_id": ctx.entity_id,
         "site_id": ctx.site_id,
+        # Which grid factor this site will be priced at, and how we know. An
+        # unresolved jurisdiction is reported, never defaulted - it is the whole
+        # reason this field exists.
+        "jurisdiction": _jur.grid,
+        "jurisdiction_source": _jur.source,
+        "jurisdiction_assumed_grid": _jur.assumed_grid,
+        "site_address_seen": bool((ctx.site_address or "").strip()),
     }
     return results, diagnostics
