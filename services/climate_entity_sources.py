@@ -85,6 +85,7 @@ def _sites_from_loa(
                     "utility_type": utility_type,
                     "identifier": ident_str,
                     "retailer": retailer,
+                    "site_address": extra.get("site_address"),
                     "loa_extra": extra,
                     "etl_mapping": _etl_mapping_summary(utility_type),
                 }
@@ -150,6 +151,7 @@ def _etl_preview(
     identifier: str,
     invoice_rows: list[dict],
     period_label: str,
+    site_address: str | None = None,
 ) -> dict[str, Any]:
     if utility_type not in ETL_SUPPORTED_UTILITIES:
         return {"supported": False, "preview": [], "diagnostics": {}}
@@ -162,6 +164,7 @@ def _etl_preview(
         utility_type=utility_type,
         period_start=period_start,
         period_end=period_end,
+        site_address=site_address,
     )
     results, diagnostics = transform_invoice_rows(invoice_rows, ctx)
     preview = []
@@ -407,6 +410,7 @@ def build_entity_activity_sources(
                 ident,
                 fetch_rows,
                 period_label,
+                site.get("site_address"),
             )
             if include_etl_preview
             else {"supported": ut in ETL_SUPPORTED_UTILITIES, "preview": []}

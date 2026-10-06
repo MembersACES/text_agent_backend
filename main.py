@@ -15052,7 +15052,8 @@ def rebuild_staged_activity(
         rows = payload.get("rows", []) if isinstance(payload, dict) else []
         ctx = EtlContext(entity_id=entity_id, client_id=member_client_id, loa_client_id=loa_id,
                          site_id=str(ident).strip(), utility_type=ut,
-                         period_start=period_start, period_end=period_end)
+                         period_start=period_start, period_end=period_end,
+                         site_address=s.get("site_address"))
         results, _diag = transform_invoice_rows(rows, ctx)
         s_staged = 0
         s_skipped = 0
