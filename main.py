@@ -63,6 +63,7 @@ from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
 from tools.bne_gas_contracts import lookup_bne_gas_contract
+from tools.bne_electricity_contracts import lookup_bne_electricity_contract
 from tools.alinta_gas_ef import (
     apply_flat_overrides,
     build_email_html,
@@ -241,6 +242,7 @@ from models import (
     PuduConsumableBaselineRun,
     OperationalEmailTemplate,
     OperationalEmailRecipient,
+    UtilityChecklist,
 )
 from schemas import (
     TaskCreate,
@@ -2290,8 +2292,9 @@ class UtilityRecordUpdateRequest(BaseModel):
     identifier: str    # NMI, MRIN, account number, etc.
     data_requested: Optional[str] = None   # YYYY-MM-DD
     data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
-    contract_end_date: Optional[str] = None  # YYYY-MM-DD
-    dma_end_date: Optional[str] = None  # YYYY-MM-DD
+    contract_end_date: Optional[str] = None  # YYYY-MM-DD; empty string clears the Airtable date
+    dma_end_date: Optional[str] = None  # YYYY-MM-DD; empty string clears the Airtable date
+    retailer: Optional[str] = None
 
 
 class UtilityInvoiceRowsRequest(BaseModel):
@@ -2827,6 +2830,68 @@ def get_base2_bne_gas_contract(
         sum(len(c.get("periods") or []) for c in (result.get("contracts") or [])),
     )
     return result
+
+
+@app.get("/api/base2/bne-electricity-contract")
+def get_base2_bne_electricity_contract(
+    nmi: str = Query(
+        ...,
+        min_length=10,
+        max_length=20,
+        description="NMI; matched against signed C&I electricity sheet (checksum / last-digit tolerant)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Look up signed C&I electricity contract periods for the same sheet Base 2 uses."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    try:
+        result = lookup_bne_electricity_contract(nmi)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-electricity-contract] user=%s nmi=%r match=%s contracts=%s",
+        email,
+        nmi,
+        result.get("match_kind"),
+        len(result.get("contracts") or []),
+    )
+    return result
+
+
+@app.get("/api/base2/bne-contract-checks")
+def get_base2_bne_contract_checks(
+    fuel: str = Query(..., pattern="^(electricity|gas)$"),
+    identifiers: str = Query(..., min_length=1, max_length=2000),
+    user_info: dict = Depends(verify_google_token),
+):
+    """One signed-contract sheet read for every C&I identifier on a checklist."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    seen: set[str] = set()
+    ids: list[str] = []
+    for part in identifiers.split(","):
+        value = part.strip()
+        if not value or value.upper() in seen:
+            continue
+        seen.add(value.upper())
+        ids.append(value)
+        if len(ids) >= 30:
+            break
+    results: list[dict] = []
+    try:
+        for index, value in enumerate(ids):
+            if fuel == "gas":
+                results.append(lookup_bne_gas_contract(value, force=index == 0))
+            else:
+                results.append(lookup_bne_electricity_contract(value, force=index == 0))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-contract-checks] user=%s fuel=%s ids=%s",
+        email,
+        fuel,
+        len(ids),
+    )
+    return {"results": results}
 
 
 @app.post("/api/get-waste-info")
@@ -4732,6 +4797,28 @@ def data_request(
     return response_payload
 
 
+@app.get("/api/utility-records")
+def get_utility_records_endpoint(
+    utility_type: str = Query(..., min_length=1, max_length=80),
+    identifiers: str = Query(..., min_length=1, max_length=2000),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Read contract end and retailer for the linked utility rows a checklist is showing."""
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for part in identifiers.split(","):
+        value = part.strip()
+        if not value or value.upper() in seen:
+            continue
+        seen.add(value.upper())
+        ids.append(value)
+        if len(ids) >= 30:
+            break
+    return {"records": airtable_client.lookup_utility_records(utility_type, ids)}
+
+
 @app.patch("/api/utility-record")
 def update_utility_record_endpoint(
     request: UtilityRecordUpdateRequest,
@@ -4755,6 +4842,7 @@ def update_utility_record_endpoint(
             data_recieved=request.data_recieved,
             contract_end_date=request.contract_end_date,
             dma_end_date=request.dma_end_date,
+            retailer=request.retailer,
         )
     except Exception as e:
         logging.exception("[utility-record PATCH] Airtable update raised: %s", e)
@@ -11537,6 +11625,10 @@ def delete_client(
         synchronize_session=False
     )
 
+    db.query(UtilityChecklist).filter(UtilityChecklist.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
     # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
@@ -15084,3 +15176,7 @@ register_agreement_followup_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
 register_partner_routes(app, verify_partner_token, get_db)
 register_partner_admin_routes(app, verify_google_token)
+
+from utility_checklist_routes import register_utility_checklist_routes
+
+register_utility_checklist_routes(app, get_current_user_with_db)

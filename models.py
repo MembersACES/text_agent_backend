@@ -799,3 +799,32 @@ class OperationalEmailRecipient(Base):
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
+
+class UtilityChecklist(Base):
+    """One electricity or gas checklist per client, fuel, and account identifier."""
+
+    __tablename__ = "utility_checklists"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "fuel",
+            "identifier",
+            name="uq_utility_checklists_client_fuel_identifier",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
+    fuel = Column(String(16), nullable=False)
+    utility_type = Column(String(32), nullable=False)
+    identifier = Column(String(255), nullable=False)
+    status = Column(String(16), nullable=False)
+    answers = Column(JSON_COLUMN_TYPE, nullable=False)
+    template_version = Column(Integer, nullable=False)
+    row_version = Column(Integer, nullable=False, default=1)
+    completed_at = Column(DateTime, nullable=True)
+    updated_by = Column(String(255), nullable=True)
+    drive_file_id = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+

@@ -11,7 +11,13 @@ import re
 import time
 from typing import Any, Optional
 
-from tools.bne_gas_contracts import mrin_match_kind, parse_sheet_number
+from tools.bne_gas_contracts import (
+    _with_checksum_twins,
+    contract_header_row,
+    mrin_match_kind,
+    parse_sheet_number,
+    sheet_date_key,
+)
 from tools.business_info import get_sheets_service
 from tools.one_month_savings_calculation import MEMBER_ACES_DATA_SHEET_ID
 
@@ -87,8 +93,6 @@ def nmi_match_kind(query: str, sheet: str) -> Optional[str]:
         return None
     if q == s:
         return "exact"
-    if q.isalpha() or s.isalpha() or not (q.isdigit() and s.isdigit()):
-        return "exact" if q == s else None
     return mrin_match_kind(q, s)
 
 
@@ -158,7 +162,7 @@ def _build_period(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_contract(nmi: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    first = rows[0]
+    first = contract_header_row(rows)
     periods = [_build_period(row) for row in rows]
     periods.sort(key=_period_sort_key)
     return {
@@ -178,7 +182,9 @@ def lookup_bne_electricity_contract_from_rows(
     query_nmi: str, rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
     canonical = [canonicalize_row(row) for row in rows]
-    kind, matched = select_matched_nmis(query_nmi, [row.get("nmi", "") for row in canonical])
+    sheet_nmis = [row.get("nmi", "") for row in canonical]
+    kind, matched = select_matched_nmis(query_nmi, sheet_nmis)
+    matched = _with_checksum_twins(normalize_nmi(query_nmi), matched, sheet_nmis, nmi_match_kind)
     matched_set = set(matched)
     grouped: dict[str, list[dict[str, Any]]] = {nmi: [] for nmi in matched}
     for row in canonical:
@@ -186,6 +192,9 @@ def lookup_bne_electricity_contract_from_rows(
         if nmi in matched_set:
             grouped[nmi].append(row)
     contracts = [_build_contract(nmi, grouped[nmi]) for nmi in matched if grouped[nmi]]
+    contracts.sort(key=lambda contract: sheet_date_key(contract.get("contract_end_date")), reverse=True)
+    if contracts:
+        kind = nmi_match_kind(normalize_nmi(query_nmi), str(contracts[0].get("nmi") or "")) or kind
     return {
         "query_nmi": str(query_nmi or "").strip(),
         "normalized_nmi": normalize_nmi(query_nmi),
@@ -200,6 +209,28 @@ def _escape_sheet_title(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
 
 
+def _remember_sheet_gid(service: Any) -> None:
+    if isinstance(_CACHE.get("gid"), int):
+        return
+    try:
+        meta = (
+            service.spreadsheets()
+            .get(
+                spreadsheetId=MEMBER_ACES_DATA_SHEET_ID,
+                fields="sheets(properties(sheetId,title))",
+            )
+            .execute()
+        )
+    except Exception:
+        logger.warning("[bne-electricity-contracts] could not resolve sheet gid", exc_info=True)
+        return
+    for sheet in meta.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        if props.get("title") == SIGNED_CI_E_TAB and isinstance(props.get("sheetId"), int):
+            _CACHE["gid"] = props["sheetId"]
+            return
+
+
 def _read_signed_ci_e_rows(force: bool = False) -> list[dict[str, Any]]:
     now = time.time()
     cached = _CACHE.get("rows")
@@ -209,6 +240,8 @@ def _read_signed_ci_e_rows(force: bool = False) -> list[dict[str, Any]]:
     service = get_sheets_service()
     if not service:
         raise RuntimeError("Could not create Google Sheets service (check SERVICE_ACCOUNT_*)")
+
+    _remember_sheet_gid(service)
 
     tab = SIGNED_CI_E_TAB
     resp = (
@@ -241,9 +274,13 @@ def _read_signed_ci_e_rows(force: bool = False) -> list[dict[str, Any]]:
     return rows
 
 
-def lookup_bne_electricity_contract(nmi: str) -> dict[str, Any]:
-    rows = _read_signed_ci_e_rows()
-    return lookup_bne_electricity_contract_from_rows(nmi, rows)
+def lookup_bne_electricity_contract(nmi: str, force: bool = False) -> dict[str, Any]:
+    rows = _read_signed_ci_e_rows(force=force)
+    result = lookup_bne_electricity_contract_from_rows(nmi, rows)
+    gid = _CACHE.get("gid")
+    if isinstance(gid, int):
+        result["sheet_gid"] = gid
+    return result
 
 
 def lookup_bne_electricity_contracts(nmis: list[str]) -> dict[str, Any]:

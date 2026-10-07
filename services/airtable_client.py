@@ -53,8 +53,8 @@ UTILITY_CONFIG = [
     },
     {
         "app_key": "C&I Gas",
-        "loa_link_field": "4th Sheet - Large Gas",
-        "loa_link_field_fallbacks": ["Link to C&I Gas Client"],
+        "loa_link_field": "Link to C&I Gas Client",
+        "loa_link_field_fallbacks": ["4th Sheet - Large Gas"],
         "table_name": "C&I Gas Clients",
         "identifier_field": "MRIN",
         "retailer_field": "Retailer C&I Gas",
@@ -924,15 +924,17 @@ def find_utility_record_by_identifier(
     """
     if not identifier or not AIRTABLE_API_KEY:
         return None
-    identifier = str(identifier).strip()
-    for cfg in UTILITY_CONFIG:
-        if cfg["app_key"] != utility_type_identifier:
-            continue
-        table_name = cfg["table_name"]
-        id_field = cfg["identifier_field"]
-        # filterByFormula: {NMI}='value' (escape value)
-        escaped = _escape_formula_value(identifier)
-        formula = f"{{{id_field}}}='{escaped}'"
+        identifier = _normalize_identifier_raw(identifier) or str(identifier).strip()
+        for cfg in UTILITY_CONFIG:
+            if cfg["app_key"] != utility_type_identifier:
+                continue
+            table_name = cfg["table_name"]
+            id_field = cfg["identifier_field"]
+            escaped = _escape_formula_value(identifier)
+            formula_parts = [f"TRIM({{{id_field}}}&'')='{escaped}'"]
+            if identifier.isdigit():
+                formula_parts.append(f"{{{id_field}}}={identifier}")
+            formula = "OR(" + ",".join(formula_parts) + ")" if len(formula_parts) > 1 else formula_parts[0]
         try:
             r = requests.get(
                 _url(table_name),
@@ -948,6 +950,44 @@ def find_utility_record_by_identifier(
             logger.debug("Airtable find_utility_record failed: %s", e)
             return None
     return None
+
+
+def lookup_utility_records(utility_type_identifier: str, identifiers: list[str]) -> list[dict]:
+    """Read the stored identifier, contract end, and retailer for each Airtable utility row."""
+    cfg = _utility_config(utility_type_identifier)
+    if not cfg or not AIRTABLE_API_KEY:
+        return []
+    id_field = cfg["identifier_field"]
+    retailer_field = cfg.get("retailer_field") or "Retailer"
+    found_rows: list[dict] = []
+    seen_ids: set[str] = set()
+    for raw in identifiers:
+        query = str(raw or "").strip()
+        if not query:
+            continue
+        located = find_utility_record_by_identifier(utility_type_identifier, query)
+        if not located:
+            continue
+        table_name, record_id = located
+        if record_id in seen_ids:
+            continue
+        seen_ids.add(record_id)
+        record = _fetch_record(table_name, record_id)
+        if not record:
+            continue
+        fields = record.get("fields") or {}
+        stored = _normalize_identifier_raw(fields.get(id_field)) or query
+        retailer = fields.get(retailer_field)
+        if isinstance(retailer, list):
+            retailer = retailer[0] if retailer else ""
+        found_rows.append({
+            "query": query,
+            "identifier": stored,
+            "contract_end_date": _normalize_contract_end_date(_get_contract_end_date_from_fields(fields)),
+            "dma_end_date": _normalize_contract_end_date(fields.get("DMA End Date")),
+            "retailer": str(retailer).strip() if retailer else "",
+        })
+    return found_rows
 
 
 def _normalize_match_value(value: Any, strategy: str) -> str:
@@ -1187,6 +1227,23 @@ def update_utility_record_data_requested(
     )
 
 
+def _utility_config(utility_type_identifier: str) -> Optional[dict]:
+    key = (utility_type_identifier or "").strip()
+    if key == "Small Gas":
+        key = "SME Gas"
+    for cfg in UTILITY_CONFIG:
+        if cfg.get("app_key") == key:
+            return cfg
+    return None
+
+
+def retailer_field_writable(utility_type_identifier: str) -> bool:
+    """Lookup fields such as 'Retailer (from …)' cannot be patched on the utility record."""
+    cfg = _utility_config(utility_type_identifier)
+    field = str((cfg or {}).get("retailer_field") or "")
+    return bool(field) and "(from " not in field.lower()
+
+
 def update_utility_record(
     utility_type_identifier: str,
     identifier: str,
@@ -1195,6 +1252,7 @@ def update_utility_record(
     data_recieved: Optional[Any] = None,  # Checkbox: pass True/False (or "Yes"/"No" string, we convert to bool)
     contract_end_date: Optional[str] = None,
     dma_end_date: Optional[str] = None,
+    retailer: Optional[str] = None,
 ) -> bool:
     """
     Update one or more of Data Requested, Data Received (checkbox), Contract End Date, DMA End Date
@@ -1218,10 +1276,14 @@ def update_utility_record(
         else:
             bool_val = bool(data_recieved)
         fields["Data Received"] = bool_val
-    if contract_end_date is not None and contract_end_date != "":
-        fields["Contract End Date"] = contract_end_date
-    if dma_end_date is not None and dma_end_date != "":
-        fields["DMA End Date"] = dma_end_date
+    if contract_end_date is not None:
+        fields["Contract End Date"] = contract_end_date or None
+    if dma_end_date is not None:
+        fields["DMA End Date"] = dma_end_date or None
+    if retailer is not None and retailer_field_writable(utility_type_identifier):
+        cfg = _utility_config(utility_type_identifier)
+        retailer_field = str((cfg or {}).get("retailer_field") or "Retailer")
+        fields[retailer_field] = retailer
     if not fields:
         return True
     url = _url(table_name, record_id)
