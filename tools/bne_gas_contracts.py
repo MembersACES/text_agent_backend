@@ -170,8 +170,31 @@ def _build_period(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_DATE_DMY = re.compile(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{2,4})")
+_DATE_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
+
+
+def sheet_date_key(raw: Any) -> tuple[int, int, int]:
+    text = str(raw or "").strip()
+    iso = _DATE_ISO.match(text)
+    if iso:
+        return (int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+    dmy = _DATE_DMY.match(text)
+    if not dmy:
+        return (0, 0, 0)
+    year = int(dmy.group(3))
+    if year < 100:
+        year += 2000
+    return (year, int(dmy.group(2)), int(dmy.group(1)))
+
+
+def contract_header_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Header fields come from the row with the latest contract end, not the first sheet row."""
+    return max(rows, key=lambda row: sheet_date_key(row.get("contract_end_date")))
+
+
 def _build_contract(mrin: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    first = rows[0]
+    first = contract_header_row(rows)
     periods = [_build_period(row) for row in rows]
     periods.sort(key=_period_sort_key)
     return {
@@ -190,7 +213,9 @@ def _build_contract(mrin: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
 def lookup_bne_gas_contract_from_rows(query_mrin: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Pure lookup against already-read sheet rows (header-keyed or canonical)."""
     canonical = [canonicalize_row(row) for row in rows]
-    kind, matched = select_matched_mrins(query_mrin, [row.get("mrin", "") for row in canonical])
+    sheet_mrins = [row.get("mrin", "") for row in canonical]
+    kind, matched = select_matched_mrins(query_mrin, sheet_mrins)
+    matched = _with_checksum_twins(normalize_mrin(query_mrin), matched, sheet_mrins, mrin_match_kind)
     matched_set = set(matched)
     grouped: dict[str, list[dict[str, Any]]] = {mrin: [] for mrin in matched}
     for row in canonical:
@@ -198,6 +223,9 @@ def lookup_bne_gas_contract_from_rows(query_mrin: str, rows: list[dict[str, Any]
         if mrin in matched_set:
             grouped[mrin].append(row)
     contracts = [_build_contract(mrin, grouped[mrin]) for mrin in matched if grouped[mrin]]
+    contracts.sort(key=lambda contract: sheet_date_key(contract.get("contract_end_date")), reverse=True)
+    if contracts:
+        kind = mrin_match_kind(normalize_mrin(query_mrin), str(contracts[0].get("mrin") or "")) or kind
     return {
         "query_mrin": str(query_mrin or "").strip(),
         "normalized_mrin": normalize_mrin(query_mrin),
@@ -254,6 +282,25 @@ def _read_signed_ci_gas_rows(force: bool = False) -> list[dict[str, Any]]:
     return rows
 
 
-def lookup_bne_gas_contract(mrin: str) -> dict[str, Any]:
-    rows = _read_signed_ci_gas_rows()
+def lookup_bne_gas_contract(mrin: str, force: bool = False) -> dict[str, Any]:
+    rows = _read_signed_ci_gas_rows(force=force)
     return lookup_bne_gas_contract_from_rows(mrin, rows)
+
+
+def _with_checksum_twins(
+    query: str,
+    matched: list[str],
+    sheet_ids: list[str],
+    match_kind,
+) -> list[str]:
+    """Keep an older exact row in the set, and include a one-digit twin so a later contract can win."""
+    found = list(matched)
+    seen = set(found)
+    for raw in sheet_ids:
+        ident = str(raw or "")
+        if not ident or ident in seen:
+            continue
+        if match_kind(query, ident) == "checksum":
+            found.append(ident)
+            seen.add(ident)
+    return found
