@@ -993,6 +993,12 @@ class AssociationDocumentsResponse(BaseModel):
     files: List[AssociationFileItem] = []
 
 
+class AssociationRegisterTestimonial(BaseModel):
+    file_id: str
+    file_name: str
+    testimonial_savings: Optional[str] = None
+
+
 class AssociationUploadResponse(BaseModel):
     id: str
     name: str

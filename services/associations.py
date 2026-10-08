@@ -17,6 +17,7 @@ from tools.association_folders import (
     create_named_folder,
     ensure_testimonials_folder,
     get_associations_parent_id,
+    file_is_under_association,
     list_association_documents,
     list_association_drive_folders,
     normalize_association_status,
@@ -412,3 +413,60 @@ def upload_association_file(
         "association_id": row.id,
         "testimonial": testimonial_row,
     }, None, 200
+
+
+def register_existing_testimonial(
+    db: Session,
+    association_id: int,
+    *,
+    file_id: str,
+    file_name: str,
+    testimonial_savings: Optional[str],
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Testimonial], Optional[str], int]:
+    row = _get(db, association_id)
+    if not row:
+        return None, "Association not found.", 404
+    if not row.drive_folder_id:
+        return None, "This association does not have a Drive folder yet.", 404
+    fid = (file_id or "").strip()
+    name = (file_name or "").strip()
+    if not fid or not name:
+        return None, "Choose a file to register.", 400
+
+    existing = (
+        db.query(Testimonial)
+        .filter(Testimonial.association_id == row.id, Testimonial.file_id == fid)
+        .first()
+    )
+    if existing:
+        return existing, None, 200
+
+    allowed, err, status = file_is_under_association(
+        row.drive_folder_id,
+        fid,
+        user_access_token,
+    )
+    if not allowed:
+        if err == "folder_not_under_association":
+            return None, "That file is not inside this association.", 404
+        return None, err, status
+
+    savings = _blank(testimonial_savings)
+    if savings and len(savings) > 255:
+        savings = savings[:255]
+    testimonial = Testimonial(
+        business_name=row.name,
+        file_name=name[:512],
+        file_id=fid,
+        invoice_number=NO_INVOICE_RECORDED,
+        status="Draft",
+        testimonial_type=ASSOCIATION_SOLUTION_TYPE_LABEL,
+        testimonial_solution_type_id=ASSOCIATION_SOLUTION_TYPE_ID,
+        testimonial_savings=savings,
+        association_id=row.id,
+    )
+    db.add(testimonial)
+    db.commit()
+    db.refresh(testimonial)
+    return testimonial, None, 200

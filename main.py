@@ -205,6 +205,7 @@ from services.associations import (
     list_association_testimonials,
     list_associations,
     sync_associations_from_drive,
+    register_existing_testimonial,
     update_association,
     upload_association_file,
 )
@@ -296,6 +297,7 @@ from schemas import (
     AssociationCreate,
     AssociationDocumentsResponse,
     AssociationListResponse,
+    AssociationRegisterTestimonial,
     AssociationResponse,
     AssociationSyncResponse,
     AssociationUpdate,
@@ -2145,6 +2147,28 @@ def associations_testimonials(
     if err or items is None:
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Association not found")
     return [TestimonialResponse.model_validate(item) for item in items]
+
+
+@app.post("/api/associations/{association_id}/testimonials", response_model=TestimonialResponse)
+def associations_register_testimonial(
+    association_id: int,
+    body: AssociationRegisterTestimonial,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    testimonial, err, status = register_existing_testimonial(
+        db,
+        association_id,
+        file_id=body.file_id,
+        file_name=body.file_name,
+        testimonial_savings=body.testimonial_savings,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or testimonial is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not register testimonial")
+    return testimonial
 
 
 @app.get("/api/associations/{association_id}/files", response_model=AssociationDocumentsResponse)

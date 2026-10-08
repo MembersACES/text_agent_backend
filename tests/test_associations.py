@@ -6,7 +6,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from database import Base
-from services.associations import create_association, update_association
+from services.associations import create_association, register_existing_testimonial, update_association
 from tools.association_folders import clean_association_name, normalize_association_status
 
 
@@ -99,3 +99,55 @@ def test_update_rejects_unknown_status(monkeypatch):
     assert updated is None
     assert status == 400
     assert err
+
+
+def test_register_existing_file_links_testimonial(monkeypatch):
+    monkeypatch.setattr(
+        "services.associations.create_named_folder",
+        lambda parent_id, name, user_access_token=None: ("folder-3", True),
+    )
+    monkeypatch.setattr(
+        "services.associations.ensure_testimonials_folder",
+        lambda folder_id, user_access_token=None: "testimonials-3",
+    )
+    monkeypatch.setattr("services.associations.get_associations_parent_id", lambda: "parent-1")
+    monkeypatch.setattr(
+        "services.associations.file_is_under_association",
+        lambda association_folder_id, file_id, user_access_token=None: (True, None, 200),
+    )
+
+    db = _db()
+    created, err, _status = create_association(
+        db,
+        name="RSL Victoria",
+        status="targeting",
+        contact_name=None,
+        contact_email=None,
+        notes=None,
+        results_note=None,
+    )
+    assert err is None and created is not None
+    first, err, status = register_existing_testimonial(
+        db,
+        created["id"],
+        file_id="drive-file-1",
+        file_name="RSL Victoria Testimonial.png",
+        testimonial_savings="Savings across the network",
+    )
+    assert err is None
+    assert status == 200
+    assert first is not None
+    assert first.association_id == created["id"]
+    assert first.status == "Draft"
+    assert first.testimonial_solution_type_id == "association_endorsement"
+
+    again, err, status = register_existing_testimonial(
+        db,
+        created["id"],
+        file_id="drive-file-1",
+        file_name="RSL Victoria Testimonial.png",
+        testimonial_savings=None,
+    )
+    assert err is None and again is not None
+    assert again.id == first.id
+    assert status == 200

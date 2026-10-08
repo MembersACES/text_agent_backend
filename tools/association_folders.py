@@ -18,7 +18,9 @@ from tools.member_folder_drive import (
 from tools.one_month_savings import get_drive_service
 from tools.share_folder import drive_file_url, drive_folder_url, is_sa_quota_error
 from tools.supplier_folders import (
+    FOLDER_MIME,
     MAX_UPLOAD_BYTES,
+    _get_drive_meta,
     _list_children,
     _normalize_file,
     _resolve_under_supplier,
@@ -218,6 +220,39 @@ def _confirm_under_association(
     if str(top.get("id") or "") != association_folder_id:
         return None, "folder_not_under_association"
     return scope, None
+
+
+def file_is_under_association(
+    association_folder_id: str,
+    file_id: str,
+    user_access_token: Optional[str] = None,
+) -> Tuple[bool, Optional[str], int]:
+    """True when file_id is the association folder or sits inside it."""
+    root_id = (association_folder_id or "").strip()
+    fid = (file_id or "").strip()
+    if not root_id or not fid:
+        return False, "missing_folder_id", 400
+    drives, err = _candidate_drives(user_access_token)
+    if not drives:
+        return False, err, 503
+    parent_id, parent_err = _parent_or_error()
+    if parent_err:
+        return False, parent_err, 503
+
+    for drive in drives:
+        meta = _get_drive_meta(drive, fid)
+        if not meta or meta.get("trashed"):
+            continue
+        check_id = fid
+        if meta.get("mimeType") != FOLDER_MIME:
+            parents = [str(parent) for parent in (meta.get("parents") or []) if parent]
+            check_id = parents[0] if parents else ""
+            if not check_id:
+                continue
+        scope, confirm_err = _confirm_under_association(drive, check_id, root_id, parent_id)
+        if scope and not confirm_err:
+            return True, None, 200
+    return False, "folder_not_under_association", 404
 
 
 def list_association_documents(
