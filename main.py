@@ -359,6 +359,7 @@ from services.crm import (
     create_offer_activity,
     get_or_create_offer_for_activity,
     resolve_offer_for_member_upload,
+    record_signed_agreement_lodgement,
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
     enrich_client_response,
@@ -7106,14 +7107,27 @@ async def send_quote_request_endpoint(
         logging.error(f"Quote request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _form_flag(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.post("/api/signed-agreement-lodgement")
 async def signed_agreement_lodgement(
     request: Request,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """
-    Handle signed agreement lodgement with dynamic file upload support
+    Handle signed agreement lodgement with dynamic file upload support.
+    Optional skip_drive_filing skips the second Drive upload (Documents tab already filed).
+    Optional nmi / mirn are included in the supplier email the same way as an NMI/MIRN suffix on business_name.
     """
+    from tools.send_supplier_signed_agreement import (
+        resolve_lodgement_identifier,
+        resolve_lodgement_recipients,
+        utility_label_for_lodgement,
+    )
+
     # Parse the multipart form data
     form_data = await request.form()
     
@@ -7122,6 +7136,19 @@ async def signed_agreement_lodgement(
     contract_type = form_data.get("contract_type")
     agreement_type = form_data.get("agreement_type", "contract")
     file_count = int(form_data.get("file_count", 1))
+    nmi = str(form_data.get("nmi") or "").strip() or None
+    mirn = str(form_data.get("mirn") or "").strip() or None
+    utility_type = str(form_data.get("utility_type") or "").strip() or None
+    skip_drive_filing = _form_flag(form_data.get("skip_drive_filing"))
+    document_link = str(form_data.get("document_link") or "").strip() or None
+    recipient_emails = str(form_data.get("recipient_emails") or "").strip() or None
+    raw_client_id = form_data.get("client_id")
+    client_id = None
+    if raw_client_id not in (None, ""):
+        try:
+            client_id = int(str(raw_client_id))
+        except (TypeError, ValueError):
+            client_id = None
     
     if not business_name or not contract_type:
         raise HTTPException(status_code=400, detail="business_name and contract_type are required")
@@ -7161,7 +7188,12 @@ async def signed_agreement_lodgement(
                 business_name=business_name,
                 contract_type=contract_type,
                 agreement_type=agreement_type,
-                filenames=filenames
+                filenames=filenames,
+                nmi=nmi,
+                mirn=mirn,
+                utility_type=utility_type,
+                skip_drive_filing=skip_drive_filing,
+                recipient_emails=recipient_emails,
             )
         else:
             # For single file, use existing function
@@ -7169,8 +7201,39 @@ async def signed_agreement_lodgement(
                 file_path=temp_file_paths[0],
                 business_name=business_name,
                 contract_type=contract_type,
-                agreement_type=agreement_type
+                agreement_type=agreement_type,
+                nmi=nmi,
+                mirn=mirn,
+                utility_type=utility_type,
+                skip_drive_filing=skip_drive_filing,
+                recipient_emails=recipient_emails,
             )
+
+        if "✅" in result:
+            try:
+                lookup_type = "eoi" if agreement_type == "eoi" else "contract"
+                supplier_email, resolved_name, _is_default = resolve_lodgement_recipients(
+                    str(contract_type), lookup_type, recipient_emails
+                )
+                label = utility_label_for_lodgement(str(contract_type), utility_type)
+                clean_name, _, _ = resolve_lodgement_identifier(
+                    str(business_name or ""), nmi, mirn
+                )
+                record_signed_agreement_lodgement(
+                    db,
+                    business_name=clean_name,
+                    utility_label=label,
+                    supplier=str(contract_type),
+                    retailer_name=resolved_name,
+                    recipients=supplier_email,
+                    created_by=user_info.get("email") if isinstance(user_info, dict) else None,
+                    document_link=document_link,
+                    client_id=client_id,
+                    nmi=nmi,
+                    mirn=mirn,
+                )
+            except Exception as act_e:
+                logging.warning("Failed to log signed agreement lodgement activity: %s", act_e)
         
         # Structure the response for the frontend
         response = {
