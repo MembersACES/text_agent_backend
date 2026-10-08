@@ -859,7 +859,7 @@ class StrategyItemResponse(StrategyItemBase):
 # --- Testimonials (member savings testimonials, optional link to 1st Month Savings invoice) ---
 
 TESTIMONIAL_STATUSES = ("Draft", "Sent for approval", "Approved")
-SOCIAL_POST_STATUSES = ("Drafted", "Ready to post", "Posted")
+SOCIAL_POST_STATUSES = ("Planned", "Drafted", "Ready to post", "Posted")
 
 
 class TestimonialResponse(BaseModel):
@@ -875,7 +875,7 @@ class TestimonialResponse(BaseModel):
     testimonial_savings: Optional[str] = None
     video_long_file_id: Optional[str] = None
     video_short_file_id: Optional[str] = None
-    social_status: Optional[str] = None  # Drafted | Ready to post | Posted; empty until a post is started
+    social_status: Optional[str] = None  # Planned | Drafted | Ready to post | Posted; empty until a post is started
     association_id: Optional[int] = None
     source: Optional[str] = "crm"  # crm | sheet
     created_at: datetime

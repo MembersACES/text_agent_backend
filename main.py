@@ -9989,7 +9989,7 @@ async def update_testimonial(
         elif social not in SOCIAL_POST_STATUSES:
             raise HTTPException(
                 status_code=400,
-                detail="Social status must be Drafted, Ready to post, or Posted.",
+                detail="Social status must be Planned, Drafted, Ready to post, or Posted.",
             )
         elif testimonial.status != "Approved":
             raise HTTPException(
