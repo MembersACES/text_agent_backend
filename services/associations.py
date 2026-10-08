@@ -9,6 +9,13 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models import Association, Testimonial
+from tools.association_contacts import (
+    load_sheet_contacts,
+    locate_or_create_contacts_sheet,
+    new_contact,
+    save_sheet_contacts,
+    with_single_primary,
+)
 from tools.association_folders import (
     ASSOCIATION_SOLUTION_TYPE_ID,
     ASSOCIATION_SOLUTION_TYPE_LABEL,
@@ -69,6 +76,8 @@ def association_payload(
         "drive_folder_id": row.drive_folder_id,
         "drive_folder_url": row.drive_folder_url,
         "testimonials_folder_id": row.testimonials_folder_id,
+        "contacts_sheet_id": row.contacts_sheet_id,
+        "contacts_sheet_url": row.contacts_sheet_url,
         "contact_name": row.contact_name,
         "contact_email": row.contact_email,
         "notes": row.notes,
@@ -193,7 +202,10 @@ def update_association(
             return None, "Status must be Targeting or Working with.", 400
         row.status = normalized
 
+    sheet_owns_contact = bool((row.contacts_sheet_id or "").strip())
     for key in ("contact_name", "contact_email", "notes", "results_note"):
+        if sheet_owns_contact and key in ("contact_name", "contact_email"):
+            continue
         if key in fields:
             setattr(row, key, _blank(None if fields[key] is None else str(fields[key])))
 
@@ -470,3 +482,231 @@ def register_existing_testimonial(
     db.commit()
     db.refresh(testimonial)
     return testimonial, None, 200
+
+
+_CONTACT_LIMITS = {
+    "name": 200,
+    "role": 120,
+    "email": 255,
+    "phone": 50,
+    "mobile": 50,
+    "notes": 2000,
+}
+
+
+def _contact_text(value: Any, key: str) -> str:
+    return str(value or "").strip()[: _CONTACT_LIMITS[key]]
+
+
+def _sync_sheet_primary(row: Association, contacts: List[Dict[str, Any]]) -> None:
+    primary = next((item for item in contacts if item.get("primary")), None)
+    if primary:
+        row.contact_name = _blank(str(primary.get("name") or ""))
+        row.contact_email = _blank(str(primary.get("email") or ""))
+    else:
+        row.contact_name = None
+        row.contact_email = None
+
+
+def _prefer_primary(
+    contacts: List[Dict[str, Any]],
+    preferred_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not contacts:
+        return contacts
+    if preferred_id and any(item["id"] == preferred_id for item in contacts):
+        return with_single_primary(contacts, preferred_id)
+    current = next((item["id"] for item in contacts if item.get("primary")), None)
+    return with_single_primary(contacts, current or contacts[0]["id"])
+
+
+def _contacts_payload(row: Association, contacts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "contacts_sheet_id": row.contacts_sheet_id or "",
+        "contacts_sheet_url": row.contacts_sheet_url or "",
+        "contact_name": row.contact_name,
+        "contact_email": row.contact_email,
+        "contacts": contacts,
+    }
+
+
+def _association_for_contacts(
+    db: Session,
+    association_id: int,
+) -> Tuple[Optional[Association], Optional[str], int]:
+    row = _get(db, association_id)
+    if not row:
+        return None, "Association not found.", 404
+    if not (row.drive_folder_id or "").strip():
+        return None, "This association has no Drive folder yet.", 400
+    return row, None, 200
+
+
+def _open_contacts(
+    row: Association,
+    user_access_token: Optional[str],
+    *,
+    seed_existing: bool,
+) -> List[Dict[str, Any]]:
+    first_link = not (row.contacts_sheet_id or "").strip()
+    sheet_id, url, created = locate_or_create_contacts_sheet(
+        row.drive_folder_id or "",
+        row.contacts_sheet_id,
+        user_access_token,
+    )
+    row.contacts_sheet_id = sheet_id
+    row.contacts_sheet_url = url
+    contacts, dirty = load_sheet_contacts(sheet_id, user_access_token)
+    if (
+        seed_existing
+        and not contacts
+        and (created or first_link)
+        and (_blank(row.contact_name) or _blank(row.contact_email))
+    ):
+        contacts = [
+            new_contact(
+                name=_blank(row.contact_name) or _blank(row.contact_email) or "Contact",
+                email=_blank(row.contact_email) or "",
+                primary=True,
+            )
+        ]
+        dirty = True
+    if contacts and not any(item.get("primary") for item in contacts):
+        contacts = _prefer_primary(contacts, None)
+        dirty = True
+    if created or dirty:
+        save_sheet_contacts(sheet_id, contacts, user_access_token)
+    _sync_sheet_primary(row, contacts)
+    return contacts
+
+
+def _commit_contacts(
+    db: Session,
+    row: Association,
+    contacts: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], None, int]:
+    db.commit()
+    db.refresh(row)
+    return _contacts_payload(row, contacts), None, 200
+
+
+def ensure_association_contacts(
+    db: Session,
+    association_id: int,
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    row, err, status = _association_for_contacts(db, association_id)
+    if err or row is None:
+        return None, err, status
+    try:
+        contacts = _open_contacts(row, user_access_token, seed_existing=True)
+    except MemberFolderDriveError as exc:
+        db.rollback()
+        return None, exc.message, exc.status_code
+    return _commit_contacts(db, row, contacts)
+
+
+def add_association_contact(
+    db: Session,
+    association_id: int,
+    fields: Dict[str, Any],
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    row, err, status = _association_for_contacts(db, association_id)
+    if err or row is None:
+        return None, err, status
+    name = _contact_text(fields.get("name"), "name")
+    if not name:
+        return None, "Contact name is required.", 400
+    try:
+        contacts = _open_contacts(row, user_access_token, seed_existing=False)
+        contact = new_contact(
+            name=name,
+            role=_contact_text(fields.get("role"), "role"),
+            email=_contact_text(fields.get("email"), "email"),
+            phone=_contact_text(fields.get("phone"), "phone"),
+            mobile=_contact_text(fields.get("mobile"), "mobile"),
+            notes=_contact_text(fields.get("notes"), "notes"),
+            primary=bool(fields.get("primary")),
+        )
+        contacts.append(contact)
+        preferred = contact["id"] if contact["primary"] or len(contacts) == 1 else None
+        contacts = _prefer_primary(contacts, preferred)
+        save_sheet_contacts(row.contacts_sheet_id or "", contacts, user_access_token)
+        _sync_sheet_primary(row, contacts)
+    except MemberFolderDriveError as exc:
+        db.rollback()
+        return None, exc.message, exc.status_code
+    return _commit_contacts(db, row, contacts)
+
+
+def update_association_contact(
+    db: Session,
+    association_id: int,
+    contact_id: str,
+    fields: Dict[str, Any],
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    row, err, status = _association_for_contacts(db, association_id)
+    if err or row is None:
+        return None, err, status
+    target = (contact_id or "").strip()
+    if not target:
+        return None, "Contact not found.", 404
+    try:
+        contacts = _open_contacts(row, user_access_token, seed_existing=False)
+        current = next((item for item in contacts if item["id"] == target), None)
+        if current is None:
+            db.rollback()
+            return None, "Contact not found.", 404
+        updated = dict(current)
+        for key in ("name", "role", "email", "phone", "mobile", "notes"):
+            if key in fields and fields[key] is not None:
+                updated[key] = _contact_text(fields[key], key)
+        if not updated["name"]:
+            db.rollback()
+            return None, "Contact name is required.", 400
+        contacts = [updated if item["id"] == target else item for item in contacts]
+        if "primary" in fields and fields["primary"] is True:
+            contacts = _prefer_primary(contacts, target)
+        elif "primary" in fields and fields["primary"] is False:
+            updated["primary"] = False
+            contacts = [updated if item["id"] == target else item for item in contacts]
+            if any(item.get("primary") for item in contacts):
+                contacts = _prefer_primary(contacts, None)
+            else:
+                others = [item["id"] for item in contacts if item["id"] != target]
+                contacts = _prefer_primary(contacts, others[0] if others else target)
+        else:
+            contacts = _prefer_primary(contacts, None)
+        save_sheet_contacts(row.contacts_sheet_id or "", contacts, user_access_token)
+        _sync_sheet_primary(row, contacts)
+    except MemberFolderDriveError as exc:
+        db.rollback()
+        return None, exc.message, exc.status_code
+    return _commit_contacts(db, row, contacts)
+
+
+def delete_association_contact(
+    db: Session,
+    association_id: int,
+    contact_id: str,
+    user_access_token: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    row, err, status = _association_for_contacts(db, association_id)
+    if err or row is None:
+        return None, err, status
+    target = (contact_id or "").strip()
+    try:
+        contacts = _open_contacts(row, user_access_token, seed_existing=False)
+        if not any(item["id"] == target for item in contacts):
+            db.rollback()
+            return None, "Contact not found.", 404
+        contacts = [item for item in contacts if item["id"] != target]
+        contacts = _prefer_primary(contacts, None)
+        save_sheet_contacts(row.contacts_sheet_id or "", contacts, user_access_token)
+        _sync_sheet_primary(row, contacts)
+    except MemberFolderDriveError as exc:
+        db.rollback()
+        return None, exc.message, exc.status_code
+    return _commit_contacts(db, row, contacts)

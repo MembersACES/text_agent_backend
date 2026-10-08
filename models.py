@@ -358,6 +358,8 @@ class Association(Base):
     drive_folder_id = Column(String(255), nullable=True, unique=True, index=True)
     drive_folder_url = Column(String(512), nullable=True)
     testimonials_folder_id = Column(String(255), nullable=True)
+    contacts_sheet_id = Column(String(255), nullable=True)
+    contacts_sheet_url = Column(String(512), nullable=True)
     contact_name = Column(String(255), nullable=True)
     contact_email = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)

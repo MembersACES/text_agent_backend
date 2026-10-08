@@ -198,6 +198,22 @@ def init_db():
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
 
+    try:
+        insp = inspect(engine)
+        if "associations" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("associations")]
+            for col_name, col_type in [
+                ("contacts_sheet_id", "VARCHAR(255)"),
+                ("contacts_sheet_url", "VARCHAR(512)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing associations.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE associations ADD COLUMN {col_name} {col_type}"))
+                    logging.info("Added associations.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure associations columns: %s", e)
+
     # marketing_videos table is created via Base.metadata.create_all; ensure columns if table pre-exists.
     try:
         insp = inspect(engine)

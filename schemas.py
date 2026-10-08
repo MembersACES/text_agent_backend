@@ -914,6 +914,8 @@ class AssociationResponse(BaseModel):
     drive_folder_id: Optional[str] = None
     drive_folder_url: Optional[str] = None
     testimonials_folder_id: Optional[str] = None
+    contacts_sheet_id: Optional[str] = None
+    contacts_sheet_url: Optional[str] = None
     contact_name: Optional[str] = None
     contact_email: Optional[str] = None
     notes: Optional[str] = None
@@ -997,6 +999,45 @@ class AssociationRegisterTestimonial(BaseModel):
     file_id: str
     file_name: str
     testimonial_savings: Optional[str] = None
+
+
+class AssociationContact(BaseModel):
+    id: str
+    name: str
+    role: str = ""
+    email: str = ""
+    phone: str = ""
+    mobile: str = ""
+    primary: bool = False
+    notes: str = ""
+
+
+class AssociationContactsResponse(BaseModel):
+    contacts_sheet_id: str
+    contacts_sheet_url: str
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    contacts: List[AssociationContact] = []
+
+
+class AssociationContactWrite(BaseModel):
+    name: str
+    role: str = ""
+    email: str = ""
+    phone: str = ""
+    mobile: str = ""
+    primary: bool = False
+    notes: str = ""
+
+
+class AssociationContactUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    mobile: Optional[str] = None
+    primary: Optional[bool] = None
+    notes: Optional[str] = None
 
 
 class AssociationUploadResponse(BaseModel):

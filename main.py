@@ -200,13 +200,17 @@ from tools.distributor_folders import (
     upload_distributor_document,
 )
 from services.associations import (
+    add_association_contact,
     create_association,
+    delete_association_contact,
+    ensure_association_contacts,
     list_association_files,
     list_association_testimonials,
     list_associations,
     sync_associations_from_drive,
     register_existing_testimonial,
     update_association,
+    update_association_contact,
     upload_association_file,
 )
 from tools.supplier_folders import (
@@ -294,6 +298,9 @@ from schemas import (
     StrategyItemResponse,
     TestimonialResponse,
     TestimonialUpdate,
+    AssociationContactUpdate,
+    AssociationContactWrite,
+    AssociationContactsResponse,
     AssociationCreate,
     AssociationDocumentsResponse,
     AssociationListResponse,
@@ -2228,6 +2235,93 @@ async def associations_upload(
     if err or payload is None:
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Upload failed")
     return payload
+
+
+def _association_contacts_or_error(payload, err, status):
+    if err or payload is None:
+        raise HTTPException(
+            status_code=status if status >= 400 else 502,
+            detail=err or "Could not update contacts",
+        )
+    return payload
+
+
+@app.post("/api/associations/{association_id}/contacts/sheet", response_model=AssociationContactsResponse)
+def associations_contacts_sheet(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = ensure_association_contacts(
+        db,
+        association_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.post("/api/associations/{association_id}/contacts", response_model=AssociationContactsResponse)
+def associations_contacts_add(
+    association_id: int,
+    body: AssociationContactWrite,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = add_association_contact(
+        db,
+        association_id,
+        body.model_dump(),
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.patch(
+    "/api/associations/{association_id}/contacts/{contact_id}",
+    response_model=AssociationContactsResponse,
+)
+def associations_contacts_update(
+    association_id: int,
+    contact_id: str,
+    body: AssociationContactUpdate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = update_association_contact(
+        db,
+        association_id,
+        contact_id,
+        body.model_dump(exclude_unset=True),
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.delete(
+    "/api/associations/{association_id}/contacts/{contact_id}",
+    response_model=AssociationContactsResponse,
+)
+def associations_contacts_delete(
+    association_id: int,
+    contact_id: str,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = delete_association_contact(
+        db,
+        association_id,
+        contact_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
 
 
 @app.post("/api/distributors/create")
