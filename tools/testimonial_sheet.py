@@ -218,6 +218,7 @@ def merge_db_and_sheet_testimonials(
             "testimonial_solution_type_id": row.testimonial_solution_type_id,
             "testimonial_savings": row.testimonial_savings,
             "social_status": getattr(row, "social_status", None),
+            "association_id": getattr(row, "association_id", None),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
             "source": "crm",

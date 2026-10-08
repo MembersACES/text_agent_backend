@@ -199,6 +199,16 @@ from tools.distributor_folders import (
     list_distributor_folders,
     upload_distributor_document,
 )
+from services.associations import (
+    create_association,
+    list_association_files,
+    list_association_testimonials,
+    list_associations,
+    sync_associations_from_drive,
+    register_existing_testimonial,
+    update_association,
+    upload_association_file,
+)
 from tools.supplier_folders import (
     create_supplier_folder,
     list_supplier_documents,
@@ -284,6 +294,14 @@ from schemas import (
     StrategyItemResponse,
     TestimonialResponse,
     TestimonialUpdate,
+    AssociationCreate,
+    AssociationDocumentsResponse,
+    AssociationListResponse,
+    AssociationRegisterTestimonial,
+    AssociationResponse,
+    AssociationSyncResponse,
+    AssociationUpdate,
+    AssociationUploadResponse,
     TestimonialCheckApprovedResponse,
     MarketingVideoResponse,
     MarketingVideoUpdate,
@@ -2039,6 +2057,176 @@ async def distributors_drive_upload(
                 detail="Folder not found under 003-Distributors.",
             )
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+def _association_token(
+    google_access_token: str = "",
+    x_google_access_token: Optional[str] = None,
+) -> Optional[str]:
+    return (google_access_token or x_google_access_token or "").strip() or None
+
+
+@app.get("/api/associations", response_model=AssociationListResponse)
+def associations_list(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    return list_associations(db)
+
+
+@app.post("/api/associations", response_model=AssociationResponse)
+def associations_create(
+    body: AssociationCreate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info("associations/create name=%r user=%s", body.name, user_info.get("email"))
+    payload, err, status = create_association(
+        db,
+        name=body.name,
+        status=body.status,
+        contact_name=body.contact_name,
+        contact_email=body.contact_email,
+        notes=body.notes,
+        results_note=body.results_note,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not create association")
+    return payload
+
+
+@app.post("/api/associations/sync", response_model=AssociationSyncResponse)
+def associations_sync(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info("associations/sync user=%s", user_info.get("email"))
+    payload, err, status = sync_associations_from_drive(
+        db,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not read Drive")
+    return payload
+
+
+@app.patch("/api/associations/{association_id}", response_model=AssociationResponse)
+def associations_update(
+    association_id: int,
+    body: AssociationUpdate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    fields = body.model_dump(exclude_unset=True)
+    payload, err, status = update_association(
+        db,
+        association_id,
+        fields,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not update association")
+    return payload
+
+
+@app.get("/api/associations/{association_id}/testimonials", response_model=List[TestimonialResponse])
+def associations_testimonials(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    items, err, status = list_association_testimonials(db, association_id)
+    if err or items is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Association not found")
+    return [TestimonialResponse.model_validate(item) for item in items]
+
+
+@app.post("/api/associations/{association_id}/testimonials", response_model=TestimonialResponse)
+def associations_register_testimonial(
+    association_id: int,
+    body: AssociationRegisterTestimonial,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    testimonial, err, status = register_existing_testimonial(
+        db,
+        association_id,
+        file_id=body.file_id,
+        file_name=body.file_name,
+        testimonial_savings=body.testimonial_savings,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or testimonial is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not register testimonial")
+    return testimonial
+
+
+@app.get("/api/associations/{association_id}/files", response_model=AssociationDocumentsResponse)
+def associations_files(
+    association_id: int,
+    folder_id: Optional[str] = None,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = list_association_files(
+        db,
+        association_id,
+        folder_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not list files")
+    return payload
+
+
+@app.post("/api/associations/{association_id}/files", response_model=AssociationUploadResponse)
+async def associations_upload(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    file: UploadFile = File(...),
+    filename: str = Form(""),
+    folder_id: str = Form(""),
+    register_testimonial: str = Form(""),
+    testimonial_savings: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "associations/upload id=%s file=%s user=%s testimonial=%s",
+        association_id,
+        file.filename,
+        user_info.get("email"),
+        register_testimonial,
+    )
+    contents = await file.read()
+    flag = (register_testimonial or "").strip().lower() in {"1", "true", "yes", "on"}
+    payload, err, status = upload_association_file(
+        db,
+        association_id,
+        folder_id=folder_id.strip() or None,
+        file_bytes=contents,
+        filename=file.filename or "upload.bin",
+        content_type=file.content_type,
+        display_name=filename.strip() or None,
+        register_testimonial=flag,
+        testimonial_savings=testimonial_savings.strip() or None,
+        user_access_token=_association_token(google_access_token, x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Upload failed")
     return payload
 
 
