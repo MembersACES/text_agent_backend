@@ -345,10 +345,32 @@ class StrategyItem(Base):
     )
 
 
+class Association(Base):
+    """
+    Peak body we are targeting or working with.
+    Files live in a Drive subfolder; endorsements are testimonials linked by association_id.
+    """
+    __tablename__ = "associations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="targeting", index=True)  # targeting | working_with
+    drive_folder_id = Column(String(255), nullable=True, unique=True, index=True)
+    drive_folder_url = Column(String(512), nullable=True)
+    testimonials_folder_id = Column(String(255), nullable=True)
+    contact_name = Column(String(255), nullable=True)
+    contact_email = Column(String(255), nullable=True)
+    notes = Column(Text, nullable=True)
+    results_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class Testimonial(Base):
     """
     Member testimonial document (e.g. 1-page savings confirmation).
     Optional link to a 1st Month Savings invoice. Status: Draft, Sent for approval, Approved.
+    association_id set when the endorsement is on behalf of an association.
     """
     __tablename__ = "testimonials"
 
@@ -364,6 +386,7 @@ class Testimonial(Base):
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
     video_long_file_id = Column(String(255), nullable=True)  # Drive ID for long-cut MP4
     video_short_file_id = Column(String(255), nullable=True)  # Drive ID for 30s-cut MP4
+    association_id = Column(Integer, ForeignKey("associations.id"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

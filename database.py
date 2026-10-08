@@ -178,12 +178,23 @@ def init_db():
                 ("video_long_file_id", "VARCHAR(255)"),
                 ("video_short_file_id", "VARCHAR(255)"),
                 ("social_status", "VARCHAR(50)"),
+                ("association_id", "INTEGER"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing testimonials.%s column", col_name)
                     with engine.begin() as conn:
                         conn.execute(text(f"ALTER TABLE testimonials ADD COLUMN {col_name} {col_type}"))
                     logging.info("✅ Added testimonials.%s column", col_name)
+            if "association_id" in cols or "association_id" in [
+                c["name"] for c in inspect(engine).get_columns("testimonials")
+            ]:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_testimonials_association_id "
+                            "ON testimonials (association_id)"
+                        )
+                    )
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
 
