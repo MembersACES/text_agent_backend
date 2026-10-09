@@ -10,6 +10,9 @@ Rules agreed 25 Sep 2026 (project doc: sme-gas-invoice-normalisation-spec.md):
 - Price change on invoice = Y: the row holds the latest price period only. Each MJ figure is
   paired with its own days (whole-bill MJ with invoice days, latest-period MJ with rates-period
   days). Block amounts are not reconciled against the invoice total on these rows.
+  The current energy and supply rates are that latest period, with no whole-bill discount
+  subtracted. The credit belongs to the whole bill, and taking it off this slice understates
+  the rate they pay from now on.
 - "Invoice Total:" is ex GST. Reconciliation uses "Invoice Total incl GST".
 - Annual consumption of 1,000 GJ (1 TJ) or more is flagged as C&I.
 """
@@ -269,6 +272,15 @@ def normalise_invoice(raw: dict[str, Any]) -> dict[str, Any]:
     if network["id"] is None:
         flags.append(_flag("error", "no_network", f"No gas network mapped for MIRN prefix {mirn[:3] or '?'}."))
 
+    rate_energy = energy_amount if price_change else energy_net
+    rate_supply = supply_amount if price_change else supply_net
+    if price_change and total_disc:
+        flags.append(_flag(
+            "info",
+            "price_change_discount_excluded",
+            "Discount dollars are for the whole bill. The current rate is the latest price period, without that credit.",
+        ))
+
     return {
         "mirn": mirn,
         "client_name": row.text("Client Name"),
@@ -288,8 +300,8 @@ def normalise_invoice(raw: dict[str, Any]) -> dict[str, Any]:
         "supply": {"days": supply_days, "rate_aud_per_day": supply_rate, "amount_aud": supply_amount},
         "discounts": {"usage_aud": usage_disc, "supply_aud": supply_disc, "total_aud": total_disc,
                       "plan_discount_included_aud": row.num("Plan Discount Included $")},
-        "energy_rate_aud_per_gj": energy_net / gj if gj else None,
-        "supply_aud_per_day": supply_net / supply_days if supply_days else None,
+        "energy_rate_aud_per_gj": rate_energy / gj if gj else None,
+        "supply_aud_per_day": rate_supply / supply_days if supply_days else None,
         "all_in_aud_per_gj": all_in / gj if gj else None,
         "invoice_total_ex_gst_aud": total_ex,
         "invoice_total_incl_gst_aud": total_inc,
