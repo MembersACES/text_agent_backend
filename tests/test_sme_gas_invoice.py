@@ -149,6 +149,21 @@ def test_east_malvern_price_change():
     assert any(f["code"] == "price_change_no_whole_bill_mj" for f in inv["flags"])
 
 
+def test_price_change_rate_ignores_whole_bill_discount():
+    row = {**EAST_MALVERN, "Usage Discount $": "400", "Invoice Total MJ (whole bill)": "60000"}
+    inv = normalise_invoice(row)
+    assert inv["energy_rate_aud_per_gj"] == pytest.approx((259.13 + 710.57 + 43.97) / 28.52)
+    assert inv["supply_aud_per_day"] == pytest.approx(35.34 / 27)
+    assert any(f["code"] == "price_change_discount_excluded" for f in inv["flags"])
+
+
+def test_single_period_discount_still_reduces_the_rate():
+    row = {**GLENROY, "Usage Discount $": "100"}
+    inv = normalise_invoice(row)
+    mj = 104500 + 41834.25
+    assert inv["energy_rate_aud_per_gj"] == pytest.approx((2745.01 + 948.42 - 100) / (mj / 1000))
+
+
 def test_east_malvern_with_whole_bill_mj_uses_invoice_days():
     row = {**EAST_MALVERN, "Invoice Total MJ (whole bill)": "60000"}
     inv = normalise_invoice(row)
