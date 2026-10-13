@@ -2839,11 +2839,16 @@ async def alinta_gas_agreement_send(
     if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
         draft["gdrive_folder_url"] = client.gdrive_folder_url
 
+    tracker_client_id = str(client.id) if client is not None else ""
+    if not tracker_client_id and raw_client_id not in (None, ""):
+        tracker_client_id = str(raw_client_id).strip()
+
     result = send_alinta_gas_agreement(
         draft,
         pdf_bytes=contents,
         filename=file.filename or "",
         user_email=email,
+        client_id=tracker_client_id,
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
@@ -2979,11 +2984,16 @@ async def alinta_electricity_agreement_send(
     if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
         draft["gdrive_folder_url"] = client.gdrive_folder_url
 
+    tracker_client_id = str(client.id) if client is not None else ""
+    if not tracker_client_id and raw_client_id not in (None, ""):
+        tracker_client_id = str(raw_client_id).strip()
+
     result = send_alinta_electricity_agreement(
         draft,
         pdf_bytes=contents,
         filename=file.filename or "",
         user_email=email,
+        client_id=tracker_client_id,
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")

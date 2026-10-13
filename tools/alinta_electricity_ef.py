@@ -797,6 +797,7 @@ def send_alinta_electricity_agreement(
     pdf_bytes: Optional[bytes] = None,
     filename: str = "",
     user_email: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> dict[str, Any]:
     errors = required_electricity_send_errors(draft)
     if errors:
@@ -896,6 +897,54 @@ def send_alinta_electricity_agreement(
         notes.append(f"LOA attachment: {loa_dl_error}")
     notes.append(f"LOA file ID: {draft.get('loa_file_id')}")
 
+    from tools.alinta_agreement_sheet import (
+        ELECTRICITY_COLUMNS,
+        ELECTRICITY_TAB,
+        append_tracker_row,
+        gmail_ids_from_webhook,
+        sydney_sent_at,
+    )
+
+    thread_id, message_id = gmail_ids_from_webhook(response.text or "")
+    mailed = _elec_merge_values(draft)
+    sheet_error = append_tracker_row(
+        ELECTRICITY_TAB,
+        ELECTRICITY_COLUMNS,
+        {
+            "sent_at": sydney_sent_at(),
+            "sent_by": user_email or "",
+            "client_id": (client_id or "").strip(),
+            "company_name": mailed["company_name"],
+            "nmis": mailed["nmis"],
+            "request_kind": mailed["request_kind"],
+            "email_subject": subject,
+            "gmail_thread_id": thread_id,
+            "gmail_message_id": message_id,
+            "drive_folder_url": client_folder_url,
+            "acn_abn": mailed["acn_abn"],
+            "address": mailed["address"],
+            "tel": mailed["tel"],
+            "contact_name": mailed["contact_name"],
+            "email": mailed["email"],
+            "start_date": mailed["start_date"],
+            "end_date": mailed["end_date"],
+            "peak_rate_c_kwh": mailed["peak_rate_c_kwh"],
+            "off_peak_rate_c_kwh": mailed["off_peak_rate_c_kwh"],
+            "shoulder_rate_c_kwh": mailed["shoulder_rate_c_kwh"],
+            "commission_c_kwh": mailed["commission_c_kwh"],
+            "annual_kwh": mailed["annual_kwh"],
+            "take_or_pay_pct": mailed["take_or_pay_pct"],
+        },
+    )
+    if sheet_error:
+        notes.append(f"Agreement tracker was not updated: {sheet_error}")
+    else:
+        notes.append("Added to the Alinta agreement tracker (Electricity).")
+    if not thread_id:
+        notes.append(
+            "Gmail thread id was not on the n8n response, so a chase cannot reply on this thread yet."
+        )
+
     return {
         "ok": True,
         "message": "\n".join(notes),
@@ -907,6 +956,9 @@ def send_alinta_electricity_agreement(
         "drive_folder_url": client_folder_url or None,
         "lodge_error": lodge_error or None,
         "agreement_type": N8N_AGREEMENT_TYPE,
+        "gmail_thread_id": thread_id or None,
+        "gmail_message_id": message_id or None,
+        "tracker_error": sheet_error,
     }
 
 
