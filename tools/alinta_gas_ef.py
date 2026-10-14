@@ -982,6 +982,7 @@ def send_alinta_gas_agreement(
     pdf_bytes: Optional[bytes] = None,
     filename: str = "",
     user_email: Optional[str] = None,
+    client_id: Optional[str] = None,
 ) -> dict[str, Any]:
     errors = required_send_errors(draft)
     if errors:
@@ -1080,6 +1081,54 @@ def send_alinta_gas_agreement(
         notes.append(f"LOA attachment: {loa_dl_error}")
     notes.append(f"LOA file ID: {draft.get('loa_file_id')}")
 
+    from tools.alinta_agreement_sheet import (
+        GAS_COLUMNS,
+        GAS_TAB,
+        append_tracker_row,
+        gmail_ids_from_webhook,
+        sydney_sent_at,
+    )
+
+    thread_id, message_id = gmail_ids_from_webhook(response.text or "")
+    mailed = _alinta_merge_values(draft)
+    sheet_error = append_tracker_row(
+        GAS_TAB,
+        GAS_COLUMNS,
+        {
+            "sent_at": sydney_sent_at(),
+            "sent_by": user_email or "",
+            "client_id": (client_id or "").strip(),
+            "company_name": mailed["company_name"],
+            "mirn": mailed["mirn"],
+            "request_kind": mailed["request_kind"],
+            "email_subject": subject,
+            "gmail_thread_id": thread_id,
+            "gmail_message_id": message_id,
+            "drive_folder_url": client_folder_url,
+            "acn_abn": mailed["acn_abn"],
+            "address": mailed["address"],
+            "tel": mailed["tel"],
+            "contact_name": mailed["contact_name"],
+            "email": mailed["email"],
+            "start_date": mailed["start_date"],
+            "end_date": mailed["end_date"],
+            "price_per_gj": mailed["price_per_gj"],
+            "commission_per_gj": mailed["commission_per_gj"],
+            "cpq_gj": mailed["cpq_gj"],
+            "min_cpq_gj": mailed["min_cpq_gj"],
+            "min_cpq_pct": mailed["min_cpq_pct"],
+            "mdq_gj": mailed["mdq_gj"],
+        },
+    )
+    if sheet_error:
+        notes.append(f"Agreement tracker was not updated: {sheet_error}")
+    else:
+        notes.append("Added to the Alinta agreement tracker (Gas).")
+    if not thread_id:
+        notes.append(
+            "Gmail thread id was not on the n8n response, so a chase cannot reply on this thread yet."
+        )
+
     return {
         "ok": True,
         "message": "\n".join(notes),
@@ -1091,6 +1140,9 @@ def send_alinta_gas_agreement(
         "drive_folder_url": client_folder_url or None,
         "lodge_error": lodge_error or None,
         "agreement_type": N8N_AGREEMENT_TYPE,
+        "gmail_thread_id": thread_id or None,
+        "gmail_message_id": message_id or None,
+        "tracker_error": sheet_error,
     }
 
 
