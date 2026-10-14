@@ -63,6 +63,8 @@ class OfferActivityType(str, Enum):
     CONTRACT_RECEIVED = "contract_received"
     CONTRACT_SENT_FOR_SIGNING = "contract_sent_for_signing"
     CONTRACT_SIGNED_LODGED = "contract_signed_lodged"
+    # Supplier email after a signed agreement is filed. No pipeline or FILE_IDS side effects.
+    SIGNED_AGREEMENT_LODGED = "signed_agreement_lodged"
     DISCREPANCY_EMAIL_SENT = "discrepancy_email_sent"
     DMA_REVIEW_GENERATED = "dma_review_generated"
     DMA_EMAIL_SENT = "dma_email_sent"

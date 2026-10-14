@@ -177,14 +177,42 @@ def init_db():
                 ("testimonial_savings", "VARCHAR(255)"),
                 ("video_long_file_id", "VARCHAR(255)"),
                 ("video_short_file_id", "VARCHAR(255)"),
+                ("social_status", "VARCHAR(50)"),
+                ("association_id", "INTEGER"),
             ]:
                 if col_name not in cols:
                     logging.info("Adding missing testimonials.%s column", col_name)
                     with engine.begin() as conn:
                         conn.execute(text(f"ALTER TABLE testimonials ADD COLUMN {col_name} {col_type}"))
                     logging.info("✅ Added testimonials.%s column", col_name)
+            if "association_id" in cols or "association_id" in [
+                c["name"] for c in inspect(engine).get_columns("testimonials")
+            ]:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_testimonials_association_id "
+                            "ON testimonials (association_id)"
+                        )
+                    )
     except Exception as e:
         logging.warning("Could not ensure testimonials columns: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "associations" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("associations")]
+            for col_name, col_type in [
+                ("contacts_sheet_id", "VARCHAR(255)"),
+                ("contacts_sheet_url", "VARCHAR(512)"),
+            ]:
+                if col_name not in cols:
+                    logging.info("Adding missing associations.%s column", col_name)
+                    with engine.begin() as conn:
+                        conn.execute(text(f"ALTER TABLE associations ADD COLUMN {col_name} {col_type}"))
+                    logging.info("Added associations.%s column", col_name)
+    except Exception as e:
+        logging.warning("Could not ensure associations columns: %s", e)
 
     # marketing_videos table is created via Base.metadata.create_all; ensure columns if table pre-exists.
     try:
@@ -473,6 +501,18 @@ def init_db():
                 logging.info("✅ Added campaigns.archived column")
     except Exception as e:
         logging.warning("Could not ensure campaigns.archived column: %s", e)
+
+    try:
+        insp = inspect(engine)
+        if "campaigns" in (insp.get_table_names() or []):
+            cols = [c["name"] for c in insp.get_columns("campaigns")]
+            if "include_calls" not in cols:
+                logging.info("Adding missing campaigns.include_calls column")
+                with engine.begin() as conn:
+                    conn.execute(text("ALTER TABLE campaigns ADD COLUMN include_calls INTEGER DEFAULT 0 NOT NULL"))
+                logging.info("✅ Added campaigns.include_calls column")
+    except Exception as e:
+        logging.warning("Could not ensure campaigns.include_calls column: %s", e)
 
     try:
         insp = inspect(engine)

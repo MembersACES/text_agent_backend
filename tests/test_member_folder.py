@@ -84,10 +84,10 @@ Date: _______24/8/2026_________________________
 
 def test_extract_distribution_agreement_from_text(monkeypatch):
     monkeypatch.setattr(
-        "tools.distributor_agreement._pdf_to_text",
+        "tools.distributor_agreement.pdf_to_text",
         lambda _b: SAMPLE_AGREEMENT,
     )
-    monkeypatch.setattr("tools.distributor_agreement._pdf_page_images", lambda _b: [])
+    monkeypatch.setattr("tools.distributor_agreement.collect_page_images", lambda _b: [])
     out = extract_distribution_agreement(b"%PDF-fake")
     assert out["distributor_business"] == "Specialist Energy Management Pty Ltd"
     assert out["email"] == "nigel@specialistenergy.com.au"
@@ -103,9 +103,9 @@ def test_extract_distribution_agreement_from_text(monkeypatch):
 
 
 def test_extract_distribution_agreement_from_scan(monkeypatch):
-    monkeypatch.setattr("tools.distributor_agreement._pdf_to_text", lambda _b: "")
+    monkeypatch.setattr("tools.distributor_agreement.pdf_to_text", lambda _b: "")
     monkeypatch.setattr(
-        "tools.distributor_agreement._pdf_page_images",
+        "tools.distributor_agreement.collect_page_images",
         lambda _b: [b"fake-scan-bytes"],
     )
     monkeypatch.setattr(

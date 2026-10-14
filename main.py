@@ -63,6 +63,7 @@ from tools.loa_business_details import get_return_business_details
 from tools.return_utility_info import get_return_utility_info
 from tools.sheet_preview import get_sheet_preview
 from tools.bne_gas_contracts import lookup_bne_gas_contract
+from tools.bne_electricity_contracts import lookup_bne_electricity_contract
 from tools.alinta_gas_ef import (
     apply_flat_overrides,
     build_email_html,
@@ -198,6 +199,20 @@ from tools.distributor_folders import (
     list_distributor_folders,
     upload_distributor_document,
 )
+from services.associations import (
+    add_association_contact,
+    create_association,
+    delete_association_contact,
+    ensure_association_contacts,
+    list_association_files,
+    list_association_testimonials,
+    list_associations,
+    sync_associations_from_drive,
+    register_existing_testimonial,
+    update_association,
+    update_association_contact,
+    upload_association_file,
+)
 from tools.supplier_folders import (
     create_supplier_folder,
     list_supplier_documents,
@@ -241,6 +256,7 @@ from models import (
     PuduConsumableBaselineRun,
     OperationalEmailTemplate,
     OperationalEmailRecipient,
+    UtilityChecklist,
 )
 from schemas import (
     TaskCreate,
@@ -282,12 +298,24 @@ from schemas import (
     StrategyItemResponse,
     TestimonialResponse,
     TestimonialUpdate,
+    AssociationContactUpdate,
+    AssociationContactWrite,
+    AssociationContactsResponse,
+    AssociationCreate,
+    AssociationDocumentsResponse,
+    AssociationListResponse,
+    AssociationRegisterTestimonial,
+    AssociationResponse,
+    AssociationSyncResponse,
+    AssociationUpdate,
+    AssociationUploadResponse,
     TestimonialCheckApprovedResponse,
     MarketingVideoResponse,
     MarketingVideoUpdate,
     MarketingVideoPublishPackRequest,
     VideoRegistryResponse,
     MARKETING_VIDEO_STATUSES,
+    SOCIAL_POST_STATUSES,
     TestimonialSolutionContentItem,
     TestimonialSolutionContentUpdate,
     AutonomousSequenceStartRequest,
@@ -331,6 +359,7 @@ from services.crm import (
     create_offer_activity,
     get_or_create_offer_for_activity,
     resolve_offer_for_member_upload,
+    record_signed_agreement_lodgement,
     sync_strategy_status_from_offer,
     sync_strategy_items_from_crm,
     enrich_client_response,
@@ -411,6 +440,9 @@ def on_startup() -> None:
     from services.campaigns import assert_campaign_unsubscribe_config
 
     assert_campaign_unsubscribe_config()
+    from services.agreement_followup import log_agreement_followup_webhook_at_boot
+
+    log_agreement_followup_webhook_at_boot()
     try:
         from database import SessionLocal
         from services.autonomous_sequence import ensure_default_sequence_templates
@@ -418,6 +450,9 @@ def on_startup() -> None:
         db = SessionLocal()
         try:
             ensure_default_sequence_templates(db)
+            from services.agreement_followup import ensure_agreement_followup_types
+
+            ensure_agreement_followup_types(db)
         finally:
             db.close()
     except Exception:
@@ -2033,6 +2068,263 @@ async def distributors_drive_upload(
     return payload
 
 
+def _association_token(
+    google_access_token: str = "",
+    x_google_access_token: Optional[str] = None,
+) -> Optional[str]:
+    return (google_access_token or x_google_access_token or "").strip() or None
+
+
+@app.get("/api/associations", response_model=AssociationListResponse)
+def associations_list(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    return list_associations(db)
+
+
+@app.post("/api/associations", response_model=AssociationResponse)
+def associations_create(
+    body: AssociationCreate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info("associations/create name=%r user=%s", body.name, user_info.get("email"))
+    payload, err, status = create_association(
+        db,
+        name=body.name,
+        status=body.status,
+        contact_name=body.contact_name,
+        contact_email=body.contact_email,
+        notes=body.notes,
+        results_note=body.results_note,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not create association")
+    return payload
+
+
+@app.post("/api/associations/sync", response_model=AssociationSyncResponse)
+def associations_sync(
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info("associations/sync user=%s", user_info.get("email"))
+    payload, err, status = sync_associations_from_drive(
+        db,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not read Drive")
+    return payload
+
+
+@app.patch("/api/associations/{association_id}", response_model=AssociationResponse)
+def associations_update(
+    association_id: int,
+    body: AssociationUpdate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    fields = body.model_dump(exclude_unset=True)
+    payload, err, status = update_association(
+        db,
+        association_id,
+        fields,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not update association")
+    return payload
+
+
+@app.get("/api/associations/{association_id}/testimonials", response_model=List[TestimonialResponse])
+def associations_testimonials(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+):
+    _ = user_info
+    items, err, status = list_association_testimonials(db, association_id)
+    if err or items is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Association not found")
+    return [TestimonialResponse.model_validate(item) for item in items]
+
+
+@app.post("/api/associations/{association_id}/testimonials", response_model=TestimonialResponse)
+def associations_register_testimonial(
+    association_id: int,
+    body: AssociationRegisterTestimonial,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    testimonial, err, status = register_existing_testimonial(
+        db,
+        association_id,
+        file_id=body.file_id,
+        file_name=body.file_name,
+        testimonial_savings=body.testimonial_savings,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or testimonial is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not register testimonial")
+    return testimonial
+
+
+@app.get("/api/associations/{association_id}/files", response_model=AssociationDocumentsResponse)
+def associations_files(
+    association_id: int,
+    folder_id: Optional[str] = None,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = list_association_files(
+        db,
+        association_id,
+        folder_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Could not list files")
+    return payload
+
+
+@app.post("/api/associations/{association_id}/files", response_model=AssociationUploadResponse)
+async def associations_upload(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    file: UploadFile = File(...),
+    filename: str = Form(""),
+    folder_id: str = Form(""),
+    register_testimonial: str = Form(""),
+    testimonial_savings: str = Form(""),
+    google_access_token: str = Form(""),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    logging.info(
+        "associations/upload id=%s file=%s user=%s testimonial=%s",
+        association_id,
+        file.filename,
+        user_info.get("email"),
+        register_testimonial,
+    )
+    contents = await file.read()
+    flag = (register_testimonial or "").strip().lower() in {"1", "true", "yes", "on"}
+    payload, err, status = upload_association_file(
+        db,
+        association_id,
+        folder_id=folder_id.strip() or None,
+        file_bytes=contents,
+        filename=file.filename or "upload.bin",
+        content_type=file.content_type,
+        display_name=filename.strip() or None,
+        register_testimonial=flag,
+        testimonial_savings=testimonial_savings.strip() or None,
+        user_access_token=_association_token(google_access_token, x_google_access_token),
+    )
+    if err or payload is None:
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err or "Upload failed")
+    return payload
+
+
+def _association_contacts_or_error(payload, err, status):
+    if err or payload is None:
+        raise HTTPException(
+            status_code=status if status >= 400 else 502,
+            detail=err or "Could not update contacts",
+        )
+    return payload
+
+
+@app.post("/api/associations/{association_id}/contacts/sheet", response_model=AssociationContactsResponse)
+def associations_contacts_sheet(
+    association_id: int,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = ensure_association_contacts(
+        db,
+        association_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.post("/api/associations/{association_id}/contacts", response_model=AssociationContactsResponse)
+def associations_contacts_add(
+    association_id: int,
+    body: AssociationContactWrite,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = add_association_contact(
+        db,
+        association_id,
+        body.model_dump(),
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.patch(
+    "/api/associations/{association_id}/contacts/{contact_id}",
+    response_model=AssociationContactsResponse,
+)
+def associations_contacts_update(
+    association_id: int,
+    contact_id: str,
+    body: AssociationContactUpdate,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = update_association_contact(
+        db,
+        association_id,
+        contact_id,
+        body.model_dump(exclude_unset=True),
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
+@app.delete(
+    "/api/associations/{association_id}/contacts/{contact_id}",
+    response_model=AssociationContactsResponse,
+)
+def associations_contacts_delete(
+    association_id: int,
+    contact_id: str,
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
+    x_google_access_token: Optional[str] = Header(None, alias="X-Google-Access-Token"),
+):
+    _ = user_info
+    payload, err, status = delete_association_contact(
+        db,
+        association_id,
+        contact_id,
+        user_access_token=_association_token(x_google_access_token=x_google_access_token),
+    )
+    return _association_contacts_or_error(payload, err, status)
+
+
 @app.post("/api/distributors/create")
 async def distributors_create(
     user_info: dict = Depends(verify_google_token),
@@ -2228,6 +2520,11 @@ class DataRequest(BaseModel):
     supplier_name: str
     request_type: str
     details: Optional[str] = None
+    # Set by the Data disclosure page when chasing a specific coverage gap.
+    # missing_months are human labels ("Jul 2025"); invoice_url is an invoice we
+    # already hold for this meter, passed to n8n to attach beside the LOA.
+    missing_months: Optional[List[str]] = None
+    invoice_url: Optional[str] = None
 
 class RobotDataRequest(BaseModel):
     robot_number: str
@@ -2278,8 +2575,9 @@ class UtilityRecordUpdateRequest(BaseModel):
     identifier: str    # NMI, MRIN, account number, etc.
     data_requested: Optional[str] = None   # YYYY-MM-DD
     data_recieved: Optional[Union[str, bool]] = None   # Checkbox in Airtable: send True/False
-    contract_end_date: Optional[str] = None  # YYYY-MM-DD
-    dma_end_date: Optional[str] = None  # YYYY-MM-DD
+    contract_end_date: Optional[str] = None  # YYYY-MM-DD; empty string clears the Airtable date
+    dma_end_date: Optional[str] = None  # YYYY-MM-DD; empty string clears the Airtable date
+    retailer: Optional[str] = None
 
 
 class UtilityInvoiceRowsRequest(BaseModel):
@@ -2541,11 +2839,16 @@ async def alinta_gas_agreement_send(
     if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
         draft["gdrive_folder_url"] = client.gdrive_folder_url
 
+    tracker_client_id = str(client.id) if client is not None else ""
+    if not tracker_client_id and raw_client_id not in (None, ""):
+        tracker_client_id = str(raw_client_id).strip()
+
     result = send_alinta_gas_agreement(
         draft,
         pdf_bytes=contents,
         filename=file.filename or "",
         user_email=email,
+        client_id=tracker_client_id,
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
@@ -2681,11 +2984,16 @@ async def alinta_electricity_agreement_send(
     if client and not draft.get("gdrive_folder_url") and getattr(client, "gdrive_folder_url", None):
         draft["gdrive_folder_url"] = client.gdrive_folder_url
 
+    tracker_client_id = str(client.id) if client is not None else ""
+    if not tracker_client_id and raw_client_id not in (None, ""):
+        tracker_client_id = str(raw_client_id).strip()
+
     result = send_alinta_electricity_agreement(
         draft,
         pdf_bytes=contents,
         filename=file.filename or "",
         user_email=email,
+        client_id=tracker_client_id,
     )
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("message") or "Send failed")
@@ -2815,6 +3123,68 @@ def get_base2_bne_gas_contract(
         sum(len(c.get("periods") or []) for c in (result.get("contracts") or [])),
     )
     return result
+
+
+@app.get("/api/base2/bne-electricity-contract")
+def get_base2_bne_electricity_contract(
+    nmi: str = Query(
+        ...,
+        min_length=10,
+        max_length=20,
+        description="NMI; matched against signed C&I electricity sheet (checksum / last-digit tolerant)",
+    ),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Look up signed C&I electricity contract periods for the same sheet Base 2 uses."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    try:
+        result = lookup_bne_electricity_contract(nmi)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-electricity-contract] user=%s nmi=%r match=%s contracts=%s",
+        email,
+        nmi,
+        result.get("match_kind"),
+        len(result.get("contracts") or []),
+    )
+    return result
+
+
+@app.get("/api/base2/bne-contract-checks")
+def get_base2_bne_contract_checks(
+    fuel: str = Query(..., pattern="^(electricity|gas)$"),
+    identifiers: str = Query(..., min_length=1, max_length=2000),
+    user_info: dict = Depends(verify_google_token),
+):
+    """One signed-contract sheet read for every C&I identifier on a checklist."""
+    email = user_info.get("email") if isinstance(user_info, dict) else None
+    seen: set[str] = set()
+    ids: list[str] = []
+    for part in identifiers.split(","):
+        value = part.strip()
+        if not value or value.upper() in seen:
+            continue
+        seen.add(value.upper())
+        ids.append(value)
+        if len(ids) >= 30:
+            break
+    results: list[dict] = []
+    try:
+        for index, value in enumerate(ids):
+            if fuel == "gas":
+                results.append(lookup_bne_gas_contract(value, force=index == 0))
+            else:
+                results.append(lookup_bne_electricity_contract(value, force=index == 0))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    logging.info(
+        "[base2/bne-contract-checks] user=%s fuel=%s ids=%s",
+        email,
+        fuel,
+        len(ids),
+    )
+    return {"results": results}
 
 
 @app.post("/api/get-waste-info")
@@ -4630,6 +5000,8 @@ def data_request(
             service_type=service_type,
             account_identifier=account_identifier,
             identifier_type=identifier_type,
+            missing_months=request.missing_months,
+            invoice_url=request.invoice_url,
         )
         message = str(raw_result or "").strip()
         is_success = message.startswith("✅") or "Data request successfully sent" in message
@@ -4718,6 +5090,28 @@ def data_request(
     return response_payload
 
 
+@app.get("/api/utility-records")
+def get_utility_records_endpoint(
+    utility_type: str = Query(..., min_length=1, max_length=80),
+    identifiers: str = Query(..., min_length=1, max_length=2000),
+    user_info: dict = Depends(verify_google_token),
+):
+    """Read contract end and retailer for the linked utility rows a checklist is showing."""
+    if not airtable_client.AIRTABLE_API_KEY:
+        raise HTTPException(status_code=503, detail="Airtable integration is not configured")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for part in identifiers.split(","):
+        value = part.strip()
+        if not value or value.upper() in seen:
+            continue
+        seen.add(value.upper())
+        ids.append(value)
+        if len(ids) >= 30:
+            break
+    return {"records": airtable_client.lookup_utility_records(utility_type, ids)}
+
+
 @app.patch("/api/utility-record")
 def update_utility_record_endpoint(
     request: UtilityRecordUpdateRequest,
@@ -4741,6 +5135,7 @@ def update_utility_record_endpoint(
             data_recieved=request.data_recieved,
             contract_end_date=request.contract_end_date,
             dma_end_date=request.dma_end_date,
+            retailer=request.retailer,
         )
     except Exception as e:
         logging.exception("[utility-record PATCH] Airtable update raised: %s", e)
@@ -6722,14 +7117,27 @@ async def send_quote_request_endpoint(
         logging.error(f"Quote request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _form_flag(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 @app.post("/api/signed-agreement-lodgement")
 async def signed_agreement_lodgement(
     request: Request,
-    user_info: dict = Depends(verify_google_token)
+    user_info: dict = Depends(verify_google_token),
+    db: Session = Depends(get_db),
 ):
     """
-    Handle signed agreement lodgement with dynamic file upload support
+    Handle signed agreement lodgement with dynamic file upload support.
+    Optional skip_drive_filing skips the second Drive upload (Documents tab already filed).
+    Optional nmi / mirn are included in the supplier email the same way as an NMI/MIRN suffix on business_name.
     """
+    from tools.send_supplier_signed_agreement import (
+        resolve_lodgement_identifier,
+        resolve_lodgement_recipients,
+        utility_label_for_lodgement,
+    )
+
     # Parse the multipart form data
     form_data = await request.form()
     
@@ -6738,6 +7146,19 @@ async def signed_agreement_lodgement(
     contract_type = form_data.get("contract_type")
     agreement_type = form_data.get("agreement_type", "contract")
     file_count = int(form_data.get("file_count", 1))
+    nmi = str(form_data.get("nmi") or "").strip() or None
+    mirn = str(form_data.get("mirn") or "").strip() or None
+    utility_type = str(form_data.get("utility_type") or "").strip() or None
+    skip_drive_filing = _form_flag(form_data.get("skip_drive_filing"))
+    document_link = str(form_data.get("document_link") or "").strip() or None
+    recipient_emails = str(form_data.get("recipient_emails") or "").strip() or None
+    raw_client_id = form_data.get("client_id")
+    client_id = None
+    if raw_client_id not in (None, ""):
+        try:
+            client_id = int(str(raw_client_id))
+        except (TypeError, ValueError):
+            client_id = None
     
     if not business_name or not contract_type:
         raise HTTPException(status_code=400, detail="business_name and contract_type are required")
@@ -6777,7 +7198,12 @@ async def signed_agreement_lodgement(
                 business_name=business_name,
                 contract_type=contract_type,
                 agreement_type=agreement_type,
-                filenames=filenames
+                filenames=filenames,
+                nmi=nmi,
+                mirn=mirn,
+                utility_type=utility_type,
+                skip_drive_filing=skip_drive_filing,
+                recipient_emails=recipient_emails,
             )
         else:
             # For single file, use existing function
@@ -6785,8 +7211,39 @@ async def signed_agreement_lodgement(
                 file_path=temp_file_paths[0],
                 business_name=business_name,
                 contract_type=contract_type,
-                agreement_type=agreement_type
+                agreement_type=agreement_type,
+                nmi=nmi,
+                mirn=mirn,
+                utility_type=utility_type,
+                skip_drive_filing=skip_drive_filing,
+                recipient_emails=recipient_emails,
             )
+
+        if "✅" in result:
+            try:
+                lookup_type = "eoi" if agreement_type == "eoi" else "contract"
+                supplier_email, resolved_name, _is_default = resolve_lodgement_recipients(
+                    str(contract_type), lookup_type, recipient_emails
+                )
+                label = utility_label_for_lodgement(str(contract_type), utility_type)
+                clean_name, _, _ = resolve_lodgement_identifier(
+                    str(business_name or ""), nmi, mirn
+                )
+                record_signed_agreement_lodgement(
+                    db,
+                    business_name=clean_name,
+                    utility_label=label,
+                    supplier=str(contract_type),
+                    retailer_name=resolved_name,
+                    recipients=supplier_email,
+                    created_by=user_info.get("email") if isinstance(user_info, dict) else None,
+                    document_link=document_link,
+                    client_id=client_id,
+                    nmi=nmi,
+                    mirn=mirn,
+                )
+            except Exception as act_e:
+                logging.warning("Failed to log signed agreement lodgement activity: %s", act_e)
         
         # Structure the response for the frontend
         response = {
@@ -9521,7 +9978,7 @@ async def update_testimonial(
     authorization: str = Header(...),
     db: Session = Depends(get_db),
 ):
-    """Update testimonial status, invoice number, type, and/or linked Drive document (file_id, file_name)."""
+    """Update testimonial status, social post status, invoice number, type, and/or linked Drive document."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid authorization format")
     token = authorization.split("Bearer ")[1]
@@ -9598,6 +10055,22 @@ async def update_testimonial(
         testimonial.video_long_file_id = body.video_long_file_id.strip() or None
     if body.video_short_file_id is not None:
         testimonial.video_short_file_id = body.video_short_file_id.strip() or None
+    if body.social_status is not None:
+        social = body.social_status.strip()
+        if not social:
+            testimonial.social_status = None
+        elif social not in SOCIAL_POST_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail="Social status must be Planned, Drafted, Ready to post, or Posted.",
+            )
+        elif testimonial.status != "Approved":
+            raise HTTPException(
+                status_code=400,
+                detail="Social posts can only be tracked on Approved testimonials.",
+            )
+        else:
+            testimonial.social_status = social
     db.commit()
     db.refresh(testimonial)
     return TestimonialResponse.model_validate(testimonial)
@@ -11507,6 +11980,10 @@ def delete_client(
         synchronize_session=False
     )
 
+    db.query(UtilityChecklist).filter(UtilityChecklist.client_id == client_id).delete(
+        synchronize_session=False
+    )
+
     # 5) Finally, delete the client itself
     db.delete(client)
     db.commit()
@@ -12578,6 +13055,11 @@ def _autonomous_list_item(
         p = min(pending, key=lambda x: x.scheduled_at)
         next_ch, next_at = p.channel, p.scheduled_at
     from services.autonomous_sequence import count_steps_done
+    from services.agreement_followup import (
+        AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME,
+        is_agreement_followup_test_offer,
+        shared_gmail_thread_run_id,
+    )
 
     done = count_steps_done(steps)
     return AutonomousSequenceRunListItem(
@@ -12596,6 +13078,9 @@ def _autonomous_list_item(
         ack_draft_thread_id=(ack_draft or {}).get("thread_id"),
         campaign_id=resolved_campaign_id,
         campaign_name=resolved_campaign_name,
+        is_test=is_agreement_followup_test_offer(offer)
+        or (resolved_campaign_name == AGREEMENT_FOLLOWUP_TEST_CAMPAIGN_NAME),
+        shared_thread_with_run_id=shared_gmail_thread_run_id(run),
     )
 
 
@@ -12634,6 +13119,7 @@ def autonomous_sequence_start(
 ):
     from services.autonomous_sequence import (
         SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
         apply_validity_to_context,
         ensure_autonomous_sequence_type_row,
         get_sequence_template_by_type,
@@ -12675,7 +13161,10 @@ def autonomous_sequence_start(
     sequence_type = str(template.sequence_type)
 
     sequence_context.setdefault("offer_generated_at", anchor_utc.isoformat())
-    if requested_type != SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if requested_type not in {
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+    }:
         incoming_validity = str(sequence_context.get("offer_validity_date") or "").strip()
         if not incoming_validity:
             # Recover date from labels like "12pm on 30/07/2026" when the UI only sent a label.
@@ -15010,7 +15499,8 @@ def rebuild_staged_activity(
         rows = payload.get("rows", []) if isinstance(payload, dict) else []
         ctx = EtlContext(entity_id=entity_id, client_id=member_client_id, loa_client_id=loa_id,
                          site_id=str(ident).strip(), utility_type=ut,
-                         period_start=period_start, period_end=period_end)
+                         period_start=period_start, period_end=period_end,
+                         site_address=s.get("site_address"))
         results, _diag = transform_invoice_rows(rows, ctx)
         s_staged = 0
         s_skipped = 0
@@ -15031,9 +15521,17 @@ def rebuild_staged_activity(
 
 
 from campaign_routes import register_campaign_routes
+from agreement_followup_routes import register_agreement_followup_routes
 from email_template_routes import register_email_template_routes
 from partner_routes import register_partner_routes
+from partner_admin_routes import register_partner_admin_routes
 
 register_campaign_routes(app, get_current_user_with_db)
+register_agreement_followup_routes(app, get_current_user_with_db)
 register_email_template_routes(app, verify_google_token)
 register_partner_routes(app, verify_partner_token, get_db)
+register_partner_admin_routes(app, verify_google_token)
+
+from utility_checklist_routes import register_utility_checklist_routes
+
+register_utility_checklist_routes(app, get_current_user_with_db)

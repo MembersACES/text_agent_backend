@@ -466,6 +466,65 @@ def resolve_offer_for_member_upload(
     )
 
 
+def record_signed_agreement_lodgement(
+    db: Session,
+    *,
+    business_name: str,
+    utility_label: str,
+    supplier: str,
+    recipients: str,
+    retailer_name: Optional[str] = None,
+    created_by: Optional[str] = None,
+    document_link: Optional[str] = None,
+    client_id: Optional[int] = None,
+    nmi: Optional[str] = None,
+    mirn: Optional[str] = None,
+) -> Optional[OfferActivity]:
+    """Log a supplier lodgement on the client. Does not change offer status or FILE_IDS."""
+    client = None
+    if client_id is not None:
+        client = db.query(Client).filter(Client.id == client_id).first()
+    name = (business_name or "").strip()
+    if client is None and name:
+        client = db.query(Client).filter(Client.business_name == name).first()
+    if client is None:
+        return None
+    label = (utility_label or "").strip() or supplier
+    offer = resolve_offer_for_member_upload(
+        db,
+        client=client,
+        business_name=client.business_name or name,
+        created_by=created_by,
+        utility_key=label,
+    )
+    summary = (
+        f"Signed {label} agreement lodged with {supplier}, sent to {recipients}"
+    )
+    link = (document_link or "").strip() or (client.gdrive_folder_url or None)
+    retailer = (retailer_name or "").strip() or supplier
+    meta = {
+        "summary": summary,
+        "utility": label,
+        "supplier": supplier,
+        "retailer_name": retailer,
+        "recipients": recipients,
+        "source": "signed_agreement_lodgement",
+    }
+    if nmi:
+        meta["nmi"] = nmi
+    if mirn:
+        meta["mirn"] = mirn
+    return create_offer_activity(
+        db,
+        offer=offer,
+        client=client,
+        activity_type=OfferActivityType.SIGNED_AGREEMENT_LODGED,
+        document_link=link or None,
+        metadata=meta,
+        created_by=created_by,
+    )
+
+
 def get_or_create_offer_for_activity(
     db: Session,
     client_id: int,
@@ -560,6 +619,7 @@ ACTIVITY_TYPE_LABELS = {
     OfferActivityType.SOLAR_CLEANING_QUOTE_SENT: "Solar panel cleaning quote sent to client",
     OfferActivityType.SOLAR_CLEANING_SIGNED_OFFER: "Solar panel cleaning signed offer uploaded",
     OfferActivityType.MEMBER_DOCUMENT_UPLOAD: "Member document uploaded",
+    OfferActivityType.SIGNED_AGREEMENT_LODGED: "Signed agreement lodged with retailer",
 }
 
 # Map offer status to Strategy & WIP status text.

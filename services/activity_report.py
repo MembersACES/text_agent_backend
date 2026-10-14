@@ -75,6 +75,7 @@ CSV_TYPE_LABELS = {
     "solar_cleaning_quote_sent": "Solar panel cleaning quote sent to client",
     "solar_cleaning_signed_offer": "Solar panel cleaning signed offer uploaded",
     "member_document_upload": "Member document uploaded",
+    "signed_agreement_lodged": "Signed agreement lodged with retailer",
     "note_added": "Note added",
     "task_created": "Task created",
     "task_edited": "Task edited",

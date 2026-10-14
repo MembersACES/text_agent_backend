@@ -18,6 +18,7 @@ that, open the site in the workspace.
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import date, datetime, timezone
 from typing import Any, Optional
@@ -25,7 +26,11 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from models import ClimateActivityRecord
-from services.climate_activity_etl import UTILITY_ACTIVITY_MAP, default_fy_period
+from services.climate_activity_etl import (
+    UTILITY_ACTIVITY_MAP,
+    canonical_site_id,
+    default_fy_period,
+)
 from services.entity_groups import clients_in_disclosure_rollup
 
 # Severity ordering — worst first, so the UI can sort on it without knowing the words.
@@ -75,8 +80,50 @@ def _months_spanned(start: Optional[date], end: Optional[date]) -> list[str]:
     return out
 
 
+_MONTH_NAMES = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+
+
+def month_label(ym: str) -> str:
+    """'2025-07' -> 'Jul 2025'. What a retailer reads, not what a database stores."""
+    try:
+        y, m = str(ym).split("-")
+        return f"{_MONTH_NAMES[int(m) - 1]} {y}"
+    except Exception:
+        return str(ym)
+
+
+def _evidence_uri_of(row: ClimateActivityRecord) -> Optional[str]:
+    """
+    The invoice link the ETL carried through from Airtable, if this row has one.
+
+    Used to attach an invoice we already hold to the data request, so the
+    retailer can see the account and the format we are asking them to match.
+    """
+    try:
+        refs = (json.loads(row.body_json or "{}") or {}).get("evidence_refs") or []
+    except Exception:
+        return None
+    for ref in refs:
+        uri = (ref or {}).get("evidence_uri")
+        if uri and str(uri).strip().lower().startswith("http"):
+            return str(uri).strip()
+    return None
+
+
 def _site_key(utility_type: str, identifier: str) -> str:
-    return f"{(utility_type or '').strip()}|{(identifier or '').strip()}"
+    """
+    Group by PHYSICAL meter, not by however the identifier happened to be typed.
+
+    canonical_site_id collapses the 10- and 11-character spellings of one NMI
+    (the 11th digit is an AEMO checksum). Without this the LOA's duplicate links
+    show up as two sites — one complete, one empty — and the report reads as a
+    data gap when it is really a duplicate.
+    """
+    ut = (utility_type or "").strip()
+    return f"{ut}|{canonical_site_id(ut, identifier)}"
 
 
 def build_entity_data_gaps(
@@ -136,6 +183,8 @@ def build_entity_data_gaps(
                 "undated": 0,
                 "months_present": set(),
                 "activity_types": set(),
+                "sample_invoice_url": None,
+                "sample_invoice_end": None,
             },
         )
 
@@ -152,6 +201,13 @@ def build_entity_data_gaps(
             for mth in _months_spanned(start, end):
                 if mth in fy_months:
                     s["months_present"].add(mth)
+            # Keep the newest invoice link seen for this meter: the most recent
+            # bill is the most useful thing to put in front of a retailer.
+            if s["sample_invoice_end"] is None or (end and end > s["sample_invoice_end"]):
+                uri = _evidence_uri_of(r)
+                if uri:
+                    s["sample_invoice_url"] = uri
+                    s["sample_invoice_end"] = end or start
         elif start:
             # A different financial year — worth reporting, since multi-year
             # staging means prior years are now genuinely available.
@@ -177,6 +233,8 @@ def build_entity_data_gaps(
                     "undated": 0,
                     "months_present": set(),
                     "activity_types": set(),
+                    "sample_invoice_url": None,
+                    "sample_invoice_end": None,
                 },
             )
             s["retailer"] = str(site.get("retailer") or "").strip()
@@ -226,6 +284,8 @@ def build_entity_data_gaps(
                 "activity_types": sorted(s["activity_types"]),
                 "months_present": present,
                 "months_missing": missing,
+                "months_missing_labels": [month_label(m) for m in missing],
+                "sample_invoice_url": s.get("sample_invoice_url"),
                 "coverage_pct": round(100.0 * len(present) / max(1, len(fy_months)), 1),
                 "severity": severity,
                 "headline": headline,

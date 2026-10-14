@@ -836,6 +836,7 @@ N8N_ENGAGEMENT_FORM_URL = os.getenv("N8N_AUTONOMOUS_ENGAGEMENT_FORM_WEBHOOK_URL"
 
 SOLAR_PANEL_CLEANING_ENGAGEMENT_FORM_TYPE = "Solar Panel Cleaning"
 SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE = "solar_panel_cleaning_engagement_form_v1"
+AGREEMENT_FOLLOWUP_SEQUENCE_TYPE = "agreement_followup_v1"
 
 SOLAR_ENGAGEMENT_INITIAL_SUBJECT = (
     "Solar cleaning — quick win to protect performance and your solar investment"
@@ -918,6 +919,40 @@ SOLAR_ENGAGEMENT_STEP_PROMPTS: tuple[str, str, str] = (
     "Follow-up 1 (reply on thread): gentle check-in; no validity date; no Drive links; do not re-attach files.",
     "Follow-up 2 (reply on thread): polite reminder to return signed engagement form; no validity; no links.",
     "Follow-up 3 (reply on thread): final friendly nudge; offer to close out if not proceeding; no validity; no links.",
+)
+
+AGREEMENT_FOLLOWUP_INITIAL_SUBJECT = "Alinta agreement ready for signing"
+
+AGREEMENT_FOLLOWUP_SYSTEM_PROMPT = """You write follow-up emails for ACES after a retailer agreement PDF has already been emailed to the member.
+
+The client already received the initial email with the agreement PDF attached. These follow-ups must REPLY on that Gmail thread (do not start a new email). Do not include Google Drive links — the client cannot access them; the PDF is on the original message. Do not re-attach the PDF.
+
+Do NOT mention offer validity dates, "valid until", expiry, or savings figures unless they are explicitly in context.
+
+Tone: professional, warm, Australian English. Greet with first name only (first_name), never the full contact_name. Sign with the HTML signature provided in context.
+
+Step 0 was the first-touch with the PDF (already sent). Step 1: light follow-up asking them to return the signed agreement. Step 2: polite reminder. Step 3: final friendly nudge (offer to close out if not proceeding). Keep body under 120 words before the signature."""
+
+AGREEMENT_FOLLOWUP_EMAIL_EXAMPLE = """Hi {{first_name}},
+
+Just following up on the {{agreement_label}} we sent through for {{business_name}}.
+
+When you have a moment, please return the signed agreement by replying to this email. Happy to walk through any questions.
+
+Kind regards,"""
+
+AGREEMENT_FOLLOWUP_STEP_PROMPTS: tuple[str, str, str, str] = (
+    "First-touch already sent with the agreement PDF attached. Do not send this step again.",
+    "Follow-up 1 (reply on thread): gentle check-in to return the signed {{agreement_label}}; no validity; no Drive links; do not re-attach.",
+    "Follow-up 2 (reply on thread): polite reminder to sign and return the agreement; no validity; no links.",
+    "Follow-up 3 (reply on thread): final friendly nudge; offer to close out if not proceeding; no validity; no links.",
+)
+
+SIGNING_FOLLOWUP_SEQUENCE_TYPES = frozenset(
+    {
+        SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE,
+        AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+    }
 )
 
 RETELL_BASE = os.getenv("RETELL_API_BASE_URL", "https://api.retellai.com").rstrip("/")
@@ -1062,6 +1097,34 @@ def _plan_template_times(
                 local_dt.astimezone(timezone.utc).replace(tzinfo=None),
                 s.prompt_text,
                 s.retell_agent_id,
+            )
+        )
+    return plan
+
+
+def _plan_agreement_chase_days(
+    anchor: datetime,
+    chase_days: list,
+    *,
+    timezone_name: str = AUTONOMOUS_SCHEDULE_TZ,
+) -> list[tuple[int, str, datetime, Optional[str], Optional[str]]]:
+    tz = ZoneInfo(timezone_name)
+    a = anchor if anchor.tzinfo else anchor.replace(tzinfo=tz)
+    local = a.astimezone(tz)
+    day1 = next_business_day(local.date())
+    plan: list[tuple[int, str, datetime, Optional[str], Optional[str]]] = []
+    for raw in chase_days:
+        day_num = int(raw)
+        target_date = ensure_weekday(day1 + timedelta(days=max(0, day_num - 1)))
+        local_dt = datetime.combine(target_date, time(9, 0), tzinfo=tz)
+        local_dt = clamp_to_contact_hours(local_dt, timezone_name=timezone_name)
+        plan.append(
+            (
+                day_num,
+                "email",
+                local_dt.astimezone(timezone.utc).replace(tzinfo=None),
+                None,
+                None,
             )
         )
     return plan
@@ -1252,6 +1315,7 @@ _RESTARTABLE_SEQUENCE_TYPES = frozenset(
         "gas_base2_followup_v1",
         "ci_electricity_base2_followup_v1",
         "ci_electricity_offer",
+        "sme_electricity_base2_followup_v1",
     }
 )
 
@@ -1411,6 +1475,70 @@ def rename_sequence_template_type(
         )
 
 
+def copy_sme_electricity_prompts_from_ci(db: Session) -> bool:
+    """Fill empty SME electricity prompts from the C&I electricity template. Does not overwrite staff edits."""
+    source_type = "ci_electricity_base2_followup_v1"
+    dest_type = "sme_electricity_base2_followup_v1"
+    changed = False
+    source = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.sequence_type == source_type)
+        .first()
+    )
+    dest = (
+        db.query(AutonomousSequenceTemplate)
+        .filter(AutonomousSequenceTemplate.sequence_type == dest_type)
+        .first()
+    )
+    if source and dest:
+        source_steps = (
+            db.query(AutonomousSequenceTemplateStep)
+            .filter(AutonomousSequenceTemplateStep.template_id == source.id)
+            .all()
+        )
+        dest_steps = (
+            db.query(AutonomousSequenceTemplateStep)
+            .filter(AutonomousSequenceTemplateStep.template_id == dest.id)
+            .all()
+        )
+        by_index = {step.step_index: step.prompt_text for step in source_steps}
+        for step in dest_steps:
+            want = by_index.get(step.step_index)
+            if want and not (step.prompt_text or "").strip():
+                step.prompt_text = want
+                changed = True
+    bind = db.bind
+    insp = inspect(bind)
+    tables = _reflect_table_names(insp, bind)
+    if "autonomous_sequence_type" in tables:
+        ast_tbl = _qualified_table(bind, "autonomous_sequence_type")
+        cols = {
+            str(c.get("name") or "")
+            for c in insp.get_columns("autonomous_sequence_type", **_inspector_schema_kw(bind))
+        }
+        prompt_cols = [col for col in ("system_prompt", "email_system_prompt", "email_example", "sms_example", "retell_agent_id") if col in cols]
+        if prompt_cols:
+            src = db.execute(
+                text(f"SELECT {', '.join(prompt_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+                {"st": source_type},
+            ).mappings().first()
+            dst = db.execute(
+                text(f"SELECT {', '.join(prompt_cols)} FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+                {"st": dest_type},
+            ).mappings().first()
+            if src and dst:
+                for col in prompt_cols:
+                    current = str(dst.get(col) or "").strip()
+                    incoming = str(src.get(col) or "").strip()
+                    if incoming and not current:
+                        db.execute(
+                            text(f"UPDATE {ast_tbl} SET {col} = :value WHERE sequence_type = :st"),
+                            {"value": incoming, "st": dest_type},
+                        )
+                        changed = True
+    return changed
+
+
 def ensure_default_sequence_templates(db: Session) -> None:
     """Seed default templates if missing (idempotent)."""
     defaults = [
@@ -1427,6 +1555,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
             "is_restartable": 1,
         },
         {
+            "sequence_type": "sme_electricity_base2_followup_v1",
+            "display_name": "SME Electricity Base 2 Follow-up v1",
+            "description": "Base 2 cadence after an SME vs SME electricity comparison. Same steps as C&I electricity.",
+            "is_restartable": 1,
+        },
+        {
             "sequence_type": "ci_electricity_offer",
             "display_name": "C&I Electricity Offer",
             "description": "Utility Invoice Info C&I electricity offer comparison follow-up.",
@@ -1440,6 +1574,17 @@ def ensure_default_sequence_templates(db: Session) -> None:
                 "emailed to the client from Document Generation."
             ),
             "is_restartable": 0,
+        },
+        {
+            "sequence_type": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            "display_name": "Agreement Follow-up v1",
+            "description": (
+                "Send the retailer agreement PDF immediately, then three email follow-ups "
+                "every two business days until the member returns the signed agreement."
+            ),
+            "is_restartable": 0,
+            "figures_mode": FIGURES_MODE_NONE,
+            "stop_on": json.dumps(["agreement_signed", "negative_sentiment_stop"]),
         },
         {
             "sequence_type": "solar_panel_cleaning_followup_v1",
@@ -1461,6 +1606,12 @@ def ensure_default_sequence_templates(db: Session) -> None:
         (1, 2, "email", "09:00"),
         (2, 3, "email", "09:00"),
     ]
+    agreement_followup_step_defaults = [
+        (0, 1, "email", "09:00"),
+        (1, 3, "email", "09:00"),
+        (2, 5, "email", "09:00"),
+        (3, 7, "email", "09:00"),
+    ]
     solar_followup_step_defaults = step_defaults
     changed = False
     for d in defaults:
@@ -1480,16 +1631,28 @@ def ensure_default_sequence_templates(db: Session) -> None:
             timezone=AUTONOMOUS_SCHEDULE_TZ,
             is_active=1,
             is_restartable=d["is_restartable"],
+            figures_mode=d.get("figures_mode"),
+            stop_on=d.get("stop_on"),
         )
         db.add(t)
         db.flush()
         if d["sequence_type"] == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
             steps_for_template = solar_engagement_step_defaults
+        elif d["sequence_type"] == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            steps_for_template = agreement_followup_step_defaults
         elif d["sequence_type"] == "solar_panel_cleaning_followup_v1":
             steps_for_template = solar_followup_step_defaults
         else:
             steps_for_template = step_defaults
+        agreement_prompts = (
+            AGREEMENT_FOLLOWUP_STEP_PROMPTS
+            if d["sequence_type"] == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE
+            else None
+        )
         for idx, day_num, channel, hhmm in steps_for_template:
+            prompt_text = None
+            if agreement_prompts and idx < len(agreement_prompts):
+                prompt_text = agreement_prompts[idx]
             db.add(
                 AutonomousSequenceTemplateStep(
                     template_id=t.id,
@@ -1497,7 +1660,7 @@ def ensure_default_sequence_templates(db: Session) -> None:
                     day_number=day_num,
                     channel=channel,
                     send_time_local=hhmm,
-                    prompt_text=None,
+                    prompt_text=prompt_text,
                     retell_agent_id=None,
                     is_active=1,
                 )
@@ -1512,6 +1675,10 @@ def ensure_default_sequence_templates(db: Session) -> None:
     elif sync_solar_engagement_step_prompts_only(db):
         db.commit()
     if ensure_solar_engagement_type_prompts(db):
+        db.commit()
+    if ensure_agreement_followup_type_prompts(db):
+        db.commit()
+    if copy_sme_electricity_prompts_from_ci(db):
         db.commit()
 
     # Bootstrap templates from existing run data where needed.
@@ -1688,6 +1855,39 @@ def ensure_solar_engagement_type_prompts(db: Session) -> bool:
     return True
 
 
+def ensure_agreement_followup_type_prompts(db: Session) -> bool:
+    """Seed / refresh autonomous_sequence_type prompts for agreement signing follow-ups."""
+    ensure_autonomous_sequence_type_row(db, AGREEMENT_FOLLOWUP_SEQUENCE_TYPE)
+    insp = inspect(db.bind)
+    tables = _reflect_table_names(insp, db.bind)
+    if "autonomous_sequence_type" not in tables:
+        return False
+    ast_tbl = _qualified_table(db.bind, "autonomous_sequence_type")
+    row = db.execute(
+        text(f"SELECT system_prompt, email_example FROM {ast_tbl} WHERE sequence_type = :st LIMIT 1"),
+        {"st": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE},
+    ).mappings().first()
+    if not row:
+        return False
+    cur_sys = str(row.get("system_prompt") or "")
+    cur_email = str(row.get("email_example") or "")
+    if cur_sys.strip() and cur_email.strip():
+        return False
+    db.execute(
+        text(
+            f"UPDATE {ast_tbl} SET system_prompt = :system_prompt, email_example = :email_example "
+            "WHERE sequence_type = :st"
+        ),
+        {
+            "st": AGREEMENT_FOLLOWUP_SEQUENCE_TYPE,
+            "system_prompt": AGREEMENT_FOLLOWUP_SYSTEM_PROMPT,
+            "email_example": AGREEMENT_FOLLOWUP_EMAIL_EXAMPLE,
+        },
+    )
+    logger.info("Updated agreement follow-up type prompts in autonomous_sequence_type")
+    return True
+
+
 def sync_solar_engagement_step_prompts_only(db: Session) -> bool:
     """Update step prompt_text on existing 3-step template without resetting schedules."""
     tpl = get_sequence_template_by_type(db, SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE)
@@ -1714,25 +1914,28 @@ def _prepare_email_context(
     out = dict(ctx)
     out["sequence_type"] = run.sequence_type
     out["step_index"] = int(step.step_index)
-    msg_id = str(run.email_ID or out.get("email_ID") or out.get("email_id") or "").strip()
+    msg_id = str(run.email_ID or "").strip()
+    thread_id = str(
+        out.get("gmail_thread_id") or out.get("thread_id") or ""
+    ).strip()
     if msg_id:
         out["email_ID"] = msg_id
         out["email_id"] = msg_id
         out["gmail_message_id"] = msg_id
-    thread_id = str(
-        out.get("gmail_thread_id") or out.get("thread_id") or out.get("gmail_threadId") or ""
-    ).strip()
     if thread_id:
         out["gmail_thread_id"] = thread_id
         out["thread_id"] = thread_id
-    if run.sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
-        out["reply_in_thread"] = True
+    if run.sequence_type in SIGNING_FOLLOWUP_SEQUENCE_TYPES:
+        out["reply_in_thread"] = bool(msg_id or thread_id)
         out["omit_validity"] = True
         out["omit_document_links"] = True
         out.pop("offer_validity_date", None)
         out.pop("offer_valid_until", None)
         out.pop("offer_validity_days", None)
-        out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        if run.sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+            out.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        elif run.sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            out.setdefault("initial_email_subject", AGREEMENT_FOLLOWUP_INITIAL_SUBJECT)
     out["signature_html"] = _resolve_signature_html(run.sequence_type, template, out)
     out["use_html_signature"] = True
     extra = _resolve_extra_context(template, out)
@@ -1997,14 +2200,17 @@ def start_gas_base2_sequence(
     anchor_utc = _to_utc_naive(anchor_at)
     context_payload = dict(context or {})
     run_validity_date: Optional[date] = None
-    if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+    if sequence_type in SIGNING_FOLLOWUP_SEQUENCE_TYPES:
         context_payload.pop("offer_validity_date", None)
         context_payload.pop("offer_valid_until", None)
         context_payload.pop("offer_validity_days", None)
         context_payload.setdefault("reply_in_thread", True)
         context_payload.setdefault("omit_validity", True)
         context_payload.setdefault("omit_document_links", True)
-        context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        if sequence_type == SOLAR_ENGAGEMENT_FORM_SEQUENCE_TYPE:
+            context_payload.setdefault("initial_email_subject", SOLAR_ENGAGEMENT_INITIAL_SUBJECT)
+        elif sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+            context_payload.setdefault("initial_email_subject", AGREEMENT_FOLLOWUP_INITIAL_SUBJECT)
     else:
         validity_raw = str(context_payload.get("offer_validity_date") or "").strip()
         if validity_raw:
@@ -2061,6 +2267,15 @@ def start_gas_base2_sequence(
     else:
         fallback_plan = plan_gas_base2_followup_times(anchor_at, timezone_name=schedule_tz_name)
         plan = [(d, c, at, None, None) for d, c, at in fallback_plan]
+
+    if sequence_type == AGREEMENT_FOLLOWUP_SEQUENCE_TYPE:
+        raw_days = context_payload.get("chase_days")
+        if isinstance(raw_days, list) and raw_days:
+            plan = _plan_agreement_chase_days(
+                anchor_at,
+                raw_days,
+                timezone_name=schedule_tz_name,
+            )
 
     if dashboard_test and plan:
         # Production Day 1 is the next business day, so a test started today is not due yet.
@@ -2357,20 +2572,26 @@ def _send_email_placeholder(offer_id: int, run_id: int, step_id: int, context: d
         "reply_in_thread": bool(context.get("reply_in_thread")),
         "gmail_message_id": context.get("gmail_message_id") or context.get("email_ID") or context.get("email_id"),
         "gmail_thread_id": context.get("gmail_thread_id") or context.get("thread_id"),
+        "append_account_signature": False,
         "omit_validity": bool(context.get("omit_validity")),
         "omit_document_links": bool(context.get("omit_document_links")),
         "initial_email_subject": context.get("initial_email_subject"),
         "signature_html": context.get("signature_html"),
         "use_html_signature": context.get("use_html_signature"),
+        "sender": context.get("sender") or "ACES",
         "context": context,
     }
     with httpx.Client(timeout=30.0) as client:
         r = client.post(N8N_EMAIL_URL, json=payload)
         r.raise_for_status()
         try:
-            return {"ok": True, "channel": "email", "response": r.json()}
+            body = r.json()
         except Exception:
             return {"ok": True, "channel": "email", "response_text": r.text[:2000]}
+        failure = explicit_failure_detail(body)
+        if failure:
+            return {"ok": False, "channel": "email", "error": failure, "response": body}
+        return {"ok": True, "channel": "email", "response": body}
 
 
 def _send_sms_placeholder(offer_id: int, run_id: int, step_id: int, context: dict[str, Any]) -> dict[str, Any]:
@@ -2428,6 +2649,33 @@ def _voice_retell_placeholder(
             return {"ok": True, "channel": "voice_call", "response_text": r.text[:2000]}
 
 
+def explicit_failure_detail(payload: Any) -> str | None:
+    """Return the detail string when a dispatch body says success is false.
+
+    A missing success field is not a failure. HTTP 200 with success false is.
+    """
+    if isinstance(payload, list):
+        for item in payload:
+            found = explicit_failure_detail(item)
+            if found:
+                return found
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        detail = payload.get("detail") or payload.get("error") or payload.get("message")
+        return str(detail or "success: false")
+    nested = payload.get("response")
+    if nested is not None and nested is not payload:
+        found = explicit_failure_detail(nested)
+        if found:
+            return found
+    if payload.get("ok") is False:
+        detail = payload.get("error") or payload.get("detail") or payload.get("message")
+        return str(detail or "Send failed")
+    return None
+
+
 def execute_due_steps_sync(db: Session) -> int:
     now = _utc_now_naive()
     runs = (
@@ -2462,6 +2710,9 @@ def execute_due_steps_sync(db: Session) -> int:
 
             try:
                 out = _send_one_step(db, run, step)
+                failure = explicit_failure_detail(out)
+                if failure:
+                    raise RuntimeError(failure)
                 step.step_status = "executed"
                 step.completed_at = _utc_now_naive()
                 step.last_outcome_summary = json.dumps(out)[:4000]
@@ -2564,6 +2815,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
         finalize_run_if_exhausted(db, run)
         db.commit()
         raise
+    failure = explicit_failure_detail(out)
     if out.get("mode") == "placeholder":
         step.step_status = "ready"
         step.started_at = None
@@ -2572,9 +2824,9 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
             "This API cannot actually send this step (email/SMS webhook or Retell key missing), "
             "and the send worker could not see the step in its database."
         )
-    if out.get("ok") is False:
+    if failure or out.get("ok") is False:
         step.step_status = "error"
-        step.last_outcome_summary = json.dumps(out)[:4000]
+        step.last_outcome_summary = (failure or json.dumps(out))[:4000]
         _log_event(
             db,
             run.id,
@@ -2584,7 +2836,7 @@ def execute_step_now(db: Session, run_id: int, step_id: int) -> dict[str, Any]:
         )
         finalize_run_if_exhausted(db, run)
         db.commit()
-        raise ValueError(str(out.get("error") or "Send failed"))
+        raise ValueError(failure or str(out.get("error") or "Send failed"))
 
     step.step_status = "executed"
     step.completed_at = _utc_now_naive()

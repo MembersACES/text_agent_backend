@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+from services.jurisdiction import resolve_jurisdiction
+
 ADAPTER_VERSION = "0.1.0"
 
 UTILITY_ACTIVITY_MAP: dict[str, dict[str, Any]] = {
@@ -161,6 +163,18 @@ EVIDENCE_URI_FIELDS = [
 ]
 
 
+def _jurisdiction_fields(ctx) -> dict:
+    """
+    The two fields that decide, and explain, which grid factor B4 applies.
+
+    jurisdiction None means the site's state could not be established. That is
+    deliberately not a value the adapter can price: the whole defect this fixes
+    was an unknown state quietly inheriting Victoria's 0.78.
+    """
+    j = ctx.jurisdiction()
+    return {"jurisdiction": j.grid, "jurisdiction_source": j.source}
+
+
 @dataclass
 class EtlContext:
     entity_id: str
@@ -170,6 +184,17 @@ class EtlContext:
     utility_type: str
     period_start: date
     period_end: date
+    # Where this site physically is. The grid factor applied downstream depends
+    # on it: NSW is 0.64 against Victoria's 0.78, South Australia 0.22. Before
+    # this existed every record fell through to the B4 adapter's pilot default
+    # of VIC, which was right for Frankston and wrong for anyone multi-state.
+    site_address: Optional[str] = None
+    # An explicit state, when one is known from somewhere other than the address.
+    fallback_state: Optional[str] = None
+
+    def jurisdiction(self):
+        """Resolved grid for this site, or an unresolved marker. Never guesses."""
+        return resolve_jurisdiction(self.site_address, self.fallback_state)
 
 
 @dataclass
@@ -405,6 +430,70 @@ def _evidence_uri(row: dict) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# NMI canonicalisation
+#
+# An Australian NMI is 10 characters. An optional 11th digit is a checksum
+# (AEMO "NMI Checksum" procedure). Both spellings circulate, and the LOA has
+# been linking the SAME physical meter under both — e.g. Centurion had
+# 2002323086 (12 invoices) and 20023230869 (0) as two separate "sites", so the
+# coverage report showed one complete meter and one with nothing, when there is
+# only one meter with twelve months of invoices.
+#
+# We collapse to the 10-character form, and only when the trailing digit is the
+# genuine checksum for the preceding ten. That self-validating test means an
+# unrelated 11-character identifier is left alone (it would have to accidentally
+# carry a correct check digit to be touched).
+#
+# Applied to electricity only. Gas MIRNs and waste/oil account numbers do not
+# use this scheme, and guessing at them would be worse than leaving them split.
+# ---------------------------------------------------------------------------
+# Identifier schemes that carry an AEMO mod-10 check digit as an optional 11th
+# character. Electricity NMIs and Victorian gas MIRNs both do, and both circulate
+# in the LOA under either spelling, which splits one physical meter into two
+# sites. Proven on Frankston RSL: 5321568754 + check digit 4 = 53215687544, two
+# links whose invoice months are complementary rather than duplicated.
+# Waste account numbers and oil site names use no such scheme - leave them alone.
+_CHECKSUMMED_UTILITY_TYPES = frozenset({
+    "C&I Electricity", "SME Electricity", "C&I Gas", "SME Gas",
+})
+# Kept for anything still importing the old name.
+_NMI_UTILITY_TYPES = _CHECKSUMMED_UTILITY_TYPES
+
+
+def nmi_check_digit(nmi10: str) -> Optional[int]:
+    """AEMO checksum for a 10-character NMI. None if the input isn't 10 chars."""
+    s = (nmi10 or "").strip().upper()
+    if len(s) != 10 or not s.isalnum():
+        return None
+    total = 0
+    for i, ch in enumerate(reversed(s)):
+        v = ord(ch)
+        if i % 2 == 0:
+            v *= 2
+        total += sum(int(d) for d in str(v))
+    return (10 - (total % 10)) % 10
+
+
+def canonical_site_id(utility_type: str, identifier: str) -> str:
+    """
+    One physical meter -> one site id.
+
+    Strips a valid NMI checksum digit so the 10- and 11-character spellings of
+    the same meter group together. Anything else is returned unchanged (trimmed
+    and upper-cased for electricity, so casing can't split a site either).
+    """
+    ident = (identifier or "").strip()
+    if not ident or utility_type not in _CHECKSUMMED_UTILITY_TYPES:
+        return ident
+    up = ident.upper()
+    if len(up) == 11 and up.isalnum():
+        check = nmi_check_digit(up[:10])
+        if check is not None and up[10] == str(check):
+            return up[:10]
+    return up
+
+
 def _make_record_id(entity_id: str, activity_type: str, source_row_id: str) -> str:
     digest = hashlib.sha256(f"{entity_id}:{activity_type}:{source_row_id}".encode()).hexdigest()[:12]
     return f"act_{digest}"
@@ -458,7 +547,8 @@ def invoice_row_to_activity_record(row: dict, ctx: EtlContext) -> EtlRowResult:
         "schema_version": "1.0",
         "record_id": record_id,
         "entity_id": ctx.entity_id,
-        "site_id": ctx.site_id or None,
+        "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
+        **_jurisdiction_fields(ctx),
         "client_id": ctx.loa_client_id,
         "reporting_period": {
             "start": period_start.isoformat(),
@@ -546,7 +636,8 @@ def _oil_record(ctx: EtlContext, source_row_id: str, period_start, period_end,
         "schema_version": "1.0",
         "record_id": record_id,
         "entity_id": ctx.entity_id,
-        "site_id": ctx.site_id or None,
+        "site_id": canonical_site_id(ctx.utility_type, ctx.site_id) or None,
+        **_jurisdiction_fields(ctx),
         "client_id": ctx.loa_client_id,
         "reporting_period": {"start": period_start.isoformat(), "end": period_end.isoformat()},
         "activity_type": "cooking_oil",
@@ -653,6 +744,7 @@ def transform_invoice_rows(
             years[f"FY{(y + 1 if m >= 7 else y) % 100:02d}"] = (
                 years.get(f"FY{(y + 1 if m >= 7 else y) % 100:02d}", 0) + 1
             )
+    _jur = ctx.jurisdiction()
     diagnostics = {
         "input_rows": len(rows),
         "produced": len(kept),
@@ -662,5 +754,12 @@ def transform_invoice_rows(
         "utility_type": ctx.utility_type,
         "entity_id": ctx.entity_id,
         "site_id": ctx.site_id,
+        # Which grid factor this site will be priced at, and how we know. An
+        # unresolved jurisdiction is reported, never defaulted - it is the whole
+        # reason this field exists.
+        "jurisdiction": _jur.grid,
+        "jurisdiction_source": _jur.source,
+        "jurisdiction_assumed_grid": _jur.assumed_grid,
+        "site_address_seen": bool((ctx.site_address or "").strip()),
     }
     return results, diagnostics

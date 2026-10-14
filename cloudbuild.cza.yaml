@@ -37,6 +37,8 @@ steps:
       - --platform
       - managed
       - --allow-unauthenticated
+      - --update-env-vars
+      - N8N_AGREEMENT_FOLLOWUP_EMAIL_WEBHOOK_URL=https://membersaces.app.n8n.cloud/webhook/aces-autonomous-agent/agreement-followup-email
       - --project
       - $PROJECT_ID
 

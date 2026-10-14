@@ -2,7 +2,7 @@
 Supplier Data Request Tool with Email Templates
 """
 import requests
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 import logging
 from tools.business_info import get_business_information
 import re
@@ -44,7 +44,7 @@ RETAILER_EMAILS = {
     },
     "Veolia Waste": {
         "name": "Veolia",
-        "email": "cx.service@veolia.com.au, business@acesolutions.com.au",
+        "email": "cx.service@veolia.com.au, business@acesolutions.com.au, data.quote@fornrg.com",
         "variants": ["Veolia"]
     },
     "Alinta C&I Electricity": {
@@ -230,7 +230,7 @@ EMAIL_TEMPLATES = {
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -252,7 +252,7 @@ EMAIL_TEMPLATES = {
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -276,7 +276,7 @@ EMAIL_TEMPLATES = {
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -297,7 +297,7 @@ EMAIL_TEMPLATES = {
 </ul>
 <p>Please see attached:</p>
 <ul>
-<li>The Letter of Authority</li>
+<li>The Letter of Authority</li>{invoice_attachment_clause}
 </ul>
 <p>Please let me know if you have any questions or concerns.</p>
 <p>Kind Regards,</p>
@@ -327,6 +327,87 @@ EMAIL_TEMPLATES = {
 }
 
 
+# The supplier-data-request webhook accepts invoice_url but does not attach the
+# file. Keep the URL on the payload so that workflow can start attaching without
+# another deploy, and leave this off until it does — the email must not promise
+# a file that is not coming.
+ATTACH_HELD_INVOICE = False
+
+
+def _invoice_attachment_clause(invoice_url: Optional[str] = None) -> str:
+    """
+    Names the invoice in the attachment list when we are sending one.
+
+    Empty while ATTACH_HELD_INVOICE is off, and empty when we hold nothing for
+    the account.
+    """
+    if not ATTACH_HELD_INVOICE:
+        return ""
+    if not (invoice_url or "").strip():
+        return ""
+    return "\r\n<li>A recent invoice for this account, for reference</li>"
+
+
+_INVOICE_BULLETS = (
+    "12 Months worth of invoices (if applicable)",
+    "Copy of 12 months worth of invoices",
+    "Copy of the most recent invoice",
+    "12 Months worth of invoices",
+)
+
+
+def _month_list(missing_months: Optional[List[str]] = None) -> list[str]:
+    months = [str(m).strip() for m in (missing_months or []) if str(m).strip()]
+    if len(months) > 12:
+        months = months[:12] + ["and earlier"]
+    return months
+
+
+def _invoice_ask(missing_months: Optional[List[str]] = None) -> str:
+    """The invoice bullet when the coverage report knows which periods are missing."""
+    months = _month_list(missing_months)
+    if not months:
+        return ""
+    return (
+        "Copies of the invoices for these periods, which we do not hold: "
+        + ", ".join(months)
+    )
+
+
+def place_missing_invoice_ask(body: str, missing_months: Optional[List[str]] = None) -> str:
+    """
+    Put the missing periods in the invoice bullet, where the retailer reads the ask.
+
+    A saved template has no token for this, so the previous version appended a
+    note after the confidentiality footer. That note is what went out, under
+    the signature, while the bullet still said "Copy of the most recent invoice".
+    Rewriting that bullet keeps a request with no gap byte-identical, and puts
+    the periods in the list when a gap is being chased.
+    """
+    ask = _invoice_ask(missing_months)
+    if not ask or not body:
+        return body
+    if ask in body:
+        return body
+    for bullet in _INVOICE_BULLETS:
+        if bullet in body:
+            return body.replace(bullet, ask, 1)
+    paragraph = f"<p><b>Please send {ask[0].lower()}{ask[1:]}.</b></p>"
+    for marker in (
+        "<p>Please see attached:</p>",
+        "<p>Please see attached",
+        "Please see attached:",
+        "<p>Please let me know if you have any questions",
+        "<p>Kind Regards,</p>",
+        "<p>Kind Regards</p>",
+        "Kind Regards,",
+    ):
+        idx = body.find(marker)
+        if idx != -1:
+            return body[:idx] + paragraph + body[idx:]
+    return paragraph + body
+
+
 def clean_parameter(value: str) -> str:
     """Clean parameter values to remove extra brackets and whitespace"""
     if not value:
@@ -348,7 +429,9 @@ def supplier_data_request(
     business_name: str,
     service_type: Literal["electricity_ci", "electricity_sme", "gas_ci", "gas_sme", "waste"],
     account_identifier: str,
-    identifier_type: str = "NMI"
+    identifier_type: str = "NMI",
+    missing_months: Optional[List[str]] = None,
+    invoice_url: Optional[str] = None,
 ) -> str:
     """
     Request data from a supplier using specific email templates and attaching LOA
@@ -359,6 +442,10 @@ def supplier_data_request(
         service_type: Type of service (electricity_ci, electricity_sme, gas_ci, gas_sme, waste)
         account_identifier: The account identifier (NMI, MRIN, or account number)
         identifier_type: Type of identifier (NMI, MRIN, or account_number)
+        missing_months: Periods with no invoice on file, pre-formatted ("Jul 2025").
+                        Named explicitly in the email when supplied.
+        invoice_url: Link to an invoice we already hold, passed to n8n to attach
+                     alongside the LOA.
     """
     
     try:
@@ -392,7 +479,8 @@ def supplier_data_request(
             "business_name": business_name,
             "nmi": account_identifier if identifier_type == "NMI" else "",
             "mrin": account_identifier if identifier_type == "MRIN" else "",
-            "account_number": account_identifier if identifier_type == "account_number" else ""
+            "account_number": account_identifier if identifier_type == "account_number" else "",
+            "invoice_attachment_clause": _invoice_attachment_clause(invoice_url),
         }
 
         db_template = None
@@ -449,7 +537,17 @@ def supplier_data_request(
             except KeyError as e:
                 logger.error(f"Template formatting error: {e}")
                 return f"Error: Template formatting failed - missing variable: {e}"
-        
+
+        email_body = place_missing_invoice_ask(email_body, missing_months)
+        if (
+            ATTACH_HELD_INVOICE
+            and invoice_url
+            and "A recent invoice for this account" not in email_body
+        ):
+            email_body += (
+                "<p>A recent invoice for this account is attached for reference.</p>"
+            )
+
         # Prepare request for n8n
         request_data = {
             "supplier_name": resolved_supplier_name,
@@ -461,7 +559,9 @@ def supplier_data_request(
             "identifier_type": identifier_type,
             "email_subject": email_subject,
             "email_body": email_body,
-            "request_type": "supplier_data_request"
+            "request_type": "supplier_data_request",
+            "invoice_url": invoice_url or "",
+            "missing_months": missing_months or [],
         }
         
         logger.info(f"Sending to n8n webhook...")

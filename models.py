@@ -345,10 +345,34 @@ class StrategyItem(Base):
     )
 
 
+class Association(Base):
+    """
+    Peak body we are targeting or working with.
+    Files live in a Drive subfolder; endorsements are testimonials linked by association_id.
+    """
+    __tablename__ = "associations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="targeting", index=True)  # targeting | working_with
+    drive_folder_id = Column(String(255), nullable=True, unique=True, index=True)
+    drive_folder_url = Column(String(512), nullable=True)
+    testimonials_folder_id = Column(String(255), nullable=True)
+    contacts_sheet_id = Column(String(255), nullable=True)
+    contacts_sheet_url = Column(String(512), nullable=True)
+    contact_name = Column(String(255), nullable=True)
+    contact_email = Column(String(255), nullable=True)
+    notes = Column(Text, nullable=True)
+    results_note = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class Testimonial(Base):
     """
     Member testimonial document (e.g. 1-page savings confirmation).
     Optional link to a 1st Month Savings invoice. Status: Draft, Sent for approval, Approved.
+    association_id set when the endorsement is on behalf of an association.
     """
     __tablename__ = "testimonials"
 
@@ -358,11 +382,13 @@ class Testimonial(Base):
     file_id = Column(String(255), nullable=False)  # Google Drive file ID
     invoice_number = Column(String(100), nullable=True, index=True)  # Optional link to 1st Month Savings
     status = Column(String(50), nullable=False, default="Draft", index=True)  # Draft | Sent for approval | Approved
+    social_status = Column(String(50), nullable=True, index=True)  # Planned | Drafted | Ready to post | Posted
     testimonial_type = Column(String(255), nullable=True)  # e.g. C&I Electricity Reviews
     testimonial_solution_type_id = Column(String(100), nullable=True)  # e.g. ci_electricity
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary
     video_long_file_id = Column(String(255), nullable=True)  # Drive ID for long-cut MP4
     video_short_file_id = Column(String(255), nullable=True)  # Drive ID for 30s-cut MP4
+    association_id = Column(Integer, ForeignKey("associations.id"), nullable=True, index=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -386,6 +412,28 @@ class TestimonialSolutionType(Base):
     conclusion = Column(Text, nullable=False, default="")
     esg_scope_for_solution = Column(Text, nullable=False, default="")
     sdg_impact_for_solution = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AgreementFollowupType(Base):
+    """Staff-managed retailer agreement types for the Agreement Follow Up page."""
+
+    __tablename__ = "agreement_followup_types"
+
+    id = Column(String(80), primary_key=True)
+    label = Column(String(160), nullable=False)
+    utility_type = Column(String(80), nullable=False)
+    retailer = Column(String(80), nullable=True)
+    default_subject = Column(Text, nullable=True)
+    default_body = Column(Text, nullable=True)
+    first_email_subject = Column(Text, nullable=True)
+    first_email_body = Column(Text, nullable=True)
+    chase_body = Column(Text, nullable=True)
+    chase_days = Column(Text, nullable=True)
+    is_active = Column(Integer, nullable=False, default=1)
+    sort_order = Column(Integer, nullable=False, default=0)
+    created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -683,6 +731,8 @@ class Campaign(Base):
     send_window_start = Column(String(5), nullable=True)
     send_window_end = Column(String(5), nullable=True)
     archived = Column(Integer, nullable=False, default=0)
+    # Off by default: a campaign sends emails only unless someone ticks Call step.
+    include_calls = Column(Integer, nullable=False, default=0)
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -771,6 +821,35 @@ class OperationalEmailRecipient(Base):
     is_active = Column(Integer, nullable=False, default=1)
     sort_order = Column(Integer, nullable=False, default=0)
     updated_by = Column(String(255), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class UtilityChecklist(Base):
+    """One electricity or gas checklist per client, fuel, and account identifier."""
+
+    __tablename__ = "utility_checklists"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "fuel",
+            "identifier",
+            name="uq_utility_checklists_client_fuel_identifier",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_id = Column(Integer, ForeignKey("clients.id"), nullable=False, index=True)
+    fuel = Column(String(16), nullable=False)
+    utility_type = Column(String(32), nullable=False)
+    identifier = Column(String(255), nullable=False)
+    status = Column(String(16), nullable=False)
+    answers = Column(JSON_COLUMN_TYPE, nullable=False)
+    template_version = Column(Integer, nullable=False)
+    row_version = Column(Integer, nullable=False, default=1)
+    completed_at = Column(DateTime, nullable=True)
+    updated_by = Column(String(255), nullable=True)
+    drive_file_id = Column(String(255), nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 

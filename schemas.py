@@ -859,6 +859,7 @@ class StrategyItemResponse(StrategyItemBase):
 # --- Testimonials (member savings testimonials, optional link to 1st Month Savings invoice) ---
 
 TESTIMONIAL_STATUSES = ("Draft", "Sent for approval", "Approved")
+SOCIAL_POST_STATUSES = ("Planned", "Drafted", "Ready to post", "Posted")
 
 
 class TestimonialResponse(BaseModel):
@@ -874,6 +875,8 @@ class TestimonialResponse(BaseModel):
     testimonial_savings: Optional[str] = None
     video_long_file_id: Optional[str] = None
     video_short_file_id: Optional[str] = None
+    social_status: Optional[str] = None  # Planned | Drafted | Ready to post | Posted; empty until a post is started
+    association_id: Optional[int] = None
     source: Optional[str] = "crm"  # crm | sheet
     created_at: datetime
     updated_at: datetime
@@ -897,6 +900,154 @@ class TestimonialUpdate(BaseModel):
     testimonial_solution_type_id: Optional[str] = None
     video_long_file_id: Optional[str] = None
     video_short_file_id: Optional[str] = None
+    social_status: Optional[str] = None
+
+
+ASSOCIATION_STATUSES = ("targeting", "working_with")
+
+
+class AssociationResponse(BaseModel):
+    id: int
+    name: str
+    status: str
+    endorsed: bool = False
+    drive_folder_id: Optional[str] = None
+    drive_folder_url: Optional[str] = None
+    testimonials_folder_id: Optional[str] = None
+    contacts_sheet_id: Optional[str] = None
+    contacts_sheet_url: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    notes: Optional[str] = None
+    results_note: Optional[str] = None
+    testimonial_count: int = 0
+    approved_testimonial_count: int = 0
+    warnings: List[str] = []
+    created_at: datetime
+    updated_at: datetime
+
+    @field_serializer("created_at", "updated_at")
+    def serialize_datetime(self, dt: Optional[datetime], _info):
+        if dt is None:
+            return None
+        return to_melbourne_iso(dt)
+
+    class Config:
+        from_attributes = True
+
+
+class AssociationListResponse(BaseModel):
+    parent_folder_id: str
+    parent_folder_url: str
+    associations: List[AssociationResponse]
+
+
+class AssociationCreate(BaseModel):
+    name: str
+    status: str = "targeting"
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    notes: Optional[str] = None
+    results_note: Optional[str] = None
+
+
+class AssociationUpdate(BaseModel):
+    name: Optional[str] = None
+    status: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    notes: Optional[str] = None
+    results_note: Optional[str] = None
+
+
+class AssociationSyncResponse(BaseModel):
+    adopted: int = 0
+    linked: int = 0
+    skipped: List[str] = []
+    parent_folder_id: str
+    parent_folder_url: str
+    associations: List[AssociationResponse]
+
+
+class AssociationFileItem(BaseModel):
+    id: str
+    name: str
+    mime_type: str = ""
+    file_type: str = "other"
+    web_view_link: str = ""
+    preview_url: Optional[str] = None
+    created_time: Optional[str] = None
+    modified_time: Optional[str] = None
+    size: Optional[str] = None
+
+
+class AssociationPathItem(BaseModel):
+    id: str
+    name: str
+    folder_url: str = ""
+
+
+class AssociationDocumentsResponse(BaseModel):
+    association_id: int
+    current_folder: AssociationPathItem
+    path: List[AssociationPathItem] = []
+    folders: List[AssociationFileItem] = []
+    files: List[AssociationFileItem] = []
+
+
+class AssociationRegisterTestimonial(BaseModel):
+    file_id: str
+    file_name: str
+    testimonial_savings: Optional[str] = None
+
+
+class AssociationContact(BaseModel):
+    id: str
+    name: str
+    role: str = ""
+    email: str = ""
+    phone: str = ""
+    mobile: str = ""
+    primary: bool = False
+    notes: str = ""
+
+
+class AssociationContactsResponse(BaseModel):
+    contacts_sheet_id: str
+    contacts_sheet_url: str
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+    contacts: List[AssociationContact] = []
+
+
+class AssociationContactWrite(BaseModel):
+    name: str
+    role: str = ""
+    email: str = ""
+    phone: str = ""
+    mobile: str = ""
+    primary: bool = False
+    notes: str = ""
+
+
+class AssociationContactUpdate(BaseModel):
+    name: Optional[str] = None
+    role: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    mobile: Optional[str] = None
+    primary: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class AssociationUploadResponse(BaseModel):
+    id: str
+    name: str
+    web_view_link: str = ""
+    folder_id: str
+    folder_url: str = ""
+    association_id: int
+    testimonial: Optional[TestimonialResponse] = None
 
 
 # --- Marketing videos (CZA video library) ---
@@ -1280,6 +1431,8 @@ class AutonomousSequenceRunListItem(BaseModel):
     ack_draft_thread_id: Optional[str] = None
     campaign_id: Optional[int] = None
     campaign_name: Optional[str] = None
+    is_test: bool = False
+    shared_thread_with_run_id: Optional[int] = None
 
     @field_serializer("anchor_at", "next_step_at")
     def serialize_item_dt(self, dt: Optional[datetime], _info):

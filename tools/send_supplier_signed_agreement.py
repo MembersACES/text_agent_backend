@@ -218,6 +218,40 @@ def find_supplier_email_for_agreement(contract_type: str, agreement_type: str) -
     return DEFAULT_EMAIL["email"], DEFAULT_EMAIL["name"], True
 
 
+def recipient_emails_csv(value: str | None) -> str | None:
+    """Normalise a one-send recipient override. Blank means 'not provided'."""
+    if value is None:
+        return None
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for part in str(value).replace(";", ",").split(","):
+        email = part.strip()
+        if not email:
+            continue
+        key = email.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(email)
+    if not cleaned:
+        return None
+    return ", ".join(cleaned)
+
+
+def resolve_lodgement_recipients(
+    contract_type: str,
+    agreement_type: str,
+    recipient_emails: str | None = None,
+) -> Tuple[str, str, bool]:
+    supplier_email, resolved_name, is_default = find_supplier_email_for_agreement(
+        contract_type, agreement_type
+    )
+    override = recipient_emails_csv(recipient_emails)
+    if override:
+        return override, resolved_name, False
+    return supplier_email, resolved_name, is_default
+
+
 def _signed_agreement_email_fields(
     business_name: str,
     contract_type: str,
@@ -261,11 +295,104 @@ def _signed_agreement_email_fields(
     )
     return {"email_subject": subject, "email_html_content": html}
 
+
+UTILITY_FILING_TYPES = {
+    "C&I Electricity": "signed_CI_E",
+    "SME Electricity": "signed_SME_E",
+    "C&I Gas": "signed_CI_G",
+    "SME Gas": "signed_SME_G",
+    "Waste": "signed_WASTE",
+    "Oil": "signed_OIL",
+    "DMA": "signed_DMA",
+}
+
+_FILING_LABELS_LONGEST_FIRST = sorted(UTILITY_FILING_TYPES, key=len, reverse=True)
+
+NOT_MAPPED_DRIVE_NOTE = "\n\n(No drive filing performed: contract type not mapped)"
+
+
+def filing_type_for_supplier(contract_type: str, utility_type: str | None = None) -> str | None:
+    """Map a supplier option or utility label to a Drive filing type.
+
+    "Alinta C&I Electricity" and utility_type "C&I Electricity" both resolve to signed_CI_E.
+    Longer utility labels are tried first so "SME Electricity" is not confused with a shorter token.
+    """
+    explicit = (utility_type or "").strip()
+    if explicit in UTILITY_FILING_TYPES:
+        return UTILITY_FILING_TYPES[explicit]
+    name = (contract_type or "").strip()
+    if name in UTILITY_FILING_TYPES:
+        return UTILITY_FILING_TYPES[name]
+    lowered = name.lower()
+    for label in _FILING_LABELS_LONGEST_FIRST:
+        token = label.lower()
+        if lowered == token or lowered.endswith(token) or f" {token}" in f" {lowered}":
+            return UTILITY_FILING_TYPES[label]
+    return None
+
+
+def utility_label_for_lodgement(contract_type: str, utility_type: str | None = None) -> str:
+    explicit = (utility_type or "").strip()
+    if explicit:
+        return explicit
+    name = (contract_type or "").strip()
+    lowered = name.lower()
+    for label in _FILING_LABELS_LONGEST_FIRST:
+        token = label.lower()
+        if lowered == token or lowered.endswith(token) or f" {token}" in f" {lowered}":
+            return label
+    return name
+
+
+def unmapped_drive_note(
+    contract_type: str,
+    utility_type: str | None = None,
+    skip_drive_filing: bool = False,
+) -> str:
+    if skip_drive_filing:
+        return ""
+    if filing_type_for_supplier(contract_type, utility_type):
+        return ""
+    return NOT_MAPPED_DRIVE_NOTE
+
+
+def resolve_lodgement_identifier(
+    business_name: str,
+    nmi: str | None = None,
+    mirn: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """Return (business name without NMI/MIRN suffix, identifier, identifier type).
+
+    An explicit nmi or mirn argument wins over a suffix parsed from the business name.
+    """
+    explicit_nmi = (nmi or "").strip()
+    explicit_mirn = (mirn or "").strip()
+    nmi_match = re.search(r"NMI:\s*(\d+)", business_name or "")
+    mirn_match = re.search(r"MIRN:\s*(\d+)", business_name or "")
+    if explicit_nmi:
+        identifier, identifier_type = explicit_nmi, "nmi"
+    elif explicit_mirn:
+        identifier, identifier_type = explicit_mirn, "mirn"
+    elif nmi_match:
+        identifier, identifier_type = nmi_match.group(1), "nmi"
+    elif mirn_match:
+        identifier, identifier_type = mirn_match.group(1), "mirn"
+    else:
+        identifier, identifier_type = None, None
+    actual = re.sub(r"\s*(?:NMI|MIRN):\s*\S+", "", business_name or "").strip()
+    return actual, identifier, identifier_type
+
+
 def send_supplier_signed_agreement(
     file_path: str,
     business_name: str,
     contract_type: str,
-    agreement_type: str = "contract"
+    agreement_type: str = "contract",
+    nmi: str | None = None,
+    mirn: str | None = None,
+    utility_type: str | None = None,
+    skip_drive_filing: bool = False,
+    recipient_emails: str | None = None,
 ) -> str:
     """
     Send a signed supplier agreement (Contract or EOI) to a supplier via email.
@@ -280,26 +407,14 @@ def send_supplier_signed_agreement(
         String with success/error message and details
     """
     logger.info(f"Processing signed agreement: {contract_type} ({agreement_type})")
-    
-    # Parse business name and identifier if present
-    nmi_match = re.search(r'NMI:\s*(\d+)', business_name)
-    mirn_match = re.search(r'MIRN:\s*(\d+)', business_name)
-    
-    if nmi_match:
-        identifier = nmi_match.group(1)
-        identifier_type = "nmi"
-        actual_business_name = business_name[:nmi_match.start()].strip()
-    elif mirn_match:
-        identifier = mirn_match.group(1)
-        identifier_type = "mirn"
-        actual_business_name = business_name[:mirn_match.start()].strip()
-    else:
-        identifier = None
-        identifier_type = None
-        actual_business_name = business_name.strip()
-    
-    # Get supplier email using the mapping
-    supplier_email, resolved_supplier_name, is_default = find_supplier_email_for_agreement(contract_type, agreement_type)
+
+    actual_business_name, identifier, identifier_type = resolve_lodgement_identifier(
+        business_name, nmi, mirn
+    )
+
+    supplier_email, resolved_supplier_name, is_default = resolve_lodgement_recipients(
+        contract_type, agreement_type, recipient_emails
+    )
     logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
     
     # Prepare file and payload
@@ -373,38 +488,39 @@ def send_supplier_signed_agreement(
             except:
                 pass
             
-            # --- Drive Filing Integration (if available) ---
-            if drive_filing and get_business_information:
-                try:
-                    # Map contract types to filing types
-                    contract_type_to_filing_type = {
-                        "C&I Electricity": "signed_CI_E",
-                        "SME Electricity": "signed_SME_E", 
-                        "C&I Gas": "signed_CI_G",
-                        "SME Gas": "signed_SME_G",
-                        "Waste": "signed_WASTE",
-                        "Oil": "signed_OIL",
-                        "DMA": "signed_DMA",
-                    }
-                    
-                    filing_type = contract_type_to_filing_type.get(contract_type)
-                    if filing_type:
-                        business_info = get_business_information(actual_business_name)
-                        drive_filing_result = drive_filing({
-                            "file_path": file_path,
-                            "business_name": actual_business_name,
-                            "filing_type": filing_type,
-                            "business_info": business_info
-                        })
-                        success_msg += f"\n\n**Drive Filing Result:** {drive_filing_result}"
-                    else:
-                        success_msg += "\n\n(No drive filing performed: contract type not mapped)"
-                except Exception as e:
-                    logger.error(f"Drive filing error: {str(e)}")
-                    success_msg += f"\n\n**Drive Filing Error:** {str(e)}"
-            else:
-                success_msg += "\n\n(Drive filing not available)"
-            # --- End Drive Filing Integration ---
+            # Second Drive upload for the standalone lodgement page.
+            # The Documents tab files first and sends skip_drive_filing=true.
+            # Do not send contract_status: that cell is owned by the File in Drive step.
+            if not skip_drive_filing:
+                note = unmapped_drive_note(contract_type, utility_type, skip_drive_filing=False)
+                if note:
+                    success_msg += note
+                elif drive_filing and get_business_information:
+                    filing_type = filing_type_for_supplier(contract_type, utility_type)
+                    try:
+                        business_info = get_business_information(actual_business_name) or {}
+                        gdrive = business_info.get("gdrive") if isinstance(business_info, dict) else None
+                        gdrive_url = ""
+                        if isinstance(gdrive, dict):
+                            gdrive_url = str(gdrive.get("folder_url") or "").strip()
+                        if filing_type and gdrive_url:
+                            with open(file_path, "rb") as filed:
+                                payload_bytes = filed.read()
+                            drive_filing_result = drive_filing(
+                                file_payloads=[(payload_bytes, os.path.basename(file_path))],
+                                business_name=actual_business_name,
+                                gdrive_url=gdrive_url,
+                                filing_type=filing_type,
+                                contract_update_mode="append",
+                            )
+                            success_msg += f"\n\n**Drive Filing Result:** {drive_filing_result}"
+                        elif filing_type:
+                            success_msg += "\n\n(No drive filing performed: no Google Drive folder)"
+                    except Exception as e:
+                        logger.error(f"Drive filing error: {str(e)}")
+                        success_msg += f"\n\n**Drive Filing Error:** {str(e)}"
+                else:
+                    success_msg += "\n\n(Drive filing not available)"
             
             return success_msg
         else:
@@ -427,7 +543,12 @@ def send_supplier_signed_agreement_multiple(
     business_name: str,
     contract_type: str,
     agreement_type: str = "contract_multiple_attachments",
-    filenames: list = None
+    filenames: list = None,
+    nmi: str | None = None,
+    mirn: str | None = None,
+    utility_type: str | None = None,
+    skip_drive_filing: bool = False,
+    recipient_emails: str | None = None,
 ) -> str:
     """
     Send multiple signed supplier agreements to a supplier via email.
@@ -442,27 +563,18 @@ def send_supplier_signed_agreement_multiple(
     Returns:
         String with success/error message and details
     """
-    logger.info(f"Processing multiple signed agreements: {contract_type} ({agreement_type}) - {len(file_paths)} files")
-    
-    # Parse business name and identifier if present
-    nmi_match = re.search(r'NMI:\s*(\d+)', business_name)
-    mirn_match = re.search(r'MIRN:\s*(\d+)', business_name)
-    
-    if nmi_match:
-        identifier = nmi_match.group(1)
-        identifier_type = "nmi"
-        actual_business_name = business_name[:nmi_match.start()].strip()
-    elif mirn_match:
-        identifier = mirn_match.group(1)
-        identifier_type = "mirn"
-        actual_business_name = business_name[:mirn_match.start()].strip()
-    else:
-        identifier = None
-        identifier_type = None
-        actual_business_name = business_name.strip()
-    
-    # Get supplier email using the existing mapping (only use CONTRACT_EMAIL_MAPPINGS for multiple attachments)
-    supplier_email, resolved_supplier_name, is_default = find_supplier_email_for_agreement(contract_type, "contract")
+    logger.info(
+        f"Processing multiple signed agreements: {contract_type} ({agreement_type}) "
+        f"utility={utility_type} skip_drive_filing={skip_drive_filing} - {len(file_paths)} files"
+    )
+
+    actual_business_name, identifier, identifier_type = resolve_lodgement_identifier(
+        business_name, nmi, mirn
+    )
+
+    supplier_email, resolved_supplier_name, is_default = resolve_lodgement_recipients(
+        contract_type, "contract", recipient_emails
+    )
     logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
     
     # Prepare files and payload

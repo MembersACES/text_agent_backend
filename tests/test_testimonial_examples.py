@@ -39,6 +39,7 @@ def test_omitting_solution_type_returns_every_row():
         "Peninsula Villages Limited",
     ]
     assert items[0]["invoice_number"] == "RA5714"
+    assert items[0]["social_status"] is None
     query.filter.assert_not_called()
     from schemas import TestimonialResponse as TestimonialPayload
 

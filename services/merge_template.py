@@ -267,8 +267,11 @@ def row_shape_failures(merge: dict[str, str], raised_keys: set[str]) -> list[str
     return failures
 
 
-def shape_summary(merges: list[dict[str, str]]) -> tuple[int, list[dict[str, Any]], list[list[str]]]:
-    warnings = column_shape_warnings(merges)
+def shape_summary(
+    merges: list[dict[str, str]],
+    ignore_keys: frozenset[str] = frozenset(),
+) -> tuple[int, list[dict[str, Any]], list[list[str]]]:
+    warnings = [item for item in column_shape_warnings(merges) if item["key"] not in ignore_keys]
     raised = {item["key"] for item in warnings}
     per_row = [row_shape_failures(merge, raised) for merge in merges]
     warning_rows = sum(1 for keys in per_row if keys)
