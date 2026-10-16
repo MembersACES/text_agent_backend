@@ -37,7 +37,13 @@ CONTRACT_GROUPS: dict[str, str] = {
     "Veolia Waste": "Waste",
     "Alinta C&I Electricity": "C&I Electricity",
     "Alinta C&I Gas": "C&I Gas",
+    "Alinta SME": "SME Electricity",
     "Other": "Other",
+}
+
+CONTRACT_EXTRA_GROUPS: dict[str, list[str]] = {
+    "Other": ["C&I Electricity", "SME Electricity", "C&I Gas", "SME Gas", "Waste", "DMA"],
+    "Alinta SME": ["SME Gas"],
 }
 
 EOI_GROUPS: dict[str, str] = {
@@ -603,11 +609,7 @@ def all_recipients() -> list[dict]:
             )
         )
     for index, (key, config) in enumerate(CONTRACT_EMAIL_MAPPINGS.items()):
-        extra = (
-            ["C&I Electricity", "SME Electricity", "C&I Gas", "SME Gas", "Waste", "DMA"]
-            if key == "Other"
-            else []
-        )
+        extra = CONTRACT_EXTRA_GROUPS.get(key, [])
         rows.append(
             _recipient_row(
                 flow="signed_contract",

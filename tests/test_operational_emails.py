@@ -58,8 +58,25 @@ def test_seed_creates_templates_and_placeholders():
     assert cleaning.is_placeholder == 1
     dma = next(row for row in eois if row.key == "Direct Meter Agreement")
     assert dma.is_placeholder == 0
+    contracts = list_recipients(db, "signed_contract")
+    alinta_sme = next(row for row in contracts if row.key == "Alinta SME")
+    assert alinta_sme.display_name == "Alinta SME"
+    assert alinta_sme.group_name == "SME Electricity"
+    assert "SME Gas" in (alinta_sme.extra_groups_json or "")
+    assert "Steven.Gordon@alintaenergy.com.au" in (alinta_sme.emails_json or "")
     second = seed_operational_emails(db)
     assert second == {"templates": 0, "recipients": 0}
+
+
+def test_seed_replaces_alinta_sme_test_inbox():
+    db = _db()
+    seed_operational_emails(db)
+    row = next(item for item in list_recipients(db, "signed_contract") if item.key == "Alinta SME")
+    update_recipient(db, row.id, emails=["morgan.h@acesolutions.com.au"])
+    seed_operational_emails(db)
+    refreshed = next(item for item in list_recipients(db, "signed_contract") if item.key == "Alinta SME")
+    assert "Steven.Gordon@alintaenergy.com.au" in (refreshed.emails_json or "")
+    assert "morgan.h@acesolutions.com.au" not in (refreshed.emails_json or "")
 
 
 def test_seed_does_not_overwrite_edits():

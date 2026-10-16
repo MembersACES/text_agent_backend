@@ -126,6 +126,27 @@ def recipient_to_dict(row: OperationalEmailRecipient) -> dict[str, Any]:
     }
 
 
+def _move_alinta_sme_off_test_inbox(db: Session) -> bool:
+    """Replace the temporary Alinta SME test inbox with the seeded retailer address."""
+    row = get_recipient_by_key(db, "signed_contract", "Alinta SME", include_inactive=True)
+    if row is None:
+        return False
+    if [email.lower() for email in _loads_list(row.emails_json)] != ["morgan.h@acesolutions.com.au"]:
+        return False
+    spec = next(
+        (
+            item
+            for item in all_recipients()
+            if item["flow"] == "signed_contract" and item["key"] == "Alinta SME"
+        ),
+        None,
+    )
+    if spec is None:
+        return False
+    row.emails_json = _dumps_list(spec["emails"])
+    return True
+
+
 def seed_operational_emails(db: Session) -> dict[str, int]:
     inserted_templates = 0
     inserted_recipients = 0
@@ -171,7 +192,8 @@ def seed_operational_emails(db: Session) -> dict[str, int]:
             )
         )
         inserted_recipients += 1
-    if inserted_templates or inserted_recipients:
+    corrected_test_inbox = _move_alinta_sme_off_test_inbox(db)
+    if inserted_templates or inserted_recipients or corrected_test_inbox:
         db.commit()
     return {"templates": inserted_templates, "recipients": inserted_recipients}
 

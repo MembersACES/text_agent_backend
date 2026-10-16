@@ -67,6 +67,10 @@ CONTRACT_EMAIL_MAPPINGS = {
         "name": "Alinta",
         "email": "Andrew.Barnes@alintaenergy.com.au, Lewis.Chase@alintaenergy.com.au, Cindy.Ho@alintaenergy.com.au, business@acesolutions.com.au, data.quote@fornrg.com"
     },
+    "Alinta SME": {
+        "name": "Alinta SME",
+        "email": "Steven.Gordon@alintaenergy.com.au"
+    },
     "Other": {
         "name": "Other",
         "email": "members@acesolutions.com.au, data.quote@fornrg.com, morgan.h@acesolutions.com.au"
