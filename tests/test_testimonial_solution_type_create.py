@@ -6,11 +6,13 @@ from sqlalchemy.orm import sessionmaker
 from database import Base
 from tools.testimonial_solution_content import (
     ALL_SOLUTION_TYPE_IDS,
+    DEFAULT_CONTENT,
     create_custom_type,
     delete_custom_type,
     get_merged_content,
     save_override,
     slugify_solution_type,
+    solution_family_fields,
     solution_type_id_from_label,
 )
 
@@ -167,3 +169,118 @@ def test_sheet_row_gets_solution_type_id():
     assert mapped is not None
     assert mapped["testimonial_solution_type_id"] == "client_endorsement"
     assert mapped["source"] == "sheet"
+
+
+_UNMAPPED_FAMILIES = {"client_endorsement", "association_endorsement", "ghg_roadmap"}
+
+
+def test_default_copy_stays_within_the_one_page_budget():
+    limits = {
+        "key_outcome_metrics": 42,
+        "key_challenge_of_solution": 170,
+        "key_approach_of_solution": 120,
+        "key_outcome_of_solution": 250,
+        "key_outcome_dotpoints_1": 42,
+        "key_outcome_dotpoints_2": 42,
+        "key_outcome_dotpoints_3": 42,
+        "key_outcome_dotpoints_4": 42,
+        "key_outcome_dotpoints_5": 42,
+        "conclusion": 95,
+    }
+    for type_id, item in DEFAULT_CONTENT.items():
+        for key, limit in limits.items():
+            text = item.get(key) or ""
+            assert len(text) <= limit, f"{type_id} {key} is {len(text)} characters"
+
+
+def test_every_builtin_type_has_a_family_or_is_explicitly_blank():
+    for type_id in ALL_SOLUTION_TYPE_IDS:
+        fields = solution_family_fields(type_id)
+        if type_id in _UNMAPPED_FAMILIES:
+            assert fields == {"solution_family": "", "solution_family_lead_in": ""}
+            continue
+        assert fields["solution_family"] in {
+            "Profile Reset",
+            "Asset Optimisation",
+            "Resource Recovery",
+        }
+        assert fields["solution_family_lead_in"].startswith("Starting with")
+    assert solution_family_fields("led_upgrade")["solution_family"] == ""
+    assert solution_family_fields("ci_gas")["solution_family"] == "Profile Reset"
+    assert solution_family_fields("cds")["solution_family"] == "Resource Recovery"
+    assert solution_family_fields("solar_review")["solution_family"] == "Asset Optimisation"
+
+
+def test_generate_payload_sends_family_to_n8n(monkeypatch):
+    captured = {}
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"document_link": "https://drive.google.com/file/d/abc/view"}
+
+    def fake_post(url, json, timeout):
+        captured["url"] = url
+        captured["json"] = json
+        return _Response()
+
+    monkeypatch.setattr("tools.document_generation.requests.post", fake_post)
+    from tools.document_generation import generate_testimonial_document
+
+    result = generate_testimonial_document(
+        business_name="Club Rivers",
+        trading_as="",
+        testimonial_business_name="Club Rivers",
+        testimonial_business_name_source="business_name",
+        contact_name="",
+        position="",
+        email="",
+        telephone="",
+        client_folder_url="https://drive.google.com/drive/folders/folder",
+        solution_type_id="ci_gas",
+        savings_amount=4533.18,
+    )
+    assert result["status"] == "success"
+    data = captured["json"]["data"]
+    assert data["solution_type"] == "C&I Gas Reviews"
+    assert data["solution_family"] == "Profile Reset"
+    assert "Profile Resets" in data["solution_family_lead_in"]
+
+    generate_testimonial_document(
+        business_name="Club Rivers",
+        trading_as="",
+        testimonial_business_name="",
+        testimonial_business_name_source="business_name",
+        contact_name="",
+        position="",
+        email="",
+        telephone="",
+        client_folder_url="",
+        solution_type_id="ghg_roadmap",
+        savings_amount=0,
+    )
+    blank = captured["json"]["data"]
+    assert blank["solution_family"] == ""
+    assert blank["solution_family_lead_in"] == ""
+    assert blank["solution_type"] == "GHG Roadmap"
+
+    generate_testimonial_document(
+        business_name="Club Rivers",
+        trading_as="",
+        testimonial_business_name="",
+        testimonial_business_name_source="business_name",
+        contact_name="",
+        position="",
+        email="",
+        telephone="",
+        client_folder_url="",
+        solution_type_id="solar_panel_cleaning",
+        savings_amount=100,
+        pv_system_size="99",
+        solar_pre_daily_kwh=100,
+        solar_post_daily_kwh=110,
+    )
+    solar = captured["json"]["data"]
+    assert solar["solution_family"] == "Asset Optimisation"
+    assert solar["estimated_annual_production_increase_percent"] == "10.0"
