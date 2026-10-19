@@ -64,9 +64,9 @@ def _build_solar_n8n_fields(
         "Lower risk of undetected degradation shortening asset life or warranty exposure."
     )
 
-    dot1 = f"Previously measured generation of {pre_s} kWh new generation {post_s} kWh"
-    dot2 = f"{pct_s}% increase in electricity production observed for the day {yield_s} kWh gained."
-    dot3 = f"{pct_s}% decrease in greenhouse gas emissions {co2_daily_s} kg CO₂ avoided."
+    dot1 = f"{pre_s} kWh before, {post_s} kWh after."
+    dot2 = f"{pct_s}% more production, {yield_s} kWh gained."
+    dot3 = f"{co2_daily_s} kg CO₂ avoided that day."
 
     return {
         "solar_pre_daily_generation_kwh": pre_s,
@@ -538,6 +538,7 @@ def generate_testimonial_document(
         get_merged_content,
         TESTIMONIAL_TEMPLATE_DOC_ID,
         build_testimonial_file_name,
+        solution_family_fields,
     )
 
     current_date = datetime.datetime.now()
@@ -640,6 +641,7 @@ def generate_testimonial_document(
         "monthly_savings": monthly_savings_formatted,
         "annual_savings": annual_savings_formatted,
         "net_outcome": net_outcome_formatted,
+        **solution_family_fields(solution_type_id),
     }
 
     if solar_extra:
