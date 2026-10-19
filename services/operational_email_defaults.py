@@ -113,6 +113,14 @@ DATA_REQUEST_GROUPS: dict[str, str] = {
     "Sun Retail": "SME Electricity",
     "Ergon Energy": "SME Electricity",
     "Veolia Waste": "Waste",
+    "Jemena Gas Networks (NSW)": "C&I Gas",
+    "Australian Gas Networks": "C&I Gas",
+    "Multinet Gas": "C&I Gas",
+    "AusNet Gas": "C&I Gas",
+    "Allgas (APA)": "C&I Gas",
+    "Evoenergy": "C&I Gas",
+    "ATCO Gas": "C&I Gas",
+    "TasGas Networks": "C&I Gas",
     "Other": "Other",
 }
 
@@ -323,6 +331,7 @@ def data_request_templates() -> list[dict]:
         "electricity_ci_data": "C&I Electricity data request",
         "electricity_sme_data": "SME Electricity data request",
         "gas_ci_data": "C&I Gas data request",
+        "gas_ci_network_data": "C&I Gas network data request",
         "gas_sme_data": "SME Gas data request",
         "waste_data": "Waste data request",
     }
@@ -330,6 +339,7 @@ def data_request_templates() -> list[dict]:
         "electricity_ci_data": "Sent when requesting interval data and contract details from a C&I electricity retailer.",
         "electricity_sme_data": "Sent when requesting SME electricity invoices and contract end date.",
         "gas_ci_data": "Sent when requesting C&I gas interval data, invoices, and contract copy.",
+        "gas_ci_network_data": "Sent to a gas network for 36 months of interval and meter-read data, plus confirmation of MDQ, MHQ, and tariff.",
         "gas_sme_data": "Sent when requesting SME gas invoices and contract end date.",
         "waste_data": "Sent when requesting waste invoices, bin weights, and recycling confirmation.",
     }
@@ -337,6 +347,7 @@ def data_request_templates() -> list[dict]:
         "electricity_ci_data": ["business_name", "nmi"],
         "electricity_sme_data": ["business_name", "nmi"],
         "gas_ci_data": ["business_name", "mrin"],
+        "gas_ci_network_data": ["business_name", "mrin"],
         "gas_sme_data": ["business_name", "mrin"],
         "waste_data": ["business_name", "account_number"],
     }

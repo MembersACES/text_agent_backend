@@ -132,6 +132,46 @@ RETAILER_EMAILS = {
         "email": "commercial@ergon.com.au, data.quote@fornrg.com",
         "variants": ["Ergon Energy Queensland Pty Ltd", "Ergon Energy"]
     },
+    "Jemena Gas Networks (NSW)": {
+        "name": "Jemena Gas Networks (NSW)",
+        "email": "customerrelations@jemena.com.au, data.quote@fornrg.com",
+        "variants": ["Jemena", "Jemena Gas Networks"]
+    },
+    "Australian Gas Networks": {
+        "name": "Australian Gas Networks",
+        "email": "agnl@agig.com.au, data.quote@fornrg.com",
+        "variants": ["AGN", "Australian Gas Networks (SA)", "Australian Gas Networks (VIC)"]
+    },
+    "Multinet Gas": {
+        "name": "Multinet Gas",
+        "email": "mgservicedesk@agig.com.au, data.quote@fornrg.com",
+        "variants": ["Multinet", "Multinet Gas Networks"]
+    },
+    "AusNet Gas": {
+        "name": "AusNet Gas",
+        "email": "meterdata@ausnetservices.com.au, data.quote@fornrg.com",
+        "variants": ["AusNet", "AusNet Services"]
+    },
+    "Allgas (APA)": {
+        "name": "Allgas (APA)",
+        "email": "connectionsqld@apa.com.au, data.quote@fornrg.com",
+        "variants": ["Allgas", "APA Allgas"]
+    },
+    "Evoenergy": {
+        "name": "Evoenergy",
+        "email": "data.quote@fornrg.com",
+        "variants": ["Evoenergy"]
+    },
+    "ATCO Gas": {
+        "name": "ATCO Gas",
+        "email": "data.quote@fornrg.com",
+        "variants": ["ATCO"]
+    },
+    "TasGas Networks": {
+        "name": "TasGas Networks",
+        "email": "data.quote@fornrg.com",
+        "variants": ["TasGas"]
+    },
     "Other": {
         "name": "Other Supplier",
         "email": "members@acesolutions.com.au, data.quote@fornrg.com",
@@ -286,6 +326,26 @@ EMAIL_TEMPLATES = {
 <p>P: 1300 440 224</p>
 <p>W: <a href="http://www.fornrg.com/">http://www.fornrg.com/</a></p>"""
     },
+    "gas_ci_network_data": {
+        "subject": "GAS Meter read data request {business_name} MRIN {mrin}",
+        "template": """<p>Hi Team,</p>
+<p>I am contacting you on behalf of our member {business_name} MRIN {mrin}.</p>
+<p>Please find the Letter of Authority attached.</p>
+<p>Could you please provide the following:</p>
+<ul>
+<li>36 months to date of interval and meter read data</li>
+<li>Confirmation of the current MDQ</li>
+<li>Confirmation of the current MHQ</li>
+<li>Confirmation of the current tariff</li>
+</ul>
+<p>If you have any questions, please feel free to contact me.</p>
+<p>Kind regards,</p>
+<p>Alice</p>
+<p>FORNRG Pty Ltd</p>
+<p>1300 938 638</p>
+<p>W: <a href="http://www.fornrg.com/">http://www.fornrg.com/</a></p>
+<p>NOTE: This email, including any attachments, is strictly confidential. If you received this email in error, please notify the sender and delete it as well as any copies from your system. You must not use, print, distribute, copy, or disclose the content of this email if you are not the intended recipient.</p>"""
+    },
     "gas_sme_data": {
         "subject": "SME Gas Data Request - {business_name} - MRIN: {mrin}",
         "template": """<p>Hello,</p>
@@ -432,6 +492,7 @@ def supplier_data_request(
     identifier_type: str = "NMI",
     missing_months: Optional[List[str]] = None,
     invoice_url: Optional[str] = None,
+    network_data_request: bool = False,
 ) -> str:
     """
     Request data from a supplier using specific email templates and attaching LOA
@@ -446,6 +507,9 @@ def supplier_data_request(
                         Named explicitly in the email when supplied.
         invoice_url: Link to an invoice we already hold, passed to n8n to attach
                      alongside the LOA.
+        network_data_request: C&I gas only. Sends the network meter-data template
+                              instead of the retailer template. Recipient is still
+                              whoever supplier_name resolves to.
     """
     
     try:
@@ -466,6 +530,8 @@ def supplier_data_request(
             service_type_display = "SME Gas"
         elif service_type == "waste":
             service_type_display = "Waste"
+        network_request = bool(network_data_request) and service_type == "gas_ci"
+        template_service_type = "gas_ci_network" if network_request else service_type
         
         logger.info(f"========== SUPPLIER DATA REQUEST ==========")
         logger.info(f"Raw inputs - Supplier: '{supplier_name}'")
@@ -495,7 +561,7 @@ def supplier_data_request(
 
             def _load(db):
                 return (
-                    load_template_content(db, f"data_request.{service_type}"),
+                    load_template_content(db, f"data_request.{template_service_type}"),
                     find_data_request_recipient(db, supplier_name, service_type),
                 )
 
@@ -525,7 +591,7 @@ def supplier_data_request(
                 db_template = None
 
         if not db_template:
-            template_key = f"{service_type}_data"
+            template_key = f"{template_service_type}_data"
             if template_key not in EMAIL_TEMPLATES:
                 logger.error(f"No template found for service type: {service_type}")
                 return f"Error: No template found for {service_type}. Valid types are: electricity_ci, electricity_sme, gas_ci, gas_sme, waste"
@@ -538,7 +604,8 @@ def supplier_data_request(
                 logger.error(f"Template formatting error: {e}")
                 return f"Error: Template formatting failed - missing variable: {e}"
 
-        email_body = place_missing_invoice_ask(email_body, missing_months)
+        if not network_request:
+            email_body = place_missing_invoice_ask(email_body, missing_months)
         if (
             ATTACH_HELD_INVOICE
             and invoice_url
@@ -560,6 +627,7 @@ def supplier_data_request(
             "email_subject": email_subject,
             "email_body": email_body,
             "request_type": "supplier_data_request",
+            "network_data_request": network_request,
             "invoice_url": invoice_url or "",
             "missing_months": missing_months or [],
         }

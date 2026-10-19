@@ -2525,6 +2525,7 @@ class DataRequest(BaseModel):
     # already hold for this meter, passed to n8n to attach beside the LOA.
     missing_months: Optional[List[str]] = None
     invoice_url: Optional[str] = None
+    network_data_request: bool = False
 
 class RobotDataRequest(BaseModel):
     robot_number: str
@@ -5002,6 +5003,7 @@ def data_request(
             identifier_type=identifier_type,
             missing_months=request.missing_months,
             invoice_url=request.invoice_url,
+            network_data_request=bool(request.network_data_request) and service_type == "gas_ci",
         )
         message = str(raw_result or "").strip()
         is_success = message.startswith("✅") or "Data request successfully sent" in message
@@ -5039,6 +5041,7 @@ def data_request(
                     "identifier_type": identifier_type,
                     "identifier": account_identifier or None,
                     "supplier_name": request.supplier_name,
+                    "network_data_request": bool(request.network_data_request) and service_type == "gas_ci",
                     "source": "data_request_page",
                 }
                 try:
@@ -11542,6 +11545,7 @@ def link_client_from_loa(
         client_id=body.client_id,
         owner_email=owner_email,
         reassign=body.reassign,
+        stage=body.stage.value if body.stage is not None else None,
     )
 
 

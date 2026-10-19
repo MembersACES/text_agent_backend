@@ -100,7 +100,10 @@ def test_the_ask_is_capped_so_a_broken_report_cannot_flood_the_email():
 
 # --- templates --------------------------------------------------------------
 
-@pytest.mark.parametrize("key", sorted(EMAIL_TEMPLATES))
+RETAILER_TEMPLATE_KEYS = [key for key in sorted(EMAIL_TEMPLATES) if key != "gas_ci_network_data"]
+
+
+@pytest.mark.parametrize("key", RETAILER_TEMPLATE_KEYS)
 def test_every_template_renders_and_the_gap_rewrites_the_invoice_bullet(key):
     cfg = EMAIL_TEMPLATES[key]
     rendered = cfg["template"].format(**TEMPLATE_VARS, invoice_attachment_clause="")
@@ -111,7 +114,7 @@ def test_every_template_renders_and_the_gap_rewrites_the_invoice_bullet(key):
     assert asked.index("Jul 2025") < asked.index("Kind Regards")
 
 
-@pytest.mark.parametrize("key", sorted(EMAIL_TEMPLATES))
+@pytest.mark.parametrize("key", RETAILER_TEMPLATE_KEYS)
 def test_every_template_asks_for_invoices(key):
     """The rider hangs off the invoice line; no invoice line, no ask."""
     assert "invoice" in EMAIL_TEMPLATES[key]["template"].lower()
@@ -267,3 +270,42 @@ def test_a_request_with_no_gap_reads_as_it_always_did(monkeypatch):
     assert "A recent invoice for this account" not in body
     assert sent["payload"]["invoice_url"] == ""
     assert sent["payload"]["missing_months"] == []
+
+
+def test_network_data_request_asks_for_meter_data_and_contract_terms(monkeypatch):
+    import tools.supplier_data_request as sdr
+
+    sent = {}
+    monkeypatch.setattr(
+        sdr.requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: (
+            sent.update(payload=json) or _FakeResponse()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr("services.operational_emails.with_db", lambda callback: None)
+
+    sdr.supplier_data_request(
+        supplier_name="Jemena Gas Networks (NSW)",
+        business_name="Specialised Linen Services (Sydney) Pty Ltd",
+        service_type="gas_ci",
+        account_identifier="52477254208",
+        identifier_type="MRIN",
+        missing_months=["Jul 2025"],
+        network_data_request=True,
+    )
+
+    payload = sent["payload"]
+    assert payload["network_data_request"] is True
+    assert payload["service_type"] == "gas_ci"
+    assert "customerrelations@jemena.com.au" in payload["supplier_email"]
+    assert "data.quote@fornrg.com" in payload["supplier_email"]
+    assert "52477254208" in payload["email_subject"]
+    body = payload["email_body"]
+    assert "36 months to date of interval and meter read data" in body
+    assert "Confirmation of the current MDQ" in body
+    assert "Confirmation of the current MHQ" in body
+    assert "Confirmation of the current tariff" in body
+    assert "Copy of 12 months worth of invoices" not in body
+    assert "Jul 2025" not in body

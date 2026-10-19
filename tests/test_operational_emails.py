@@ -115,6 +115,50 @@ def test_data_request_recipient_lookup():
     assert "members@acesolutions.com.au" in unknown_email
 
 
+def test_gas_network_inboxes_copy_data_quote_and_old_jemena_is_replaced():
+    db = _db()
+    seed_operational_emails(db)
+    rows = {row.key: row for row in list_recipients(db, "data_request")}
+    expected = {
+        "Jemena Gas Networks (NSW)": "customerrelations@jemena.com.au",
+        "Australian Gas Networks": "agnl@agig.com.au",
+        "Multinet Gas": "mgservicedesk@agig.com.au",
+        "AusNet Gas": "meterdata@ausnetservices.com.au",
+        "Allgas (APA)": "connectionsqld@apa.com.au",
+        "Evoenergy": None,
+        "ATCO Gas": None,
+        "TasGas Networks": None,
+    }
+    for key, inbox in expected.items():
+        emails = (rows[key].emails_json or "").lower()
+        assert "data.quote@fornrg.com" in emails
+        if inbox:
+            assert inbox in emails
+
+    update_recipient(
+        db,
+        rows["Jemena Gas Networks (NSW)"].id,
+        emails=["jenservicedesk@jemena.com.au", "data.quote@fornrg.com"],
+    )
+    seed_operational_emails(db)
+    refreshed = next(
+        row for row in list_recipients(db, "data_request") if row.key == "Jemena Gas Networks (NSW)"
+    )
+    assert "customerrelations@jemena.com.au" in (refreshed.emails_json or "")
+    assert "jenservicedesk@jemena.com.au" not in (refreshed.emails_json or "").lower()
+
+    update_recipient(
+        db,
+        refreshed.id,
+        emails=["desk@jemena.com.au", "data.quote@fornrg.com"],
+    )
+    seed_operational_emails(db)
+    kept = next(
+        row for row in list_recipients(db, "data_request") if row.key == "Jemena Gas Networks (NSW)"
+    )
+    assert "desk@jemena.com.au" in (kept.emails_json or "")
+
+
 def test_add_and_update_recipient_emails():
     db = _db()
     seed_operational_emails(db)
