@@ -333,7 +333,7 @@ EMAIL_TEMPLATES = {
 <p>Please find the Letter of Authority attached.</p>
 <p>Could you please provide the following:</p>
 <ul>
-<li>36 months to date of interval and meter read data</li>
+<li>{history_period} to date of interval and meter read data</li>
 <li>Confirmation of the current MDQ</li>
 <li>Confirmation of the current MHQ</li>
 <li>Confirmation of the current tariff</li>
@@ -484,6 +484,31 @@ def clean_parameter(value: str) -> str:
     return cleaned
 
 
+DATA_QUOTE_EMAIL = "data.quote@fornrg.com"
+DEFAULT_NETWORK_HISTORY_YEARS = 3
+LEGACY_NETWORK_HISTORY_PHRASE = "36 months to date of interval and meter read data"
+
+
+def clamp_network_history_years(years: Optional[int]) -> int:
+    """1–10 years. Anything else, including a missing value, stays at 3 years."""
+    if isinstance(years, bool) or not isinstance(years, int):
+        return DEFAULT_NETWORK_HISTORY_YEARS
+    if years < 1 or years > 10:
+        return DEFAULT_NETWORK_HISTORY_YEARS
+    return years
+
+
+def network_history_label(years: Optional[int]) -> str:
+    count = clamp_network_history_years(years)
+    return "1 year" if count == 1 else f"{count} years"
+
+
+def apply_network_history_period(body: str, years: Optional[int]) -> str:
+    """Rewrite a stored template that still asks for a fixed 36 months."""
+    phrase = f"{network_history_label(years)} to date of interval and meter read data"
+    return (body or "").replace(LEGACY_NETWORK_HISTORY_PHRASE, phrase)
+
+
 def supplier_data_request(
     supplier_name: str,
     business_name: str,
@@ -493,6 +518,8 @@ def supplier_data_request(
     missing_months: Optional[List[str]] = None,
     invoice_url: Optional[str] = None,
     network_data_request: bool = False,
+    data_years: Optional[int] = None,
+    test_send: bool = False,
 ) -> str:
     """
     Request data from a supplier using specific email templates and attaching LOA
@@ -510,6 +537,10 @@ def supplier_data_request(
         network_data_request: C&I gas only. Sends the network meter-data template
                               instead of the retailer template. Recipient is still
                               whoever supplier_name resolves to.
+        data_years: C&I gas network requests only. Years of interval and meter-read
+                    history to ask for (1–10). Defaults to 3.
+        test_send: Deliver the email only to data quote. The network or retailer
+                   address is left off.
     """
     
     try:
@@ -541,12 +572,14 @@ def supplier_data_request(
         logger.info(f"Identifier type: {identifier_type}")
         logger.info(f"========================================")
         
+        history_years = clamp_network_history_years(data_years) if network_request else None
         template_vars = {
             "business_name": business_name,
             "nmi": account_identifier if identifier_type == "NMI" else "",
             "mrin": account_identifier if identifier_type == "MRIN" else "",
             "account_number": account_identifier if identifier_type == "account_number" else "",
             "invoice_attachment_clause": _invoice_attachment_clause(invoice_url),
+            "history_period": network_history_label(history_years) if network_request else "",
         }
 
         db_template = None
@@ -575,6 +608,9 @@ def supplier_data_request(
             supplier_email, resolved_supplier_name, is_default = db_recipient
         else:
             supplier_email, resolved_supplier_name, is_default = find_retailer_email(supplier_name, service_type)
+        if test_send:
+            supplier_email = DATA_QUOTE_EMAIL
+            is_default = False
         logger.info(f"Resolved supplier email: {supplier_email} for {resolved_supplier_name} (default: {is_default})")
 
         default_note = ""
@@ -604,7 +640,9 @@ def supplier_data_request(
                 logger.error(f"Template formatting error: {e}")
                 return f"Error: Template formatting failed - missing variable: {e}"
 
-        if not network_request:
+        if network_request:
+            email_body = apply_network_history_period(email_body, history_years)
+        else:
             email_body = place_missing_invoice_ask(email_body, missing_months)
         if (
             ATTACH_HELD_INVOICE
@@ -628,6 +666,8 @@ def supplier_data_request(
             "email_body": email_body,
             "request_type": "supplier_data_request",
             "network_data_request": network_request,
+            "data_years": history_years,
+            "test_send": bool(test_send),
             "invoice_url": invoice_url or "",
             "missing_months": missing_months or [],
         }

@@ -142,7 +142,7 @@ from tools.get_gas_sme_latest_invoice_information import get_gas_sme_latest_invo
 from tools.get_waste_latest_invoice_information import get_waste_latest_invoice_information
 from tools.get_oil_invoice_information import get_oil_invoice_information
 from tools.get_cleaning_invoice_information import get_cleaning_invoice_information
-from tools.supplier_data_request import supplier_data_request
+from tools.supplier_data_request import clamp_network_history_years, supplier_data_request
 from tools.drive_filing import drive_filing
 from tools.send_supplier_signed_agreement import send_supplier_signed_agreement
 from tools.document_generation import (
@@ -2528,6 +2528,11 @@ class DataRequest(BaseModel):
     missing_months: Optional[List[str]] = None
     invoice_url: Optional[str] = None
     network_data_request: bool = False
+    # C&I gas network requests only. 1–10 years of interval and meter-read history.
+    # Omitted or out of range falls back to 3 years (the previous 36-month ask).
+    data_years: Optional[int] = None
+    # When set, the email goes only to data.quote@fornrg.com.
+    test_send: bool = False
 
 class RobotDataRequest(BaseModel):
     robot_number: str
@@ -5006,6 +5011,8 @@ def data_request(
             missing_months=request.missing_months,
             invoice_url=request.invoice_url,
             network_data_request=bool(request.network_data_request) and service_type == "gas_ci",
+            data_years=request.data_years,
+            test_send=bool(request.test_send),
         )
         message = str(raw_result or "").strip()
         is_success = message.startswith("✅") or "Data request successfully sent" in message
@@ -5044,6 +5051,12 @@ def data_request(
                     "identifier": account_identifier or None,
                     "supplier_name": request.supplier_name,
                     "network_data_request": bool(request.network_data_request) and service_type == "gas_ci",
+                    "data_years": (
+                        clamp_network_history_years(request.data_years)
+                        if bool(request.network_data_request) and service_type == "gas_ci"
+                        else None
+                    ),
+                    "test_send": bool(request.test_send),
                     "source": "data_request_page",
                 }
                 try:

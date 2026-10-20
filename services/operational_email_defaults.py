@@ -129,6 +129,7 @@ DATA_REQUEST_SAMPLE = {
     "nmi": "4102000000",
     "mrin": "5300000000",
     "account_number": "ACC-12345",
+    "history_period": "3 years",
 }
 
 QUOTE_HTML = """<!DOCTYPE html>
@@ -339,7 +340,7 @@ def data_request_templates() -> list[dict]:
         "electricity_ci_data": "Sent when requesting interval data and contract details from a C&I electricity retailer.",
         "electricity_sme_data": "Sent when requesting SME electricity invoices and contract end date.",
         "gas_ci_data": "Sent when requesting C&I gas interval data, invoices, and contract copy.",
-        "gas_ci_network_data": "Sent to a gas network for 36 months of interval and meter-read data, plus confirmation of MDQ, MHQ, and tariff.",
+        "gas_ci_network_data": "Sent to a gas network for the selected years of interval and meter-read data, plus confirmation of MDQ, MHQ, and tariff.",
         "gas_sme_data": "Sent when requesting SME gas invoices and contract end date.",
         "waste_data": "Sent when requesting waste invoices, bin weights, and recycling confirmation.",
     }
@@ -347,7 +348,7 @@ def data_request_templates() -> list[dict]:
         "electricity_ci_data": ["business_name", "nmi"],
         "electricity_sme_data": ["business_name", "nmi"],
         "gas_ci_data": ["business_name", "mrin"],
-        "gas_ci_network_data": ["business_name", "mrin"],
+        "gas_ci_network_data": ["business_name", "mrin", "history_period"],
         "gas_sme_data": ["business_name", "mrin"],
         "waste_data": ["business_name", "account_number"],
     }
