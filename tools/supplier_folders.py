@@ -16,12 +16,13 @@ from tools.member_folder_drive import (
     upload_bytes_to_folder,
     _user_drive_service,
 )
-from tools.one_month_savings import extract_folder_id_from_url, get_drive_service
+from tools.one_month_savings import extract_folder_id_from_url, get_drive_service, get_sheets_service
 from tools.share_folder import drive_file_url, drive_folder_url, is_sa_quota_error
 
 logger = logging.getLogger(__name__)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SUPPLIER_FOLDERS_NAME = "Supplier Folders"
 PREFERRED_PARENT_NAME = "005-Suppliers"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -610,6 +611,73 @@ def list_supplier_documents(
         "path": scope["path"],
         "folders": subfolders,
         "files": files,
+    }, None, 200
+
+
+def list_supplier_sheet_tabs(
+    file_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    """Tab names and gids for a Google Sheet stored under Supplier Folders."""
+    fid = (file_id or "").strip()
+    if not fid or not _DRIVE_ID_RE.match(fid):
+        return None, "missing_file_id", 400
+
+    drive, err = _drive_or_error()
+    if err:
+        return None, err, 503
+
+    parent_id, parent_err = _discover_parent_id(drive)
+    if parent_err or not parent_id:
+        return None, parent_err or _not_configured_message(), 503
+
+    meta = _get_drive_meta(drive, fid)
+    if not meta or meta.get("trashed"):
+        return None, "supplier_not_found", 404
+    if meta.get("mimeType") != SPREADSHEET_MIME:
+        return None, "not_a_sheet", 400
+
+    scope = None
+    for folder_id in meta.get("parents") or []:
+        scope, _confirm_err = _resolve_under_supplier(drive, str(folder_id), parent_id)
+        if scope:
+            break
+    if not scope:
+        return None, "supplier_not_found", 404
+
+    service = get_sheets_service()
+    if not service:
+        return None, "sheets_unavailable", 503
+
+    try:
+        raw = (
+            service.spreadsheets()
+            .get(spreadsheetId=fid, fields="sheets(properties(sheetId,title))")
+            .execute()
+        )
+    except HttpError as e:
+        logger.warning(
+            "supplier sheet tabs HttpError file=%s status=%s",
+            fid,
+            getattr(e.resp, "status", e),
+        )
+        return None, "http_error", 502
+    except Exception:
+        logger.exception("supplier sheet tabs failed file=%s", fid)
+        return None, "http_error", 502
+
+    tabs: List[Dict[str, str]] = []
+    for sheet in raw.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        title = props.get("title")
+        gid = props.get("sheetId")
+        if title is None or gid is None:
+            continue
+        tabs.append({"name": str(title), "gid": str(gid)})
+
+    return {
+        "file_id": fid,
+        "name": str(meta.get("name") or "Sheet"),
+        "tabs": tabs,
     }, None, 200
 
 

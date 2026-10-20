@@ -218,6 +218,7 @@ from tools.supplier_folders import (
     create_supplier_folder,
     list_supplier_documents,
     list_supplier_folders,
+    list_supplier_sheet_tabs,
     upload_supplier_document,
 )
 from tools.testimonial_solution_content import (
@@ -5427,6 +5428,28 @@ def suppliers_files(
             raise HTTPException(
                 status_code=404,
                 detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.get("/api/suppliers/files/{file_id}/tabs")
+def suppliers_sheet_tabs(
+    file_id: str,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Sheet tabs for a Google Sheet stored inside a supplier folder."""
+    _ = user_info
+    payload, err, status = list_supplier_sheet_tabs(file_id)
+    if err:
+        if err == "missing_file_id":
+            raise HTTPException(status_code=400, detail="file_id is required")
+        if err == "not_a_sheet":
+            raise HTTPException(status_code=400, detail="That file is not a Google Sheet")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Sheet not found under Supplier Folders.",
             )
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
     return payload
