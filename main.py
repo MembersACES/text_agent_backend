@@ -5416,14 +5416,17 @@ async def suppliers_create(
 @app.get("/api/suppliers/{folder_id}/files")
 def suppliers_files(
     folder_id: str,
+    scope: str = Query("all", description="folders | files | all"),
     user_info: dict = Depends(verify_google_token),
 ):
-    """List files and subfolders in a supplier folder or any nested folder under it."""
+    """List one level of a supplier folder. Use scope=folders to skip files."""
     _ = user_info
-    payload, err, status = list_supplier_documents(folder_id)
+    payload, err, status = list_supplier_documents(folder_id, scope)
     if err:
         if err == "missing_folder_id":
             raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "invalid_scope":
+            raise HTTPException(status_code=400, detail="scope must be folders, files, or all")
         if err == "supplier_not_found":
             raise HTTPException(
                 status_code=404,
