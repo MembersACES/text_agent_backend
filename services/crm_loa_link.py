@@ -6,6 +6,7 @@ from typing import Any, Optional
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from crm_enums import ClientStage
 from models import Client
 from services.crm import enrich_client_response
 
@@ -70,6 +71,16 @@ def resolve_crm_client_for_loa(
     }
 
 
+def _stage_for_new_member(stage: Optional[str]) -> str:
+    raw = (stage or "").strip()
+    if not raw:
+        return ClientStage.LEAD.value
+    try:
+        return ClientStage(raw).value
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid client stage") from exc
+
+
 def link_or_create_client_from_loa(
     db: Session,
     *,
@@ -80,8 +91,13 @@ def link_or_create_client_from_loa(
     client_id: Optional[int] = None,
     owner_email: Optional[str] = None,
     reassign: bool = False,
+    stage: Optional[str] = None,
 ):
-    """Explicit user-confirmed link to existing member or create new — ID-first."""
+    """Explicit user-confirmed link to existing member or create new — ID-first.
+
+    ``stage`` applies only when creating a new member. Linking an existing member
+    leaves that member's stage unchanged.
+    """
     rid = (record_id or "").strip()
     name = (business_name or "").strip()
     if not rid:
@@ -137,6 +153,7 @@ def link_or_create_client_from_loa(
         primary_contact_email=primary_contact_email,
         gdrive_folder_url=gdrive_folder_url,
         owner_email=owner_email,
+        stage=_stage_for_new_member(stage),
     )
     db.add(client)
     db.commit()

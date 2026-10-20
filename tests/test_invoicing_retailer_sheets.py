@@ -1,5 +1,6 @@
 from tools.invoicing_retailer_sheets import (
     _commission_up_to_date_title,
+    summarise_annual_savings,
     summarise_commission_up_to_date,
 )
 
@@ -35,6 +36,28 @@ def test_summarise_missing_total_commission_column():
     data, err = summarise_commission_up_to_date(["MRIN", "Name"], [["1", "Acme"]])
     assert data is None
     assert err == "total_commission_column_not_found"
+
+
+def test_summarise_annual_savings_skips_blank_and_total_rows():
+    header = ["Business", "Utility", "NMI / MIRN", "Monthly Savings", "Annual Savings"]
+    rows = [
+        ["Healesville RSL", "Gas", "53218011423", 152.21, 1826.53],
+        ["Fawkner RSL", "Gas", "53301269869", "", ""],
+        ["", "", "", "", 999],
+        ["Total", "", "", "", 5000],
+        ["Noble Park RSL", "Gas", "53107029690", "$505.39", "$6,064.63"],
+    ]
+    data, err = summarise_annual_savings(header, rows)
+    assert err is None
+    assert data is not None
+    assert data["row_count"] == 3
+    assert data["annual_savings"] == 7891.16
+
+
+def test_summarise_annual_savings_missing_column():
+    data, err = summarise_annual_savings(["Business", "Notes"], [["Acme", "n/a"]])
+    assert data is None
+    assert err == "annual_savings_column_not_found"
 
 
 def test_commission_up_to_date_title_prefers_exact_then_gas_prefix():

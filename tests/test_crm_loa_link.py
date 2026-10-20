@@ -4,6 +4,7 @@ from unittest.mock import patch
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from crm_enums import ClientStage
 from database import Base
 from models import Client
 from services.crm_loa_link import (
@@ -104,6 +105,29 @@ def test_create_from_loa_new_member():
     )
     assert result.external_business_id == "recMelbourne"
     assert result.primary_contact_email == "ops@example.com"
+    assert result.stage == ClientStage.LEAD
+
+
+def test_create_from_loa_uses_requested_stage_only_for_new_members():
+    db = _make_test_session()
+    created = link_or_create_client_from_loa(
+        db,
+        record_id="recNew",
+        business_name="New Member Pty Ltd",
+        stage="qualified",
+    )
+    assert created.stage == ClientStage.QUALIFIED
+
+    existing = _make_client(db, business_name="Already Here", external_business_id=None)
+    linked = link_or_create_client_from_loa(
+        db,
+        record_id="recExisting",
+        business_name="Already Here",
+        client_id=existing.id,
+        stage="qualified",
+    )
+    assert linked.id == existing.id
+    assert linked.stage == ClientStage.LEAD
 
 
 def test_link_existing_without_reassign_rejects_other_holder():

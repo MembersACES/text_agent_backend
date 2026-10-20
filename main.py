@@ -81,6 +81,7 @@ from tools.alinta_electricity_ef import (
 )
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
+    get_alinta_sme_sheet_summary,
     get_commission_figures_client_count,
     get_commission_up_to_date_summary,
     get_trojan_oil_unique_client_count,
@@ -217,6 +218,7 @@ from tools.supplier_folders import (
     create_supplier_folder,
     list_supplier_documents,
     list_supplier_folders,
+    list_supplier_sheet_tabs,
     upload_supplier_document,
 )
 from tools.testimonial_solution_content import (
@@ -2525,6 +2527,7 @@ class DataRequest(BaseModel):
     # already hold for this meter, passed to n8n to attach beside the LOA.
     missing_months: Optional[List[str]] = None
     invoice_url: Optional[str] = None
+    network_data_request: bool = False
 
 class RobotDataRequest(BaseModel):
     robot_number: str
@@ -5002,6 +5005,7 @@ def data_request(
             identifier_type=identifier_type,
             missing_months=request.missing_months,
             invoice_url=request.invoice_url,
+            network_data_request=bool(request.network_data_request) and service_type == "gas_ci",
         )
         message = str(raw_result or "").strip()
         is_success = message.startswith("✅") or "Data request successfully sent" in message
@@ -5039,6 +5043,7 @@ def data_request(
                     "identifier_type": identifier_type,
                     "identifier": account_identifier or None,
                     "supplier_name": request.supplier_name,
+                    "network_data_request": bool(request.network_data_request) and service_type == "gas_ci",
                     "source": "data_request_page",
                 }
                 try:
@@ -5411,18 +5416,43 @@ async def suppliers_create(
 @app.get("/api/suppliers/{folder_id}/files")
 def suppliers_files(
     folder_id: str,
+    scope: str = Query("all", description="folders | files | all"),
     user_info: dict = Depends(verify_google_token),
 ):
-    """List files and subfolders in a supplier folder or any nested folder under it."""
+    """List one level of a supplier folder. Use scope=folders to skip files."""
     _ = user_info
-    payload, err, status = list_supplier_documents(folder_id)
+    payload, err, status = list_supplier_documents(folder_id, scope)
     if err:
         if err == "missing_folder_id":
             raise HTTPException(status_code=400, detail="folder_id is required")
+        if err == "invalid_scope":
+            raise HTTPException(status_code=400, detail="scope must be folders, files, or all")
         if err == "supplier_not_found":
             raise HTTPException(
                 status_code=404,
                 detail="Folder not found under Supplier Folders.",
+            )
+        raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
+    return payload
+
+
+@app.get("/api/suppliers/files/{file_id}/tabs")
+def suppliers_sheet_tabs(
+    file_id: str,
+    user_info: dict = Depends(verify_google_token),
+):
+    """Sheet tabs for a Google Sheet stored inside a supplier folder."""
+    _ = user_info
+    payload, err, status = list_supplier_sheet_tabs(file_id)
+    if err:
+        if err == "missing_file_id":
+            raise HTTPException(status_code=400, detail="file_id is required")
+        if err == "not_a_sheet":
+            raise HTTPException(status_code=400, detail="That file is not a Google Sheet")
+        if err == "supplier_not_found":
+            raise HTTPException(
+                status_code=404,
+                detail="Sheet not found under Supplier Folders.",
             )
         raise HTTPException(status_code=status if status >= 400 else 502, detail=err)
     return payload
@@ -7393,6 +7423,21 @@ def invoicing_commission_up_to_date_summary_endpoint(
         "row_count": data["row_count"] if data else 0,
         "total_commission": data["total_commission"] if data else 0,
         "row_label": data["row_label"] if data else "row",
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/alinta-sme-summary")
+def invoicing_alinta_sme_summary_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Alinta SME workbook tabs plus the Annual Savings total for each tab.
+    Replaces the footer sum that used to sit on the bottom row of the sheet.
+    """
+    tabs, err = get_alinta_sme_sheet_summary()
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "tabs": tabs or [],
         "user_email": user_info.get("email"),
     }
 
@@ -11542,6 +11587,7 @@ def link_client_from_loa(
         client_id=body.client_id,
         owner_email=owner_email,
         reassign=body.reassign,
+        stage=body.stage.value if body.stage is not None else None,
     )
 
 

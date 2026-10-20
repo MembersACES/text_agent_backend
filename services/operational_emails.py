@@ -147,6 +147,20 @@ def _move_alinta_sme_off_test_inbox(db: Session) -> bool:
     return True
 
 
+def _replace_old_jemena_service_desk(db: Session) -> bool:
+    """Swap the first Jemena seed for the published customer relations inbox."""
+    row = get_recipient_by_key(db, "data_request", "Jemena Gas Networks (NSW)", include_inactive=True)
+    if row is None:
+        return False
+    current = [email.lower() for email in _loads_list(row.emails_json)]
+    if current != ["jenservicedesk@jemena.com.au", "data.quote@fornrg.com"]:
+        return False
+    row.emails_json = _dumps_list(
+        ["customerrelations@jemena.com.au", "data.quote@fornrg.com"]
+    )
+    return True
+
+
 def seed_operational_emails(db: Session) -> dict[str, int]:
     inserted_templates = 0
     inserted_recipients = 0
@@ -193,7 +207,8 @@ def seed_operational_emails(db: Session) -> dict[str, int]:
         )
         inserted_recipients += 1
     corrected_test_inbox = _move_alinta_sme_off_test_inbox(db)
-    if inserted_templates or inserted_recipients or corrected_test_inbox:
+    corrected_jemena = _replace_old_jemena_service_desk(db)
+    if inserted_templates or inserted_recipients or corrected_test_inbox or corrected_jemena:
         db.commit()
     return {"templates": inserted_templates, "recipients": inserted_recipients}
 

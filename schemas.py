@@ -240,6 +240,7 @@ class ClientLinkFromLoaRequest(BaseModel):
     gdrive_folder_url: Optional[str] = None
     client_id: Optional[int] = None
     reassign: bool = False
+    stage: Optional[ClientStage] = None
 
 
 class ClientResponse(BaseModel):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,12 +17,13 @@ from tools.member_folder_drive import (
     upload_bytes_to_folder,
     _user_drive_service,
 )
-from tools.one_month_savings import extract_folder_id_from_url, get_drive_service
+from tools.one_month_savings import extract_folder_id_from_url, get_drive_service, get_sheets_service
 from tools.share_folder import drive_file_url, drive_folder_url, is_sa_quota_error
 
 logger = logging.getLogger(__name__)
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+SPREADSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 SUPPLIER_FOLDERS_NAME = "Supplier Folders"
 PREFERRED_PARENT_NAME = "005-Suppliers"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -246,6 +248,30 @@ def _list_children(
 
 
 _MAX_FOLDER_DEPTH = 24
+_LIST_CACHE_TTL_SECONDS = 60.0
+_LIST_CACHE: Dict[str, tuple[float, Any]] = {}
+_DOCUMENT_SCOPES = frozenset({"all", "folders", "files"})
+
+
+def _cache_get(key: str) -> Any:
+    hit = _LIST_CACHE.get(key)
+    if not hit:
+        return None
+    stored_at, value = hit
+    if time.monotonic() - stored_at > _LIST_CACHE_TTL_SECONDS:
+        _LIST_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _LIST_CACHE[key] = (time.monotonic(), value)
+
+
+def _cache_drop_prefix(prefix: str) -> None:
+    for key in list(_LIST_CACHE):
+        if key.startswith(prefix):
+            _LIST_CACHE.pop(key, None)
 
 
 def _get_drive_meta(drive: Any, file_id: str) -> Optional[Dict[str, Any]]:
@@ -417,6 +443,10 @@ def _normalize_file(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def list_supplier_folders() -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    cached = _cache_get("suppliers")
+    if cached is not None:
+        return cached, None, 200
+
     drive, err = _drive_or_error()
     if err:
         return None, err, 503
@@ -452,11 +482,13 @@ def list_supplier_folders() -> Tuple[Optional[Dict[str, Any]], Optional[str], in
             }
         )
     suppliers.sort(key=lambda row: (row["name"] or "").lower())
-    return {
+    payload = {
         "parent_folder_id": parent_id,
         "parent_folder_url": drive_folder_url(parent_id),
         "suppliers": suppliers,
-    }, None, 200
+    }
+    _cache_set("suppliers", payload)
+    return payload, None, 200
 
 
 def _supplier_row(fid: str, name: str, folder_url: str, modified_time: Optional[str] = None) -> Dict[str, Any]:
@@ -545,6 +577,7 @@ def create_supplier_folder(
         else:
             return None, f"Google Drive error: {getattr(e, 'reason', e)}", 502
 
+    _cache_drop_prefix("suppliers")
     return {
         **_supplier_row(folder_id, folder_name, drive_folder_url(folder_id)),
         "created": created,
@@ -553,10 +586,18 @@ def create_supplier_folder(
 
 def list_supplier_documents(
     folder_id: str,
+    scope: str = "all",
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
     fid = (folder_id or "").strip()
     if not fid:
         return None, "missing_folder_id", 400
+    listing = (scope or "all").strip().lower()
+    if listing not in _DOCUMENT_SCOPES:
+        return None, "invalid_scope", 400
+
+    cached = _cache_get(f"docs:{fid}:{listing}")
+    if cached is not None:
+        return cached, None, 200
 
     drive, err = _drive_or_error()
     if err:
@@ -566,17 +607,27 @@ def list_supplier_documents(
     if parent_err or not parent_id:
         return None, parent_err or _not_configured_message(), 503
 
-    scope, confirm_err = _resolve_under_supplier(drive, fid, parent_id)
-    if confirm_err or not scope:
-        return None, "supplier_not_found", 404
+    resolved = _cache_get(f"scope:{parent_id}:{fid}")
+    if resolved is None:
+        resolved, confirm_err = _resolve_under_supplier(drive, fid, parent_id)
+        if confirm_err or not resolved:
+            return None, "supplier_not_found", 404
+        _cache_set(f"scope:{parent_id}:{fid}", resolved)
 
-    current = scope["current"]
-    supplier = scope["supplier"]
+    current = resolved["current"]
+    supplier = resolved["supplier"]
     current_id = str(current.get("id") or fid)
     supplier_id = str(supplier.get("id") or "")
     supplier_name = str(supplier.get("name") or "Supplier")
 
-    children, list_err = _list_children(drive, current_id)
+    folders_only = listing == "folders"
+    files_only = listing == "files"
+    children, list_err = _list_children(
+        drive,
+        current_id,
+        folders_only=folders_only,
+        files_only=files_only,
+    )
     if list_err:
         return None, "drive_error", 502
 
@@ -594,7 +645,7 @@ def list_supplier_documents(
     files.sort(key=lambda row: (row.get("name") or "").lower())
     subfolders.sort(key=lambda row: (row.get("name") or "").lower())
 
-    return {
+    payload = {
         "supplier": {
             "id": supplier_id,
             "name": supplier_name,
@@ -607,9 +658,78 @@ def list_supplier_documents(
             "name": str(current.get("name") or supplier_name),
             "folder_url": current.get("webViewLink") or drive_folder_url(current_id),
         },
-        "path": scope["path"],
+        "path": resolved["path"],
         "folders": subfolders,
         "files": files,
+    }
+    _cache_set(f"docs:{fid}:{listing}", payload)
+    return payload, None, 200
+
+
+def list_supplier_sheet_tabs(
+    file_id: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    """Tab names and gids for a Google Sheet stored under Supplier Folders."""
+    fid = (file_id or "").strip()
+    if not fid or not _DRIVE_ID_RE.match(fid):
+        return None, "missing_file_id", 400
+
+    drive, err = _drive_or_error()
+    if err:
+        return None, err, 503
+
+    parent_id, parent_err = _discover_parent_id(drive)
+    if parent_err or not parent_id:
+        return None, parent_err or _not_configured_message(), 503
+
+    meta = _get_drive_meta(drive, fid)
+    if not meta or meta.get("trashed"):
+        return None, "supplier_not_found", 404
+    if meta.get("mimeType") != SPREADSHEET_MIME:
+        return None, "not_a_sheet", 400
+
+    scope = None
+    for folder_id in meta.get("parents") or []:
+        scope, _confirm_err = _resolve_under_supplier(drive, str(folder_id), parent_id)
+        if scope:
+            break
+    if not scope:
+        return None, "supplier_not_found", 404
+
+    service = get_sheets_service()
+    if not service:
+        return None, "sheets_unavailable", 503
+
+    try:
+        raw = (
+            service.spreadsheets()
+            .get(spreadsheetId=fid, fields="sheets(properties(sheetId,title))")
+            .execute()
+        )
+    except HttpError as e:
+        logger.warning(
+            "supplier sheet tabs HttpError file=%s status=%s",
+            fid,
+            getattr(e.resp, "status", e),
+        )
+        return None, "http_error", 502
+    except Exception:
+        logger.exception("supplier sheet tabs failed file=%s", fid)
+        return None, "http_error", 502
+
+    tabs: List[Dict[str, str]] = []
+    for sheet in raw.get("sheets") or []:
+        props = sheet.get("properties") or {}
+        title = props.get("title")
+        gid = props.get("sheetId")
+        if title is None or gid is None:
+            continue
+        tabs.append({"name": str(title), "gid": str(gid)})
+
+    return {
+        "file_id": fid,
+        "name": str(meta.get("name") or "Sheet"),
+        "tabs": tabs,
     }, None, 200
 
 
@@ -685,6 +805,7 @@ def upload_supplier_document(
         return None, f"Google Drive error: {getattr(e, 'reason', e)}", 502
 
     file_id = created.get("id") or ""
+    _cache_drop_prefix(f"docs:{fid}:")
     return {
         "id": file_id,
         "name": name,

@@ -38,6 +38,11 @@ _MONEY_NOISE_RE = re.compile(r"[$,]|aud", re.IGNORECASE)
 TROJAN_OIL_SPREADSHEET_ID = "1lFAUB1nl7yh2JkwgEI7Zd_lSDGusDtVnDIuZFPVmhdU"
 TROJAN_OIL_ALL_DATA_GID = 2013429471
 
+# Alinta SME workbook shown on the invoicing dashboard.
+ALINTA_SME_SPREADSHEET_ID = "1cqoC1xBYmAlPtA4-perDkpRPnbJg7ZWkRfzAhkyZfuo"
+_ANNUAL_SAVINGS_HEADER = "annual savings"
+_BUSINESS_HEADER = "business"
+
 
 def list_retailer_keys() -> list[str]:
     return sorted(_RETAILER_SHEETS.keys())
@@ -152,6 +157,100 @@ def summarise_commission_up_to_date(
         "total_commission": round(total, 2),
         "row_label": row_label,
     }, None
+
+
+def summarise_annual_savings(
+    header: list, rows: list
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """
+    Sum the Annual Savings column for business rows.
+    Skips blank rows and a leftover Total / Sum footer.
+    """
+    if not header:
+        return None, "missing_header"
+
+    normalized = [_normalize_header(cell) for cell in header]
+    try:
+        savings_idx = normalized.index(_ANNUAL_SAVINGS_HEADER)
+    except ValueError:
+        return None, "annual_savings_column_not_found"
+
+    business_idx = normalized.index(_BUSINESS_HEADER) if _BUSINESS_HEADER in normalized else 0
+    count = 0
+    total = 0.0
+    for row in rows:
+        business = row[business_idx] if business_idx < len(row) else None
+        if not _is_data_identifier(business):
+            continue
+        count += 1
+        amount = row[savings_idx] if savings_idx < len(row) else None
+        total += _parse_money(amount)
+
+    return {
+        "row_count": count,
+        "annual_savings": round(total, 2),
+    }, None
+
+
+def get_alinta_sme_sheet_summary() -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """Tab names, gids, and Annual Savings totals for the Alinta SME workbook."""
+    service = get_sheets_service()
+    if not service:
+        return None, "sheets_unavailable"
+
+    try:
+        tabs = _list_sheet_properties(service, ALINTA_SME_SPREADSHEET_ID)
+        if not tabs:
+            return None, "tab_not_found"
+        ranges = [f"{_escape_sheet_title(tab['name'])}!A1:Z" for tab in tabs]
+        resp = (
+            service.spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=ALINTA_SME_SPREADSHEET_ID,
+                ranges=ranges,
+                valueRenderOption="UNFORMATTED_VALUE",
+            )
+            .execute()
+        )
+    except HttpError as e:
+        logger.warning(
+            "alinta sme summary HttpError status=%s",
+            getattr(e.resp, "status", e),
+        )
+        return None, "http_error"
+    except Exception:
+        logger.exception("alinta sme summary failed")
+        return None, "http_error"
+
+    blocks = resp.get("valueRanges") or []
+    out: list[dict[str, Any]] = []
+    for tab, block in zip(tabs, blocks):
+        values = block.get("values") or []
+        header = values[0] if values else []
+        rows = values[1:] if len(values) > 1 else []
+        summary, err = summarise_annual_savings(header, rows)
+        if err == "annual_savings_column_not_found" or not header:
+            out.append(
+                {
+                    "name": tab["name"],
+                    "gid": tab["gid"],
+                    "row_count": 0,
+                    "annual_savings": None,
+                }
+            )
+            continue
+        if err or summary is None:
+            return None, err or "summary_failed"
+        out.append(
+            {
+                "name": tab["name"],
+                "gid": tab["gid"],
+                "row_count": summary["row_count"],
+                "annual_savings": summary["annual_savings"],
+            }
+        )
+    return out, None
 
 
 def _commission_up_to_date_title(tabs: list[dict[str, Any]]) -> Optional[str]:
