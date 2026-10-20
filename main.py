@@ -81,6 +81,7 @@ from tools.alinta_electricity_ef import (
 )
 from tools.invoicing_retailer_sheets import (
     ORIGIN_COMMISSION_READY_KEYS,
+    get_alinta_sme_sheet_summary,
     get_commission_figures_client_count,
     get_commission_up_to_date_summary,
     get_trojan_oil_unique_client_count,
@@ -7396,6 +7397,21 @@ def invoicing_commission_up_to_date_summary_endpoint(
         "row_count": data["row_count"] if data else 0,
         "total_commission": data["total_commission"] if data else 0,
         "row_label": data["row_label"] if data else "row",
+        "user_email": user_info.get("email"),
+    }
+
+
+@app.get("/api/invoicing/alinta-sme-summary")
+def invoicing_alinta_sme_summary_endpoint(user_info: dict = Depends(verify_google_token)):
+    """
+    Alinta SME workbook tabs plus the Annual Savings total for each tab.
+    Replaces the footer sum that used to sit on the bottom row of the sheet.
+    """
+    tabs, err = get_alinta_sme_sheet_summary()
+    if err:
+        raise HTTPException(status_code=502, detail=err)
+    return {
+        "tabs": tabs or [],
         "user_email": user_info.get("email"),
     }
 
