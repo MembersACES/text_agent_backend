@@ -5,6 +5,7 @@ from tools.alinta_gas_ef import (
     build_email_html,
     build_email_subject,
     compose_alinta_gas_draft,
+    estimate_mdq_gj,
     extract_alinta_gas_ef,
     flatten_draft_fields,
     gas_ef_folder_id,
@@ -114,6 +115,39 @@ def test_empty_ef_dates_are_not_filled_from_sheet():
     assert draft["fields"]["start_date"]["value"] == ""
     assert draft["fields"]["start_date"]["source"] == "missing"
     assert draft["fields"]["end_date"]["source"] == "missing"
+
+
+def test_alinta_mdq_is_cpq_over_365_times_load_factor_two():
+    assert estimate_mdq_gj(50000) == 274
+    assert estimate_mdq_gj("47,760.85") == 262
+    assert estimate_mdq_gj(19000) == 104
+    assert estimate_mdq_gj("") is None
+    assert estimate_mdq_gj(50) is None
+
+
+def test_blank_mdq_is_estimated_from_cpq():
+    draft = compose_alinta_gas_draft(
+        _extract(mdq_gj="", cpq_gj="50000"),
+        {"match_kind": "none", "contracts": []},
+    )
+    assert draft["fields"]["mdq_gj"]["source"] == "estimated"
+    assert draft["fields"]["mdq_gj"]["estimated"] is True
+    assert draft["fields"]["mdq_gj"]["value"] == "274"
+    assert "274" in build_email_html(draft)
+
+
+def test_sheet_or_ef_mdq_is_not_replaced_by_the_alinta_calc():
+    kept = compose_alinta_gas_draft(_extract(), _sheet_lookup())
+    assert kept["fields"]["mdq_gj"]["source"] == "sheet"
+    assert kept["fields"]["mdq_gj"]["value"] == "65"
+    assert kept["fields"]["mdq_gj"]["estimated"] is False
+
+    from_ef = compose_alinta_gas_draft(
+        _extract(mdq_gj="65", cpq_gj="19000"),
+        {"match_kind": "none", "contracts": []},
+    )
+    assert from_ef["fields"]["mdq_gj"]["source"] == "ef"
+    assert from_ef["fields"]["mdq_gj"]["value"] == "65"
 
 
 def test_sheet_miss_uses_ef_and_estimates_min_cpq():

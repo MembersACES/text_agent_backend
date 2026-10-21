@@ -7,6 +7,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional
 
 import requests
@@ -86,6 +87,8 @@ INVOICE_API_PROCESS_EF_URL = (
     or "https://aces-invoice-api-672026052958.australia-southeast2.run.app/v1/ef/process-ef"
 )
 DEFAULT_MIN_CPQ_PCT = 80.0
+MDQ_YEAR_DAYS = 365
+MDQ_MARKET_LOAD_FACTOR = 2
 
 EXTRACT_KEYS: tuple[str, ...] = (
     "company_name",
@@ -288,6 +291,18 @@ def _fmt_qty(value: Any) -> str:
     if abs(number - round(number)) < 1e-9:
         return f"{int(round(number)):,}"
     return f"{number:,.2f}"
+
+
+def estimate_mdq_gj(cpq: Any) -> int | None:
+    """Alinta market load factor 2: MDQ = CPQ / 365 × 2, rounded to a whole GJ."""
+    number = parse_sheet_number(cpq)
+    if number is None or number <= 0:
+        return None
+    raw = (Decimal(str(number)) / Decimal(MDQ_YEAR_DAYS)) * Decimal(MDQ_MARKET_LOAD_FACTOR)
+    rounded = int(raw.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    if rounded < 1:
+        return None
+    return rounded
 
 
 def _fmt_pct(value: Any) -> str:
@@ -752,6 +767,10 @@ def compose_alinta_gas_draft(
             min_cpq = _field(_fmt_qty(cpq_num * (pct_num / 100.0)), "estimated", estimated=True)
 
     mdq = commercial(period.get("mdq_gj_per_day"), extract.get("mdq_gj"), qty=True)
+    if mdq["source"] == "missing" and cpq["value"]:
+        estimated_mdq = estimate_mdq_gj(cpq["value"])
+        if estimated_mdq is not None:
+            mdq = _field(_fmt_qty(estimated_mdq), "estimated", estimated=True)
 
     request_kind = "Retention" if found else "Acquisition"
     loa_file_id = drive_file_id(biz.get("loa_link"))
