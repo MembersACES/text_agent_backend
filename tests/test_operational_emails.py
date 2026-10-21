@@ -159,6 +159,36 @@ def test_gas_network_inboxes_copy_data_quote_and_old_jemena_is_replaced():
     assert "desk@jemena.com.au" in (kept.emails_json or "")
 
 
+def test_seed_turns_fixed_network_history_into_a_token():
+    db = _db()
+    seed_operational_emails(db)
+    row = next(item for item in list_templates(db) if item.key == "data_request.gas_ci_network")
+    assert "{{history_period}}" in (row.html_body or "")
+    row.html_body = (row.html_body or "").replace(
+        "{{history_period}} to date of interval and meter read data",
+        "36 months to date of interval and meter read data",
+    )
+    row.description = "Sent to a gas network for 36 months of interval and meter-read data, plus confirmation of MDQ, MHQ, and tariff."
+    db.commit()
+
+    seed_operational_emails(db)
+    refreshed = next(item for item in list_templates(db) if item.key == "data_request.gas_ci_network")
+    assert "{{history_period}} to date of interval and meter read data" in (refreshed.html_body or "")
+    assert "36 months" not in (refreshed.html_body or "")
+    assert "history_period" in (refreshed.merge_fields or "")
+    assert "the selected years" in (refreshed.description or "")
+
+    update_template(
+        db,
+        "data_request.gas_ci_network",
+        html_body="<p>Please send the meter data you hold for {{business_name}}</p>",
+        updated_by="alex@acesolutions.com.au",
+    )
+    seed_operational_emails(db)
+    kept = next(item for item in list_templates(db) if item.key == "data_request.gas_ci_network")
+    assert "meter data you hold" in (kept.html_body or "")
+
+
 def test_add_and_update_recipient_emails():
     db = _db()
     seed_operational_emails(db)

@@ -45,6 +45,7 @@ TEMPLATE_VARS = {
     "nmi": "2002323086",
     "mrin": "5323746742",
     "account_number": "ACC-1",
+    "history_period": "3 years",
 }
 
 
@@ -303,9 +304,117 @@ def test_network_data_request_asks_for_meter_data_and_contract_terms(monkeypatch
     assert "data.quote@fornrg.com" in payload["supplier_email"]
     assert "52477254208" in payload["email_subject"]
     body = payload["email_body"]
-    assert "36 months to date of interval and meter read data" in body
+    assert payload["data_years"] == 3
+    assert "3 years to date of interval and meter read data" in body
+    assert "36 months" not in body
     assert "Confirmation of the current MDQ" in body
     assert "Confirmation of the current MHQ" in body
     assert "Confirmation of the current tariff" in body
     assert "Copy of 12 months worth of invoices" not in body
     assert "Jul 2025" not in body
+
+
+@pytest.mark.parametrize(
+    ("years", "phrase"),
+    [
+        (1, "1 year to date of interval and meter read data"),
+        (7, "7 years to date of interval and meter read data"),
+        (0, "3 years to date of interval and meter read data"),
+        (11, "3 years to date of interval and meter read data"),
+    ],
+)
+def test_network_data_request_uses_the_selected_history(monkeypatch, years, phrase):
+    import tools.supplier_data_request as sdr
+
+    sent = {}
+    monkeypatch.setattr(
+        sdr.requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: (
+            sent.update(payload=json) or _FakeResponse()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr("services.operational_emails.with_db", lambda callback: None)
+
+    sdr.supplier_data_request(
+        supplier_name="Australian Gas Networks",
+        business_name="Frankston RSL Sub Branch Inc",
+        service_type="gas_ci",
+        account_identifier="5325687564",
+        identifier_type="MRIN",
+        network_data_request=True,
+        data_years=years,
+    )
+
+    body = sent["payload"]["email_body"]
+    assert phrase in body
+    assert sent["payload"]["data_years"] == (years if 1 <= years <= 10 else 3)
+
+
+def test_network_data_request_rewrites_a_stored_36_month_template(monkeypatch):
+    import tools.supplier_data_request as sdr
+
+    sent = {}
+    monkeypatch.setattr(
+        sdr.requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: (
+            sent.update(payload=json) or _FakeResponse()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "services.operational_emails.with_db",
+        lambda callback: (
+            (
+                "GAS Meter read data request {{business_name}} MRIN {{mrin}}",
+                "<li>36 months to date of interval and meter read data</li>",
+            ),
+            None,
+        ),
+    )
+
+    sdr.supplier_data_request(
+        supplier_name="Australian Gas Networks",
+        business_name="Frankston RSL Sub Branch Inc",
+        service_type="gas_ci",
+        account_identifier="5325687564",
+        identifier_type="MRIN",
+        network_data_request=True,
+        data_years=5,
+    )
+
+    assert "5 years to date of interval and meter read data" in sent["payload"]["email_body"]
+    assert "36 months" not in sent["payload"]["email_body"]
+
+
+def test_a_test_send_goes_only_to_data_quote(monkeypatch):
+    import tools.supplier_data_request as sdr
+
+    sent = {}
+    monkeypatch.setattr(
+        sdr.requests,
+        "post",
+        lambda url, json=None, headers=None, timeout=None: (
+            sent.update(payload=json) or _FakeResponse()
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr("services.operational_emails.with_db", lambda callback: None)
+
+    sdr.supplier_data_request(
+        supplier_name="Australian Gas Networks",
+        business_name="Frankston RSL Sub Branch Inc",
+        service_type="gas_ci",
+        account_identifier="5325687564",
+        identifier_type="MRIN",
+        network_data_request=True,
+        data_years=3,
+        test_send=True,
+    )
+
+    assert sent["payload"]["supplier_email"] == "data.quote@fornrg.com"
+    assert "agnl@agig.com.au" not in sent["payload"]["supplier_email"]
+    assert sent["payload"]["test_send"] is True
+    assert "3 years to date of interval and meter read data" in sent["payload"]["email_body"]

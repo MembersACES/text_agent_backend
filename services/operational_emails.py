@@ -161,6 +161,31 @@ def _replace_old_jemena_service_desk(db: Session) -> bool:
     return True
 
 
+def _patch_network_history_token(db: Session) -> bool:
+    """Turn a stored 36-month ask into the {{history_period}} merge field."""
+    row = get_template_or_none(db, "data_request.gas_ci_network")
+    if row is None or "36 months to date of interval and meter read data" not in (row.html_body or ""):
+        return False
+    row.html_body = row.html_body.replace(
+        "36 months to date of interval and meter read data",
+        "{{history_period}} to date of interval and meter read data",
+    )
+    fields = _loads_list(row.merge_fields)
+    if "history_period" not in fields:
+        fields.append("history_period")
+        row.merge_fields = _dumps_list(fields)
+    sample = _loads_obj(row.sample_values)
+    if "history_period" not in sample:
+        sample["history_period"] = "3 years"
+        row.sample_values = json.dumps(sample)
+    if row.description and "36 months of interval and meter-read data" in row.description:
+        row.description = row.description.replace(
+            "36 months of interval and meter-read data",
+            "the selected years of interval and meter-read data",
+        )
+    return True
+
+
 def seed_operational_emails(db: Session) -> dict[str, int]:
     inserted_templates = 0
     inserted_recipients = 0
@@ -208,7 +233,8 @@ def seed_operational_emails(db: Session) -> dict[str, int]:
         inserted_recipients += 1
     corrected_test_inbox = _move_alinta_sme_off_test_inbox(db)
     corrected_jemena = _replace_old_jemena_service_desk(db)
-    if inserted_templates or inserted_recipients or corrected_test_inbox or corrected_jemena:
+    corrected_history = _patch_network_history_token(db)
+    if inserted_templates or inserted_recipients or corrected_test_inbox or corrected_jemena or corrected_history:
         db.commit()
     return {"templates": inserted_templates, "recipients": inserted_recipients}
 
