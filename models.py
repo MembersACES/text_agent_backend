@@ -383,6 +383,7 @@ class Testimonial(Base):
     invoice_number = Column(String(100), nullable=True, index=True)  # Optional link to 1st Month Savings
     status = Column(String(50), nullable=False, default="Draft", index=True)  # Draft | Sent for approval | Approved
     social_status = Column(String(50), nullable=True, index=True)  # Planned | Drafted | Ready to post | Posted
+    social_draft_file_id = Column(String(255), nullable=True)  # LinkedIn draft in the shared Drive folder
     testimonial_type = Column(String(255), nullable=True)  # e.g. C&I Electricity Reviews
     testimonial_solution_type_id = Column(String(100), nullable=True)  # e.g. ci_electricity
     testimonial_savings = Column(String(255), nullable=True)  # Free-text savings summary

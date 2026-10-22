@@ -178,6 +178,7 @@ def init_db():
                 ("video_long_file_id", "VARCHAR(255)"),
                 ("video_short_file_id", "VARCHAR(255)"),
                 ("social_status", "VARCHAR(50)"),
+                ("social_draft_file_id", "VARCHAR(255)"),
                 ("association_id", "INTEGER"),
             ]:
                 if col_name not in cols:
