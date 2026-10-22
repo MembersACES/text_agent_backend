@@ -892,6 +892,28 @@ class TestimonialResponse(BaseModel):
         from_attributes = True
 
 
+class SocialDraftFile(BaseModel):
+    file_id: str
+    file_name: str
+    file_url: str
+    modified_time: Optional[str] = None
+    text: str = ""
+    read_error: Optional[str] = None
+
+
+class SocialDraftMatch(SocialDraftFile):
+    testimonial_id: int
+    business_name: str
+
+
+class SocialDraftsResponse(BaseModel):
+    folder_url: str
+    guide: Optional[SocialDraftFile] = None
+    drafts: List[SocialDraftMatch] = []
+    unlinked: List[SocialDraftFile] = []
+    error: Optional[str] = None
+
+
 class TestimonialUpdate(BaseModel):
     status: Optional[str] = None
     invoice_number: Optional[str] = None

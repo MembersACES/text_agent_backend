@@ -230,6 +230,7 @@ from tools.testimonial_solution_content import (
     resolve_testimonial_type,
 )
 from tools.testimonial_examples import get_testimonials_for_solution_type
+from tools.social_drafts import load_social_drafts
 from tools.dma_contract_details import file_dma_contract_details
 
 # Database imports
@@ -300,6 +301,7 @@ from schemas import (
     StrategyItemResponse,
     TestimonialResponse,
     TestimonialUpdate,
+    SocialDraftsResponse,
     AssociationContactUpdate,
     AssociationContactWrite,
     AssociationContactsResponse,
@@ -10262,6 +10264,24 @@ async def update_testimonial_solution_content(
         return TestimonialSolutionContentItem(**merged)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/testimonials/social-drafts", response_model=SocialDraftsResponse)
+async def get_testimonial_social_drafts(
+    authorization: str = Header(...),
+    db: Session = Depends(get_db),
+):
+    """LinkedIn draft posts from the shared Drive folder, matched to testimonials."""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Invalid authorization format")
+    token = authorization.split("Bearer ")[1]
+    if token != os.getenv("BACKEND_API_KEY", "test-key"):
+        try:
+            verify_google_token(authorization)
+        except Exception as e:
+            logging.error(f"Token verification failed: {e}")
+            raise HTTPException(status_code=401, detail="Invalid Google token")
+    return load_social_drafts(db)
 
 
 @app.get("/api/testimonials/examples", response_model=List[TestimonialResponse])
